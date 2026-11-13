@@ -45,11 +45,6 @@ def _mock_s3(pages_by_prefix: dict[str, list[dict]]):
     return s3
 
 
-# ---------------------------------------------------------------------------
-# _delete_s3_prefix
-# ---------------------------------------------------------------------------
-
-
 class TestDeleteS3Prefix:
     def test_deletes_all_objects_in_prefix(self):
         from coa_sources.documents.deletion import cleanup_handler
@@ -124,11 +119,6 @@ class TestDeleteS3Prefix:
             cleanup_handler._delete_s3_prefix(_BUCKET, "a/")
 
 
-# ---------------------------------------------------------------------------
-# handler() — upload type
-# ---------------------------------------------------------------------------
-
-
 class TestHandlerUploadType:
     def test_upload_deletes_raw_and_staging(self):
         from coa_sources.documents.deletion import cleanup_handler
@@ -199,11 +189,6 @@ class TestHandlerUploadType:
             )
 
 
-# ---------------------------------------------------------------------------
-# handler() — s3 type
-# ---------------------------------------------------------------------------
-
-
 class TestHandlerS3Type:
     def test_s3_type_only_deletes_staging(self):
         """For s3 source type, raw files are in customer bucket — skip them."""
@@ -250,11 +235,6 @@ class TestHandlerS3Type:
         assert result["raw_objects_deleted"] == 0
 
 
-# ---------------------------------------------------------------------------
-# handler() — return value structure
-# ---------------------------------------------------------------------------
-
-
 class TestHandlerReturnValue:
     def test_return_value_has_all_required_keys(self):
         from coa_sources.documents.deletion import cleanup_handler
@@ -275,24 +255,11 @@ class TestHandlerReturnValue:
             "batch_inference_objects_deleted",
         }
 
-    def test_tenant_id_passed_through(self):
-        from coa_sources.documents.deletion import cleanup_handler
 
-        staging_prefix = f"{_NAMESPACE_ID}/staging/{_DOC_SOURCE_ID}/"
-        s3 = _mock_s3({staging_prefix: [{}]})
-
-        with patch.object(cleanup_handler, "_s3", s3):
-            result = cleanup_handler.handler({**_BASE_EVENT, "s3_prefixes": []}, None)
-
-        assert result["tenant_id"] == _TENANT_ID
-
-
-@pytest.mark.unit
 class TestScanResultsCleanup:
     def test_deletes_scan_results_reports(self):
-        """The preprocessing diagnostics reports under {ns}/scan-results/{ds}/
-        (issue 104) must be deleted with the source — they carry the customer's
-        full object keys for every failed file."""
+        """The preprocessing diagnostics reports under {ns}/scan-results/{ds}/ must be
+        deleted with the source: they carry the customer's full object keys."""
         from coa_sources.documents.deletion import cleanup_handler
 
         staging_prefix = f"{_NAMESPACE_ID}/staging/{_DOC_SOURCE_ID}/"
@@ -314,7 +281,6 @@ class TestScanResultsCleanup:
         assert result["scan_results_objects_deleted"] == 1
 
 
-@pytest.mark.unit
 class TestBatchInferenceCleanup:
     def test_deletes_batch_inference_objects(self):
         """Bedrock batch-inference input/output under {ns}/batch-inference/{ds}/

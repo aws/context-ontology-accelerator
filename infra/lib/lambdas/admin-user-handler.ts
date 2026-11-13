@@ -22,10 +22,7 @@ import { DEFAULT_ADMIN_EMAIL } from "../constants";
 
 const cognito = new CognitoIdentityProviderClient({});
 
-/**
- * Validate required custom resource properties.
- * Email is passed directly — no Secrets Manager involved.
- */
+/** Validate required custom resource properties. */
 function validateProps(props: Record<string, unknown>): {
   userPoolId: string;
   email: string;
@@ -132,9 +129,6 @@ async function handleDelete(
 /**
  * Create the admin user with a temporary password (Cognito emails it, except to
  * the placeholder address) and assign them to the admin group.
- *
- * No permanent password is set — the user must change it on first login.
- * No Secrets Manager secret is created.
  */
 async function createUserAndGroup(
   userPoolId: string,

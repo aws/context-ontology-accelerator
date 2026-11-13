@@ -1,7 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { render, waitFor, cleanup, within } from "@testing-library/react";
+import { render, waitFor, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { InductedSourcesView } from "./InductedSourcesView";
 import type { ApiClient } from "@components/ApiClientProvider";
@@ -48,7 +48,6 @@ function renderView(props: { namespace?: string } = { namespace: "ns" }) {
 
 describe("InductedSourcesView", () => {
   beforeEach(() => {
-    cleanup();
     vi.clearAllMocks();
   });
 

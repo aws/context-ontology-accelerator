@@ -42,9 +42,8 @@ const TIER_LABELS: Readonly<Record<number, AppMessage>> = {
   3: "Tier 3 — Knowledge Retrieval",
 };
 
-// Deep Reasoning is an execution MODE, not a tier. It resolves through the
-// tier-3 assembly path but must be labelled by its mode, otherwise it reads
-// identically to a Standard cascade that happened to resolve at tier 3 (#1166).
+// Deep Reasoning is an execution mode, not a tier. It resolves through the
+// tier-3 assembly path but is labelled by its mode.
 const DEEP_REASONING_LABEL = "Deep Reasoning";
 
 // Only surface a parallel-savings hint when it's material — for fast sources
@@ -62,9 +61,6 @@ function resolutionLabel(
   trace: TraceStep[],
   executionMode?: string,
 ): string {
-  // Mode wins over tier: a Deep Reasoning answer resolves at tier 3 but is not
-  // Standard mode's Tier-3 result (#1166). Standard / unset falls through to the
-  // tier label below.
   if (executionMode === "deep-reasoning") {
     return t(DEEP_REASONING_LABEL);
   }
@@ -85,12 +81,8 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-// Confidence display bands. These are DISPLAY bands only — they are
-// deliberately independent of the Tier-2→Tier-3 routing filter
-// (EMPTY_RESULT_CONFIDENCE_FLOOR = 0.3 in the orchestrator), which is an
-// internal junk filter, never a user-facing trust bar (#1166). The cutoffs
-// reuse the long-standing badge-colour thresholds so the word and the colour
-// can never disagree.
+// Confidence display bands only, independent of the backend routing filter.
+// They reuse the badge-colour thresholds so the word and colour agree.
 const CONFIDENCE_HIGH_MIN = 0.8;
 const CONFIDENCE_MEDIUM_MIN = 0.5;
 
@@ -182,7 +174,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
 
   return (
     <SpaceBetween size="l">
-      {/* Metadata key-value pairs */}
       <KeyValuePairs
         columns={2}
         items={[
@@ -210,7 +201,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         ]}
       />
 
-      {/* Confidence */}
       <SpaceBetween size="xxs">
         <Box variant="h5">{t("Confidence")}</Box>
         <SpaceBetween size="xs" direction="horizontal" alignItems="center">
@@ -223,7 +213,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         </SpaceBetween>
       </SpaceBetween>
 
-      {/* Boundary controls */}
       <SpaceBetween size="xxs">
         <Box variant="h5">{t("Boundary controls")}</Box>
         <SpaceBetween size="xs" direction="horizontal">
@@ -241,7 +230,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         </SpaceBetween>
       </SpaceBetween>
 
-      {/* Data sources */}
       {result.dataSources && result.dataSources.length > 0 && (
         <SpaceBetween size="xxs">
           <Box variant="h5">{t("Data sources")}</Box>
@@ -255,7 +243,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         </SpaceBetween>
       )}
 
-      {/* Supporting content */}
       {result.supportingContent && result.supportingContent.length > 0 && (
         <ExpandableSection
           headerText={t("Supporting content ({count})", {
@@ -313,7 +300,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
         </ExpandableSection>
       )}
 
-      {/* Execution plan — grouped into tier sections */}
       {trace.length > 0 && (
         <SpaceBetween size="s">
           <Box variant="h3">{t("Execution plan")}</Box>
@@ -363,8 +349,6 @@ export const RationalePanel: React.FC<RationalePanelProps> = ({
   );
 };
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
 interface StrategySubgroup {
   label: string;
   steps: StepsProps.Step[];
@@ -386,7 +370,6 @@ const SECTION_TITLES: Readonly<Record<string, AppMessage>> = {
   other: "Other",
 };
 
-// Stable display order for sections.
 const SECTION_ORDER = ["t1", "t2", "t3", "other"];
 
 // Setup steps (embedding/routing) run once Tier 1 misses, as a lead-in to the
@@ -403,10 +386,7 @@ function sectionKeyFor(stepId: string, setupTarget: string): string {
   if (stepId.startsWith("t1.")) return "t1";
   if (stepId.startsWith("t2.")) return "t2";
   if (stepId.startsWith("t3.")) return "t3";
-  // The graphrag lexical retriever (TIER3_STRATEGY=lexical-baseline) emits
-  // "lexical_baseline_retrieve" without a "t3." prefix; it IS a Tier-3 step, so
-  // classify it there — otherwise it lands in a stray "other" section and the
-  // Tier-3 execution plan looks incomplete.
+  // The lexical retriever emits this Tier-3 step without a "t3." prefix.
   if (stepId === "lexical_baseline_retrieve") return "t3";
   return "other";
 }
@@ -426,7 +406,6 @@ function buildTierSections(t: AppTranslate, trace: TraceStep[]): TierSection[] {
     }
   }
 
-  // Fold setup steps into the first retrieval tier that actually ran.
   const setupTarget = trace.some((s) => s.step.startsWith("t2.")) ? "t2" : "t3";
 
   const toRow = (step: TraceStep): StepsProps.Step => {

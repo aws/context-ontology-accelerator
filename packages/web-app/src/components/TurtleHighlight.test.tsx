@@ -14,12 +14,9 @@ describe("TurtleHighlight", () => {
       </TurtleHighlight>,
     );
     const pre = container.querySelector("pre")!;
-    // Syntax coloring is present (per-token color spans in the HTML string).
     expect(pre.querySelector("span")).toBeTruthy();
-    // Content is HTML-escaped, not injected as markup.
     expect(pre.innerHTML).toContain("&lt;");
     expect(pre.innerHTML).toContain("&amp;");
-    // ...but the visible text is preserved.
     expect(pre.textContent).toContain("a <b> & c");
   });
 
@@ -28,9 +25,7 @@ describe("TurtleHighlight", () => {
       'ex:Foo rdfs:comment "<script>alert(1)</script>" ;\n  rdfs:label "\\" onmouseover=\\"alert(2)" .';
     const { container } = render(<TurtleHighlight>{payload}</TurtleHighlight>);
     const pre = container.querySelector("pre")!;
-    // No live <script> element is created from the input.
     expect(pre.querySelector("script")).toBeNull();
-    // The angle brackets are escaped, so the markup cannot execute.
     expect(pre.innerHTML).toContain("&lt;script&gt;");
     expect(pre.innerHTML).not.toContain("<script>");
     // The quote in the payload stays in text context — no element picks up an
@@ -40,7 +35,6 @@ describe("TurtleHighlight", () => {
     for (const span of Array.from(pre.querySelectorAll("span"))) {
       expect(span.getAttribute("style")).toMatch(/^color:#[0-9a-f]+$/i);
     }
-    // The literal text is still displayed verbatim.
     expect(pre.textContent).toContain("<script>alert(1)</script>");
   });
 

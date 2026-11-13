@@ -45,8 +45,7 @@ ONTOLOGY_STORAGE_PATH = os.getenv("ONTOLOGY_STORAGE_PATH", "./data/ontologies")
 VSS_DIMENSION = int(os.getenv("VSS_DIMENSION", "1024"))
 NA_MAX_RETRIES = int(os.getenv("NA_MAX_RETRIES", "5"))
 # Bound the per-request read so a hung Neptune Analytics query can't block the
-# accept worker forever (#456/#466: the daemon thread otherwise hangs with no
-# timeout). 0 / unset-to-0 restores the old unbounded behavior if ever needed.
+# accept worker forever. 0 disables the bound.
 NA_READ_TIMEOUT = int(os.getenv("NA_READ_TIMEOUT", "120"))
 DEFAULT_NAMESPACE = os.getenv("DYNAMODB_DEFAULT_NAMESPACE", "default")
 
@@ -95,10 +94,6 @@ def _get_client():
         kwargs["endpoint_url"] = NA_ENDPOINT
     # AWS best practice: disable SDK retries for execute_query — NA rejects
     # retried SDK requests with UnprocessableException. We retry ourselves.
-    # read_timeout is bounded (NA_READ_TIMEOUT, default 120s) so a hung query
-    # surfaces as a timeout the accept worker can fail/retry, rather than
-    # blocking the daemon thread forever (#456/#466). Set NA_READ_TIMEOUT=0 to
-    # restore the previous unbounded behavior.
     boto_cfg = {
         "retries": {"total_max_attempts": 1, "mode": "standard"},
         "read_timeout": NA_READ_TIMEOUT if NA_READ_TIMEOUT > 0 else None,
@@ -221,14 +216,6 @@ def _fill_ont_edges(ont: dict, namespace: str | None = None) -> dict:
 def create_ontology(data: dict, namespace: str | None = None) -> dict:
     """Create an Ontology node (plus tag and import edges) and return the stored record.
 
-    Args:
-        data: Ontology fields (``uri`` and ``title`` required; ``domain_tags`` and
-            ``imports`` become TAGGED / IMPORTS edges).
-        namespace: The namespace to create the ontology under.
-
-    Returns:
-        The stored ontology as read back from the graph.
-
     Raises:
         RuntimeError: If the ontology cannot be read back after the write.
     """
@@ -294,16 +281,7 @@ def get_ontology(oid: str, namespace: str | None = None) -> dict | None:
 
 
 def get_ontology_by_uri(uri: str, namespace: str | None = None) -> dict | None:
-    """Fetch an ontology by URI, including its tag and import edges.
-
-    Args:
-        uri: The ontology URI to fetch.
-        namespace: The namespace to look in.
-
-    Returns:
-        The ontology record with ``domain_tags`` and ``imports`` filled, or None
-        when no such ontology exists.
-    """
+    """Fetch an ontology by URI, including its tag and import edges."""
     ns = _ns(namespace)
     nid = _nid(uri, namespace)
     res = _oc_query(
@@ -326,21 +304,7 @@ def list_ontologies(
     limit=50,
     namespace: str | None = None,
 ) -> list[dict]:
-    """List ontologies in a namespace, filtered and paginated.
-
-    Args:
-        ontology_type: Optional filter by ontology type.
-        uri: Optional filter to a single ontology URI.
-        source_registry: Optional filter by source registry.
-        license_tier: Optional filter by license tier.
-        domain_tag: Optional filter to ontologies carrying this domain tag.
-        skip: Number of results to skip (pagination offset).
-        limit: Maximum number of results to return.
-        namespace: The namespace to list within.
-
-    Returns:
-        The matching ontologies, each with tag/import edges filled.
-    """
+    """List ontologies in a namespace, filtered and paginated."""
     ns = _ns(namespace)
     wheres, params = ["n.namespace = $ns"], {"ns": ns}
     if ontology_type:
@@ -375,14 +339,6 @@ def update_ontology(uri: str, updates: dict, namespace: str | None = None) -> di
 
     The ``namespace`` property is never mutated; ``domain_tags`` and ``imports``
     are replaced wholesale (existing edges deleted, then re-created).
-
-    Args:
-        uri: The ontology URI to update.
-        updates: The fields to set; may include ``domain_tags`` and ``imports``.
-        namespace: The namespace the ontology lives in.
-
-    Returns:
-        The updated ontology record, or None when it does not exist.
     """
     if not updates:
         return get_ontology_by_uri(uri, namespace=namespace)
@@ -436,15 +392,7 @@ def update_ontology(uri: str, updates: dict, namespace: str | None = None) -> di
 
 
 def delete_ontology(uri: str, namespace: str | None = None) -> bool:
-    """Delete an ontology and its defined classes/properties and embeddings.
-
-    Args:
-        uri: The ontology URI to delete.
-        namespace: The namespace the ontology lives in.
-
-    Returns:
-        True if the Ontology node was deleted, False if it did not exist.
-    """
+    """Delete an ontology and its defined classes/properties and embeddings."""
     ns = _ns(namespace)
     nid = _nid(uri, namespace)
     # Delete embeddings linked via DEFINES edges (namespace-scoped)
@@ -481,16 +429,7 @@ def store_class(
     superclass_uris: list[str] | None = None,
     namespace: str | None = None,
 ) -> None:
-    """Upsert a Class node, link it to its ontology, and create SUBCLASS_OF edges.
-
-    Args:
-        ontology_uri: URI of the ontology that defines the class.
-        class_uri: URI of the class to store.
-        labels: Optional labels; the first is stored as the class label.
-        comments: Optional comments; the first is stored as the class comment.
-        superclass_uris: Optional parent class URIs to link via SUBCLASS_OF.
-        namespace: The namespace to store the class under.
-    """
+    """Upsert a Class node, link it to its ontology, and create SUBCLASS_OF edges."""
     ns = _ns(namespace)
     c_nid = _nid(class_uri, namespace)
     o_nid = _nid(ontology_uri, namespace)
@@ -520,17 +459,7 @@ def store_property(
     range_uris: list[str] | None = None,
     namespace: str | None = None,
 ) -> None:
-    """Upsert a Property node, link it to its ontology, and create domain/range edges.
-
-    Args:
-        ontology_uri: URI of the ontology that defines the property.
-        prop_uri: URI of the property to store.
-        label: The property label.
-        comment: The property comment.
-        domain_uris: Optional class URIs to link via HAS_DOMAIN.
-        range_uris: Optional class URIs to link via HAS_RANGE.
-        namespace: The namespace to store the property under.
-    """
+    """Upsert a Property node, link it to its ontology, and create domain/range edges."""
     ns = _ns(namespace)
     p_nid = _nid(prop_uri, namespace)
     o_nid = _nid(ontology_uri, namespace)
@@ -567,17 +496,7 @@ def _emb_node_id(entity_uri: str, embedding_type: str, model_id: str) -> str:
 
 
 def store_embedding(data: dict, namespace: str | None = None) -> dict:
-    """Create an Embedding node, upsert its vector, and link it to its entity node.
-
-    Args:
-        data: Embedding fields including ``entity_uri``, ``entity_type``,
-            ``embedding_type``, ``model_id``, ``ontology_id``, and ``vector``.
-            An item-level ``namespace`` overrides the argument.
-        namespace: The default namespace to store under.
-
-    Returns:
-        The stored embedding's metadata (node id, dimensions, timestamps, etc.).
-    """
+    """Create an Embedding node, upsert its vector, and link it to its entity node."""
     ns = _ns(namespace)
     # Allow namespace to be supplied via the data dict too (for batch callers
     # that put namespace on each item).
@@ -639,13 +558,6 @@ def store_embeddings_batch(items: list[dict], namespace: str | None = None) -> l
     Nodes are created via ``UNWIND``, vectors upserted in chunks, and
     HAS_EMBEDDING edges created per entity label. Each item's own ``namespace``
     is honored, falling back to the argument.
-
-    Args:
-        items: Embedding dicts (same shape as :func:`store_embedding`'s ``data``).
-        namespace: The default namespace for items that don't carry one.
-
-    Returns:
-        The stored embeddings' metadata, one per input item.
     """
     if not items:
         return []
@@ -739,18 +651,7 @@ def store_embeddings_batch(items: list[dict], namespace: str | None = None) -> l
 def get_embeddings_for_entity(
     entity_uri: str, entity_type=None, embedding_type=None, model_id=None, namespace: str | None = None
 ) -> list[dict]:
-    """Return all embeddings for an entity URI, each hydrated with its vector.
-
-    Args:
-        entity_uri: The entity whose embeddings to fetch.
-        entity_type: Optional filter by entity type (class/property).
-        embedding_type: Optional filter by embedding type (lexical/structural).
-        model_id: Optional filter by embedding model.
-        namespace: The namespace to query.
-
-    Returns:
-        Matching embedding records, each including its (trimmed) vector.
-    """
+    """Return all embeddings for an entity URI, each hydrated with its vector."""
     ns = _ns(namespace)
     wheres = ["e.entity_uri = $euri", "e.namespace = $ns"]
     params: dict = {"euri": entity_uri, "ns": ns}
@@ -792,20 +693,7 @@ def list_embeddings_for_ontology(
     limit=100,
     namespace: str | None = None,
 ) -> list[dict]:
-    """List an ontology's embeddings (metadata only), filtered and paginated.
-
-    Args:
-        ontology_id: The ontology whose embeddings to list.
-        entity_type: Optional filter by entity type (class/property).
-        embedding_type: Optional filter by embedding type (lexical/structural).
-        model_id: Optional filter by embedding model.
-        skip: Number of results to skip (pagination offset).
-        limit: Maximum number of results to return.
-        namespace: The namespace to query.
-
-    Returns:
-        Matching embedding metadata rows (without vectors).
-    """
+    """List an ontology's embeddings (metadata only), filtered and paginated."""
     ns = _ns(namespace)
     wheres = ["e.ontology_id = $oid", "e.namespace = $ns"]
     params: dict = {"oid": ontology_id, "ns": ns}
@@ -933,25 +821,6 @@ def search_nearest(
     return res.get("results", [])
 
 
-def get_vector(node_id: str) -> list[float]:
-    """Fetch the stored embedding vector for an Embedding node by id.
-
-    Args:
-        node_id: The Embedding node's graph id.
-
-    Returns:
-        The vector, or an empty list when the id is empty or has no vector.
-    """
-    if not node_id:
-        return []
-    res = _oc_query(
-        "MATCH (e) WHERE id(e) = $nid CALL neptune.algo.vectors.get(e) YIELD embedding RETURN embedding",
-        {"nid": node_id},
-    )
-    rows = res.get("results", [])
-    return rows[0]["embedding"] if rows else []
-
-
 def delete_embeddings_for_entities(
     entity_uris: list[str],
     ontology_id: str,
@@ -985,15 +854,7 @@ def delete_embeddings_for_entities(
 
 
 def delete_embeddings_for_ontology(ontology_id: str, namespace: str | None = None) -> int:
-    """Delete all Embedding nodes for an ontology within a namespace.
-
-    Args:
-        ontology_id: The ontology whose embeddings to delete.
-        namespace: The namespace to delete within.
-
-    Returns:
-        The number of Embedding nodes deleted.
-    """
+    """Delete all Embedding nodes for an ontology within a namespace."""
     ns = _ns(namespace)
     res = _oc_query(
         "MATCH (e:Embedding) WHERE e.ontology_id = $oid AND e.namespace = $ns DETACH DELETE e RETURN count(e) AS c",

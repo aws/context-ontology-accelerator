@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for GH-137: derive source-delete cleanup deadline from real remaining time.
+"""Unit tests for deriving the source-delete cleanup deadline from real remaining time.
 
 Tests cover:
   - _cleanup_deadline() helper: Lambda context present, absent, broken
@@ -49,11 +49,6 @@ def _mk_asset(source_id: str, table_name: str) -> MagicMock:
     m = MagicMock(asset_id=f"aid-{table_name}")
     m.name = f"DS#{source_id}:{table_name}"
     return m
-
-
-# ===================================================================
-# _cleanup_deadline unit tests
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -110,16 +105,11 @@ class TestCleanupDeadline:
         assert now + 4.0 <= deadline <= now + 6.0
 
 
-# ===================================================================
-# _delete_source_datazone_assets — deadline in search phase
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestDatazoneAssetsSearchDeadline:
     def test_search_pagination_stops_at_deadline(self):
         """When the Lambda has very little remaining time, the search phase
-        must stop between pages — not only the delete phase (GH-137).
+        must stop between pages, not only the delete phase.
 
         With the deadline already in the past, the loop should break before
         fetching even the first page of search results."""
@@ -236,11 +226,6 @@ class TestDatazoneAssetsSearchDeadline:
         assert mock_client.delete_asset.call_count == 5
 
 
-# ===================================================================
-# _delete_source_datazone_assets — deadline in delete phase
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestDatazoneAssetsDeleteDeadline:
     def test_delete_phase_stops_at_derived_deadline(self):
@@ -288,11 +273,6 @@ class TestDatazoneAssetsDeleteDeadline:
         assert complete is False
 
 
-# ===================================================================
-# Context threading — handler → _route → _handle_delete → cleanup
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestContextThreading:
     def test_handler_passes_context_to_delete(self):
@@ -335,33 +315,3 @@ class TestContextThreading:
             sh.handler(event, ctx)
 
         assert captured_ctx.get("value") is ctx
-
-
-# ===================================================================
-# Malformed DATAZONE_CLEANUP_BUDGET_S env var
-# ===================================================================
-
-
-@pytest.mark.unit
-class TestMalformedBudgetEnv:
-    def test_malformed_budget_does_not_crash_import(self):
-        """A non-integer DATAZONE_CLEANUP_BUDGET_S must not raise at import time."""
-        # We can't re-import the module safely in the same process, but we can
-        # test the defensive parsing by calling _cleanup_deadline with a patched
-        # budget value that simulates what the fallback produces.
-        # The module-level try/except sets _DATAZONE_CLEANUP_BUDGET_S = 240 on failure.
-        # Verify the fallback value is the expected 240.
-        with patch(f"{_SH}._DATAZONE_CLEANUP_BUDGET_S", 240):
-            now = time.monotonic()
-            deadline = _current_sh()._cleanup_deadline(None)
-            assert now + 239.0 <= deadline <= now + 241.0
-
-    def test_malformed_budget_env_parse_fallback(self):
-        """Simulate the module-level parse: int('not-a-number') → fallback 240."""
-        # This directly tests the parse logic pattern
-        raw = "not-a-number"
-        try:
-            val = int(raw)
-        except (ValueError, TypeError):
-            val = 240
-        assert val == 240

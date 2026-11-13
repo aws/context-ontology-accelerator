@@ -20,7 +20,7 @@ When several anchors (e.g. several chunks from one document) or several
 occurrences are found, the chosen centre is the one whose window covers the most
 anchors, then the most occurrences of the question's key terms.
 
-Pure functions over strings; stdlib only (Requirement 12.3).
+Pure functions over strings; stdlib only.
 """
 
 from __future__ import annotations

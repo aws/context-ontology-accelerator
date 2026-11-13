@@ -2,21 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * SSE streaming hook for the Playground chat.
- *
- * Sends queries via HTTP POST to the AgentCore Runtime /invocations endpoint
- * and parses the SSE response stream using `eventsource-parser`. Replaces the
- * WebSocket hook (use-playground-socket.ts) with a stateless request model.
- *
- * Key differences from the WebSocket hook:
- * - No persistent connection, no heartbeat, no reconnection state machine
- * - Each query is an independent fetch() call with AbortController
- * - Auth via standard Authorization header (no Sec-WebSocket-Protocol hack)
- * - Session affinity via X-Amzn-Bedrock-AgentCore-Runtime-Session-Id header
- * - SSE parsing via eventsource-parser (spec-compliant, 0 dependencies)
- *
- * Token buffering (75ms flush) is handled by the existing useTokenBuffer hook;
- * this hook dispatches raw events and lets the caller decide on buffering.
+ * SSE streaming hook for the Playground chat: POSTs to the AgentCore Runtime
+ * /invocations endpoint and parses the stream with `eventsource-parser`.
+ * Session affinity uses the X-Amzn-Bedrock-AgentCore-Runtime-Session-Id header.
+ * The caller does any token buffering.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EventSourceParserStream } from "eventsource-parser/stream";
@@ -36,18 +25,13 @@ export const PLAYGROUND_UNAVAILABLE_MESSAGE =
 export interface UsePlaygroundStreamOptions {
   /** AgentCore Runtime invocations endpoint (public Bedrock endpoint, fetched cross-origin). */
   queryEndpoint: string | undefined;
-  /** OIDC config for token retrieval. */
   oidcConfig: { authority: string; clientId: string } | undefined;
-  /** Called for each parsed SSE event. */
   onEvent: (event: StreamingEvent) => void;
 }
 
 export interface UsePlaygroundStreamReturn {
-  /** Submit a query and begin streaming the response. */
   submit: (request: PlaygroundRequest) => void;
-  /** Whether a stream is currently in-flight. */
   isStreaming: boolean;
-  /** Cancel the current in-flight stream. */
   cancel: () => void;
 }
 
@@ -67,7 +51,7 @@ export function usePlaygroundStream({
   const submit = useCallback(
     async (request: PlaygroundRequest) => {
       if (!queryEndpoint || !oidcConfig) {
-        // End the request visibly: returning silently left the chat on "Resolving query" for good.
+        // Emit an error so the request ends instead of spinning forever.
         onEventRef.current(
           makeErrorEvent(
             request.requestId ?? "",
@@ -79,7 +63,7 @@ export function usePlaygroundStream({
         return;
       }
 
-      // Cancel any in-flight stream (AbortController pattern per Vercel AI SDK)
+      // Cancel any in-flight stream.
       controllerRef.current?.abort();
       const controller = new AbortController();
       controllerRef.current = controller;
@@ -88,7 +72,7 @@ export function usePlaygroundStream({
       // Get ID token and user sub (carries email + groups for Cedar auth; AgentCore validates aud)
       // Sub feeds X-Amzn-Bedrock-AgentCore-Runtime-Session-Id (must be ≥33 chars,
       // sticky routing) — deriveRuntimeSessionId pads/normalizes since some IdPs
-      // issue short subs (e.g. "noahpaig") that fail that constraint as-is.
+      // issue short subs (e.g. "jdoe") that fail that constraint as-is.
       let token: string;
       let runtimeSessionId: string | undefined;
       try {

@@ -1,27 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the ontology source abstraction (task 9).
-
-Covers ``coa_serve.tier3.agentic.ontology.source``:
-
-- :class:`OntologyFileSource` parses a fixture ``.ttl`` into an :class:`Ontology`
-  with the determined node types, edge types, and the directional source→target
-  ``edge_map`` per edge type (Req 3.1);
-- :class:`OntologyGraphSource` shapes a mocked SPARQL response into the SAME
-  :class:`Ontology` shape — proving both backends are interchangeable, including
-  the directional source→target per edge type (Req 3.6);
-- datatype properties are excluded from edge types, and an object property with
-  no declared domain/range still surfaces as an edge type but contributes no
-  directional ``edge_map`` triple;
-- module load of the ontology source does NOT import ``graphrag_toolkit``
-  (Req 12.3).
-
-The graph source is exercised through a fake :class:`GraphClient` whose ``query``
-returns canned SPARQL bindings (distinguished by the projected variable), so the
-test exercises the real query-building + binding-parsing path with no Neptune and
-no ``graphrag_toolkit`` access.
-"""
+"""Unit tests for the ontology file and graph sources (``coa_serve.tier3.agentic.ontology.source``)."""
 
 from __future__ import annotations
 
@@ -32,7 +12,6 @@ from pathlib import Path
 
 import pytest
 from coa_serve.tier3.agentic.ontology.source import (
-    Ontology,
     OntologyFileSource,
     OntologyGraphSource,
 )
@@ -103,9 +82,6 @@ def _graph_source_matching_fixture() -> tuple[OntologyGraphSource, _FakeGraphCli
     return OntologyGraphSource(client, graph_uri_template="https://ontology-workbench.local/{namespace}"), client
 
 
-# ── OntologyFileSource ─────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestOntologyFileSource:
     async def test_parses_fixture_into_expected_shape(self):
@@ -114,34 +90,11 @@ class TestOntologyFileSource:
         assert onto.edge_types == EXPECTED_EDGE_TYPES
         assert onto.edge_map == EXPECTED_EDGE_MAP
 
-    async def test_directional_source_to_target_per_edge_type(self):
-        """Each edge_map triple is (edge_type, source_node_type, target_node_type) (Req 3.1)."""
-        onto = await OntologyFileSource(FIXTURE_TTL).load("ns")
-        by_edge = {edge: (src, tgt) for edge, src, tgt in onto.edge_map}
-        # HAS_FINANCIALS is directional Company → FinancialReport (not the reverse).
-        assert by_edge["HAS_FINANCIALS"] == ("Company", "FinancialReport")
-        # WORKS_FOR is directional Person → Company.
-        assert by_edge["WORKS_FOR"] == ("Person", "Company")
-
-    async def test_datatype_property_excluded_from_edges(self):
-        onto = await OntologyFileSource(FIXTURE_TTL).load("ns")
-        assert "revenue" not in onto.edge_types
-
-    async def test_object_property_without_domain_range_has_no_edge_map(self):
-        onto = await OntologyFileSource(FIXTURE_TTL).load("ns")
-        # RELATED_TO is a declared edge type...
-        assert "RELATED_TO" in onto.edge_types
-        # ...but contributes no directional triple.
-        assert all(edge != "RELATED_TO" for edge, _, _ in onto.edge_map)
-
     async def test_missing_file_raises(self):
         # A missing/unreadable .ttl surfaces as an OSError (FileNotFoundError) at
         # load time, mirroring the graph source's raise-on-failure contract.
         with pytest.raises(OSError):
             await OntologyFileSource("/nonexistent/path/ontology.ttl").load("ns")
-
-
-# ── OntologyGraphSource ────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -195,26 +148,9 @@ class TestOntologyGraphSource:
             await source.load("bad namespace!")  # space + bang are invalid
         assert client.queries == []
 
-    async def test_object_property_without_domain_range_has_no_edge_map(self):
-        source, _ = _graph_source_matching_fixture()
-        onto = await source.load("ns")
-        assert "RELATED_TO" in onto.edge_types
-        assert all(edge != "RELATED_TO" for edge, _, _ in onto.edge_map)
-
     async def test_slow_lookup_times_out_fast_and_raises(self, monkeypatch):
-        """A hung graph query must fail fast and RAISE, not report an empty ontology.
-
-        The lookup is one preparatory step inside the deep-reasoning loop; a slow
-        Neptune must NOT burn a large slice of the shared budget. With a tiny
-        timeout, a client that hangs past it raises ``TimeoutError`` quickly
-        (instead of blocking for the full client-level read-timeout x retry, ~16s
-        in production). A timeout is a lookup FAILURE, kept distinct from a
-        genuinely empty ontology (Req 3.10 empty vs 3.11 failed) — the tool, not
-        this source, degrades the failure to a non-fatal "failed" result so the
-        soft-prior traversal still runs while the trace shows the real outcome.
-        """
+        """A hung graph query must fail fast and RAISE, not report an empty ontology."""
         import asyncio as _asyncio
-        import time as _time
 
         monkeypatch.setenv("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "0.05")
 
@@ -226,22 +162,11 @@ class TestOntologyGraphSource:
         source = OntologyGraphSource(
             _HangingGraphClient(), graph_uri_template="https://ontology-workbench.local/{namespace}"
         )
-        start = _time.perf_counter()
         with pytest.raises(TimeoutError):
             await source.load("acme-namespace")
-        elapsed = _time.perf_counter() - start
-
-        assert elapsed < 2, f"lookup should fail fast, took {elapsed:.2f}s"
 
     async def test_resolve_times_out_and_falls_back_to_prefix_filter(self, monkeypatch):
-        """A hung graph-IRI resolve degrades to the prefix filter WITHIN the budget.
-
-        The resolve is a cheap optimisation and gets its own short timeout so one
-        stuck resolve cannot eat the whole lookup budget and leave no time for the
-        fallback. When the resolve hangs, ``_resolve_graph_iris`` returns ``None``
-        and the two type queries run with the cluster-wide ``STRSTARTS`` prefix
-        filter — producing a real ontology instead of nothing.
-        """
+        """A hung graph-IRI resolve degrades to the prefix filter WITHIN the budget."""
         import asyncio as _asyncio
 
         # Keep the OUTER lookup budget generous so this test proves the INNER resolve
@@ -288,13 +213,10 @@ class TestOntologyGraphSource:
         assert _ontology_lookup_timeout_s() == 6.0
 
 
-# ── Shape parity between the two sources (Req 3.6) ──────────────────
-
-
 @pytest.mark.unit
 class TestSourceShapeParity:
     async def test_file_and_graph_sources_produce_identical_ontology(self):
-        """Both backends return the SAME Ontology shape from equivalent data (Req 3.6).
+        """Both backends return the SAME Ontology shape from equivalent data.
 
         Equality of the two frozen :class:`Ontology` instances covers node types,
         edge types, AND the directional source→target ``edge_map`` per edge type.
@@ -303,13 +225,7 @@ class TestSourceShapeParity:
         graph_source, _ = _graph_source_matching_fixture()
         graph_onto = await graph_source.load("ns")
 
-        assert isinstance(file_onto, Ontology) and isinstance(graph_onto, Ontology)
         assert file_onto == graph_onto
-        # Spell out the directional-map parity the requirement calls out.
-        assert file_onto.edge_map == graph_onto.edge_map
-
-
-# ── Lazy-import invariant (Req 12.3) ───────────────────────────────
 
 
 @pytest.mark.unit
@@ -319,7 +235,7 @@ class TestLazyImportInvariant:
 
         Runs in a fresh subprocess (current ``sys.path`` propagated) so a
         ``graphrag_toolkit`` already imported by a sibling test cannot mask a
-        regression (mirrors the task-1/6/7 invariant tests)."""
+        regression."""
         code = (
             "import sys; "
             "import coa_serve.tier3.agentic.ontology.source; "

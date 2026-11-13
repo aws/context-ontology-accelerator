@@ -4,12 +4,12 @@
 """Retrieval_Strategy_Tool: one Tool per graphrag-toolkit RetrieverStrategy.
 
 Each :class:`RetrievalStrategyTool` wraps the existing, already-lazy
-``BaselineLexicalRetriever`` adapter and invokes exactly one of the seven
-registered graphrag-toolkit ``RetrieverStrategy`` options (Req 2.2, 5.1). The
+``BaselineLexicalRetriever`` adapter and invokes exactly one of the
+registered graphrag-toolkit ``RetrieverStrategy`` options. The
 builder :func:`build_strategy_tools` registers one Tool per enum member, named
 ``strategy:<value>`` (e.g. ``strategy:entity_network``).
 
-Import discipline (Requirement 12.3): module load of this module MUST NOT import
+Import discipline: module load of this module MUST NOT import
 ``graphrag_toolkit`` — nor anything from the ``coa_serve.lexical``
 package, whose ``__init__`` imports the toolkit eagerly. Accordingly:
 
@@ -21,7 +21,7 @@ package, whose ``__init__`` imports the toolkit eagerly. Accordingly:
   :meth:`RetrievalStrategyTool.invoke`; the enum is imported lazily inside
   :func:`build_strategy_tools`.
 
-Per-Tool failure tolerance (Req 9.1-9.2): the wrapped adapter already degrades to
+Per-Tool failure tolerance: the wrapped adapter already degrades to
 an empty result with an error trace step on timeout/error and never raises, so a
 strategy Tool invocation likewise never raises — it returns a (possibly empty)
 :class:`ToolResult` whose ``detail`` records any degradation for the controller.
@@ -45,9 +45,7 @@ logger = structlog.get_logger(__name__)
 
 # Static, graphrag-free descriptions keyed by the RetrieverStrategy *value*
 # string (the ``StrEnum`` value). Keying by string lets this module load without
-# importing the enum (and therefore without importing graphrag_toolkit). The
-# seven keys are the seven non-deprecated graphrag-toolkit retrievers exposed by
-# ``coa_serve.lexical.strategies.RetrieverStrategy``.
+# importing the enum (and therefore without importing graphrag_toolkit).
 _STRATEGY_DESCRIPTIONS: dict[str, str] = {
     "chunk_based": (
         "Chunk-based retrieval: ranks document chunks by vector similarity to "
@@ -91,8 +89,8 @@ _STRATEGY_DESCRIPTIONS: dict[str, str] = {
     ),
 }
 
-# The uniform input/output contracts every Retrieval_Strategy_Tool declares
-# (Req 11.1). A strategy tool takes the natural-language sub-question text and
+# The uniform input/output contracts every Retrieval_Strategy_Tool declares.
+# A strategy tool takes the natural-language sub-question text and
 # returns native chunks + entities (passed through to synthesis) plus their
 # normalized dict form.
 _INPUT_SCHEMA: dict = {"query": "str"}
@@ -141,14 +139,7 @@ def _degradation(result: BaselineResult) -> tuple[str, str] | None:
 
 
 class RetrievalStrategyTool:
-    """Wraps one graphrag ``RetrieverStrategy`` via the lexical adapter (Req 2.2).
-
-    The four uniform interface fields (``name``, ``description``,
-    ``input_schema``, ``output_schema``) are set at construction from static,
-    graphrag-free data so the Tool can be registered and described to the planner
-    without importing the toolkit. The strategy's ``StrategySpec`` is resolved
-    lazily inside :meth:`invoke`.
-    """
+    """Wraps one graphrag ``RetrieverStrategy`` via the lexical adapter."""
 
     def __init__(self, strategy: RetrieverStrategy, lexical: BaselineLexicalRetriever) -> None:
         """Build a Tool for ``strategy`` backed by the ``lexical`` adapter.
@@ -176,26 +167,15 @@ class RetrievalStrategyTool:
     async def invoke(self, *, namespace: str, query: str = "", **_: Any) -> ToolResult:
         """Run the wrapped strategy for ``query`` scoped to ``namespace``.
 
-        Resolves the strategy's ``StrategySpec`` from the registry (lazy import,
-        Req 12.3) and delegates to ``BaselineLexicalRetriever.retrieve``. The
+        Resolves the strategy's ``StrategySpec`` from the registry (lazy import) and
+        delegates to ``BaselineLexicalRetriever.retrieve``. The
         adapter degrades to an empty result with an error trace step on
         timeout/error and never raises; this method mirrors that contract — it
         never raises for a retrieval failure, returning a (possibly empty)
-        :class:`ToolResult` whose ``detail`` records any degradation
-        (Req 9.1-9.2).
-
-        Args:
-            namespace: The originating request namespace; every retrieval is
-                scoped to it (Req 1.5).
-            query: The natural-language sub-question text to retrieve for.
-
-        Returns:
-            A :class:`ToolResult` carrying the native ``chunks`` / ``entities``
-            (passed through to synthesis), their normalized dict ``items``, and a
-            human-readable ``detail`` for the trace.
+        :class:`ToolResult` whose ``detail`` records any degradation.
         """
         # Lazy import — keeps graphrag_toolkit (pulled in transitively by the
-        # lexical package) out of module-load (Req 12.3).
+        # lexical package) out of module-load.
         from ....lexical.strategies import STRATEGY_REGISTRY
 
         spec = STRATEGY_REGISTRY[self._strategy]
@@ -204,7 +184,7 @@ class RetrievalStrategyTool:
             result = await self._lexical.retrieve(query, namespace, strategy=spec)
         except Exception as exc:  # noqa: BLE001 - defensive: never raise out of a Tool
             # The adapter is documented not to raise, but a Tool must never
-            # propagate a retrieval failure to the reasoning loop (Req 9.1).
+            # propagate a retrieval failure to the reasoning loop.
             logger.warning(
                 "strategy_tool_invoke_error",
                 tool=self.name,
@@ -241,29 +221,18 @@ def build_strategy_tools(
     registry: ToolRegistry,
     lexical: BaselineLexicalRetriever,
 ) -> list[str]:
-    """Register one Retrieval_Strategy_Tool per exposed ``RetrieverStrategy`` (Req 2.2).
+    """Register one Retrieval_Strategy_Tool per exposed ``RetrieverStrategy``.
 
-    Enumerates the :class:`RetrieverStrategy` enum (lazy import, Req 12.3) and
+    Enumerates the :class:`RetrieverStrategy` enum (lazy import) and
     registers one :class:`RetrievalStrategyTool` per member into ``registry``,
     each named ``strategy:<value>``.
 
-    ``topic_beam`` (TopicGraphRAG) is a first-class member of this set. It was
-    gated behind an A/B flag while its accuracy contribution was measured on
-    SEC10Q; that measurement is done and it now ships as a permanent tool. It
-    still requires a populated ``topic`` vector index (present on any graph
-    ingested after the kg-build ``EMBEDDING_INDEXES`` change) — on an older graph
-    the tool seeds empty and returns nothing, which the controller tolerates like
-    any other empty result.
-
-    Args:
-        registry: The :class:`ToolRegistry` to register the tools into.
-        lexical: The shared ``BaselineLexicalRetriever`` adapter the tools wrap.
-
-    Returns:
-        The list of registered Tool names, in enum order.
+    ``topic_beam`` requires a populated ``topic`` vector index; on a graph without
+    one it returns nothing, which the controller tolerates like any empty result.
+    Returns the registered Tool names, in enum order.
     """
     # Lazy import — enumerating the enum pulls in the lexical package (and thus
-    # graphrag_toolkit), so it must not happen at module load (Req 12.3).
+    # graphrag_toolkit), so it must not happen at module load.
     from ....lexical.strategies import RetrieverStrategy
 
     registered: list[str] = []

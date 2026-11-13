@@ -130,11 +130,7 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   if (!response) return null;
 
   if (response.guardrailBlocked) {
-    // Render the blocked answer through Markdown (same pipeline as the normal
-    // path) so headings / bold / code / tables are formatted rather than shown
-    // as raw Markdown syntax. Wrap in a warning Alert to keep the "blocked"
-    // affordance. StatusIndicator (previously used here) renders plain text and
-    // does not parse Markdown.
+    // Render the blocked answer through Markdown inside a warning Alert.
     return (
       <Alert type="warning" statusIconAriaLabel={t("Warning")}>
         <div style={{ fontSize: "14px", lineHeight: "20px" }}>
@@ -179,12 +175,9 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
     }
   })();
 
-  // The SPARQL provenance differs by mode. Standard mode's Tier-2 VKG strategy
-  // emits SPARQL that Ontop compiles to SQL, so "(Tier 2)" is accurate there.
-  // Deep Reasoning also emits SPARQL/SQL but through its agentic loop, not the
-  // Tier-2 cascade — labelling its artifacts "(Tier 2)" mislabels them (#1166).
-  // A native graph answer carries SPARQL and no SQL: it ran directly against the
-  // graph source. Ontop answers carry both — the SPARQL and the SQL it compiled to.
+  // Standard mode's Tier-2 VKG strategy emits SPARQL that Ontop compiles to SQL.
+  // Deep Reasoning emits SPARQL/SQL through its agentic loop, not the Tier-2
+  // cascade. A native graph answer carries SPARQL and no SQL.
   const isDeepReasoning = response.executionMode === "deep-reasoning";
   const sqlArtifactCaption = response.sparqlGenerated
     ? isDeepReasoning
@@ -287,8 +280,6 @@ export const ChatBubble: React.FC<ChatBubbleProps> = ({
   );
 };
 
-// ── Internal components ─────────────────────────────────────────────
-
 function ValidationErrorBubble({
   message,
   errorDetails,
@@ -341,7 +332,6 @@ const MAX_DISPLAY_ROWS = 50;
 
 function ResultTable({ rows }: { rows: Record<string, unknown>[] }) {
   const { t } = useAppI18n();
-  if (rows.length === 0) return null;
   const firstRow = rows[0];
   if (!firstRow || Object.keys(firstRow).length === 0) return null;
   const columns = Object.keys(firstRow);

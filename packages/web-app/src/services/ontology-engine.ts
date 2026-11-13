@@ -15,10 +15,6 @@ import type { OntologyRecord } from "@coa/control-plane-client";
 import type { ApiClient } from "../components/ApiClientProvider";
 import { collectAllPages } from "../utils/pagination";
 
-export { LIST_ALL_MAX_PAGES } from "../utils/pagination";
-
-// ─── Types ─────────────────────────────────────────────────────────────
-
 export type InductionJobStage =
   | "pending"
   | "fetching_metadata"
@@ -61,28 +57,20 @@ export interface Proposal {
   metadata?: Record<string, unknown>;
   ontology_turtle?: string;
   r2rml_turtle?: string;
-  /** Presigned S3 GET URLs for the (potentially multi-MB) Turtle artifacts.
-   * The detail endpoint serves these instead of inlining the Turtle, which
-   * would exceed the 6 MB API Gateway / Lambda response limit. ``null`` when
+  /** Presigned S3 GET URLs for the Turtle artifacts, served instead of inline
+   * Turtle because that can exceed the 6 MB API Gateway / Lambda response
+   * limit. The same applies to matches_url and constraints_url. ``null`` when
    * the artifact does not exist. Fetch directly from S3 (not via apiClient). */
   ontology_url?: string | null;
   r2rml_url?: string | null;
   /** Presigned S3 GET URL for the grounding-match list (``matches.json``).
-   * Served out-of-band for the same reason as the Turtle: the list is one entry
-   * per grounded table, each with up to ~30 candidate classes, so a wide schema
-   * can exceed the 6 MB response limit. ``null`` when there is no offloaded
-   * matches object — either an all-novel induction (no matches) or a legacy
-   * proposal that still carries the list inline in ``metadata.matches``. Fetch
-   * directly from S3 (not via apiClient). */
+   * ``null`` for an all-novel induction or a legacy proposal that carries the
+   * list inline in ``metadata.matches``. */
   matches_url?: string | null;
-  /** Presigned S3 GET URL for the SHACL constraint config
-   * (``metadata.constraint_config``). Served out-of-band for the same reason as
-   * the Turtle and matches: the config is one entry per class with one entry per
-   * constrained property, so a wide schema can exceed the 6 MB response limit.
-   * ``null`` when there is no offloaded constraints object — either a proposal
-   * with no constraints, or a legacy proposal that still carries the config
-   * inline in ``metadata.constraint_config``. Fetch directly from S3 (not via
-   * apiClient). The S3 body is the config object itself, not an envelope. */
+  /** Presigned S3 GET URL for the SHACL constraint config. ``null`` for a
+   * proposal with no constraints or a legacy proposal that carries it inline in
+   * ``metadata.constraint_config``. The S3 body is the config object itself,
+   * not an envelope. */
   constraints_url?: string | null;
   /** Reason from the most recent failed accept attempt, naming the pipeline
    * step that failed (ingest / embeddings_searchable / reconcile_counts /
@@ -106,18 +94,8 @@ export interface AcceptResult {
   status: string;
 }
 
-/**
- * Re-exported from the generated client rather than hand-declared.
- *
- * There used to be a second, snake_case `OntologyRecord` here. It drifted from
- * the Smithy contract (which declares camelCase inside a `{ontologies: [...]}`
- * envelope), and because the two shared a name the mismatch was invisible: the
- * generated client deserialised `out.ontologies` to `undefined`, callers turned
- * that into `[]`, and features silently did nothing. `ListOntologies` now
- * serialises the declared shape (see the `by_alias` route in
- * `catalog/routers/ontologies.py` and `test_list_ontologies_wire_shape.py`), so
- * one type covers both the REST helper below and the react-query hook.
- */
+/** Re-exported from the generated client so the REST helper and the
+ * react-query hook share one type. */
 export type { OntologyRecord };
 
 export interface GraphSearchHit {
@@ -157,18 +135,6 @@ export interface GraphVertex {
   partial?: boolean;
 }
 
-export interface ValidationJob {
-  job_id: string;
-  status: string;
-  created_at: string;
-  error?: string;
-  report?: {
-    passed: boolean;
-    findings: Array<{ tier: number; code: string; message: string }>;
-    metrics?: Record<string, unknown>;
-  };
-}
-
 export interface ProposalValidationFinding {
   validator: string;
   tier: string;
@@ -196,8 +162,6 @@ export interface ProposalValidationJob {
   } | null;
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────
-
 function qs(params: Record<string, string | number | undefined>): string {
   const entries = Object.entries(params).filter(([, v]) => v !== undefined);
   return entries.length
@@ -205,8 +169,6 @@ function qs(params: Record<string, string | number | undefined>): string {
         new URLSearchParams(entries.map(([k, v]) => [k, String(v)])).toString()
     : "";
 }
-
-// ─── Induction Jobs ────────────────────────────────────────────────────
 
 export interface TriggerInductionInput {
   datasource_ids: string[];
@@ -240,8 +202,6 @@ export async function getInductionJob(
     `/namespaces/${encodeURIComponent(namespace)}/induce/jobs/${encodeURIComponent(jobId)}`,
   );
 }
-
-// ─── Proposals ─────────────────────────────────────────────────────────
 
 /** One page of the Smithy ``ListProposals`` output. */
 export interface ListProposalsPage {
@@ -556,10 +516,8 @@ export async function repairProposalDatatypes(
   );
 }
 
-// ─── Constraint Config ────────────────────────────────────────────────
-
 /**
- * Async constraint-inference job. ``POST /infer-constraints`` now returns
+ * Async constraint-inference job. ``POST /infer-constraints`` returns
  * 202 + this handle immediately (the Bedrock call can exceed API Gateway's
  * 29s timeout); poll ``getInferConstraintsJob`` until ``completed``/``failed``.
  * Mirrors {@link ProposalValidationJob}.
@@ -578,7 +536,6 @@ export async function inferConstraints(
   namespace: string,
   proposalId: string,
 ): Promise<InferConstraintsJob> {
-  // Returns 202 + a job handle; poll getInferConstraintsJob for the result.
   return apiClient.post<InferConstraintsJob>(
     `/namespaces/${encodeURIComponent(namespace)}/proposals/${encodeURIComponent(proposalId)}/infer-constraints`,
     {},
@@ -611,8 +568,6 @@ export async function compileConstraints(
     },
   );
 }
-
-// ─── Ontology Catalog ──────────────────────────────────────────────────
 
 /**
  * A listed ontology whose id is known to be present.
@@ -683,8 +638,6 @@ export async function deleteOntology(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies?ontology_id=${encodeURIComponent(ontologyId)}`,
   );
 }
-
-// ─── Graph (entity search) ─────────────────────────────────────────────
 
 /**
  * Fetch one page of graph-search hits plus the total match count. The backend
@@ -832,9 +785,8 @@ export async function downloadOntology(
   namespace: string,
   ontologyId: string,
 ): Promise<string> {
-  // The endpoint no longer inlines the Turtle (a 6+ MB ontology would exceed the
-  // API Gateway / Lambda response limit and 502). It returns a presigned S3 URL
-  // we fetch directly, mirroring the proposal artifact path (#143).
+  // The endpoint returns a presigned S3 URL because the Turtle can exceed the
+  // 6 MB API Gateway / Lambda response limit.
   const { downloadUrl } = await apiClient.get<{ downloadUrl: string }>(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies/${encodeURIComponent(
       ontologyId,
@@ -845,36 +797,6 @@ export async function downloadOntology(
   }
   return fetchTurtleFromUrl(downloadUrl);
 }
-
-// ─── Validation (ontology-level, not proposal-level) ───────────────────
-
-export interface TriggerValidationInput {
-  ontology_id: string;
-  tiers?: number[];
-}
-
-export async function triggerValidation(
-  apiClient: ApiClient,
-  namespace: string,
-  input: TriggerValidationInput,
-): Promise<ValidationJob> {
-  return apiClient.post<ValidationJob>(
-    `/namespaces/${encodeURIComponent(namespace)}/validate`,
-    input,
-  );
-}
-
-export async function getValidationJob(
-  apiClient: ApiClient,
-  namespace: string,
-  jobId: string,
-): Promise<ValidationJob> {
-  return apiClient.get<ValidationJob>(
-    `/namespaces/${encodeURIComponent(namespace)}/validate/jobs/${encodeURIComponent(jobId)}`,
-  );
-}
-
-// ─── Inducted datasources ──────────────────────────────────────────────
 
 export interface InducedDatasource {
   datasourceId: string;
@@ -909,8 +831,6 @@ export async function listInducedDatasources(
     return { items: out?.datasources ?? [], nextToken: out?.nextToken };
   });
 }
-
-// ─── Foundational ontologies ───────────────────────────────────────────
 
 export interface FoundationalOntology {
   key: string;
@@ -988,11 +908,7 @@ export async function getOntologyIngestStatus(
   return result;
 }
 
-/**
- * Upload a user-supplied OWL/RDF Turtle file as a custom ontology.
- * Calls the existing ``POST /ontologies/{id}/upload`` endpoint after
- * creating the ontology record. Pass the raw Turtle text as ``content``.
- */
+/** Upload a Turtle/RDF file via presigned S3 PUT, then trigger ingest-from-s3. */
 export async function uploadOntologyFile(
   apiClient: ApiClient,
   namespace: string,
@@ -1009,7 +925,6 @@ export async function uploadOntologyFile(
   const ext =
     format === "rdf+xml" ? ".rdf" : format === "json-ld" ? ".jsonld" : ".ttl";
 
-  // Step 1: Get pre-signed S3 PUT URL
   const { uploadUrl, s3Key } = await apiClient.post<{
     uploadUrl: string;
     s3Key: string;
@@ -1018,7 +933,6 @@ export async function uploadOntologyFile(
     content_type: contentTypeMap[format] ?? "text/turtle",
   });
 
-  // Step 2: PUT file directly to S3 (raw File object, same as ConnectSource)
   let resp: Response;
   try {
     resp = await fetch(uploadUrl, {
@@ -1038,7 +952,6 @@ export async function uploadOntologyFile(
     );
   }
 
-  // Step 3: Trigger ingestion
   return apiClient.post(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies/${encodeURIComponent(ontologyId)}/ingest-from-s3`,
     { s3_key: s3Key, title, format, ontology_type: "user_uploaded" },

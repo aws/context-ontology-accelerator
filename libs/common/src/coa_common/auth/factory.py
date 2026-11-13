@@ -12,6 +12,7 @@ caller never has to re-derive the Cognito-vs-generic-OIDC dispatch.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from urllib.parse import urlparse
 
 from coa_common.auth.cognito_authorizer import CognitoTokenAuthorizer
@@ -47,9 +48,10 @@ def build_token_authorizer(
     *,
     issuer: str,
     region: str,
-    client_id: str | None = None,
+    client_id: str | Collection[str] | None = None,
     jwks_uri: str | None = None,
     group_claim_name: str = "groups",
+    require_id_token: bool = False,
 ) -> TokenAuthorizer:
     """Construct the right ``TokenAuthorizer`` subclass for *issuer*.
 
@@ -58,8 +60,8 @@ def build_token_authorizer(
             URL, or any other OIDC issuer URL).
         region: AWS region — only used when *issuer* is a Cognito issuer, to
             derive the user pool's JWKS URI.
-        client_id: Optional audience/client ID for ``aud``/``client_id``
-            validation.
+        client_id: Optional audience/client ID, or a collection of accepted
+            IDs (any one matches), for ``aud``/``client_id`` validation.
         jwks_uri: Explicit JWKS endpoint for non-Cognito IdPs. Ignored for
             Cognito, which derives its JWKS URI from the issuer. Falls back
             to OIDC discovery (``/.well-known/openid-configuration``) if
@@ -68,13 +70,17 @@ def build_token_authorizer(
             IdPs (Cognito always uses ``cognito:groups``). Defaults to
             ``"groups"`` — override for IdPs using a non-standard claim name
             (e.g. EntraID's ``roles``).
+        require_id_token: Accept only ID tokens (see ``TokenAuthorizer``).
     """
     if is_cognito_issuer(issuer):
         user_pool_id = issuer.rstrip("/").rsplit("/", maxsplit=1)[-1]
-        return CognitoTokenAuthorizer(user_pool_id=user_pool_id, region=region, client_id=client_id)
+        return CognitoTokenAuthorizer(
+            user_pool_id=user_pool_id, region=region, client_id=client_id, require_id_token=require_id_token
+        )
     return OIDCTokenAuthorizer(
         issuer=issuer,
         audience=client_id,
         jwks_uri=jwks_uri,
         group_claim_name=group_claim_name,
+        require_id_token=require_id_token,
     )

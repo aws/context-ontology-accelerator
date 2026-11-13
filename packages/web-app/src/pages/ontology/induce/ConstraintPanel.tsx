@@ -1,15 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * ConstraintPanel — reviewable SHACL constraint config.
- *
- * Three sections:
- *   1. Auto-generated (from DB constraints) — checkboxes, always present
- *   2. Domain constraints (LLM-inferred) — on-demand via "Generate" button
- *   3. Custom rules — NL input + raw SHACL paste for power users
- */
-import React, { useState } from "react";
+/** ConstraintPanel — reviewable SHACL constraint config. */
+import { useState } from "react";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -277,9 +270,7 @@ export function ConstraintPanel({
       }
     >
       <SpaceBetween size="m">
-        {/* Progress indicator for the async infer-constraints job — kept at the
-            TOP of the panel body (directly under the "Infer constraints" button)
-            so the user sees it immediately, not scrolled off the bottom. */}
+        {/* Top of the body so it is visible next to the Infer button. */}
         {inferring && (
           <StatusIndicator type="loading">
             {t("Inferring domain constraints from ontology...")}
@@ -289,12 +280,8 @@ export function ConstraintPanel({
         {validationResult &&
           validationResult.status === "completed" &&
           (() => {
-            // This panel validates the SHACL CONSTRAINTS specifically, so its
-            // pass/fail must reflect the SHACL findings shown below — NOT the
-            // run-level `passed`, which also folds in connectivity / reasoner /
-            // consistency findings from the same tier1 job (those are hidden
-            // here, so using run-level `passed` produced a "failed" header
-            // above an "all constraints satisfied" body).
+            // Use the SHACL findings, not the run-level `passed`, which also folds
+            // in connectivity / reasoner findings that are hidden here.
             const shaclFindings =
               validationResult.findings?.filter(
                 (f) => f.validator === "shacl",

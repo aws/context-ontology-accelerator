@@ -17,8 +17,7 @@ import { solutionStackDescription } from "../solution";
  * stack that uses the VPC must share it (CDK refuses cross-stack references
  * between an environment-agnostic stack and a concrete one), so all stacks get
  * the account and region the CDK CLI resolved from the credentials. Without
- * `vpc_id` stacks stay environment-agnostic, so a deployment that creates its
- * VPC synthesizes exactly as before.
+ * `vpc_id` stacks stay environment-agnostic.
  */
 function importedVpcEnv(scope: Construct): cdk.Environment | undefined {
   if (!scope.node.tryGetContext("vpc_id")) {

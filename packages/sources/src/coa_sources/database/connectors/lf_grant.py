@@ -203,12 +203,11 @@ def attempt_self_grant(database: str, catalog_id: str, region: str, *, owner_ver
         # Grantor lacks admin in this catalog's account (cross-account) or the
         # resource isn't LF-registered. Fall back to the actionable error.
         logger.warning("lf_self_grant: grant_permissions failed", exc_info=True)
-        return granted_any
     return granted_any
 
 
 def lf_onboarding_hint(database: str, catalog_id: str) -> str:
-    """Actionable message for the Option A fallback (customer-prerequisite grant)."""
+    """Actionable message for the customer-prerequisite grant fallback."""
     cat = f" (catalog {catalog_id})" if catalog_id else ""
     consumer = _consumer_query_role_arn()
     if not consumer and CONSUMER_QUERY_ROLE_SSM_PARAM:

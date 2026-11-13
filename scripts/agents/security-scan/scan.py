@@ -7,25 +7,11 @@ Driven by the ``security-code-review`` CI job (``templates/security-code-review.
 automatically on the weekday-nightly schedule, and behind a manual play button on
 mainline. See ``ci/security-agent/README.md``.
 
-Fire-and-forget by design — this zips the checkout, uploads it to the agent space's
-S3 bucket, points a code review at that object and starts a review job, then exits.
-It does not wait for the ~1h review, so findings are read in the Security Agent
-console, never in the job log.
+Fire-and-forget: zips the checkout, uploads it to the agent space's S3 bucket, points a
+code review at that object, starts a review job and exits. It does not wait for the ~1h
+review, so findings are read in the Security Agent console, never in the job log.
 
-Three properties matter more than anything else here, because the nightly run has no
-audience:
-
-1. **Every misconfiguration names itself.** Nothing should fail with a bare
-   ``IndexError``/``KeyError`` traceback that leaves you guessing which resource is
-   missing. :func:`die` exits 1 with a one-line cause; :func:`first` turns "the list
-   was empty" into "which resource is missing, and what deploys it".
-2. **A reused code review is repointed before it is started.** Assets are bound per
-   code review, not per job, so reuse without :func:`~botocore.client.BaseClient`
-   ``update_code_review`` would re-scan whatever snapshot created the review — every
-   night, forever, while still paying to upload a fresh zip.
-3. **A stack behind its template fails before anything else.** Nothing deploys it
-   automatically, so a merged IAM fix does nothing until someone redeploys — and
-   should say so, not surface as an ``AccessDeniedException`` three calls later.
+Every misconfiguration exits through :func:`die` with a one-line cause.
 """
 
 from __future__ import annotations
@@ -42,12 +28,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import PaginationError
 
-# Never worth shipping to the scanner. The job sets `cache: []`, so the four global
-# caches should not be present at all — these are belt-and-braces for a local run
-# and for anything a future `default:` change restores into $CI_PROJECT_DIR.
-# Matched against a single directory NAME, not a path substring: the old
-# `'/.git' in root` test also swallowed `.github/` and `.gitlab/`, silently hiding
-# the CI/CD workflows from a security review.
+# Never worth shipping to the scanner. Matched against whole directory names so
+# `.github/` and `.gitlab/` are still scanned.
 SKIP_DIRS = frozenset(
     {
         ".git",
@@ -106,12 +88,8 @@ def first(items: list[Any], what: str, hint: str) -> Any:
 def bucket_name(raw: str) -> str:
     """Normalise an S3 bucket ARN or bare name to a bare name.
 
-    ``ci/security-agent/template.yaml`` registers the bucket as
-    ``!GetAtt SourceBucket.Arn`` and ``BatchGetAgentSpaces`` is a pass-through, so
-    this usually arrives as ``arn:aws:s3:::<name>``. boto3 rejects that outright as a
-    ``Bucket=`` parameter (``ParamValidationError: Invalid bucket name``), which would
-    fail the upload on every single run. Written to accept either form, so it stays
-    correct if the service ever normalises on its side.
+    The agent space usually returns ``arn:aws:s3:::<name>``, which boto3 rejects as a
+    ``Bucket=`` parameter (``ParamValidationError: Invalid bucket name``).
     """
     return raw.split(":::")[-1].split("/")[0]
 
@@ -119,13 +97,8 @@ def bucket_name(raw: str) -> str:
 def build_zip(dest: str, root: str = ".") -> int:
     """Zip the working tree into ``dest``, returning the number of files written.
 
-    Prunes :data:`SKIP_DIRS` in place so ``os.walk`` does not even descend into them,
-    and skips dangling symlinks — ``ZipFile.write`` follows links, and a single broken
-    one (endemic to pnpm stores) would otherwise kill the job with an uncaught
-    ``FileNotFoundError``.
-
-    ``dest`` itself is skipped, so pointing it inside ``root`` cannot make the archive
-    try to contain itself.
+    Dangling symlinks are skipped: ``ZipFile.write`` follows links, and one broken link
+    (common in pnpm stores) would raise ``FileNotFoundError``.
     """
     written = 0
     dest_real = os.path.realpath(dest)
@@ -231,8 +204,7 @@ def ensure_code_review(client: Any, agent_space_id: str, title: str, assets: dic
 
     Reuses the review with this title if one exists, **repointing it** first. Assets are
     bound to the review and not to the job, so a reused review that is merely started
-    re-scans whatever snapshot created it — every night, forever, while still paying to
-    upload a fresh zip. That is the single most important line in this file.
+    re-scans whatever snapshot created it.
     """
     cr_id = find_code_review(client, agent_space_id, title)
     if cr_id:
@@ -283,8 +255,6 @@ def main() -> None:
     check_stack_current(boto3.client("cloudformation", config=BOTO_CONFIG))
     bucket, service_role = resolve_agent_space(client, agent_space_id)
 
-    # mkstemp rather than NamedTemporaryFile: build_zip and upload_file both reopen by
-    # path, so the handle is closed immediately and nothing depends on flush ordering.
     fd, zip_path = tempfile.mkstemp(suffix=".zip")
     os.close(fd)
     print(f"Zipped {build_zip(zip_path)} files")
@@ -295,10 +265,7 @@ def main() -> None:
     try:
         s3.upload_file(zip_path, bucket, key)
     except Exception as e:
-        # upload_file funnels every cause (credentials, bucket policy, network, quota)
-        # into S3UploadFailedError, so there is no useful per-cause branch to take.
-        # Name the target the CI role failed to write to; the wrapped boto3 message
-        # supplies the specifics.
+        # upload_file wraps every cause in S3UploadFailedError.
         die(f"upload to {s3_uri} failed: {e}")
 
     assets = {"sourceCode": [{"s3Location": s3_uri}]}

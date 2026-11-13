@@ -59,10 +59,8 @@ export interface JdbcConnectivityProps {
   /**
    * Security groups whose members must reach the database. Used for:
    * - **PrivateLink path:** scopes the endpoint's inbound rules to these SGs.
-   * - **Peering/TGW paths:** NOTE: this construct does NOT add egress rules
-   *   to these SGs. Clients with `allowAllOutbound: true` work implicitly;
-   *   locked-down clients (e.g. the serve AgentCore runtime SG) must add
-   *   their own egress rules for DB ports to the peer/TGW CIDRs.
+   * - **Peering/TGW paths:** adds JDBC-port egress rules to these SGs for the
+   *   peer/TGW destination CIDRs.
    */
   readonly clientSecurityGroups: ec2.ISecurityGroup[];
   readonly peering?: PeeringConfig;

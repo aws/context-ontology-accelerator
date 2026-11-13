@@ -326,8 +326,6 @@ def _load_foundational_and_wait(entry: FoundationalOntology, namespace: str) -> 
     ``ingest_ontology_and_wait`` until the vector index is searchable), then
     reads the terminal job state.
     """
-    import uuid as _uuid
-
     job_id = str(_uuid.uuid4())
     _ensure_registry_row(entry, namespace)  # row must exist before fetch -> avoids 404
     dynamo_store.put_ingest_job(job_id, entry.uri, IngestJobState.PENDING, namespace=namespace)

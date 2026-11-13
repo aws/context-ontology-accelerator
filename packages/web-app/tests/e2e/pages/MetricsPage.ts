@@ -73,26 +73,6 @@ export class MetricsPage {
     ).toBeVisible({ timeout: 30_000 });
   }
 
-  /** Edit a metric's first expression from its detail page. */
-  async editExpression(
-    namespaceId: string,
-    name: string,
-    newExpression: string,
-  ): Promise<void> {
-    await this.page.goto(
-      `/namespaces/${namespaceId}/metrics/${encodeURIComponent(name)}/edit`,
-    );
-    await expect(
-      this.page.getByRole("heading", { name: `Edit ${name}` }),
-    ).toBeVisible();
-    const expr = this.page.getByPlaceholder("SUM(orders.total_amount)").first();
-    await expr.fill(newExpression);
-    await this.page.getByRole("button", { name: "Save changes" }).click();
-    await expect(
-      this.page.getByText(name, { exact: false }).first(),
-    ).toBeVisible({ timeout: 30_000 });
-  }
-
   /** The form's Display label field. */
   get labelInput() {
     return this.page.getByPlaceholder("Monthly revenue");
@@ -144,22 +124,5 @@ export class MetricsPage {
     // The modal closes once the delete returns, which takes longer than the
     // default 5 s on a deployed stack.
     await expect(modal).toBeHidden({ timeout: 30_000 });
-  }
-
-  /** Export metrics as OSI; returns the download's suggested name. */
-  async exportOsi(): Promise<string> {
-    const downloadPromise = this.page.waitForEvent("download");
-    await this.page.getByRole("button", { name: "Export OSI" }).click();
-    const download = await downloadPromise;
-    return download.suggestedFilename();
-  }
-
-  /** Open the Import OSI modal and upload a YAML file. */
-  async importOsi(filePath: string): Promise<void> {
-    await this.page.getByRole("button", { name: "Import OSI" }).click();
-    const modal = this.page.getByRole("dialog");
-    await expect(modal).toBeVisible();
-    await modal.locator('input[type="file"]').setInputFiles(filePath);
-    await modal.getByRole("button", { name: "Import" }).click();
   }
 }

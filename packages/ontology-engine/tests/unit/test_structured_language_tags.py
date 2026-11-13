@@ -3,7 +3,7 @@
 
 """Namespace language on the structured ``table_to_ontology`` path.
 
-Pins LLD sections 2.2.4 and 2.2.6 for database sources: labels stay the
+For database sources: labels stay the
 physical names and are never tagged; descriptions, synonyms, glossary terms
 and tags are tagged only when ``generatedFields`` proves COA generated them; a
 note joined with a description without that proof stays untagged; fixed text
@@ -383,7 +383,7 @@ class TestJoinedCommentProvenance:
 # ── Glossary terms and tags ──────────────────────────────────────────────
 #
 # Enrichment writes glossary terms and tags in the namespace language and marks
-# them in generatedFields (LLD 2.2.3, 4.2), so they follow the same rule as
+# them in generatedFields, so they follow the same rule as
 # descriptions and synonyms: tagged with the field's proof, plain without it.
 
 

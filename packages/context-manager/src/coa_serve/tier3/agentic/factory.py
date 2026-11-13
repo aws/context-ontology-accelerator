@@ -1,20 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tool registry factory and Agentic Retriever assembly (Req 12.4-12.6).
+"""Tool registry factory and Agentic Retriever assembly.
 
-This module wires the internal-only :class:`ToolRegistry` and the composed
-:class:`AgenticRetriever` from the deployment :class:`ServiceConfig` and the
-shared :class:`ClientSet`, mirroring the existing client factory
-(``clients/factory.py:build_lexical_retriever``) in structure and style and
-reusing its endpoint-derivation helpers (``_graph_store_uri``) and lexical-
-retriever builder.
-
-Endpoint-gated registration (Req 12.5-12.6). A Tool is only registered when the
-Knowledge_Graph / vector endpoints it needs (and, for the Vector_Search_Tool, an
-embed client) are configured; otherwise the Tool is OMITTED rather than
-registered in an unusable state (Req 12.5), and a ``structlog`` warning names the
-omitted Tool and the missing endpoint/config (Req 12.6):
+Wires the internal-only :class:`ToolRegistry` and the composed
+:class:`AgenticRetriever` from :class:`ServiceConfig` and the shared
+:class:`ClientSet`. A Tool is registered only when the endpoints it needs are
+configured; otherwise it is OMITTED and a warning names the missing config:
 
 | Tool                       | Registered when                                |
 |----------------------------|------------------------------------------------|
@@ -23,32 +15,20 @@ omitted Tool and the missing endpoint/config (Req 12.6):
 | ``vector_search``          | ``opensearch_endpoint`` AND an embed client     |
 | ``nl_to_sql``              | a ``StructuredQueryTier`` is supplied           |
 | ``nl_to_sparql``           | a ``StructuredQueryTier`` is supplied           |
-| ``ontology_lookup``        | ALWAYS (the file source needs no endpoint)      |
+| ``ontology_lookup``        | ALWAYS                                          |
 | ``read_document``          | a ``SourcesRegistry`` is supplied (and          |
 |                            | available); offered per request only            |
 | ``find_documents``         | as ``read_document``, plus Neptune and/or       |
 |                            | OpenSearch; offered per request only            |
 
-``nl_to_sql`` / ``nl_to_sparql`` are additionally PER-NAMESPACE gated at request time: the retriever
-withholds it from the planner on a namespace with no structured source (endpoint
-gating registers it process-wide; composition gating hides it per request).
+``nl_to_sql`` / ``nl_to_sparql`` are additionally gated per namespace at request
+time by the retriever. The ontology source is selected from
+``config.deep_reasoning_ontology_source`` (``graph`` by default, or ``file`` with
+``config.deep_reasoning_ontology_file``).
 
-The Ontology_Lookup_Tool is ALWAYS registered (Req 12.4 / the design table): the
-file source reads a local ``.ttl`` and needs no endpoint, and the graph source
-reuses the already-required serve-layer graph client. Its backing
-:class:`OntologySource` is selected from ``config.deep_reasoning_ontology_source``
-(``file`` — the in-scope default for this increment — vs ``graph``, whose live
-wiring is follow-up task 21), with ``config.deep_reasoning_ontology_file`` supplying the
-file source path.
-
-Import discipline (Requirement 12.3): module load of this module MUST NOT import
-``graphrag_toolkit``. It imports only the dependency-free Tool builders, the
-ontology-source abstraction, the budget value object, and the graphrag-free
-client-factory helpers; the heavier composition pieces (controller, decomposer,
-retriever, synthesizer) are imported LAZILY inside :func:`build_agentic_retriever`,
-and ``build_lexical_retriever`` / ``build_strategy_tools`` keep their own toolkit
-access lazy (the toolkit is only pulled in when the registry is actually built on
-a configured deployment, never at import time).
+Import discipline: module load MUST NOT import ``graphrag_toolkit``. The
+controller, decomposer, retriever and synthesizer are imported lazily inside
+:func:`build_agentic_retriever`.
 """
 
 from __future__ import annotations
@@ -87,18 +67,8 @@ logger = structlog.get_logger(__name__)
 def build_budget_config(config: ServiceConfig) -> AgenticBudgetConfig:
     """Build the :class:`AgenticBudgetConfig` from the validated service config.
 
-    The four budgets are parsed and range-validated at config load (task 15), so
-    here they are simply read off the flat ``ServiceConfig`` fields and shaped into
-    the value object the session clock consumes. Keeping this mapping in the
-    factory (rather than ``config.py``) preserves the config loader's import-light
-    discipline (Req 12.3) — ``config.py`` never imports the agentic subpackage.
-
-    Args:
-        config: The loaded service configuration.
-
-    Returns:
-        An :class:`AgenticBudgetConfig` carrying the time budget, max steps,
-        per-tool timeout, and fan-out cap.
+    Kept here rather than in ``config.py`` so the config loader never imports the
+    agentic subpackage.
     """
     return AgenticBudgetConfig(
         time_budget_s=float(config.deep_reasoning_time_budget_s),
@@ -125,23 +95,11 @@ def build_stop_signal_config(config: ServiceConfig) -> StopSignalConfig:
 
 
 def build_ontology_source(config: ServiceConfig, clients: ClientSet) -> OntologySource:
-    """Select the :class:`OntologySource` for the Ontology_Lookup_Tool (Req 3.2, 12.7).
+    """Select the :class:`OntologySource` for the Ontology_Lookup_Tool.
 
-    Honors ``config.deep_reasoning_ontology_source``: ``file`` (the in-scope default for
-    this increment) builds an :class:`OntologyFileSource` over
-    ``config.deep_reasoning_ontology_file``; ``graph`` builds an
-    :class:`OntologyGraphSource` over the shared serve-layer graph client (its live
-    use is wired/verified in follow-up task 21). The config value is already
-    validated/normalized at load, so any unrecognized value would have fallen back
-    to ``file`` there.
-
-    Args:
-        config: The loaded service configuration.
-        clients: The shared client set (its ``graph`` client backs the graph
-            source).
-
-    Returns:
-        The selected :class:`OntologySource`.
+    ``file`` builds an :class:`OntologyFileSource` over
+    ``config.deep_reasoning_ontology_file``; ``graph`` (the default) builds an
+    :class:`OntologyGraphSource` over the shared serve-layer graph client.
     """
     # Defense-in-depth: a "file" source with no path would make rdflib parse the
     # CWD (IsADirectoryError on every lookup), so fall back to the graph source.
@@ -166,12 +124,12 @@ def build_tool_registry(
     sources_registry: Any | None = None,
     chunk_screener: Any | None = None,
 ) -> ToolRegistry:
-    """Build the internal :class:`ToolRegistry` with endpoint-gated tools (Req 12.4-12.6).
+    """Build the internal :class:`ToolRegistry` with endpoint-gated tools.
 
     Registers the seven Retrieval_Strategy_Tools, the Graph_Traversal_Tool, and the
     Vector_Search_Tool only when their required endpoints (and, for the vector tool,
-    an embed client) are configured — omitting and warning (Req 12.5-12.6)
-    otherwise — and ALWAYS registers the Ontology_Lookup_Tool (Req 12.4). Mirrors
+    an embed client) are configured — omitting and warning
+    otherwise — and ALWAYS registers the Ontology_Lookup_Tool. Mirrors
     ``build_lexical_retriever`` in style and reuses its endpoint helpers.
 
     Args:
@@ -194,25 +152,19 @@ def build_tool_registry(
             evidence they hand the SQL writer with it.
 
     Returns:
-        The populated :class:`ToolRegistry`, never exposed outside the Serve_Layer
-        (Req 2.7).
+        The populated :class:`ToolRegistry`, never exposed outside the Serve_Layer.
     """
     registry = ToolRegistry()
     has_neptune = bool(config.neptune_endpoint)
     has_opensearch = bool(config.opensearch_endpoint)
     embed_client = clients.llm
 
-    # ── Retrieval_Strategy_Tools × 7 — neptune + opensearch (Req 2.2) ──
+    # ── Retrieval_Strategy_Tools × 7 — neptune + opensearch ──
     # build_lexical_retriever returns None unless BOTH store endpoints are set;
     # the strategy tools wrap that adapter, so they share its gating.
     #
-    # Give the adapter the agentic PER-TOOL budget instead of its own 15s default.
-    # A graphrag traversal strategy routinely needs more than 15s, so the default
-    # made every strategy tool self-abort well inside the budget the controller had
-    # granted it (live: "strategy:entity_based degraded ... TimeoutError after
-    # 15.0s" → scored no-progress → wasted escalation step). The controller still
-    # enforces the real deadline, so this only stops the adapter from cutting the
-    # tool short first.
+    # The adapter's own 15s default is shorter than the per-tool budget, so pass the
+    # per-tool budget; the controller still enforces the real deadline.
     lexical = build_lexical_retriever(config, timeout_s=float(config.deep_reasoning_per_tool_timeout_s))
     if lexical is not None:
         build_strategy_tools(registry, lexical)
@@ -225,7 +177,7 @@ def build_tool_registry(
             reason="required Knowledge_Graph endpoints unconfigured",
         )
 
-    # ── Graph_Traversal_Tool — neptune (Req 2.3) ───────────────────────
+    # ── Graph_Traversal_Tool — neptune ───────────────────────
     if has_neptune:
         build_graph_tool(registry, _graph_store_uri(config.neptune_endpoint))
     else:
@@ -236,21 +188,19 @@ def build_tool_registry(
             reason="required Knowledge_Graph endpoint unconfigured",
         )
 
-    # ── Chunk_Expansion_Tool — neptune + opt-in flag (idea 6; DISABLED by default) ──
-    # The idea-6 benchmark showed chunk-window expansion did not improve SEC10Q
-    # accuracy (~58% with it vs ~62-64% without), so the tool is kept implemented
-    # but NOT registered by default. Set AGENTIC_ENABLE_CHUNK_WINDOW=1 to re-enable
-    # it for experiments.
+    # ── Chunk_Expansion_Tool — neptune + opt-in flag (DISABLED by default) ──
+    # Chunk-window expansion did not improve accuracy in benchmarks, so it is off by
+    # default. Set AGENTIC_ENABLE_CHUNK_WINDOW=1 to enable it.
     if has_neptune and os.getenv("AGENTIC_ENABLE_CHUNK_WINDOW", "") == "1":
         build_chunk_expansion_tool(registry, _graph_store_uri(config.neptune_endpoint))
     elif has_neptune:
         logger.info(
             "agentic_tool_disabled",
             tool="chunk_window",
-            reason="AGENTIC_ENABLE_CHUNK_WINDOW not set (idea 6 disabled by default)",
+            reason="AGENTIC_ENABLE_CHUNK_WINDOW not set (disabled by default)",
         )
 
-    # ── Vector_Search_Tool — opensearch + embed client (Req 2.3) ───────
+    # ── Vector_Search_Tool — opensearch + embed client ───────
     if has_opensearch and embed_client is not None:
         vr = vector_retriever if vector_retriever is not None else VectorRetriever(clients.vector)
         build_vector_tool(registry, vr, embed_client)
@@ -266,11 +216,7 @@ def build_tool_registry(
         )
 
     # ── NL→SQL structured tool — when a StructuredQueryTier is supplied ──
-    # Registered process-wide when the deployment has the Tier-2 structured engine
-    # wired. Per-NAMESPACE gating (a namespace with no structured source) happens at
-    # request time: the retriever withholds this tool from the planner's spec list
-    # via ``excluded_tools`` so the LLM is never offered it on a document-only
-    # namespace. Registered here only when the engine exists at all.
+    # Per-namespace gating happens at request time in the retriever.
     if structured_query_tier is not None:
         from .tools.structured_tool import build_structured_tools
 
@@ -317,7 +263,7 @@ def build_tool_registry(
             reason="no sources registry supplied (document sources cannot be scoped)",
         )
 
-    # ── Ontology_Lookup_Tool — ALWAYS (Req 12.4) ───────────────────────
+    # ── Ontology_Lookup_Tool — ALWAYS ───────────────────────
     source = ontology_source if ontology_source is not None else build_ontology_source(config, clients)
     build_ontology_tool(registry, source, source_name=type(source).__name__)
 
@@ -352,37 +298,9 @@ def build_agentic_retriever(
     :class:`AgenticRetriever` (per-request state lives on the clock/context created
     inside ``resolve``).
 
-    The composition pieces (controller, decomposer, retriever, synthesizer) are
-    imported LAZILY here so importing this module never pulls them — keeping the
-    Req 12.3 lazy-import invariant trivially satisfied at module load.
-
-    Args:
-        config: The loaded service configuration (budgets, guardrail id, endpoints,
-            ontology source).
-        clients: The shared client set (its ``llm`` is used for the planner-side
-            decomposition Converse call, synthesis, and embedding).
-        step_planner: The :class:`StepPlanner` the reasoning controller consults for
-            next-step selection and the Sufficiency_Check (the concrete Bedrock
-            planner is supplied by startup wiring — task 18).
-        registry: Optional pre-built registry; defaults to
-            :func:`build_tool_registry`.
-        vector_retriever: Optional pre-built :class:`VectorRetriever` forwarded to
-            :func:`build_tool_registry`.
-        embed_client: Optional embed client held by the retriever; defaults to
-            ``clients.llm``.
-        structured_query_tier: Optional Tier-2 structured-query tier forwarded to
-            :func:`build_tool_registry` to enable the structured (SQL/SPARQL) tools.
-        guardrail_id_provider: Optional callable returning the guardrail id LIVE on
-            each call; forwarded to the :class:`Synthesizer` and
-            :class:`DecompositionPlanner` so an operator's SSM guardrail change
-            reaches the warm agentic path without a redeploy.
-        sources_registry: Optional serve-layer ``SourcesRegistry`` forwarded to
-            :func:`build_tool_registry` to enable the ``read_document`` tool.
-        chunk_screener: Optional retrieval-guardrail screener forwarded to
-            :func:`build_tool_registry` for the SQL tools' document evidence.
-
-    Returns:
-        The composed :class:`AgenticRetriever`.
+    ``guardrail_id_provider`` returns the guardrail id LIVE on each call; it is
+    forwarded to the :class:`Synthesizer` and :class:`DecompositionPlanner` so an
+    operator's SSM guardrail change reaches the warm agentic path without a redeploy.
     """
     from ..synthesizer import Synthesizer
     from .controller import ReasoningController
@@ -454,7 +372,7 @@ def build_agentic_retriever(
 
 
 def _missing_store_endpoints(has_neptune: bool, has_opensearch: bool) -> list[str]:
-    """Return the unconfigured store endpoints the strategy tools require (Req 12.6)."""
+    """Return the unconfigured store endpoints the strategy tools require."""
     missing: list[str] = []
     if not has_neptune:
         missing.append("neptune_endpoint")

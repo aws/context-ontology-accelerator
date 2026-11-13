@@ -40,31 +40,16 @@ logger = structlog.get_logger(__name__)
 # Safety gate for a keyword before it is interpolated into a SPARQL string
 # literal (``CONTAINS(LCASE(?label), "…")`` in _build_label_query).
 #
-# Defined by what is DANGEROUS rather than by an ASCII allowlist. The previous
-# ``^[a-z0-9][a-z0-9_-]{0,63}$`` rejected every keyword in a non-Latin script and
-# every accented Latin one, so a Japanese or German query reached this stage with
-# tokens and left it with none — Tier-3's keyword hop then returned nothing, for
-# the languages the feature exists to serve.
-#
-# What the gate has to stop is escaping the literal. ``_build_label_query``
-# already escapes backslash and double-quote, which covers the direct break-out;
-# what escaping does NOT handle is a raw line terminator, because a SPARQL short
-# string literal (''STRING_LITERAL2'') may not contain one — so a newline would
-# end the literal and put the rest of the token into query position. Control
-# characters are rejected here for that reason, and because no legitimate keyword
-# contains one.
-#
-# The length bound stays: it is a cost guard on the generated query, not a
-# character-class judgement. Counted in characters, so a CJK keyword is not
-# penalised for encoding to more bytes.
+# ``_build_label_query`` escapes backslash and double-quote; a raw line terminator
+# would still end a SPARQL short string literal, so control characters are
+# rejected. The length bound (in characters) is a cost guard on the query.
 _UNSAFE_ENTITY_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 # URI safety gate for SPARQL <uri> interpolation. Permits the '#' fragment
 # separator — ontology class/property URIs are of the form
 # "https://.../pcinsurance#Claim", and '#' is a legal URI character that is
 # safe inside a <...> IRI ref. The genuinely dangerous characters for IRI-ref
 # injection (whitespace, angle brackets, quotes, braces, pipe, backslash,
-# caret, backtick) remain excluded. (Dropping '#' here silently rejected every
-# induced-ontology seed URI, making Tier-3 URI-hop return 0.)
+# caret, backtick) remain excluded.
 #
 # Mirrors ``TraversalStartUri`` in ``serve.smithy`` (the GraphTraverse ``startUri``
 # contract); ``test_graph_traverse_contract`` fails if the two drift. Matched with
@@ -80,13 +65,9 @@ def is_traversable_uri(uri: object) -> bool:
 
 
 _MAX_TRAVERSAL_RESULTS = 50
-# Row cap for the URI-hop query. Raised 100→300 when _build_hop_query grew from
-# 2 UNION arms to 8 (property-node, class-neighborhood, and 2-hop bridged arms):
-# each arm emits one row PER domain/range relationship per entity, across up to
-# 10 seeds, so the pre-dedup row count is now several-fold higher. At 100 the
-# LIMIT truncated the UNION before enough distinct entities/relationships
-# survived _parse_hop_results' de-dup, starving the synthesizer; 300 keeps the
-# richer neighborhood while _GRAPH_QUERY_TIMEOUT_S still bounds worst-case cost.
+# Row cap for the URI-hop query. Its 8 UNION arms emit one row per domain/range
+# relationship per seed, so the cap must exceed the distinct-entity target;
+# _GRAPH_QUERY_TIMEOUT_S bounds worst-case cost.
 _MAX_HOP_RESULTS = 300
 _GRAPH_QUERY_TIMEOUT_S = 15.0
 
@@ -110,48 +91,6 @@ class GraphEntity:
     type: str
     relationships: tuple[dict, ...] = ()
     properties: dict[str, str] = field(default_factory=dict)
-
-
-def _relationship_from_row(row: dict) -> dict | None:
-    """Build one canonical directed relationship from a graph result row."""
-    source_uri = row.get("sourceUri")
-    predicate_uri = row.get("predicateUri")
-    target_uri = row.get("targetUri")
-    if not source_uri or not predicate_uri or not target_uri:
-        return None
-    return {
-        "source_uri": source_uri,
-        "source_label": row.get("sourceLabel", ""),
-        "predicate_uri": predicate_uri,
-        "predicate_label": row.get("predicateLabel", ""),
-        "target_uri": target_uri,
-        "target_label": row.get("targetLabel", ""),
-    }
-
-
-def _append_unique_relationship(
-    relationships: list[dict],
-    positions: dict[tuple[str, str, str], int],
-    row: dict,
-) -> None:
-    """Append or label-enrich a relationship keyed by directed triple identity."""
-    relationship = _relationship_from_row(row)
-    if relationship is None:
-        return
-    identity = (
-        relationship["source_uri"],
-        relationship["predicate_uri"],
-        relationship["target_uri"],
-    )
-    if identity not in positions:
-        positions[identity] = len(relationships)
-        relationships.append(relationship)
-        return
-
-    existing = relationships[positions[identity]]
-    for label_field in ("source_label", "predicate_label", "target_label"):
-        if not existing.get(label_field) and relationship.get(label_field):
-            existing[label_field] = relationship[label_field]
 
 
 class GraphTraverser:
@@ -319,8 +258,7 @@ class GraphTraverser:
         # arms want opposite orders — a forward match is most specific when the
         # label is SHORTEST (an exact hit), a reverse match when the label is
         # LONGEST (a short one may have matched by straddling a word boundary) — so
-        # any single sort key demotes one of them. Sorting by label length was tried
-        # and put the exact ``claim`` hit last. ?entity keeps truncation reproducible
+        # any single sort key demotes one of them. ?entity keeps truncation reproducible
         # across identical requests without claiming a relevance order the query
         # cannot express.
         return f"""
@@ -351,19 +289,12 @@ class GraphTraverser:
         values_clause = " ".join(f"<{uri}>" for uri in uris)
         graph_uri_prefix = self._graph_uri_prefix(namespace)
 
-        # Induced (schema-only / T-Box) ontologies express class↔class edges NOT
-        # as direct labelled ?seed→?class triples, but through property definition
-        # nodes: a property P carries `P rdfs:domain ClassA` and `P rdfs:range
-        # ClassB`, linking ClassA↔ClassB. The keyword path returns these property
-        # nodes WITH their domain/range edges; the original hop pattern matched
-        # only direct outgoing edges, so from a seed *class* it returned 0.
-        #
-        # Fix: surface the property nodes attached to the seed as first-class
-        # ?entity results and expose EACH property's domain/range targets as its
-        # explicitly directed source/predicate/target relationship — mirroring the keyword
-        # path so the synthesizer sees the same class↔property↔class structure.
-        # The direct-edge arms are retained for non-induced ontologies that DO
-        # carry labelled class→class triples.
+        # Induced (schema-only / T-Box) ontologies link classes through property
+        # nodes (`P rdfs:domain ClassA`, `P rdfs:range ClassB`), not direct
+        # ?seed→?class triples. So the arms surface the property nodes attached to
+        # the seed as ?entity results, with each property's domain/range targets as a
+        # directed relationship, mirroring the keyword path. The direct-edge arms
+        # cover ontologies that DO carry labelled class→class triples.
         dr = "(rdfs:domain|rdfs:range)"
 
         # ── 1-hop arms: the seed's immediate neighborhood ──────────────────

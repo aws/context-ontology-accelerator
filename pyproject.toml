@@ -74,6 +74,7 @@ members = [
     "packages/vkg",
     "packages/mcp-server",
     "packages/sources",
+    "coa-ai/workflow-agents",
     "libs/common",
     "smithy-generated/control-plane-python-server",
     "smithy-generated/data-layer-python-server",

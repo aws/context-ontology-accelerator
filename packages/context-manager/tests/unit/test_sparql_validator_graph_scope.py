@@ -3,13 +3,9 @@
 
 """Unit tests for SPARQLValidator named-graph scoping.
 
-The validator's own queries are the LAST graph consumer on the Ontop route that
-was still priced by the whole store: unlike the T-Box fetches, they run on EVERY
-validate-and-retry attempt, and again in the second translation
-``OntopStrategy._retry_vkg`` runs. These tests pin the query TEXT, not the
-result, because both scoping forms select the same quads — the difference is only
-what the planner can push into the index scan, and that is not observable through
-a mocked client.
+These tests pin the query TEXT, not the result: both scoping forms select the
+same quads, and the difference (what the planner pushes into the index scan) is
+not observable through a mocked client.
 
 ``test_sparql_validator_strstarts.py`` covers the same methods with no graphs
 supplied, which is the fallback these tests assert stays reachable.

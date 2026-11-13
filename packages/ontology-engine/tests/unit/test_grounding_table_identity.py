@@ -282,7 +282,6 @@ def test_mixed_identity_and_legacy_column_matches_do_not_cross_contaminate():
 
     assert (finance_minted, OWL.equivalentProperty, finance_property) in graph
     assert not list(graph.objects(identity_minted, OWL.equivalentProperty))
-    assert (identity_minted, OWL.equivalentProperty, legacy_property) not in graph
 
 
 def test_column_grounding_uses_parent_table_identity():

@@ -103,11 +103,8 @@ def _fetch_ontology_turtle(ontology_catalog_url: str, ontology_id: str, namespac
 
         dl = client.get(f"{ontology_catalog_url}/ontologies/{encoded_id}/download", params=params)
         dl.raise_for_status()
-        # /download no longer inlines the Turtle: it returns {"downloadUrl", ...}
-        # pointing at a presigned S3 object, because a 6+ MB ontology would exceed
-        # the API Gateway / Lambda response limit (#143). Follow the URL
-        # out-of-band. The raw-body fallback keeps this working against an
-        # ontology-engine that still inlines (mixed versions during a rollout).
+        # /download returns a presigned downloadUrl: large ontologies exceed the
+        # API Gateway / Lambda response limit.
         download_url = None
         try:
             payload = dl.json()
@@ -172,16 +169,7 @@ def _run_validation(job_id: str, body: ValidationRequest, namespace: str, config
 
 @router.post("/", response_model=JobResponse, status_code=202)
 def start_validation(body: ValidationRequest, request: Request, namespace: str):
-    """Create a pending validation job and run it on a background thread.
-
-    Args:
-        body: The validation request (ontology id/turtle, tiers, shapes, questions).
-        request: The FastAPI request, used to read app config.
-        namespace: The namespace the caller is authorized for; scopes the job.
-
-    Returns:
-        The newly created job in PENDING status (HTTP 202).
-    """
+    """Create a pending validation job and run it on a background thread."""
     job_id = str(uuid.uuid4())
     _jobs[job_id] = JobResponse(
         job_id=job_id,
@@ -198,13 +186,6 @@ def start_validation(body: ValidationRequest, request: Request, namespace: str):
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, namespace: str):
     """Return a validation job by id, falling back to the durable DynamoDB copy.
-
-    Args:
-        job_id: Identifier of the validation job to fetch.
-        namespace: The caller's namespace; jobs from other namespaces 404.
-
-    Returns:
-        The job response.
 
     Raises:
         HTTPException: 404 when the job is unknown or belongs to another namespace.
@@ -229,12 +210,5 @@ def get_job(job_id: str, namespace: str):
 
 @router.get("/jobs", response_model=list[JobResponse])
 def list_jobs(namespace: str):
-    """List the in-memory validation jobs belonging to the given namespace.
-
-    Args:
-        namespace: The caller's namespace to filter jobs by.
-
-    Returns:
-        The validation jobs scoped to the namespace (in-memory only).
-    """
+    """List the in-memory validation jobs belonging to the given namespace."""
     return [job for job_id, job in _jobs.items() if _job_namespaces.get(job_id) == namespace]

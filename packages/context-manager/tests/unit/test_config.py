@@ -94,7 +94,6 @@ class TestLoadConfig:
     def test_disabling_guardrails_is_reported_at_error(self, mock_boto3):
         # The only trace a stack leaves that it is serving unguarded traffic, so it
         # has to be loud enough to alarm on rather than filed under info.
-        import structlog
 
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-12345"}}
@@ -196,7 +195,7 @@ class TestLoadConfig:
 
 @pytest.mark.unit
 class TestDeepReasoningBudgetConfig:
-    """Deep-reasoning Tier-3 budget knobs, including the P0 synthesis reserve."""
+    """Deep-reasoning Tier-3 budget knobs, including the synthesis reserve."""
 
     @patch("coa_serve.config.boto3")
     def test_deep_reasoning_budget_defaults(self, mock_boto3):
@@ -225,7 +224,6 @@ class TestDeepReasoningBudgetConfig:
     @patch.dict("os.environ", {"DEEP_REASONING_SYNTHESIS_RESERVE_S": "9999"})
     @patch("coa_serve.config.boto3")
     def test_synthesis_reserve_out_of_range_falls_back(self, mock_boto3):
-        """Out-of-range (>120) reserve warns and falls back to the default."""
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
@@ -484,25 +482,11 @@ class TestDeepReasoningStopSignalConfig:
 
 @pytest.mark.unit
 class TestLexicalRetrieverStrategyConfig:
-    """LEXICAL_RETRIEVER_STRATEGY parsing into ServiceConfig.lexical_retriever_strategy.
-
-    Mirrors the existing tier3_strategy validate-or-warn handling: a valid value
-    is honored, an invalid value warns (invalid_lexical_retriever_strategy) and
-    falls back to the default, and an absent var yields the documented default.
-    structlog.testing.capture_logs() is used for the warning assertion
-    (the package does not configure caplog), consistent with test_strategies.py.
-    """
+    """LEXICAL_RETRIEVER_STRATEGY parsing and fallback."""
 
     @patch("coa_serve.config.boto3")
     def test_absent_var_yields_default(self, mock_boto3):
-        """No env var → topic_beam, the strongest single-shot strategy.
-
-        Standard mode's default engine. Guards the deployment default against a
-        silent revert: topic_beam scores 45.13% strict on the SEC-10-Q benchmark
-        (195 questions) versus 34.36% for the older hand-rolled path, so a
-        regression here costs ~11pp for every caller that does not explicitly set
-        options.retrieverStrategy.
-        """
+        """No env var → topic_beam, the default single-shot strategy; guards against a silent revert."""
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
@@ -529,7 +513,6 @@ class TestLexicalRetrieverStrategyConfig:
     @patch.dict("os.environ", {"LEXICAL_RETRIEVER_STRATEGY": "traversal"})
     @patch("coa_serve.config.boto3")
     def test_valid_value_is_honored(self, mock_boto3):
-        """A valid value is parsed straight through."""
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
@@ -551,8 +534,6 @@ class TestLexicalRetrieverStrategyConfig:
     @patch.dict("os.environ", {"LEXICAL_RETRIEVER_STRATEGY": "not-a-real-strategy"})
     @patch("coa_serve.config.boto3")
     def test_invalid_value_warns_and_falls_back(self, mock_boto3):
-        """An invalid value logs invalid_lexical_retriever_strategy (warn) and falls back."""
-        import structlog
 
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
@@ -611,22 +592,15 @@ class TestLexicalRetrieverStrategyConfig:
 class TestValidLexicalRetrieverStrategiesFallback:
     """`_valid_lexical_retriever_strategies` defensive paths.
 
-    The function loads the `RetrieverStrategy` enum from `lexical/strategies.py`
-    by path so config-load doesn't trigger the graphrag/botocore import chain.
-    These tests cover the three broken-install / load-failure fallbacks: missing
-    file, unrecognized loader (None spec), and an exception during exec_module.
-    All three log a structured warning and fall back to {"chunk_based_semantic"}
-    so the documented default still loads on a broken install.
+    The loader imports `lexical/strategies.py` by path so config-load doesn't
+    trigger the graphrag/botocore import chain.
     """
 
     def test_missing_strategies_file_warns_and_falls_back(self):
-        """Missing strategies.py → warn + fallback to {chunk_based_semantic}."""
         from pathlib import Path
 
-        import structlog
         from coa_serve.config import _valid_lexical_retriever_strategies
 
-        # Force the file-existence probe to return False, simulating a broken install.
         with patch.object(Path, "exists", return_value=False), structlog.testing.capture_logs() as logs:
             strategies = _valid_lexical_retriever_strategies()
 
@@ -636,8 +610,6 @@ class TestValidLexicalRetrieverStrategiesFallback:
         assert warn_entries[0]["log_level"] == "warning"
 
     def test_none_spec_warns_and_falls_back(self):
-        """spec_from_file_location returning None → warn + fallback."""
-        import structlog
         from coa_serve.config import _valid_lexical_retriever_strategies
 
         with (
@@ -655,13 +627,10 @@ class TestValidLexicalRetrieverStrategiesFallback:
         assert warn_entries[0]["log_level"] == "warning"
 
     def test_exec_module_exception_warns_and_falls_back(self):
-        """An exception while executing strategies.py → warn + fallback + sys.modules cleanup."""
         import sys
 
-        import structlog
         from coa_serve.config import _valid_lexical_retriever_strategies
 
-        # Build a real spec but force exec_module to raise.
         real_spec_from_file_location = __import__(
             "importlib.util", fromlist=["spec_from_file_location"]
         ).spec_from_file_location
@@ -690,7 +659,6 @@ class TestValidLexicalRetrieverStrategiesFallback:
 
     @patch("coa_serve.config.boto3")
     def test_load_config_still_succeeds_when_registry_load_fails(self, mock_boto3):
-        """End-to-end: load_config() returns a valid config even if the registry can't be loaded."""
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
@@ -701,5 +669,4 @@ class TestValidLexicalRetrieverStrategiesFallback:
         ):
             config = load_config()
 
-        # Default value still loads cleanly.
         assert config.lexical_retriever_strategy == "chunk_based_semantic"
