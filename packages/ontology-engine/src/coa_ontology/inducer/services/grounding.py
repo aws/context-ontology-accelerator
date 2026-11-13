@@ -52,14 +52,9 @@ class GroundingRerankError(Exception):
     Raised when the Bedrock ``converse`` call or its response parsing fails
     (``ClientError``/``BotoCoreError`` after botocore's bounded retries, a
     missing text block, unparseable non-JSON output, or a truncated/blocked
-    ``stopReason``). This is deliberately distinct from a genuine abstention —
-    a parseable ``{"choice": "NONE"}`` meaning the LLM *considered the
-    candidates and declined* (a real "novel"). Conflating the two is the defect
-    behind github.com/aws/context-ontology-accelerator issue 59: an
-    infrastructure failure silently classified every table ``novel``. The
-    strategy's batch loop re-raises this (rather than degrading to all-novel) so
-    the induction job fails loud instead of returning a wrong-but-plausible
-    all-novel ontology.
+    ``stopReason``). Distinct from a genuine abstention, a parseable
+    ``{"choice": "NONE"}``. The strategy's batch loop re-raises this so the job
+    fails instead of returning an all-novel ontology.
     """
 
 
@@ -94,31 +89,25 @@ class GroundingRecallLimitError(GroundingLookupError):
 # a connection.
 _BEDROCK_MAX_POOL_CONNECTIONS = 32
 
-# The reranker's prompt lists at most this many recall candidates. Was a
-# hardcoded 8, too thin against a large grounding pool (e.g. 342 classes): a
-# correct class recalled at rank 9+ never reached the LLM, so no amount of
-# reranking could recover it (github.com/aws/context-ontology-accelerator
-# issue 72). Bounded, not unbounded, because the reranker runs per-table across
-# _grounding_workers (default 24) sharing one Bedrock client — a large window
-# multiplies prompt tokens and latency for little precision gain past the top
-# candidates. Lexically-recalled candidates are pinned in ADDITION to this
-# window (see _llm_rerank), so raising recall depth without raising this cap
-# still lets a token-overlap hit reach the LLM.
+# The reranker's prompt lists at most this many recall candidates. Large enough
+# that a correct class in a big pool reaches the LLM; bounded because the rerank
+# runs per table across _grounding_workers sharing one Bedrock client.
+# Lexically-recalled candidates are pinned in addition to this window.
 _RERANK_CANDIDATE_WINDOW = 20
 # How many more candidates to recall when a candidate_filter will discard part
 # of the pool (e.g. a doc-class subject whose nearest neighbours are doc classes).
 _FILTERED_RECALL_FACTOR = 4
 
 # When the top recall candidates' embedding scores span less than this, the
-# retriever did not discriminate — the ranking is near-arbitrary (issue 72
-# observed a 0.04 spread across ten unrelated classes). A pick from such a
+# retriever did not discriminate — the ranking is near-arbitrary (a 0.04 spread
+# across ten unrelated classes has been observed). A pick from such a
 # distribution is capped at "ambiguous" so it routes to steward review instead
 # of being auto-accepted on a similarity that carries no signal.
 _FLAT_RECALL_SPREAD = 0.05
 
 # A recalled class must share at least one token this long with the subject
 # name to be a lexical candidate. Two-plus chars drops noise (single letters,
-# stray digits) while keeping the real signal ("area", "tuf" in issue 72).
+# stray digits) while keeping the real signal ("area", "tuf").
 _MIN_TOKEN_LEN = 2
 
 # Both dense and lexical recall loop once per selected ontology. The structured
@@ -468,7 +457,7 @@ def classify_score_tier(
     recall did not discriminate (spread < ``_FLAT_RECALL_SPREAD``), a result
     that would otherwise be ``exact``/``high_confidence`` is capped at
     ``ambiguous`` and routed to review — a high score off an undiscriminating
-    recall is not trustworthy (issue 72). It never rescues a ``novel`` and
+    recall is not trustworthy. It never rescues a ``novel`` and
     never blocks a genuine ``ambiguous``, so the existing calibration bands are
     unchanged for well-separated recalls.
     """
@@ -895,14 +884,9 @@ class GroundingService:
 
         Scope semantics of ``ontology_ids`` (the resolved grounding pool):
           - a non-empty list → search each ontology separately and merge/dedup;
-          - an empty pool (``[]`` or ``None``) → return no candidates. The
-            caller resolved a grounding pool and it is empty (the user selected
-            no ontologies and the namespace has no accepted induced ontologies).
-            We do NOT fall back to a namespace-wide search — that fallback would
-            match loaded-but-unselected ontologies, defeating the user's choice
-            not to ground against them (the grounding opt-out bug). Grounding is
-            always scoped to exactly the pool the caller provides; there is no
-            unscoped/global recall.
+          - an empty pool (``[]`` or ``None``) → return no candidates. There is
+            no namespace-wide fallback: it would match loaded-but-unselected
+            ontologies.
         """
         if not ontology_ids:
             log.info("grounding_recall: empty grounding scope — returning no candidates (all-novel)")
@@ -939,14 +923,6 @@ class GroundingService:
                     len(hits),
                     hits[0].get("entity_uri", "")[:60] if hits else "EMPTY",
                 )
-                if hits:
-                    sample = hits[0]
-                    log.info(
-                        "grounding_recall: sample_hit keys=%s score=%s vector_len=%d",
-                        list(sample.keys())[:8],
-                        sample.get("score"),
-                        len(sample.get("vector") or []),
-                    )
                 all_results.extend(hits)
             except Exception as e:
                 # Re-raise so an incomplete recall fails the job rather than
@@ -959,8 +935,6 @@ class GroundingService:
 
         if not all_results:
             return []
-
-        import math
 
         def _cosine(a, b):
             n = min(len(a), len(b))
@@ -1014,10 +988,7 @@ class GroundingService:
                 sim = _cosine(vector, r["vector"])
             if sim <= 0:
                 continue
-            # Use the 'text' field from AOSS as the definition — it contains
-            # the label + definition text that was embedded. This is more
-            # reliable than the Neptune graph lookup (which fails for classes
-            # ingested before the skos:definition fix).
+            # The 'text' field holds the label plus definition as embedded.
             raw_text = r.get("text") or ""
             # Strip the label prefix from the text to get just the definition.
             # Handle both exact label ("Organization ...") and split CamelCase
@@ -1044,7 +1015,7 @@ class GroundingService:
 
         # Additive lexical recall: token-overlap over class local-names surfaces
         # classes sharing surface tokens with the subject that dense embedding
-        # ranked out (issue 72 — MainArea↔apaAreaGross share "area";
+        # ranked out (MainArea↔apaAreaGross share "area";
         # TUFacility↔tuf_petreg_licence share "tuf"). Deduped against the dense
         # set; pinned through the reranker window in _llm_rerank so they reach
         # the LLM regardless of dense rank.
@@ -1062,7 +1033,7 @@ class GroundingService:
 
         Complements dense embedding recall for the case it is blind to: a class
         whose name shares surface tokens with the subject but sits in a flat,
-        undiscriminating region of the embedding space (issue 72). Scores each
+        undiscriminating region of the embedding space. Scores each
         class by Jaccard token overlap between its local-name and the subject
         name, returning the top ``top_k`` with a positive overlap.
 
@@ -1271,7 +1242,7 @@ class GroundingService:
         # Show the top of the recall window, PLUS any token-overlap (lexical)
         # candidate that fell past it. The lexical retriever exists precisely to
         # surface classes dense recall ranked low, so window truncation must not
-        # drop them before the LLM judges (issue 72). Dense candidates past the
+        # drop them before the LLM judges. Dense candidates past the
         # window are dropped as before — that is the intended precision cut.
         window = list(candidates[:candidate_window])
         window.extend(c for c in candidates[candidate_window:] if c.from_lexical)
@@ -1291,21 +1262,10 @@ class GroundingService:
         )
 
         try:
-            # Warm the lazy bedrock client BEFORE timing but INSIDE the try — first
-            # access constructs the boto3 client + service model (~100-300ms), which
-            # must NOT be counted as rerank latency (_t0 is captured after the client
-            # is ready, so _t0→converse-return measures only the round-trip). Keeping
-            # the warm-up inside the try means a construction failure (e.g. bad region)
-            # is caught below and abstains, exactly like a converse() failure — never
-            # escaping to fail the whole induction job.
+            # Warm the lazy bedrock client before starting the latency timer.
             bedrock = self.bedrock
             _t0 = time.monotonic()
-            # No temperature: it is deprecated on newer models (e.g. Claude Opus 5),
-            # which reject the request with a ValidationException rather than
-            # ignoring it. We only ever wanted 0 (the model default), so omit it.
-            # botocore's bounded retries (async_boto_config, max_attempts=3) cover
-            # transient throttling / 5xx; an error surfacing past them is real and
-            # is raised below, not swallowed to a novel.
+            # No temperature: newer models reject it with a ValidationException.
             resp = bedrock.converse(
                 modelId=self._llm_model_id,
                 messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -1349,21 +1309,12 @@ class GroundingService:
             )
             return result
         except json.JSONDecodeError as e:
-            # The call succeeded but the model did not return parseable JSON
-            # (prose preamble, wrong quoting, trailing text, or a markdown
-            # wrapper the fence-strip above did not fully normalize). A genuine
-            # abstention has a parseable form ({"choice": "NONE"}); unparseable
-            # output is the model failing the JSON contract, i.e. a malfunction.
-            # Raise so the job fails loud instead of silently grounding novel.
+            # Non-JSON output breaks the contract; it is not an abstention.
             snippet = raw[:200].replace("\n", " ")
             log.error("LLM rerank returned non-JSON for table '%s': %s | raw=%r", table_name, e, snippet)
             raise GroundingRerankError(f"LLM rerank returned non-JSON for '{table_name}': {e} | raw={snippet!r}") from e
         except (ClientError, BotoCoreError, ValueError) as e:
-            # Infrastructure failure: Bedrock error after retries (ClientError /
-            # BotoCoreError — includes the temperature ValidationException and any
-            # transient error that outlived the bounded retries) or no usable text
-            # block (ValueError from extract_text_blocks). NOT an abstention —
-            # raise so the job fails loud instead of silently grounding novel.
+            # Bedrock error after retries, or no usable text block (ValueError).
             # The GroundingRerankError raised above for a bad stopReason does not
             # subclass these, so it propagates untouched rather than re-wrapping.
             log.error("LLM rerank failed for table '%s': %s", table_name, e)

@@ -24,6 +24,9 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILE = ROOT / "packages" / "context-manager" / "Dockerfile"
+# Every image built from the lock: the serve/MCP image and the self-hosted workflow-agents image.
+LOCKED_DOCKERFILES = [DOCKERFILE, ROOT / "coa-ai" / "workflow-agents" / "Dockerfile"]
+_DOCKERFILE_IDS = [p.parent.name for p in LOCKED_DOCKERFILES]
 LOCK = ROOT / "uv.lock"
 _CI_DIR = ROOT / "ci"
 
@@ -171,19 +174,26 @@ def _unpinned_installs(dockerfile: str) -> list[str]:
     return unpinned
 
 
-def test_every_project_install_in_the_serve_image_is_constrained_by_the_lock() -> None:
-    installs = [c for c in _install_commands() if re.search(r"\s(/tmp/[\w-]+/|\.)(\s|$)", c)]
+@pytest.mark.parametrize("dockerfile", LOCKED_DOCKERFILES, ids=_DOCKERFILE_IDS)
+def test_every_project_install_in_the_serve_image_is_constrained_by_the_lock(dockerfile: Path) -> None:
+    installs = [
+        c
+        for c in _install_commands(dockerfile.read_text(encoding="utf-8"))
+        if re.search(r"\s(/tmp/[\w-]+/|\.)(\s|$)", c)
+    ]
     assert installs, "the Dockerfile installs no project packages"
     for command in installs:
         assert command.startswith("uv pip install"), command
         assert "--constraint /tmp/constraints.txt" in command, command
 
 
-def test_every_python_install_in_the_serve_image_is_constrained_or_pinned() -> None:
+@pytest.mark.parametrize("dockerfile", LOCKED_DOCKERFILES, ids=_DOCKERFILE_IDS)
+def test_every_python_install_in_the_serve_image_is_constrained_or_pinned(dockerfile: Path) -> None:
     """An install outside the lock (a tool, a pip/setuptools upgrade, a later added package) still pins its versions."""
-    installs = [c for c in _install_commands() if re.match(r"(uv )?pip3? install", c)]
+    text = dockerfile.read_text(encoding="utf-8")
+    installs = [c for c in _install_commands(text) if re.match(r"(uv )?pip3? install", c)]
     assert installs, "the Dockerfile installs no Python packages"
-    assert _unpinned_installs(DOCKERFILE.read_text(encoding="utf-8")) == []
+    assert _unpinned_installs(text) == []
 
 
 @pytest.mark.parametrize(
@@ -241,10 +251,23 @@ def test_a_pinned_or_lock_constrained_install_passes(line: str) -> None:
     assert _unpinned_installs(f"FROM scratch\n{line}\n") == [], line
 
 
-def test_the_image_writes_its_constraints_from_uv_lock() -> None:
-    text = DOCKERFILE.read_text(encoding="utf-8")
+@pytest.mark.parametrize("dockerfile", LOCKED_DOCKERFILES, ids=_DOCKERFILE_IDS)
+def test_the_image_writes_its_constraints_from_uv_lock(dockerfile: Path) -> None:
+    text = dockerfile.read_text(encoding="utf-8")
     assert "COPY uv.lock scripts/uv_lock_constraints.py /tmp/lock/" in text
     assert "python /tmp/lock/uv_lock_constraints.py /tmp/lock/uv.lock > /tmp/constraints.txt" in text
+
+
+@pytest.mark.parametrize("dockerfile", LOCKED_DOCKERFILES, ids=_DOCKERFILE_IDS)
+def test_the_docker_context_admits_every_path_the_image_copies(dockerfile: Path) -> None:
+    """``.dockerignore`` ignores everything by default, so a COPY source it does not admit fails the build."""
+    allowed = {line.rstrip("/") for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()}
+    copies = re.findall(r"^COPY\s+(?!--from)(.+)\s+\S+$", dockerfile.read_text(encoding="utf-8"), re.M)
+    sources = [src for line in copies for src in line.split()]
+    assert sources, dockerfile
+    for src in sources:
+        parents = [src.rstrip("/"), *(str(p) for p in Path(src.rstrip("/")).parents if str(p) != ".")]
+        assert any(f"!{p}" in allowed for p in parents), f"{dockerfile.parent.name} COPYs {src}, not admitted"
 
 
 def test_the_docker_context_admits_the_lock_and_the_script() -> None:
@@ -325,6 +348,7 @@ def test_the_image_and_ci_install_the_same_uv_that_the_project_requires() -> Non
     """
     sources = {
         "packages/context-manager/Dockerfile": r"\buv==([0-9.]+)",
+        "coa-ai/workflow-agents/Dockerfile": r"\buv==([0-9.]+)",
         "scripts/relock-python-requirements.sh": r"^UV_VERSION=([0-9.]+)$",
     }
     if _CI_DIR.is_dir():

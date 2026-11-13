@@ -1,18 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for RedshiftDataAPIExecutor.
-
-Covers the pure SQL-preparation logic (Trino→Redshift transpile + awsdatacatalog
-3-part rewrite + LIMIT injection), the Data-API record→dict conversion, and the
-FINISHED / FAILED / timeout state-machine classification. The boto3 redshift-data
-client is stubbed — no network calls.
-"""
+"""Unit tests for RedshiftDataAPIExecutor."""
 
 from __future__ import annotations
 
 import re
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import sqlglot
@@ -55,12 +49,10 @@ class TestAwsDataCatalogRewrite:
     def test_two_part_db_table_gets_catalog_prefix(self):
         out = RedshiftDataAPIExecutor._qualify_awsdatacatalog("SELECT id FROM insurance_lake.claims", "default_db")
         n = _norm(out)
-        # explicit db in the SQL wins over the default
         assert "awsdatacatalog" in n and "insurance_lake" in n and "claims" in n
+        assert "default_db" not in n
 
     def test_three_part_catalog_is_normalized_to_awsdatacatalog(self):
-        # An Athena-style AwsDataCatalog prefix is normalized to the Redshift
-        # external-catalog name (lowercased awsdatacatalog).
         out = RedshiftDataAPIExecutor._qualify_awsdatacatalog(
             'SELECT id FROM "AwsDataCatalog"."insurance_lake"."claims"', "ignored"
         )
@@ -80,16 +72,13 @@ class TestAwsDataCatalogRewrite:
         assert RedshiftDataAPIExecutor._qualify_awsdatacatalog(junk, "db") == junk
 
     def test_cte_reference_is_not_qualified_as_a_glue_table(self):
-        """Review finding: a bare reference to a CTE must NOT be rewritten
-        into awsdatacatalog.<db>.<cte> — only real Glue tables get qualified."""
+        """A CTE reference is not qualified as a Glue table."""
         out = RedshiftDataAPIExecutor._qualify_awsdatacatalog(
             "WITH a AS (SELECT id FROM claims), b AS (SELECT id FROM a) SELECT * FROM b",
             "insurance_lake",
         )
         n = _norm(out)
-        # The real table (claims) IS qualified...
         assert "awsdatacatalog" in n and "insurance_lake" in n and "claims" in n
-        # ...but the CTE names a/b are NOT turned into catalog tables.
         assert '"awsdatacatalog"."insurance_lake"."a"' not in out.lower()
         assert '"awsdatacatalog"."insurance_lake"."b"' not in out.lower()
 
@@ -99,7 +88,6 @@ class TestAwsDataCatalogRewrite:
             "insurance_lake",
         )
         n = _norm(out)
-        # Both real tables qualified; the CTE 't' reference is not.
         assert n.count("awsdatacatalog") == 2
 
 
@@ -173,7 +161,7 @@ class TestNonSqlglotErrorsPropagate:
 class TestTranspileAndLimit:
     def test_transpile_trino_to_redshift_is_lossless_for_plain_select(self):
         out = RedshiftDataAPIExecutor._transpile_to_redshift("SELECT id FROM claims LIMIT 5")
-        assert "claims" in _norm(out)
+        assert out == "SELECT id FROM claims LIMIT 5"
 
     def test_inject_limit_appends_when_absent(self):
         out = RedshiftDataAPIExecutor._inject_limit("SELECT id FROM claims", 1000)
@@ -218,8 +206,7 @@ class TestStateMachine:
             "Records": [[{"longValue": 3}]],
         }
         ex = _make_executor(client)
-        # Stub source resolution to a Redshift-enabled Glue source.
-        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+        ex._resolve_workgroup_and_database = AsyncMock(return_value=("my-wg", "insurance_lake"))
 
         result = await ex.execute(
             "SELECT count(*) AS n FROM claims", namespace="ns", data_source_id="src", timeout_seconds=5
@@ -234,7 +221,7 @@ class TestStateMachine:
         client.execute_statement.return_value = {"Id": "stmt-2"}
         client.describe_statement.return_value = {"Status": "FAILED", "Error": "syntax error"}
         ex = _make_executor(client)
-        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+        ex._resolve_workgroup_and_database = AsyncMock(return_value=("my-wg", "insurance_lake"))
 
         with pytest.raises(RedshiftQueryError, match="syntax error"):
             await ex.execute("SELECT bad FROM claims", namespace="ns", data_source_id="src", timeout_seconds=5)
@@ -245,7 +232,7 @@ class TestStateMachine:
         # Never terminal → poll loop must hit the deadline and raise.
         client.describe_statement.return_value = {"Status": "STARTED"}
         ex = _make_executor(client)
-        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "insurance_lake"))
+        ex._resolve_workgroup_and_database = AsyncMock(return_value=("my-wg", "insurance_lake"))
 
         with pytest.raises(RedshiftTimeoutError):
             await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=1)
@@ -253,7 +240,7 @@ class TestStateMachine:
     async def test_missing_workgroup_raises_value_error(self):
         client = MagicMock()
         ex = _make_executor(client)
-        ex._resolve_workgroup_and_database = _AsyncReturn(("", ""))  # no workgroup resolvable
+        ex._resolve_workgroup_and_database = AsyncMock(return_value=("", ""))  # no workgroup resolvable
 
         with pytest.raises(ValueError, match="workgroup"):
             await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=5)
@@ -262,9 +249,11 @@ class TestStateMachine:
     async def test_foreign_qualified_database_is_denied_before_data_api_submission(self):
         client = MagicMock()
         ex = _make_executor(client)
-        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "tenant_a_db"))
-        ex._sources.sql_namespace_scope = _AsyncReturn(
-            SQLNamespaceScope(native_databases=frozenset({"tenant_a_db"}), federated_catalog_schemas=frozenset())
+        ex._resolve_workgroup_and_database = AsyncMock(return_value=("my-wg", "tenant_a_db"))
+        ex._sources.sql_namespace_scope = AsyncMock(
+            return_value=SQLNamespaceScope(
+                native_databases=frozenset({"tenant_a_db"}), federated_catalog_schemas=frozenset()
+            )
         )
 
         with pytest.raises(RedshiftQueryError, match="outside the requested namespace"):
@@ -276,13 +265,3 @@ class TestStateMachine:
             )
 
         client.execute_statement.assert_not_called()
-
-
-class _AsyncReturn:
-    """Tiny awaitable-returning stub: replaces an async method with a fixed value."""
-
-    def __init__(self, value):
-        self._value = value
-
-    async def __call__(self, *args, **kwargs):
-        return self._value

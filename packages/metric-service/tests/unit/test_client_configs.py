@@ -1,14 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""metric-service shared clients carry retry/timeout config.
-
-The OpenSearch/AOSS retry+timeout now lives in the shared
-``coa_common.opensearch.AossVectorClient`` (transient-fault retry
-via ``oss_retry``), so metric-service no longer builds its own opensearch-py
-client. The Neptune SPARQL path here is still metric-service-owned, so its
-split connect/read timeout is asserted below.
-"""
+"""The Neptune SPARQL client carries a split connect/read timeout."""
 
 from __future__ import annotations
 

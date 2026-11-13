@@ -27,14 +27,10 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _permissive_source_lookup(monkeypatch: pytest.MonkeyPatch):
-    """Skip APPROVED-source enforcement (#564) in handler tests — mirrors
-    test_create_metric. The dedicated enforcement tests below patch
-    ``check_source_approved`` directly, which bypasses this env var."""
+    """Bypass APPROVED-source enforcement in handler tests; the dedicated tests patch ``check_source_approved``."""
     monkeypatch.setenv(PERMISSIVE_ENV, "true")
     yield
 
-
-# ── Fixtures ────────────────────────────────────────────────────────────
 
 VALID_OSI_CONTENT = """\
 osi_spec_version: "1.0"
@@ -95,9 +91,6 @@ def test_shipped_sample_parses_and_converts_every_metric() -> None:
     assert len(definitions) == 3
     assert {definition.data_source_id for definition in definitions} == {"ds-warehouse-prod"}
     assert {definition.source_table for definition in definitions} == {"public.orders", "public.customers"}
-
-
-# ── Handler Tests ───────────────────────────────────────────────────────
 
 
 class TestImportOsiHandler:
@@ -218,9 +211,6 @@ metrics:
         assert "resolution failed" in body["message"]
 
 
-# ── Conversion Tests ────────────────────────────────────────────────────
-
-
 class TestOsiMetricToDefinition:
     """Tests for _osi_metric_to_definition helper."""
 
@@ -254,7 +244,6 @@ class TestOsiMetricToDefinition:
         assert result.expression_dialects[0].dialect == "SNOWFLAKE"
 
     def test_passes_through_real_dialect_redshift(self) -> None:
-        # #140: a real dialect named directly is kept, not collapsed/lowercased.
         osi_metric = OsiMetric(
             name="rs",
             description="Redshift metric",
@@ -268,7 +257,6 @@ class TestOsiMetricToDefinition:
         assert result.expression_dialects[0].dialect == "REDSHIFT"
 
     def test_normalizes_lowercase_dialect(self) -> None:
-        # #140: a mis-cased real dialect is normalized, never stored lowercase.
         osi_metric = OsiMetric(
             name="rs2",
             description="lower redshift",
@@ -282,10 +270,6 @@ class TestOsiMetricToDefinition:
         assert result.expression_dialects[0].dialect == "REDSHIFT"
 
     def test_unknown_dialect_falls_back_lowercased(self) -> None:
-        # An unknown dialect is still imported via the lenient try/except and used
-        # as-is (lowercased). Real dialects (#140) never reach this path — they
-        # pass through osi_dialect_to_internal — so this only covers genuinely
-        # unknown values.
         osi_metric = OsiMetric(
             name="odd-dialect",
             description="unknown dialect",
@@ -368,9 +352,6 @@ class TestOsiMetricToDefinition:
         assert result.default_time_grain == "MONTH"
 
 
-# ── AI Context Tests ─────────────────────────────────────────────────────
-
-
 class TestAiContextMapping:
     """Tests for structured ai_context mapping from OsiAiContext to MetricAiContext."""
 
@@ -426,9 +407,6 @@ class TestAiContextMapping:
         assert result.ai_context.instructions == instructions
 
 
-# ── SQL validation on import (#617 / #1050) ─────────────────────────────
-
-
 class TestImportSqlValidation:
     """All metric-persistence paths enforce the serve firewall's SELECT shape."""
 
@@ -482,8 +460,6 @@ class TestImportSqlValidation:
             _osi_metric_to_definition(osi_metric, doc, "user")
 
 
-# ── sourceTable enforcement on import (#161 / #564) ─────────────────────
-
 OSI_WITH_BAD_SOURCE_TABLE = """\
 osi_spec_version: "1.0"
 metrics:
@@ -518,11 +494,7 @@ metrics:
 
 
 class TestImportSourceTableEnforcement:
-    """check_source_table_exists is wired into create + update but was NOT wired
-    into import — so an imported metric could carry an unchecked sourceTable,
-    re-opening the #564 UI-bypass class. Import keeps its per-metric semantics
-    (skip-with-warning), it does not 400 the whole batch.
-    """
+    """Import skips a metric whose sourceTable is absent, with a warning, rather than 400ing the batch."""
 
     @staticmethod
     def _warnings(response: dict) -> str:
@@ -640,12 +612,7 @@ class TestImportDataSourceIdFormat:
 
 
 class TestImportSourceApprovalEnforcement:
-    """check_source_approved is wired into create + update but was NOT wired into
-    import — so a metric bound to a PENDING/REJECTED/FAILED source could be
-    imported, the same #564 bypass class as the unchecked sourceTable above.
-    Approval is checked BEFORE the table so an unapproved source is rejected
-    regardless of whether its table happens to exist.
-    """
+    """An unapproved source skips the metric with a warning, checked before the table."""
 
     @staticmethod
     def _warnings(response: dict) -> str:
@@ -714,9 +681,6 @@ class TestImportSourceApprovalEnforcement:
         neptune.create_metric.assert_not_called()
 
 
-# ── Fail-closed data source lookup (#564) ───────────────────────────────
-
-
 class TestGetLookupFailClosed:
     """_get_lookup must not silently degrade to the permissive fallback."""
 
@@ -770,8 +734,6 @@ class TestGetLookupFailClosed:
         assert lookup.data_source_exists("anything") is True
 
 
-# ── Vendor Block Shape Warnings ─────────────────────────────────────────
-
 OSI_LEGACY_X_COA_SINGLE_DATASET = """\
 osi_spec_version: "1.0"
 datasets:
@@ -797,7 +759,7 @@ class TestVendorBlockShapeWarnings:
     """An ``x_coa:`` block is not OSI and nothing reads it. With a single dataset the
     import still succeeds — data_source_id comes from the dataset and source_table
     silently defaults to the metric name — but unit/return_type/time_dimension/
-    ontology_concepts are gone, so Check 6 has nothing to validate. The response must
+    ontology_concepts are gone, so ontology validation has nothing to check. The response must
     say so rather than returning a clean 200.
     """
 
@@ -852,8 +814,6 @@ class TestVendorBlockShapeWarnings:
         assert not any("not part of OSI" in w or "no source_table" in w for w in self._warnings(response))
 
 
-# ── Client-safe failure text ────────────────────────────────────────────
-
 _INTERNAL_DETAIL = "arn:aws:neptune-db:us-east-1:123456789012:cluster-ABC/* AccessDenied"
 
 
@@ -887,19 +847,6 @@ class TestImportOsiFailureTextIsClientSafe:
         mock_opensearch.return_value.embed_metric.side_effect = RuntimeError(_INTERNAL_DETAIL)
         warnings = self._assert_safe(handler(_make_event(MINIMAL_OSI_CONTENT), None))
         assert any(w.startswith("Metric 'simple_count': search indexing delayed") for w in warnings)
-
-    @patch("coa_metrics.api.import_osi._get_metadata_store")
-    @patch("coa_metrics.api.import_osi._get_opensearch")
-    @patch("coa_metrics.api.import_osi._get_neptune")
-    @patch("coa_metrics.api.import_osi._get_lookup")
-    def test_reconciliation_failure_warning_is_fixed_text(
-        self, mock_lookup, mock_neptune, mock_opensearch, mock_store
-    ) -> None:
-        mock_lookup.return_value.data_source_exists.return_value = True
-        mock_neptune.return_value.get_metric.return_value = None
-        mock_store.side_effect = RuntimeError(_INTERNAL_DETAIL)
-        warnings = self._assert_safe(handler(_make_event(VALID_OSI_CONTENT), None))
-        assert "Metadata reconciliation skipped: metadata store unavailable" in warnings
 
     def test_lookup_init_error_message_omits_cause(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from coa_metrics.api import import_osi

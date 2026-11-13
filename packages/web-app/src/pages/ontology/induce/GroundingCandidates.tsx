@@ -2,18 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * GroundingCandidates — the grounding review/override control for a single
- * table match, rendered inside the class detail split panel's Grounding tab.
- *
- * Renders the foundational-grounding candidates as a Cloudscape embedded
- * ``<Table>`` — consistent with the Relationships / Attributes tabs — with a
- * single-select column. The selected row is the currently-chosen grounding
- * (the staged override if any, else the persisted match). Selecting a row
- * stages that candidate; the "Mark novel" header action stages "keep novel".
- * Selection is staged upward (``onSelectCandidate`` / ``onMarkNovel``) — this
- * component never persists; the ProposalDetail Save-changes flow does.
- *
- * !418 funnel invariant: render ALL persisted candidates (no ``slice``).
+ * GroundingCandidates — single-select table of foundational-grounding candidates
+ * for one table match, shown in the class detail panel's Grounding tab.
+ * Selection is staged upward (``onSelectCandidate`` / ``onMarkNovel``); this
+ * component never persists. All persisted candidates render, never truncated.
  */
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
@@ -102,8 +94,6 @@ export function GroundingCandidates({
   const isExactName = isGrounded && match.similarity === 1;
   const editable = !!onSelectCandidate && candidates.length > 0;
 
-  // Persisted-chosen URI, used to keep the originally-selected candidate at the
-  // top of the table (the funnel's "winner" row) regardless of staged edits.
   const persistedUri = match.matched_class_uri ?? null;
   const sortedCandidates = [...candidates].sort((a, b) => {
     const aChosen = persistedUri === a.entity_uri ? 1 : 0;
@@ -118,7 +108,6 @@ export function GroundingCandidates({
 
   return (
     <SpaceBetween size="s">
-      {/* Status line — current grounding state, unsaved indicator. */}
       {isSuggested && chosenUri ? (
         <StatusIndicator type={hasPending ? "pending" : "warning"}>
           {t("Ambiguous match to {name}", { name: localName(chosenUri) })}
@@ -276,8 +265,6 @@ export function GroundingCandidates({
         }
       />
 
-      {/* "Mark novel" affordance — stages "keep grounding cleared". Only shown
-          when editing is possible and the class is not already staged-novel. */}
       {editable && onMarkNovel && !stagedNovel && (
         <ButtonWithHint
           hint={t(

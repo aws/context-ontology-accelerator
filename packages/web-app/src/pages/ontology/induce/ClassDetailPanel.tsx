@@ -49,15 +49,6 @@ function replaceQuoted(body: string, pred: string, newValue: string): string {
   return `${base} ;\n    ${pred} "${newValue}" .`;
 }
 
-// R2RML parsing moved to ``grounding.ts::parseR2rmlByClass`` (Item 4). The
-// old block-slice ``parseR2rml`` here matched ``rr:tableName`` over a per-class
-// slice that never actually carried it (it lives on a separate rr:logicalTable
-// blank node), so it always fell back to "Unknown" with no columns. The parsed
-// ``R2rmlMapping`` is now derived once from the whole R2RML document upstream
-// and passed in via the ``r2rmlMapping`` prop.
-
-// ─── Property editor ────────────────────────────────────────────────
-
 function PropertyEditor({
   entity,
   onSave,
@@ -166,8 +157,6 @@ function PropertyEditor({
   );
 }
 
-// ─── Main panel ─────────────────────────────────────────────────────
-
 export interface ClassGroup {
   classEntity: TurtleEntity;
   label: string;
@@ -189,8 +178,7 @@ interface Props {
   group: ClassGroup;
   /** Raw per-class R2RML slice — for the "View raw R2RML" pane only. */
   r2rml: string | null;
-  /** Correctly-parsed mapping (source table + column mappings) from the whole
-   *  R2RML document (Item 4). Used for the readable mapping table. */
+  /** Parsed mapping for this class, built from the whole R2RML document. */
   r2rmlMapping?: R2rmlMapping | null;
   /** The whole proposal Turtle (prelude + all entities), possibly with unsaved
    *  edits. Needed by the SuggestionPanel, which re-parses the full document to
@@ -207,16 +195,16 @@ interface Props {
    *  (confirm/reject a suggested subclass). Persisted via ProposalDetail's
    *  dirty-state + Save flow. Omitted in read-only contexts. */
   onUpdateTurtle?: (updatedTurtle: string) => void;
-  // ─── Foundational grounding editor (folded into the Matches tab, Item 1) ──
+  // Foundational grounding editor (in the Grounding tab)
   /** This class's foundational ConceptMatch (grounded class + candidates), or
    *  null when the class has no table-level match. */
   groundingMatch?: ConceptMatch | null;
-  /** Staged-but-unsaved override for this class's source table. */
+  /** Staged-but-unsaved override for this class's grounding match. */
   pendingGroundingOverride?: string | null;
-  /** Stage a chosen candidate URI for a source table. */
-  onSelectGroundingCandidate?: (table: string, uri: string) => void;
-  /** Stage "keep novel" for a source table. */
-  onMarkGroundingNovel?: (table: string) => void;
+  /** Stage a chosen candidate URI for a grounding match key. */
+  onSelectGroundingCandidate?: (matchKey: string, uri: string) => void;
+  /** Stage "keep novel" for a grounding match key. */
+  onMarkGroundingNovel?: (matchKey: string) => void;
 }
 
 export function ClassDetailPanel({
@@ -264,7 +252,6 @@ export function ClassDetailPanel({
     null,
   );
 
-  // If editing a property, show the property editor instead
   if (editingProperty) {
     return (
       <PropertyEditor
@@ -289,10 +276,6 @@ export function ClassDetailPanel({
     setDirty(false);
   }
 
-  const parsedR2rml = r2rmlMapping ?? null;
-  // Candidate count drives the Grounding tab label — the number of options the
-  // steward actually sees in the table, not "1" (which conflated "a match
-  // exists" with the option count). 0 / undefined → no count on the label.
   const groundingCandidateCount = groundingMatch?.candidates?.length ?? 0;
 
   return (
@@ -362,37 +345,32 @@ export function ClassDetailPanel({
                 />
               )}
             </FormField>
-            {/* Origin — grounding is carried by skos:exactMatch/closeMatch/relatedMatch
-                (coa:groundedTo retired, Item 8); ``g.groundedTo`` is the
-                foundational target's local name. */}
+            {/* Grounding comes from skos exact/close/relatedMatch; ``g.groundedTo``
+                is the foundational target's local name. */}
             {g.matchType === "exact" || g.matchType === "close" ? (
               <Box>
                 <Box variant="awsui-key-label">{t("Grounded to")}</Box>
                 <Badge color="blue">{g.groundedTo}</Badge>
-                {g.matchType && (
-                  <>
-                    <Box variant="small" display="inline">
-                      {t(" ({type} match) ", { type: g.matchType })}
+                <Box variant="small" display="inline">
+                  {t(" ({type} match) ", { type: g.matchType })}
+                </Box>
+                <InfoPopover
+                  header={t("Exact vs close match")}
+                  ariaLabel={t("About exact vs close match")}
+                >
+                  <SpaceBetween size="xs">
+                    <Box variant="p">
+                      {t(
+                        "Exact: the same concept as the foundational class (skos:exactMatch).",
+                      )}
                     </Box>
-                    <InfoPopover
-                      header={t("Exact vs close match")}
-                      ariaLabel={t("About exact vs close match")}
-                    >
-                      <SpaceBetween size="xs">
-                        <Box variant="p">
-                          {t(
-                            "Exact: the same concept as the foundational class (skos:exactMatch).",
-                          )}
-                        </Box>
-                        <Box variant="p">
-                          {t(
-                            "Close: closely related but not identical (skos:closeMatch).",
-                          )}
-                        </Box>
-                      </SpaceBetween>
-                    </InfoPopover>
-                  </>
-                )}
+                    <Box variant="p">
+                      {t(
+                        "Close: closely related but not identical (skos:closeMatch).",
+                      )}
+                    </Box>
+                  </SpaceBetween>
+                </InfoPopover>
               </Box>
             ) : g.matchType === "related" ? (
               <Box>
@@ -413,8 +391,7 @@ export function ClassDetailPanel({
               </Box>
             )}
 
-            {/* Primary key + inheritance provenance (Item 2). Main's card did
-                not surface these; they explain WHY a subclass edge exists. */}
+            {/* Explains why a subclass edge exists. */}
             {g.pkColumns.length > 0 && (
               <Box>
                 <Box variant="awsui-key-label">
@@ -438,13 +415,8 @@ export function ClassDetailPanel({
                 </Box>
               </Box>
             )}
-            {/* Suggested subclass (Item 2 → now actionable). When we have the
-                whole Turtle + a whole-Turtle edit callback, render the real
-                SuggestionPanel so the steward can Confirm (promote to a real
-                rdfs:subClassOf) or Reject. The panel returns null when the
-                class has no coa:suggestedSubClassOf, so it's safe to always
-                render here. In read-only / turtle-less contexts we keep the
-                original static badge as an informational fallback. */}
+            {/* SuggestionPanel renders null without a suggestion; read-only
+                contexts fall back to the static badge. */}
             {fullTurtle && onUpdateTurtle && !isReadOnly ? (
               <SuggestionPanel
                 iri={classIri}
@@ -489,7 +461,6 @@ export function ClassDetailPanel({
             </SpaceBetween>
           )}
 
-          {/* Properties — clickable for editing */}
           <Tabs
             tabs={[
               {
@@ -600,22 +571,13 @@ export function ClassDetailPanel({
               },
               {
                 id: "grounding",
-                // EXTERNAL foundational grounding candidates (embedding recall +
-                // LLM rerank against foundational ontologies). The count is the
-                // number of candidate OPTIONS shown (~10), NOT "1" — always shown
-                // incl. "(0)" for consistency with the sibling tabs. Distinct
-                // from the "Matches" tab below, which counts SIBLING proposal
-                // classes (intra-proposal skos dedup).
+                // Counts the foundational candidate options, distinct from the
+                // "Matches" tab, which counts sibling classes.
                 label: t("Grounding ({count})", {
                   count: groundingCandidateCount,
                 }),
                 content: (
                   <SpaceBetween size="l">
-                    {/* Foundational grounding editor (Item 1) — folded out of
-                        the old standalone GroundingPanel. Editable Cloudscape
-                        Table (consistent with the other tabs): pick a different
-                        candidate / mark novel; staged upward and persisted via
-                        the ProposalDetail Save-changes flow (grounding_overrides). */}
                     {groundingMatch ? (
                       <GroundingCandidates
                         match={groundingMatch}
@@ -682,17 +644,16 @@ export function ClassDetailPanel({
         </SpaceBetween>
       )}
 
-      {/* R2RML — human-readable table with raw toggle */}
-      {parsedR2rml && (
+      {r2rmlMapping && (
         <ExpandableSection
           headerText={t("Mapping: {table}", {
-            table: parsedR2rml.sourceTable,
+            table: r2rmlMapping.sourceTable,
           })}
           defaultExpanded
         >
           <SpaceBetween size="s">
             <SortableTable
-              items={parsedR2rml.columnMappings}
+              items={r2rmlMapping.columnMappings}
               trackBy="column"
               variant="embedded"
               defaultSortingColumnId="column"
@@ -740,7 +701,6 @@ export function ClassDetailPanel({
         </ExpandableSection>
       )}
 
-      {/* Collapsed raw class source */}
       {!editRaw && (
         <ExpandableSection headerText={t("Source (Turtle)")}>
           <TurtleHighlight>{g.classEntity.body}</TurtleHighlight>

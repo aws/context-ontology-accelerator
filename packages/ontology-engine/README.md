@@ -1,9 +1,5 @@
 # Ontology Engine
 
-- **Owner**: TBD
-- **LLD**: TBD
-- **Status**: In development
-
 Automated induction of OWL 2 ontologies from relational schemas and
 unstructured documents. Grounds against foundational ontologies
 (Schema.org, Dublin Core, PROV-O, FOAF, FIBO) via vector similarity
@@ -29,7 +25,7 @@ that design.
     │   ├── bedrock_embeddings.py        direct Bedrock embedding client
     │   ├── catalog/                     ontology and embedding CRUD
     │   ├── inducer/                     induction pipelines
-    │   │   ├── routers/                 /induce and /induce/document endpoints
+    │   │   ├── routers/                 /induce/unstructured endpoint
     │   │   ├── services/                pipeline, LLM, embedding clients
     │   │   └── strategies/              pluggable induction strategies
     │   │       ├── table_to_ontology.py embedding-based matching
@@ -106,17 +102,16 @@ source-type-agnostic proposal endpoint:
 
 ### Stage progression
 
-A job moves through these statuses (per Requirement 2.4):
+A job moves through these statuses:
 
     pending → querying_neptune → sampling → generating_descriptions
         → resolving_iris → applying_rules → entailment → serializing
         → storing → completed → failed
 
-`applying_rules` absorbs the LLD's `aligning` and `proposing_axioms` stages
-(the class normalizer's `skos:closeMatch` bands are the alignment surface area
-v0 emits). `entailment` is reported for API-contract stability but is a
-pass-through in v0 (see below). The LLD's `validating` stage is omitted from
-v0. The orchestrator emits stages through `serializing`; the worker thread
+`applying_rules` covers alignment and axiom proposal (the class normalizer's
+`skos:closeMatch` bands are the only alignment v0 emits). `entailment` is
+reported for API-contract stability but is a pass-through in v0 (see below).
+There is no validation stage in v0. The orchestrator emits stages through `serializing`; the worker thread
 owns the terminal `storing` / `completed` / `failed` transitions.
 
 ### v0 limitations
@@ -124,40 +119,23 @@ owns the terminal `storing` / `completed` / `failed` transitions.
 v0 is intentionally incomplete in four areas. These are known gaps, not bugs;
 the first three are also surfaced at runtime in the job's
 `InductionReport.warnings` list so they show up in the API response, not just
-here. Each is handed off to a deferred task in the parent spec
-(`.kiro/specs/unstructured-ontology-induction/`).
+here.
 
 1. **Sparse `owl:DatatypeProperty` output.** ~84% of `__Fact__` nodes on the
    dev graph encode the complement inline in the `value` string with no
    `__OBJECT__` edge, so Rule 4 (`induce_datatype_properties`) sees no SPC
-   facts and emits few or zero datatype properties. → parent spec **Task 12B**
-   (predicate-type extraction from inline complements).
+   facts and emits few or zero datatype properties.
 2. **No cross-run normalizer persistence.** The `ClassNormalizer` rebuilds an
-   in-memory class-embedding index on every run, so the LLD's "subsequent
-   batches reuse existing IRIs" convergence story does not hold yet. → parent
-   spec **Task 10A** (persistent class embedding store).
+   in-memory class-embedding index on every run, so later batches do not yet
+   reuse earlier runs' IRIs.
 3. **No hierarchy axioms.** The `entailment` stage is a pass-through and emits
    zero `rdfs:subClassOf` / `owl:equivalentClass` / `owl:disjointWith` axioms.
    The only alignment triples come from the class normalizer's
-   `skos:closeMatch` bands. → parent spec **Task 13** (OntoEKG-style entailment
-   engine).
+   `skos:closeMatch` bands.
 4. **No SHACL / HermiT validation.** Tier 1/2/3 validation (HermiT, OntoQA,
    OoPS!) is not invoked, so proposals are stored without conformance checks.
    The validation framework (`validation/`) is its own subsystem, wired in
    separately rather than by a single deferred induction task.
-
-### Deferred work
-
-Pointers to the parent spec's deferred tasks that close these gaps:
-
-| Parent-spec task | Addresses |
-|---|---|
-| Task 10A | Persistent class embedding store → cross-run IRI convergence |
-| Task 12B | Predicate-type extraction → richer `owl:DatatypeProperty` output |
-| Task 13  | OntoEKG-style entailment engine → inferred class hierarchy axioms |
-
-See `.kiro/specs/unstructured-ontology-induction/` for the parent spec and
-`.kiro/specs/unstructured-ontology-induction-api/` for this API wiring spec.
 
 ## Backends
 
@@ -168,14 +146,10 @@ Selected via `WORKBENCH_BACKEND`:
 - `opensearch_neptune` — Neptune Database for graph, OpenSearch
   Serverless for vector search. Higher throughput, more moving parts.
 
-> **⚠️ Tier-2 answerability depends on the backend.** The `coa:isMapped` marker
-> that gates R2RML-mapped classes into the structured-query path (NL→SPARQL /
-> NL→SQL) is written **only by the `opensearch_neptune` (NDB) backend** at
-> ingest. The `na_only` (Neptune Analytics) backend currently **no-ops** the
-> marker write, so **every class on an NA-backed namespace is unmapped → all
-> Tier-2 structured queries fall back to Tier-3**. Use `opensearch_neptune` if
-> you need structured querying. NA marker persistence is a known limitation
-> (planned follow-up).
+> Note: only the `opensearch_neptune` backend writes the `coa:isMapped` marker
+> that admits R2RML-mapped classes to the structured-query path. On `na_only`
+> every class is unmapped, so all Tier-2 structured queries fall back to Tier-3.
+> Use `opensearch_neptune` if you need structured querying.
 
 ## Quick start
 

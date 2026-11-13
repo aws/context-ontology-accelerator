@@ -11,10 +11,6 @@ import { prefixed } from "../context";
  *   `{prefix}-{env}-{name}`
  */
 export class SCLConstruct extends Construct {
-  constructor(scope: Construct, id: string) {
-    super(scope, id);
-  }
-
   /** Return a consistently prefixed resource name. */
   protected prefixed(name: string): string {
     return prefixed(this.node, name);

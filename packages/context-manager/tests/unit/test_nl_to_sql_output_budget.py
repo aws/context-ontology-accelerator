@@ -1,19 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the flat NL→SQL writer's output budget and context observability.
-
-Organised by the failure each group prevents rather than by function:
-
-* **the budget** — a generation cut off at the output-token cap. The old 1024 was
-  under half of what a real analytic query needs once a reasoning model's thinking
-  blocks are paid for out of the same allowance.
-* **visibility** — the cap firing is an HTTP 200 with partial text, so the only
-  symptom is a query that fails at execution. ``stop_reason`` and the two warnings
-  are what turn it from invisible into greppable.
-* **the context log** — ``context_preview`` is length-capped and was read as
-  "only 4 tables reach the model"; ``context_tables`` states the real answer.
-"""
+"""Unit tests for the flat NL→SQL writer's output budget and context observability."""
 
 from __future__ import annotations
 
@@ -111,11 +99,7 @@ class TestOutputTokenBudget:
         assert [log["requested"] for log in logs if log["event"] == "nl_to_sql_max_tokens_clamped"] == [16]
 
     def test_budget_is_capped(self, monkeypatch):
-        # Bedrock rejects a cap above the model's limit outright (Opus 5: 128000),
-        # so an absurd value would 400 every request rather than run away — but a
-        # clamp keeps that misconfiguration out of the request in the first place,
-        # and a large-but-valid cap still removes the bound on one generation's
-        # worst-case latency.
+        # Bedrock rejects a cap above the model's limit outright (Opus 5: 128000).
         monkeypatch.setenv("SERVE_NL2SQL_MAX_TOKENS", "1000000")
 
         with structlog.testing.capture_logs() as logs:
@@ -304,8 +288,7 @@ class TestClassTextNameParsing:
     ]
 
     def test_whitespace_only_class_text_is_skipped_not_raised(self):
-        # `if text` is TRUE for "   " while `text.split()` yields no tokens, so the
-        # old `text.split()[0]` raised IndexError here and failed the whole request.
+        # `if text` is TRUE for "   " while `text.split()` yields no tokens.
         assert _hit_map(self.BLANK_HITS) == {"orders": {"3": "Table: orders | Columns: id (int)"}}
         assert _extract_table_names(self.BLANK_HITS) == ["orders"]
         assert _build_raw_context(self.BLANK_HITS, ["orders"]) == "Table: orders | Columns: id (int)"
@@ -313,9 +296,7 @@ class TestClassTextNameParsing:
     def test_a_whitespace_only_context_text_drops_the_hit_rather_than_raising(self):
         hits = [VectorHit(id="1", text="Table: orders | Columns: id (int)", score=0.9, metadata={"context_text": "  "})]
 
-        # `context_text or hit.text` keeps "  " (truthy), so the name is unresolvable
-        # and the hit is dropped. Losing one hit is the documented behaviour; the point
-        # is that it no longer raises IndexError and fails the request.
+        # `context_text or hit.text` keeps "  " (truthy), so the hit is dropped.
         assert _hit_map(hits) == {}
 
     def test_text_without_the_table_prefix_uses_its_first_token(self):

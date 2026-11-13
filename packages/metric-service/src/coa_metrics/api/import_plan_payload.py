@@ -16,21 +16,8 @@ from coa_metrics.api.contract import check_metric_label
 from coa_metrics.api.import_job_store import MetricDisposition
 from coa_metrics.neptune_client import MetricAiContext, MetricDefinition, MetricDialect
 
-# Schema v3 adds the definition's ``label``. A plan is written at the lowest
-# version that can hold it: v2 (byte-identical to what a pre-label worker
-# writes) when no metric in the offset has a label, v3 only when one does.
-# This worker reads both, so jobs planned before a deploy finish after it.
-#
-# After a rollback, a pre-label worker rejects a v3 plan ("unsupported offset
-# plan payload schema version 3"), so only imports that carry labels are
-# affected. The error propagates out of the handler: SQS retries the offset up
-# to the queue's maxReceiveCount, import_dlq_handler redrives it once, and on
-# the second exhaustion the job is marked FAILED with the generic
-# recovery-exhausted error. By the queue settings that is roughly three hours
-# (computed from the configuration, not measured); rolling forward again within
-# that window lets the job finish. Offsets the job had not planned yet are
-# planned by the old worker, which has no label field, so those metrics are
-# imported without their labels.
+# Schema v3 adds the definition's ``label``. A plan is written as v2 when no metric
+# in the offset has a label, v3 otherwise; both are readable.
 _PLAN_SCHEMA_VERSION = 3
 _PLAN_SCHEMA_VERSION_WITHOUT_LABELS = 2
 _READABLE_PLAN_SCHEMA_VERSIONS = frozenset({2, 3})

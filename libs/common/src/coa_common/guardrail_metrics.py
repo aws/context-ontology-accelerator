@@ -37,6 +37,7 @@ swallows its own exceptions.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import suppress
 from functools import lru_cache
 from typing import Any, Literal
@@ -133,7 +134,7 @@ def filter_type_from_assessments(assessments: list[dict[str, Any]] | None) -> st
     return next((t for t in _FILTER_TYPE_PRIORITY if t in found), "NONE")
 
 
-def assessments_from_trace(trace: dict[str, Any] | None) -> list[dict[str, Any]]:
+def assessments_from_trace(trace: Mapping[str, Any] | None) -> list[dict[str, Any]]:
     """Flatten a Converse guardrail trace into a flat list of assessments.
 
     Converse traces nest assessments under per-guardrail keys, and the value is

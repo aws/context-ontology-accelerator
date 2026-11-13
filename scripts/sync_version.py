@@ -52,11 +52,13 @@ MANIFEST_GLOBS = (
     "libs/*/package.json",
     "packages/*/pyproject.toml",
     "packages/*/package.json",
+    "coa-ai/*/pyproject.toml",
     "external-docs/package.json",
     "tests/cdk/package.json",
     "libs/*/src/*/__init__.py",
     "packages/*/src/*/__init__.py",
     "packages/*/src/*/*/__init__.py",
+    "coa-ai/*/src/*/__init__.py",
 )
 
 # One capturing-group pattern per manifest kind. Group 1 and 3 are the literal
@@ -132,12 +134,9 @@ def write_version(path: Path, version: str) -> None:
 
 
 def missing_kinds(manifests: list[Path]) -> list[str]:
-    """Return manifest kinds that matched nothing — a silent-undercoverage guard.
+    """Return manifest kinds that matched nothing.
 
-    The dangerous failure of a regex-driven sync is not a crash but matching FEWER
-    files than intended: a version silently stops being propagated. Every kind
-    exists in this repo, so any kind with zero matches means a broken pattern or a
-    layout change that MANIFEST_GLOBS no longer covers.
+    A zero-match kind means a broken pattern or layout change: the sync would silently cover fewer files.
     """
     names = {p.name for p in manifests}
     return [kind for kind in ("pyproject.toml", "package.json", "__init__.py") if kind not in names]

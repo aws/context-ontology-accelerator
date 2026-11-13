@@ -1,41 +1,42 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Graph_Traversal_Tool: entity/edge traversal over the Knowledge_Graph (Req 2.3).
+"""Graph_Traversal_Tool: entity/edge traversal over the Knowledge_Graph.
 
 :class:`GraphTraversalTool` traverses the graphrag-toolkit **property graph** (the
 graph kg-build populates in Neptune Database) using **openCypher**, executed
 through the toolkit ``GraphStore``. It is NOT SPARQL and does NOT use the serve
 layer's ``GraphTraverser``/``NeptuneGraphClient`` (those target the RDF ontology
-graph — a different dataset and query language; see the design's "Two graphs").
+graph — a different dataset and query language).
 
-Three traversal modes are exposed through the uniform :class:`Tool` contract:
+Four traversal modes are exposed through the uniform :class:`Tool` contract:
 
 - ``keyword``    — find entities whose ``search_str`` contains terms extracted
   from a natural-language sub-question.
 - ``uris``       — expand one hop over any ``__RELATION__`` edge from known entity
   ids.
-- ``edge_typed`` — the prepared :data:`EDGE_TYPED_TRAVERSAL` Query_Template
-  (Req 5.5): given 1-100 entity ids and 1-50 edge types, traverse exactly those
+- ``edge_types`` — discover the edge-type predicates present on given entities.
+- ``edge_typed`` — the prepared :data:`EDGE_TYPED_TRAVERSAL` Query_Template:
+  given 1-100 entity ids and 1-50 edge types, traverse exactly those
   edge types from those entities and return the connected nodes and their
   supporting statement text. This is the edge-type constraint the toolkit's own
   retrievers do not impose.
 
-Ontology→property-graph edge-type mapping (Req 3.9): the requested edge types
+Ontology→property-graph edge-type mapping: the requested edge types
 (chosen by the planner from the ontology's edge-type set) are normalized with
 :func:`normalize_edge_type` and matched against the same normalization of the
 property graph's ``__RELATION__.value`` predicate strings, so the two independent
 vocabularies reconcile despite casing/separator differences. A requested edge type
 with no normalized match simply yields zero rows (an empty, non-degraded result).
 
-Import discipline (Requirement 12.3): module load imports only the dependency-free
+Import discipline: module load imports only the dependency-free
 ``.base`` contract, the template strings, and the sibling ``tier3`` result
 dataclasses (``ChunkResult`` / ``GraphEntity``), none of which import
 ``graphrag_toolkit``. The toolkit ``GraphStoreFactory`` and ``TenantId`` are
 imported **lazily** inside the first invocation, so importing this module never
 pulls the toolkit into ``sys.modules``.
 
-Per-Tool failure tolerance (Req 9.1-9.2): :meth:`GraphTraversalTool.invoke` never
+Per-Tool failure tolerance: :meth:`GraphTraversalTool.invoke` never
 raises for an expected failure. A bad/empty parameter set, an out-of-bounds
 entity/edge count, an unconfigured graph store, a backend error, or a query
 timeout all yield a (possibly empty) :class:`ToolResult` whose ``detail`` records
@@ -116,7 +117,7 @@ ENTITY_MENTIONS = (
 # rejected before a query is built.
 _SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9:_.\-]{1,256}$")
 
-# Compatibility contract with graphrag-lexical-graph 3.19.'1s persisted
+# Compatibility contract with graphrag-lexical-graph 3.20.0's persisted
 # ``Entity.search_str``. Keep this tiny local copy instead of importing the
 # toolkit's private graph_utils module at import time: that module eagerly pulls
 # the toolkit and LlamaIndex graph stack, violating this tool's lazy-import
@@ -132,44 +133,18 @@ def normalize_graphrag_search_text(value: str) -> str:
     return normalized.lower().strip()
 
 
-# ── synthetic predicate identity for label-only property-graph edges ────
-#
-# The toolkit's ``EntityRelationGraphBuilder`` writes only ``r.value`` — an
-# LLM-extracted predicate STRING — on ``__RELATION__`` edges. No ingest path in
-# this repository writes ``r.predicateUri`` (``grep -rn predicateUri
-# packages/sources`` finds nothing), so on a real graph every relationship arrives
-# label-only. The wire contract requires a ``predicateUri``, and dropping the edge
-# there is worse than useless: the synthesizer still asserts the relationship in
-# the answer from the label, so the user reads a claim whose evidence is missing
-# from ``result.graphContext.relationships``.
-#
-# So a label-only edge is given a STABLE, TENANT-SCOPED SYNTHETIC identifier
-# derived from the label. It is deliberately NOT the label verbatim and not an
-# ontology IRI: the ``urn:coa:graph-predicate:`` scheme names it as minted by this
-# service from a property-graph predicate string, so a consumer can tell it apart
-# from an ontology predicate IRI. It is a pure function of (namespace, label), so
-# the same predicate in the same tenant always resolves to the same IRI across
-# requests. Both lossy display slugs carry collision-resistant digests, making
-# accidental identity sharing computationally negligible without claiming
-# mathematical uniqueness.
+# Synthetic predicate identity for label-only property-graph edges. The toolkit
+# writes only ``r.value`` (an LLM-extracted predicate STRING) on ``__RELATION__``
+# edges, but the wire contract requires a ``predicateUri``. So a label-only edge
+# gets a stable, tenant-scoped ``urn:coa:graph-predicate:`` IRI derived from
+# (namespace, label), distinguishable from an ontology predicate IRI.
 SYNTHETIC_PREDICATE_SCHEME = "urn:coa:graph-predicate"
 _SLUG_UNSAFE = re.compile(r"[^a-z0-9_]+")
 _MAX_SYNTHETIC_SLUG_CHARS = 64
 
 
 def synthetic_predicate_uri(namespace: str, predicate_label: str) -> str:
-    """Mint the stable tenant-scoped IRI for a label-only graph predicate.
-
-    Args:
-        namespace: The COA namespace owning the graph (the tenant scope).
-        predicate_label: The property graph's ``__RELATION__.value`` string.
-
-    Returns:
-        A
-        ``urn:coa:graph-predicate:<tenant>:<tenant-digest>:<slug>-<digest>`` IRI,
-        or an empty string when ``predicate_label`` is blank (nothing to derive
-        from).
-    """
+    """Mint the stable tenant-scoped IRI for a label-only graph predicate ("" when blank)."""
     if not predicate_label or not predicate_label.strip():
         return ""
     tenant_key = namespace.strip().lower() or "default"
@@ -178,10 +153,7 @@ def synthetic_predicate_uri(namespace: str, predicate_label: str) -> str:
     slug = (_SLUG_UNSAFE.sub("-", normalize_edge_type(predicate_label)).strip("-") or "predicate")[
         :_MAX_SYNTHETIC_SLUG_CHARS
     ]
-    # The slug is lossy (case, punctuation, script), so a 128-bit digest of the
-    # RAW label makes an accidental collision negligibly probable. It is still a
-    # hash-derived identifier, not a proof that arbitrary distinct inputs can
-    # never collide.
+    # The slug is lossy, so append a 128-bit digest of the RAW label.
     predicate_digest = sha256(predicate_label.encode("utf-8")).hexdigest()[:32]
     return f"{SYNTHETIC_PREDICATE_SCHEME}:{tenant}:{tenant_digest}:{slug}-{predicate_digest}"
 
@@ -253,9 +225,7 @@ def _chunk_item(chunk: ChunkResult) -> dict:
 class GraphTraversalTool:
     """openCypher traversal of the property graph via the toolkit ``GraphStore``.
 
-    The four uniform interface fields are static, graphrag-free data set at
-    construction, so the Tool is registrable and describable to the planner
-    without any toolkit access. The toolkit ``GraphStore`` is built lazily on first
+    The toolkit ``GraphStore`` is built lazily on first
     use and cached for the tool's lifetime.
     """
 
@@ -266,7 +236,7 @@ class GraphTraversalTool:
             graph_store_uri: The same ``neptune-db://<host>:8182`` (or
                 ``neptune-graph://g-…``) URI the strategy tools/kg-build use. The
                 toolkit ``GraphStore`` is constructed from it lazily inside the
-                first invocation (Req 12.3).
+                first invocation.
             query_timeout_s: Wall-clock cap applied around each graph query.
         """
         self.name = TOOL_NAME
@@ -276,8 +246,6 @@ class GraphTraversalTool:
         self._graph_store_uri = graph_store_uri
         self._query_timeout_s = query_timeout_s
         self._store: Any = None
-
-    # ── lazy toolkit wiring (Req 12.3) ─────────────────────────────────
 
     def _get_store(self) -> Any:
         """Build (once) and return the toolkit ``GraphStore``; lazy toolkit import."""
@@ -305,7 +273,7 @@ class GraphTraversalTool:
         Derives the tenant exactly as kg-build/`BaselineLexicalRetriever` do
         (``to_graphrag_tenant_id``) and uses the toolkit ``TenantId.format_label``
         so the label string matches what is stored in the graph. Both imports are
-        lazy (the toolkit one for Req 12.3; ``to_graphrag_tenant_id`` is toolkit-free
+        lazy (the toolkit one keeps module load toolkit-free; ``to_graphrag_tenant_id`` is toolkit-free
         but kept local for symmetry).
         """
         from coa_common.constants import to_graphrag_tenant_id
@@ -402,16 +370,14 @@ class GraphTraversalTool:
             )
         return limit, None
 
-    # ── dispatch ───────────────────────────────────────────────────────
-
     async def invoke(self, *, namespace: str, mode: str = "keyword", **kwargs: Any) -> ToolResult:
         """Run a traversal scoped to ``namespace`` and return a :class:`ToolResult`.
 
-        Dispatches on ``mode`` (``keyword`` / ``uris`` / ``edge_typed``). Never
+        Dispatches on ``mode`` (``keyword`` / ``uris`` / ``edge_types`` / ``edge_typed``). Never
         raises for an expected failure: an unknown mode, invalid parameters, an
         out-of-bounds entity/edge count, an unconfigured store, a backend error,
         or a timeout all return a degraded :class:`ToolResult` whose ``detail``
-        records the reason (Req 9.1-9.2).
+        records the reason.
         """
         try:
             if mode == "keyword":
@@ -429,7 +395,7 @@ class GraphTraversalTool:
                 detail=f"{self.name} timeout in mode {mode!r}",
                 degraded_reason="timeout",
             )
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning(
                 "graph_tool_invoke_error",
                 tool=self.name,
@@ -441,8 +407,6 @@ class GraphTraversalTool:
                 detail=f"{self.name} error: {type(exc).__name__}",
                 degraded_reason="error",
             )
-
-    # ── keyword mode ───────────────────────────────────────────────────
 
     async def _invoke_keyword(
         self, namespace: str, *, query: str = "", limit: int = DEFAULT_EDGE_TYPED_LIMIT, **_: Any
@@ -484,8 +448,6 @@ class GraphTraversalTool:
         ]
         return self._entities_result(entities, f"{self.name}[keyword]: {len(entities)} entities")
 
-    # ── uris mode ──────────────────────────────────────────────────────
-
     async def _invoke_uris(
         self, namespace: str, *, uris: list[str] | None = None, limit: int = DEFAULT_EDGE_TYPED_LIMIT, **_: Any
     ) -> ToolResult:
@@ -505,8 +467,6 @@ class GraphTraversalTool:
         entities = self._connected_entities(rows, namespace)
         return self._entities_result(entities, f"{self.name}[uris]: {len(entities)} connected entities")
 
-    # ── edge_types mode (predicate discovery for the soft ontology prior) ──
-
     async def _invoke_edge_types(
         self, namespace: str, *, entity_ids: list[str] | None = None, limit: int = 50, **_: Any
     ) -> ToolResult:
@@ -514,8 +474,8 @@ class GraphTraversalTool:
 
         Runs :data:`ENTITY_EDGE_TYPES` and returns the raw ``r.value`` predicates
         (with occurrence counts) as ``edge_type`` items so the planner can propose
-        real graph predicates that the pruned ontology omits (the soft-prior half of
-        idea 5). No chunks/entities are gathered — this is a metadata probe — so it
+        real graph predicates that the pruned ontology omits (the soft ontology
+        prior). No chunks/entities are gathered — this is a metadata probe — so it
         does not itself count as retrieval progress; the discovered predicates are
         surfaced to the planner via the result ``detail`` and cached on the context.
         """
@@ -542,8 +502,6 @@ class GraphTraversalTool:
         labels = ", ".join(f"{i['edge']}({i['freq']})" for i in items[:20]) or "(none)"
         return ToolResult(items=items, detail=f"{self.name}[edge_types]: {len(items)} present predicates: {labels}")
 
-    # ── edge_typed mode (prepared Query_Template, Req 5.5) ─────────────
-
     async def _invoke_edge_typed(
         self,
         namespace: str,
@@ -553,7 +511,7 @@ class GraphTraversalTool:
         limit: int = DEFAULT_EDGE_TYPED_LIMIT,
         **_: Any,
     ) -> ToolResult:
-        """Fill and execute the edge-typed traversal template (Req 5.5).
+        """Fill and execute the edge-typed traversal template.
 
         Validates the entity count (1-100) and edge-type count (1-50) before
         building the query, then runs the openCypher template with entity ids and
@@ -582,7 +540,7 @@ class GraphTraversalTool:
                 )
             )
 
-        # Normalize requested edge types to match stored r.value (Req 3.9 mapping).
+        # Normalize requested edge types to match stored r.value.
         edge_types_norm = sorted({normalize_edge_type(e) for e in edge_types})
 
         cypher = EDGE_TYPED_TRAVERSAL.format(
@@ -636,8 +594,6 @@ class GraphTraversalTool:
             namespace,
             text_degraded_reason=text_degraded_reason,
         )
-
-    # ── result assembly ────────────────────────────────────────────────
 
     @staticmethod
     def _connected_entities(
@@ -806,16 +762,9 @@ class GraphTraversalTool:
 def build_graph_tool(registry: Any, graph_store_uri: str) -> str:
     """Register the single :class:`GraphTraversalTool` into ``registry``.
 
-    Mirrors :func:`build_strategy_tools`: a thin builder the factory (task 17)
+    Mirrors :func:`build_strategy_tools`: a thin builder the factory
     calls when the Neptune graph endpoint is configured. Returns the registered
     Tool name.
-
-    Args:
-        registry: The :class:`ToolRegistry` to register the tool into.
-        graph_store_uri: The graphrag-toolkit graph-store URI the tool queries.
-
-    Returns:
-        The registered Tool name (``"graph_traversal"``).
     """
     tool = GraphTraversalTool(graph_store_uri)
     registry.register(tool)

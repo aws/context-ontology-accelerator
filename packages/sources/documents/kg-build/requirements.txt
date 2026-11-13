@@ -34,3 +34,8 @@ certifi>=2026.10.19
 pillow>=13.0.0
 nltk>=3.10.4
 filelock>=4.2.1
+# 0.15.4 is the first release that knows all three Claude 5.5 models (0.15.3
+# lacks Haiku 5.5). Older ones fail to build the extraction LLM for them and
+# still send `temperature`, which these models reject. Every 0.15.x release
+# accepts the llama-index-core pin above (core<0.15).
+llama-index-llms-bedrock-converse>=0.15.4,<0.16

@@ -61,13 +61,10 @@ export function OntologyInventoryView({
       .finally(() => setLoading(false));
   }, [apiClient, namespace, refreshKey]);
 
-  // Poll while a row is mid-delete so "Delete in progress" clears itself instead
-  // of looking hung. Same 4s cadence as the Induction page's poll.
-  //
-  // A row whose teardown failed keeps `status: "deleting"` and gains a
-  // `deleteError` (see _mark_delete_error in the catalog router), so polling on
-  // status alone never terminates. Wedged rows are excluded: the row is
-  // finished changing, and the error is surfaced in the status cell instead.
+  // Poll while a row is mid-delete so "Delete in progress" clears itself. A row
+  // whose teardown failed keeps `status: "deleting"` and gains a `deleteError`
+  // (see _mark_delete_error in the catalog router), so polling on status alone
+  // never ends; wedged rows are excluded and the error shows in the status cell.
   const hasDeleting = items.some(
     (o) => o.status === "deleting" && !o.deleteError,
   );

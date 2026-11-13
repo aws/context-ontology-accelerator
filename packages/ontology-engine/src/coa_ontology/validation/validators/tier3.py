@@ -63,7 +63,6 @@ class OoPSValidator(OntologyValidator):
             ]
 
         findings = []
-        # OoPS! self-hosted expects RDF/XML content via JSON API.
         # Strip owl:imports to prevent OoPS from trying to fetch remote ontologies.
         clean = Graph()
         for t in graph:

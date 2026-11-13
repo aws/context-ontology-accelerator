@@ -3,9 +3,8 @@
 
 """Unit tests: GET /induce/jobs/{id} is poll-shaped — report.matches[] dropped by default.
 
-Regression for #807: at 50k tables ``report.matches`` holds ~836k entries →
-multi-MB → the API-proxy Lambda 413s on its 6MB response cap, so the completed
-job becomes unpollable and every client poll times out. ``get_job`` must drop
+At large table counts ``report.matches`` exceeds the API-proxy Lambda's 6MB
+response cap, so ``get_job`` must drop
 ``report.matches[]`` by default (keeping scalar counts + terminal state) and
 only return the full body behind an explicit ``include=report`` opt-in.
 """

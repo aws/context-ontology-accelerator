@@ -60,8 +60,6 @@ export interface IdpAuthenticationStackProps extends cdk.StackProps {
   readonly refreshTokenValidity?: cdk.Duration;
 }
 
-// ── Custom domains ─────────────────────────────────────────────────
-
 /**
  * Custom-domain configuration for the public web surface.
  *
@@ -87,8 +85,6 @@ export interface CustomDomainConfig {
   /** Route53 hosted zone id for the domains; alias records are created here. */
   readonly hostedZoneId: string;
 }
-
-// ── SSM Config (JSON-serializable) ─────────────────────────────────
 
 /**
  * Deployment configuration loaded from SSM Parameter Store.
@@ -159,7 +155,7 @@ export interface SsmConfig {
    *  high-volume call, so it defaults to the chat model
    *  (DEFAULT_BEDROCK_CHAT_MODEL_ID, a Haiku-class model) rather than the
    *  heavier induction model. Set a region-valid profile here to override it
-   *  on a non-US deploy (GH #236). Accepts geo inference profiles and bare
+   *  on a non-US deploy. Accepts geo inference profiles and bare
    *  in-region IDs. */
   readonly bedrockGroundingLlmModelId?: string;
 

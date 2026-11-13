@@ -133,7 +133,8 @@ class BridgeLLM:
             system=[{"text": system}] if system else [],
             inferenceConfig={"maxTokens": max_tokens},
         )
-        blocks = ((resp.get("output") or {}).get("message") or {}).get("content") or []
+        message = resp.get("output", {}).get("message")
+        blocks = message.get("content", []) if message else []
         text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and "text" in b)
         stop = resp.get("stopReason")
         if not text.strip() or stop == "max_tokens":
@@ -786,9 +787,6 @@ def run_bridge(
         )
     report["elapsed_seconds"] = int(time.monotonic() - started)
     return report
-
-
-# ── Wiring to the deployed stores ──────────────────────────────────────
 
 
 def app_config() -> dict:

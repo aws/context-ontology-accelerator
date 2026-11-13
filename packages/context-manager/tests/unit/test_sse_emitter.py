@@ -15,8 +15,6 @@ pytestmark = pytest.mark.unit
 
 
 class TestSSEEmitterEnvelope:
-    """Validate event envelope structure."""
-
     def test_envelope_has_required_fields(self):
         emitter = SSEEmitter("req-1", session_id="sess-1")
         envelope = emitter._make_envelope("step", {"stepName": "t1.resolve"})
@@ -36,8 +34,6 @@ class TestSSEEmitterEnvelope:
 
 
 class TestSSEEmitterQueueStep:
-    """Validate queue_step behavior."""
-
     def test_queue_step_renames_step_to_stepName(self):
         emitter = SSEEmitter("req-1")
         step = TraceStep(step="t1.resolve", status="active", durationMs=42)
@@ -56,13 +52,10 @@ class TestSSEEmitterQueueStep:
         step = TraceStep(step="t1.resolve", status="active", durationMs=0)
         emitter.queue_step(step)
 
-        # Queue has only the sentinel from close(), no new step event
         assert emitter._queue.qsize() == 1  # just the sentinel
 
 
 class TestSSEEmitterQueueToken:
-    """Validate queue_token behavior."""
-
     def test_queue_token_produces_correct_envelope(self):
         emitter = SSEEmitter("req-1", session_id="sess-1")
         emitter.queue_token("Hello")
@@ -77,13 +70,10 @@ class TestSSEEmitterQueueToken:
         emitter.close()
         emitter.queue_token("ignored")
 
-        # Only sentinel in queue
         assert emitter._queue.qsize() == 1
 
 
 class TestSSEEmitterFormatDone:
-    """Validate format_done output."""
-
     def test_format_done_wraps_query_result(self):
         emitter = SSEEmitter("req-1", session_id="sess-1")
         result = QueryResult(
@@ -103,8 +93,6 @@ class TestSSEEmitterFormatDone:
 
 
 class TestSSEEmitterFormatError:
-    """Validate format_error output."""
-
     def test_format_error_produces_typed_event(self):
         emitter = SSEEmitter("req-1")
         event = emitter.format_error("TimeoutError", "Query timed out", 504)
@@ -125,8 +113,6 @@ class TestSSEEmitterFormatError:
 
 
 class TestSSEEmitterStream:
-    """Validate the async stream() generator."""
-
     @pytest.mark.asyncio
     async def test_stream_yields_queued_events_then_stops(self):
         emitter = SSEEmitter("req-1")
@@ -162,11 +148,10 @@ class TestSSEEmitterStream:
         emitter.close()  # should not push another sentinel
 
         assert emitter.is_closed
+        assert emitter._queue.qsize() == 1
 
 
 class TestSSEEmitterDone:
-    """Validate done() sentinel behavior."""
-
     @pytest.mark.asyncio
     async def test_done_sends_sentinel_stopping_stream(self):
         emitter = SSEEmitter("req-1")

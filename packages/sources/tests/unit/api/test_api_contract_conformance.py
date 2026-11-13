@@ -71,9 +71,6 @@ _KNOWN_GAPS: dict[tuple[str, str], str] = {}
 _UNDECLARED_QUERY_ALLOWLIST: dict[tuple[str, str], str] = {}
 
 
-# ── OpenAPI ──────────────────────────────────────────────────────────────────
-
-
 def _spec() -> dict:
     if not _OPENAPI.is_file():
         pytest.skip(f"{_OPENAPI} not found — it is generated, not committed. Run `make generate`.")
@@ -103,9 +100,6 @@ def _declared(spec: dict, op: dict) -> tuple[set[str], set[str], set[str], str |
         name = schema["$ref"].rsplit("/", 1)[-1]
         schema = spec["components"]["schemas"][name]
     return set(schema.get("properties", {})), query, labels, name
-
-
-# ── Handler scanning ─────────────────────────────────────────────────────────
 
 
 def _functions() -> dict[str, ast.FunctionDef]:

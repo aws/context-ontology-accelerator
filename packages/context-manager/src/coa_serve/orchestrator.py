@@ -60,8 +60,6 @@ _VALID_TIER_OVERRIDES = {1, 2, 3}
 class TierGating:
     """Which tiers source-composition gating has ruled out for a request.
 
-    Named fields (not a positional bool tuple) so callers read the decision by
-    intent — ``gating.skip_tier1`` — and cannot silently transpose two skips.
     The default (all False) is the fail-open "skip nothing" state used on the
     override / unknown / no-registry paths.
 
@@ -167,29 +165,14 @@ class Orchestrator:
         self._assembler = ResponseAssembler(model_id=model_id)
         self._firewall = firewall or SQLFirewall()
         self._lexical_retriever_strategy = lexical_retriever_strategy
-        # Optional: gate inapplicable tiers by the namespace's source composition
-        # (structured-only vs document-only). When None, no gating happens and
-        # every tier runs as before — the feature is purely additive and fail-open.
         self._sources_registry = sources_registry
-        # Optional: prune Tier 2 for a document-flavored query in a MIXED namespace
-        # (which namespace-level source-composition gating cannot rule out). When
-        # None the feature is absent — no extra work, no behavior change. Fail-open:
-        # only a SKIP decision prunes Tier 2; RUN/ABSTAIN run it as normal.
+        # Optional: prune Tier 2 for a document-flavored query in a MIXED namespace.
+        # Only a SKIP decision prunes Tier 2; RUN/ABSTAIN run it as normal.
         self._tier2_skip_evaluator = tier2_skip_evaluator
-        # Tier-3 URI-hop seeding: a multilingual ontology-concept vector search
-        # (mirrors the Tier-2 pattern in tier2/ontop/strategy.py) resolves seed
-        # class/property URIs from the query embedding so graph traversal takes
-        # the language-agnostic traverse_from_uris() branch instead of the
-        # ASCII-only keyword branch. Both are optional/fail-open: without them
-        # _resolve_seed_uris() returns [] and Tier 3 behaves exactly as before.
+        # Optional Tier-3 URI-hop seeding: an ontology-concept vector search resolves
+        # seed URIs so graph traversal is not limited to the ASCII-only keyword branch.
         self._vector_client = vector_client
         self._oss_ontology_index = oss_ontology_index
-        # Optional deep-reasoning Tier-3 path. When present it can be engaged
-        # per-request (options.mode=="deep-reasoning") or as the deployment default
-        # (tier3_deep_reasoning_default, set when
-        # config.tier3_strategy=="deep-reasoning"). When None deep reasoning is simply
-        # unavailable and Tier-3 always runs the
-        # existing hand-rolled / lexical KnowledgeRetriever — purely additive.
         self._agentic_retriever = agentic_retriever
         self._tier3_deep_reasoning_default = tier3_deep_reasoning_default
         if not 1 <= tier1_metric_timeout_s <= 300:
@@ -216,10 +199,10 @@ class Orchestrator:
             trace: Optional trace collector; a new one is created when omitted.
             on_token: Optional async callback for streaming Tier-3 tokens.
             conversation_history: Optional prior turns for conversational context.
-            deadline: Optional request-scoped time budget (A0). When supplied, it is
+            deadline: Optional request-scoped time budget. When supplied, it is
                 threaded into the Tier-2 StrategyContext so the NL→SQL correction
                 shot can skip itself rather than overrun the transport ceiling. None
-                preserves pre-A0 behaviour (strategies use fixed internal timeouts).
+                means strategies use fixed internal timeouts.
 
         Returns:
             The assembled InvokeResponse from the first tier that resolves.
@@ -247,18 +230,9 @@ class Orchestrator:
         start_tier = options.get("startTier", 1)
 
         # ── Source-composition gating (perf optimization) ────────────
-        # If the namespace has ONLY structured (DATABASE) or ONLY unstructured
-        # (DOCUMENTS) sources, skip the tier(s) that cannot possibly contribute:
-        # • no DATABASE → skip Tier 1 (metric resolver) AND Tier 2 (Ontop/NL→SQL).
-        # Both can only produce a result over a relational DATABASE source; on a
-        # document-only namespace they would otherwise pay a metric-resolver call
-        # and a full NL→SPARQL LLM attempt before no-op'ing straight to Tier 3.
-        # • no DOCUMENTS → skip Tier 3's vector search (no chunk_ index exists);
-        # graph-traversal + synthesis over the ontology graph still run.
-        # Only applied on the automatic path (no explicit tierOverride) and only on
-        # a positive zero-count signal; unknown/errors fail OPEN (run everything).
-        # The composition lookup shares the cached SRC# query with Tier-2 routing,
-        # so when both run (mixed namespace) only one DDB round-trip occurs per TTL.
+        # Skip tiers that cannot contribute given the namespace's source composition
+        # (see TierGating.from_composition). Applied only on the automatic path and
+        # only on a positive zero-count signal; unknown/errors fail open.
         gating = await self._resolve_source_gating(namespace, tier_override, trace)
 
         tier2_sparql: str | None = None
@@ -269,20 +243,10 @@ class Orchestrator:
         declined_metric: DeclinedMetricContext | None = None
 
         # ── Deep-reasoning mode owns the whole request ───────────────
-        # Mode is an execution policy, not a tier: an explicit
-        # options.mode="deep-reasoning"
-        # hands the request to the reasoning loop directly instead of running the
-        # T1 -> T2 cascade first. Without this, a question the cascade can answer
-        # returns at Tier 1/2 and the loop never runs, so the mode selector appears
-        # to do nothing on any namespace with a structured source.
-        #
-        # The loop is not losing the structured tiers — it has nl_to_sql and
-        # nl_to_sparql as tools (composition-gated), so it decides per sub-question
-        # whether to query the database, and can combine that with document
-        # retrieval in one answer, which the cascade cannot.
-        #
-        # An explicit tierOverride still wins: it is a direct instruction about which
-        # tier to run, so it is honored over the mode's routing.
+        # An explicit options.mode="deep-reasoning" hands the request to the
+        # reasoning loop directly instead of running the T1 -> T2 cascade first; the
+        # loop has nl_to_sql and nl_to_sparql as tools. An explicit tierOverride
+        # still wins.
         if tier_override is None and self._is_deep_reasoning_engaged(options):
             return await self._run_tier3(
                 query,
@@ -300,7 +264,6 @@ class Orchestrator:
                 has_unstructured_source=not gating.skip_tier3_vector_search,
             )
 
-        # ── Tier 1: Metric Resolver ──────────────────────────────────
         if self._should_run_tier1(tier_override, start_tier, gating):
             result, declined_metric = await self._run_tier1(
                 query,
@@ -318,7 +281,6 @@ class Orchestrator:
         # Query embedding — shared by Tier 2 (class retrieval) and Tier 3 (vector search).
         query_embedding = await self._embed_query(query, tier_override, trace)
 
-        # ── Tier 2: strategy-based structured query ────────────────
         strategy = self._resolve_strategy_selection(options, tier_override)
         if await self._should_run_tier2(
             strategy, gating, tier_override, options, query, namespace, query_embedding, trace
@@ -341,7 +303,6 @@ class Orchestrator:
             if strategy_result:
                 return strategy_result
 
-        # ── Tier 3: Knowledge Retriever (fallback) ───────────────────
         if self._should_run_tier3(tier_override):
             # For a structured-only namespace there is no chunk_ index, so pass
             # embedding=None: Tier 3's vector-search sub-step self-skips (via the
@@ -372,12 +333,8 @@ class Orchestrator:
                 has_unstructured_source=not gating.skip_tier3_vector_search,
             )
 
-        # / Req 2: a pinned tier that exhausts its permitted fall-through
-        # and yields nothing is a "no data found" outcome, NOT a server fault. Raise
-        # a typed NoResultError (→ 404 at the handler) instead of a bare ValueError
-        # that the WS handler would map to InternalError 500. Reached for a pinned
-        # tierOverride=1 (Tier-1 miss) or tierOverride=2 (Tier-2 strategy miss);
-        # unpinned and tierOverride=3 always resolve via Tier 3 above.
+        # A pinned tier that yields nothing is "no data found" (NoResultError, 404),
+        # not a server fault.
         raise NoResultError(
             f"No result for the requested tier (tierOverride={tier_override})",
             tier=tier_override if isinstance(tier_override, int) else None,
@@ -390,7 +347,7 @@ class Orchestrator:
         source/cache. This is the single authorization point for the retrieval
         surfaces that never build SQL — the isolated kbSearch/graphTraverse/
         translate actions and the Tier-3 path — which otherwise reach a data sink
-        without any namespace authorization (F-2, CWE-862). The Tier-1/2 SQL path
+        without any namespace authorization (CWE-862). The Tier-1/2 SQL path
         keeps its own firewall.evaluate() gate; this runs upstream of dispatch.
         """
         return self._firewall.authorize_namespace(namespace, profile)
@@ -399,14 +356,6 @@ class Orchestrator:
     def _debug_info_requested(options: dict | None) -> bool:
         """Whether the caller opted in to schema artifacts (``includeDebugInfo=true``)."""
         return (options or {}).get("includeDebugInfo", False) is True
-
-    # ADR gating B: each schema artifact is returned only when the caller BOTH
-    # opted in (``includeDebugInfo=true``) AND holds the right for the schema the
-    # artifact discloses — the SQL (``query_used``, table/column names) needs
-    # ``viewSource``; the SPARQL (``sparql_generated``, ontology classes and
-    # properties) needs ``viewOntology``. A schema-blind role (``data-analyst``)
-    # holds neither, so it never receives either artifact, even with the flag.
-    # Both fail CLOSED: the firewall returns False on evaluator error.
 
     def schema_visibility(self, namespace: str, profile: dict | None) -> SchemaVisibility:
         """The caller's schema rights (``viewSource`` / ``viewOntology``), fail-closed.
@@ -435,12 +384,6 @@ class Orchestrator:
         vis = request_schema_visibility(namespace)
         return vis.ontology if vis is not None else self._firewall.can_view_ontology(namespace, profile)
 
-    # ── Tier run/skip decisions ──────────────────────────────────────
-    # Each tier's guard is a named predicate so resolve() reads as a plain
-    # sequence. "should run" folds in three orthogonal inputs: caller intent
-    # (tierOverride / startTier / explicit strategy), namespace source-composition
-    # gating, and per-query capability pruning.
-
     @staticmethod
     def _should_run_tier1(tier_override: int | None, start_tier: int, gating: TierGating) -> bool:
         """Tier 1 runs on the automatic path or a Tier-1 pin, unless gated out."""
@@ -457,27 +400,13 @@ class Orchestrator:
     def _unhandled_qualifier(metric_match: MetricMatch, options: dict) -> str:
         """Return the part of the question Tier-1 cannot honour, or ``""``.
 
-        Tier-1 matches a metric by name/synonym anywhere in the question and then
-        executes that metric's SQL **verbatim** — it parses no filter, grouping, or
-        time window out of the natural language. Anything the match did not consume
-        is therefore a qualifier that would be silently dropped, so Tier-1 must
-        decline the question rather than answer a different one.
+        Tier-1 executes the matched metric's SQL verbatim and parses no filter,
+        grouping, or time window from the question, so any unconsumed text is a
+        qualifier it would silently drop.
 
-        Two cases are NOT unhandled:
-
-        * **Caller-supplied dimensions.** ``options.dimensions`` is the documented
-          out-of-band way to filter a metric, so a request that carries them has
-          expressed its qualifier through the supported channel; the residual words
-          are that same intent restated in prose. Substitution still validates them
-          downstream (undeclared/missing values fail closed there).
-        * **A Tier-1 pin.** ``tierOverride=1`` is an explicit instruction to answer
-          from the metric path, and bypassing would turn it into a 404. The caller
-          asked for the deterministic aggregate; the trace still carries the match
-          detail. Only the AUTOMATIC path re-routes.
-
-        Returns:
-            The unconsumed question text, or ``""`` when Tier-1 fully consumed the
-            question (or one of the exemptions above applies).
+        Not unhandled: a request carrying ``options.dimensions`` (the supported
+        filter channel), or a ``tierOverride=1`` pin (only the automatic path
+        re-routes).
         """
         if not metric_match.residual:
             return ""
@@ -547,7 +476,7 @@ class Orchestrator:
             return embedding
         except Exception as e:
             # Trace carries only the exception type — raw str(e) can leak internal
-            # detail to the client (security fix 57b9ec08); full error stays in logs.
+            # detail to the client; full error stays in logs.
             trace.record(
                 StepId.QUERY_EMBED,
                 "error",
@@ -561,17 +490,14 @@ class Orchestrator:
     async def _resolve_seed_uris(self, embedding: list[float] | None, namespace: str) -> list[str]:
         """Resolve ontology-concept seed URIs for Tier-3 URI-hop graph traversal.
 
-        Runs the same multilingual ontology-concept vector search Tier 2 uses
-        (tier2/ontop/strategy.py::_fetch_vector_hits) so a non-Latin (e.g.
-        Japanese) query — which the ASCII-only keyword traverser drops entirely
-        — still seeds graph traversal from the class/property URIs its embedding
-        matches. Fail-open: returns [] when the ontology index or vector client
-        is unconfigured, the embedding is missing, or the search errors, in which
-        case Tier 3 falls back to the keyword branch exactly as before.
+        Runs the same multilingual ontology-concept vector search Tier 2 uses, so a
+        non-Latin query, which the ASCII-only keyword traverser drops, still seeds
+        graph traversal. Fail-open: returns [] when the ontology index or vector
+        client is unconfigured, the embedding is missing, or the search errors.
 
-        The vector client returns the base VectorHit (clients/base.py), whose
-        entity type and URI live in ``metadata`` under ``entity_type`` /
-        ``entity_uri`` (stamped at ingest) — NOT the typed Tier-2 VectorHit.
+        The vector client returns the base VectorHit, whose entity type and URI
+        live in ``metadata`` under ``entity_type`` / ``entity_uri`` (stamped at
+        ingest).
         """
         if not self._vector_client or not self._oss_ontology_index or embedding is None:
             return []
@@ -607,23 +533,17 @@ class Orchestrator:
 
         Returns a :class:`TierGating` (all-False = skip nothing).
 
-        Tier 1 (metric resolver) and Tier 2 (VKG/Ontop NL→SQL) both require a
-        DATABASE source to produce a result, so they are gated together on the
-        no-structured-source signal (see :meth:`TierGating.from_composition`).
+        Tier 1 needs a SQL source and Tier 2 any structured source (see
+        :meth:`TierGating.from_composition`).
 
-        Guardrails (conservative + fail-open):
-          • No registry configured → skip nothing (feature is additive).
-          • An explicit ``tierOverride`` is user intent — never override it here.
-          • Unknown composition (registry error/timeout) → skip nothing.
-          • Only skip on a *positive zero-count* signal (``has_* == False``); a
-            MIXED namespace runs every tier.
-
-        The result is traced (ROUTING_SELECT) only when something is actually
-        skipped, so normal requests are not cluttered.
+        Fail-open: no registry configured, an explicit ``tierOverride``, or an
+        unknown composition skips nothing; only a positive zero-count signal
+        (``has_* == False``) skips. The result is traced (ROUTING_SELECT) only when
+        something is skipped.
         """
-        # With graph sources off, serve is main's: a pin skips the lookup, and graph
-        # sources answer nothing, so a graph-only namespace gates as one without
-        # structured sources and a mixed one keeps only SQL.
+        # With graph sources off, graph backends are ignored: a pin skips the lookup,
+        # a graph-only namespace gates as one without structured sources, and a
+        # mixed one keeps only SQL.
         graph_sources = graph_sources_enabled()
         if self._sources_registry is None or (tier_override is not None and not graph_sources):
             return TierGating()
@@ -641,7 +561,6 @@ class Orchestrator:
         # A pin or an uncertain read skips nothing, but strategy selection still
         # needs the backends — a graph-only namespace pinned to Tier 2 must get the
         # SPARQL strategy. (An unknown composition reports {SQL}: fail safe.)
-        # An empty set under a pin falls back to the SQL default, exactly as before.
         if tier_override is not None or composition.unknown:
             return TierGating(structured_backends=composition.structured_backends or None)
 
@@ -688,8 +607,8 @@ class Orchestrator:
     def _explicit_strategy(cls, options: dict) -> StrategyOption | None:
         """The Tier-2 strategy the caller pinned, if any.
 
-        With graph sources off ``nl_to_sparql`` is no pin: as on main, where the value
-        was unknown, the request runs the default chain.
+        With graph sources off ``nl_to_sparql`` is not a pin, so the request runs
+        the default chain.
         """
         strategy = normalize_strategy_option(options.get("strategy"))
         if strategy not in cls._EXPLICIT_STRATEGY_OPTIONS:
@@ -713,9 +632,6 @@ class Orchestrator:
         ``_should_run_tier2``.
         """
         # An explicit strategy pin takes highest precedence (caller intent).
-        # Normalized so the pre-rename "agentic" spelling still counts as a pin —
-        # otherwise it drops through to DEFAULT_STRATEGY and silently runs the cheap
-        # fallback chain instead of the agent the caller asked for.
         strategy = cls._explicit_strategy(options)
         if strategy is not None:
             return strategy
@@ -773,22 +689,14 @@ class Orchestrator:
         if result is not None:
             max_rows = capped_max_rows(options)
             if len(result.rows) > max_rows:
-                from dataclasses import replace as _replace
+                result = replace(result, rows=result.rows[:max_rows], row_count=max_rows, truncated=True)
 
-                result = _replace(result, rows=result.rows[:max_rows], row_count=max_rows, truncated=True)
-
-            # Confidence gate: a Tier-2 result below the floor is not a usable
-            # structured answer even when it returned rows — the strategy scraped
-            # together a query it wasn't confident in (e.g. a knowledge question
-            # forced through NL→SQL/VKG). Unless the caller pinned Tier 2, drop it
-            # to None so we fall through to Tier 3. Mirrors is_low_confidence_empty
-            # but also covers non-empty low-confidence results.
-            # A NOT_ANSWERABLE_RANGE row (a period the tables do not cover) is final whatever
-            # confidence the writer reported: the tables are the authority, and documents often
-            # mention other periods. A NOT_ANSWERABLE_FIELD row (no column holds the measure) is
-            # final only when the namespace has no unstructured source; otherwise a document may
-            # hold the answer, so it falls through to Tier 3 whatever confidence the writer
-            # reported (a writer sure that no column exists can still report a high confidence).
+            # Confidence gate: unless the caller pinned Tier 2, a result below the
+            # floor falls through to Tier 3 even when it returned rows.
+            # A NOT_ANSWERABLE_RANGE row is final whatever the confidence: the tables
+            # are the authority. A NOT_ANSWERABLE_FIELD row is final only when the
+            # namespace has no unstructured source; otherwise a document may hold the
+            # answer, so it falls through to Tier 3.
             refusal_kind = not_answerable_kind(result)
             field_to_tier3 = refusal_kind == NOT_ANSWERABLE_FIELD and has_unstructured_source
             keep_refusal = refusal_kind is not None and not field_to_tier3
@@ -813,16 +721,8 @@ class Orchestrator:
 
         if result is None:
             if tier_override == 2:
-                # / Req 2: pinned Tier-2 miss is "no data found", not a
-                # server fault — typed NoResultError (→ 404), not a bare ValueError
-                # that the WS handler maps to InternalError 500.
-                #
-                # Note: a Tier-2 result that executed but returned zero rows with
-                # LOW confidence (is_low_confidence_empty) also yields result=None
-                # here, so a pinned tierOverride=2 low-confidence empty is reported
-                # as 404 NoResult (there is no Tier-3 fallthrough when pinned). This
-                # is intentional — a low-confidence empty is treated as "no usable
-                # answer", consistent with the unpinned fall-through behavior.
+                # A pinned Tier-2 miss, including a low-confidence empty result, is
+                # "no data found" (404), not a server fault.
                 raise NoResultError("No result for the requested tier (tierOverride=2)", tier=2)
             logger.info(
                 "tier2_fallback_decision",
@@ -873,10 +773,8 @@ class Orchestrator:
                     sql_used=result.sql or None,
                     sparql=result.sparql,
                     confidence=result.confidence,
-                    # The ONLY truthful source: the translate response of the
-                    # VKG that executed this query. Paths without an in-band
-                    # snapshot version report null by design — a namespace-level
-                    # "current version" is not the version THIS query used (#986).
+                    # Only the executing VKG's translate response knows the snapshot
+                    # version this query used; other paths report null.
                     ontology_version=result.ontology_version or None,
                     data_sources=[result.data_source_id] if native_sparql and result.data_source_id else None,
                     trace=trace,
@@ -935,10 +833,9 @@ class Orchestrator:
         metric_match = await self._metric_resolver.match(query, namespace)
         t1_ms = int((time.perf_counter() - t1_start) * 1000)
 
-        # a query referencing MORE THAN ONE governed metric is ambiguous
-        # for the single-metric Tier-1 path — bypass Tier-1 and let Tier-2/3
-        # handle it (DoD: "match_count > 1 → bypasses Tier 1, routes to Tier 2/3").
-        # Checked before .found so we never execute just the first of several.
+        # A query referencing more than one governed metric is ambiguous for the
+        # single-metric Tier-1 path, so bypass Tier 1. Checked before .found so we
+        # never execute just the first of several.
         if metric_match.match_count > 1:
             trace.record(
                 StepId.T1_METRIC_MATCH,
@@ -948,23 +845,12 @@ class Orchestrator:
             )
             return None, None
 
-        # Grant-profile authorization runs HERE, before the residual-qualifier
-        # gate — so a metric the principal may not use is denied whether the
-        # question was clean (executed) OR carried a residual (declined). Without
-        # this ordering the declined path would forward a denied metric's formula
-        # and description into the Tier-2 prompt, letting a principal use a metric
-        # `allowedMetrics` forbids just by appending a qualifier. Enforced once,
-        # for both exits.
+        # Authorize before the residual-qualifier gate; see _enforce_allowed_metrics.
         if metric_match.found:
             self._enforce_allowed_metrics(metric_match, profile, namespace, trace, t1_ms)
 
-        # a match that leaves part of the question unconsumed is a
-        # PARTIAL match: Tier-1 executes the metric's SQL verbatim and cannot
-        # express a filter, grouping, or time window, so answering would return the
-        # unfiltered aggregate as though it were the answer to the narrower question
-        # — at confidence 1.0, with nothing marking the drop. Bypass to Tier 2,
-        # which can express predicates. Checked before .found's success trace so a
-        # declined question never records a Tier-1 hit.
+        # A partial match bypasses to Tier 2 (see _unhandled_qualifier); checked
+        # before .found's success trace so a declined question never records a hit.
         unhandled = self._unhandled_qualifier(metric_match, options) if metric_match.found else ""
         if unhandled:
             declined = DeclinedMetricContext.from_match(metric_match, unhandled)
@@ -975,21 +861,12 @@ class Orchestrator:
                 detail={
                     "metricName": metric_match.metric_name,
                     "matchSource": metric_match.match_source,
-                    # The span of the question Tier-1 could not honour — the evidence
-                    # that was previously missing: a caller can now see exactly what
-                    # was unhandled instead of inferring it from identical results.
+                    # The span of the question Tier-1 could not honour.
                     "unhandledQualifier": unhandled,
-                    # …paired with the span that DID match, so a surprising bypass is
-                    # diagnosable from the trace alone (e.g. an over-broad synonym
-                    # consuming less of the question than its author expected).
+                    # The span that did match.
                     "matchedText": metric_match.matched_text,
-                    # Declining is not total: the authored formula is handed to Tier 2
-                    # as authoritative context instead of being discarded. Surfaced
-                    # here so "did Tier 2 get the definition?" is answerable from the
-                    # trace alone, without reading Tier-2's prompt. Keyed on
-                    # ``prompt_block`` (not raw ``sql_template``) so it is False
-                    # exactly when nothing is forwarded — a template-less metric
-                    # yields an empty block, and the flag must not claim otherwise.
+                    # Whether the authored formula was forwarded to Tier 2; False
+                    # exactly when ``prompt_block`` is empty.
                     "governedDefinitionForwarded": bool(declined.prompt_block),
                 },
             )
@@ -1064,20 +941,12 @@ class Orchestrator:
 
             # Log the pre-substitution template (placeholders, not values) to
             # avoid leaking caller-supplied dimension values (potential PII) into
-            # logs. Truncated, consistent with other SQL log sites.
+            # logs.
             logger.debug("t1_sql_template", sql=metric_match.sql_template)
-            # Tier-1 data-level authorization gate. Tier-1 previously called
-            # the executor directly without firewall.evaluate(), bypassing the grant
-            # profile (executors only call .validate(), never .evaluate()). Evaluate
-            # AFTER the no-executor/no-sql_template guard above so the clean "skipped"
-            # path is preserved and an empty sql_template never hits a firewall parse
-            # failure. Execute the authorized (possibly rewritten) SQL, not the raw
-            # template, so any future row-filter rewrite cannot be bypassed.
-            #
-            # Empty profile = no data-level restriction by design (sql_firewall.py
-            # "sparse opt-in"); this terminal deny only fires when a restrictive
-            # profile is supplied. The profile is caller-supplied today; wiring the
-            # authorizer-RESOLVED profile is the Cedar follow-up (see MR notes).
+            # Tier-1 data-level authorization gate: executors only call .validate(),
+            # so evaluate the final substituted SQL here and execute the authorized
+            # (possibly rewritten) SQL, not the raw template. An empty profile means
+            # no data-level restriction (sparse opt-in).
             fw_start = time.perf_counter()
             try:
                 fw_result = self._firewall.evaluate(metric_sql, profile, namespace=namespace)
@@ -1197,8 +1066,7 @@ class Orchestrator:
                 ) from e
 
             exec_ms = int((time.perf_counter() - exec_start) * 1000)
-            # enrich with row_count/truncated already in-hand on the
-            # executor QueryResult; (A2) record the executing component.
+            # Enrich with row_count/truncated and the executing component.
             trace.record(
                 StepId.T1_EXECUTE,
                 "success",
@@ -1208,7 +1076,7 @@ class Orchestrator:
                     "table": metric_match.data_source_id or "unknown",
                     "truncated": result.truncated,
                     "timeoutSeconds": timeout_seconds,
-                    # (A2) executing engine — athena | redshift | jdbc.
+                    # Executing engine — athena | redshift | jdbc.
                     "engine": result.engine or "unknown",
                 },
                 tool_used="sql-engine",
@@ -1254,8 +1122,7 @@ class Orchestrator:
         Fail closed: ``is not None`` (not truthiness) — an ABSENT ``allowedMetrics``
         means "no metric constraint" (sparse opt-in), but an explicitly EMPTY one
         means "no metrics permitted". Collapsing the two would make a deny-all grant
-        fail OPEN — the same empty-vs-absent bug fixed for tableAllowlist in
-        sql_firewall.py.
+        fail OPEN.
         """
         allowed_metrics = profile.get("allowedMetrics")
         if allowed_metrics is not None and (
@@ -1282,13 +1149,6 @@ class Orchestrator:
                 principal=principal_id,
             )
             raise AccessDeniedError(reason)
-
-    def _collect_metric_context(self, trace: TraceCollector) -> list[dict] | None:
-        # Placeholder: intended to harvest metric definitions surfaced during a
-        # Tier-1 miss and pass them to Tier 3 as catalog_summary. Not yet
-        # implemented — always None today (Tier 3 simply gets no catalog summary).
-        # TODO(serve): populate from the Tier-1 trace when catalog grounding lands.
-        return None
 
     def _is_deep_reasoning_engaged(self, options: dict) -> bool:
         """Whether the deep-reasoning execution path should handle this request.
@@ -1338,7 +1198,7 @@ class Orchestrator:
         include_supporting = (options or {}).get("includeSupporting") is not False
 
         # A caller whose grant declares allowedMetrics sees only the metrics it permits in the catalog, and no
-        # governed metric through graph traversal; any other caller's call is exactly as before.
+        # governed metric through graph traversal.
         allowed_metrics = (profile or {}).get("allowedMetrics")
         hidden: dict[str, bool] = {}
         if allowed_metrics is not None:
@@ -1368,11 +1228,8 @@ class Orchestrator:
                 # Per-request tool ablation (benchmark/diagnostic lever): withhold
                 # named tools from the planner on top of composition gating.
                 exclude_tools=frozenset((options or {}).get("excludeTools") or ()),
-                # Out-of-band request context the structured tools need. Without the
-                # profile, SQLFirewall/Cedar fail CLOSED (no resolved roles) and every
-                # nl_to_sql / nl_to_sparql call was an AccessDeniedError silently
-                # rendered as "0 rows". options carries the row cap; model_id the
-                # per-request model override the standard Tier-2 path already honors.
+                # Without the profile, SQLFirewall/Cedar fail closed (no resolved
+                # roles). options carries the row cap; model_id the per-request model.
                 profile=profile,
                 # Unset Deep Reasoning options take the measured recommended values.
                 options=with_recommended_options(options),
@@ -1394,9 +1251,8 @@ class Orchestrator:
                 degraded_sources=tier3_result.degraded_sources or None,
                 model_id=model_id,
                 partial=tier3_result.partial,
-                # Label by MODE, not tier: Deep Reasoning resolves at tier=3 but is
-                # a distinct execution mode; without this the console mislabels it
-                # as Standard mode's "Tier 3 — Knowledge Retrieval" (#1166).
+                # Label by mode, not tier: Deep Reasoning resolves at tier=3 but is
+                # a distinct execution mode.
                 execution_mode=Mode.DEEP_REASONING.value,
                 # Return the SQL/SPARQL the agentic loop ran, same as Standard mode
                 # does — gated by includeDebugInfo opt-in AND viewSource (SQL) /
@@ -1406,20 +1262,14 @@ class Orchestrator:
                 include_sql=self._resolve_include_sql(options, namespace, profile),
                 include_sparql=self._resolve_include_sparql(options, namespace, profile),
             )
-            # Also keep the free-form metadata["mode"] stamp for request logs / eval
-            # attribution (unchanged observability contract); execution_mode above is
-            # the structural field the console reads (#1166).
+            # Keep the free-form metadata["mode"] stamp for request logs / eval
+            # attribution; execution_mode above is the field the console reads.
             result.metadata = {**(result.metadata or {}), "mode": Mode.DEEP_REASONING.value}
             return InvokeResponse(result=result)
 
-        # Resolve the graphrag retriever strategy. The lexical retriever is built
-        # on every deployment, so a per-request options.retrieverStrategy engages
-        # graphrag on-demand. self._lexical_retriever_strategy is the deployment
-        # default: a concrete strategy under TIER3_STRATEGY=lexical-baseline, or
-        # None under hand-rolled (so absence of a request value resolves to None
-        # and Tier 3 runs the hand-rolled path). resolve_strategy lives in a
-        # graphrag-free module, so importing it does not break the sync-only
-        # invariant on the hand-rolled path.
+        # A per-request options.retrieverStrategy overrides the deployment default
+        # (None under hand-rolled). resolve_strategy lives in a graphrag-free module,
+        # so importing it keeps the hand-rolled path sync-only.
         retriever_strategy = None
         resolved_metadata: dict[str, str] | None = None
         if self._knowledge_retriever.lexical_enabled:
@@ -1430,13 +1280,8 @@ class Orchestrator:
             if retriever_strategy is not None:
                 resolved_metadata = {"retrieverStrategy": str(retriever_strategy)}
 
-        # Seed graph traversal from ontology-concept URIs matched to the query
-        # embedding. This must run inside the Tier-3 path (not rely on Tier 2):
-        # on tierOverride=3 Tier 2 is skipped, and for a structured-only namespace
-        # the `embedding` arg above is None (vector-search self-skip) — but the
-        # seed search needs the *query* embedding regardless, so it uses the
-        # explicitly-threaded seed_embedding. Empty result → resolve() falls back
-        # to the keyword branch (trace strategy=="keyword"), so this is fail-open.
+        # The seed search needs the query embedding even when `embedding` is None
+        # (structured-only namespace), so it uses seed_embedding.
         entity_uris = await self._resolve_seed_uris(seed_embedding, namespace)
 
         tier3_result = await self._knowledge_retriever.resolve(
@@ -1454,10 +1299,6 @@ class Orchestrator:
             model_id=model_id,
             **hidden,
         )
-        # Trace steps are recorded progressively inside knowledge_retriever.resolve()
-        # via the trace collector callback. toolUsed annotation lives
-        # at the retriever's record sites (opensearch/neptune/bedrock).
-
         result = self._assembler.assemble_tier3(
             synthesized_answer=tier3_result.synthesized_answer,
             supporting_content=tier3_result.supporting_content if include_supporting else None,
@@ -1475,7 +1316,7 @@ class Orchestrator:
         result.with_raw_artifacts(query_used=None, sparql=tier2_sparql)
 
         # Surface the resolved strategy in response metadata so request logs and
-        # eval runs attribute results to the strategy that produced them (2.18).
+        # eval runs attribute results to the strategy that produced them.
         if resolved_metadata is not None:
             result.metadata = {**(result.metadata or {}), **resolved_metadata}
 

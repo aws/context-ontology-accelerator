@@ -59,30 +59,15 @@ def handler(event: dict, context: object) -> None:
                 datasource_id = str(body["datasourceId"])
                 if datasource_id.startswith("DS#") and len(datasource_id) > len("DS#"):
                     execution_input["sourceId"] = datasource_id[len("DS#") :]
-            # Re-scan marker, normalized to a string and ALWAYS present: the
-            # enrichment ECS step reads it as an env var and the state machine
-            # maps it via JsonPath.stringAt, both of which need a string that
-            # exists on every execution. Absent/falsy in the message => "false"
-            # (a first scan, or a retry of a failed first scan); the approved-source
-            # drift re-scan, and a retry of one that failed, send isRescan=true.
+            # These three fields are always present as strings: the state machine
+            # maps them with JsonPath.stringAt and the enrichment step reads them
+            # as env vars. isRescan is true for a drift re-scan of an approved source.
             execution_input["isRescan"] = "true" if body.get("isRescan") else "false"
-            # Forwarded alongside isRescan and normalized the same way. True ONLY
-            # when the live assets are an un-approved merge: the source was already
-            # in RESCAN_REVIEW (a prior re-scan still open), or the message retries
-            # a failed re-scan that had written its backup. Discovery reads it to
-            # decide whether to
-            # reconstruct the approved baseline from the S3 backup blob (open
-            # review) or treat the live assets as the approved baseline
-            # (re-scan from APPROVED, where any leftover backup is stale and must
-            # be ignored). The discovery Lambda receives the full execution input,
-            # so this reaches it without a state-machine change.
+            # True when the live assets are an un-approved merge (a prior re-scan is
+            # still open), so discovery rebuilds the approved baseline from the S3 backup.
             execution_input["hadOpenRescan"] = "true" if body.get("hadOpenRescan") else "false"
-            # Namespace-language snapshot the API resolved when it enqueued the
-            # scan. ALWAYS present for the same JsonPath.stringAt reason as
-            # isRescan; a message from an older API revision carries none and
-            # forwards "". The enrichment worker then resolves the language once
-            # from the namespace item and records it on the scan job; it never
-            # defaults to English.
+            # Language the API resolved at enqueue time; "" when absent. The enrichment
+            # worker then resolves it from the namespace item and never defaults to English.
             execution_input["namespaceLanguage"] = str(body.get("namespaceLanguage") or "")
             execution_name = body["scanJobId"].replace("#", "-").replace("SCAN-", "")[:80]
 

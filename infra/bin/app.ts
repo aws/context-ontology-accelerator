@@ -70,13 +70,15 @@ const configParameterName =
  */
 async function getConfigFromSSM(): Promise<SsmConfig> {
   const region = process.env.CDK_DEFAULT_REGION ?? "us-east-1";
-  const paramName = configParameterName;
   let raw: string;
 
   try {
     const ssm = new SSMClient({ region });
     const res = await ssm.send(
-      new GetParameterCommand({ Name: paramName, WithDecryption: true }),
+      new GetParameterCommand({
+        Name: configParameterName,
+        WithDecryption: true,
+      }),
     );
     if (res.Parameter?.Value == null) {
       throw new Error("GetParameter returned no Parameter.Value");
@@ -85,7 +87,7 @@ async function getConfigFromSSM(): Promise<SsmConfig> {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (err instanceof Error && err.name === "ParameterNotFound") {
-      console.warn(`SSM ${paramName} not found, using defaults`);
+      console.warn(`SSM ${configParameterName} not found, using defaults`);
       return {};
     }
     // Credentialless CI synths deliberately compile with defaults. During a
@@ -93,35 +95,27 @@ async function getConfigFromSSM(): Promise<SsmConfig> {
     // would silently replace the operator's config with US defaults.
     if (!process.env.CDK_DEFAULT_ACCOUNT) {
       console.warn(
-        `Could not read SSM ${paramName} during credentialless synth (${msg}), using defaults`,
+        `Could not read SSM ${configParameterName} during credentialless synth (${msg}), using defaults`,
       );
       return {};
     }
-    throw new Error(`Could not read SSM ${paramName} (${msg})`);
+    throw new Error(`Could not read SSM ${configParameterName} (${msg})`);
   }
-  return parseDeploymentConfig(raw, paramName);
+  return parseDeploymentConfig(raw, configParameterName);
 }
 
 async function deploy(): Promise<void> {
   const config = await getConfigFromSSM();
 
-  // Resolve AgentCore-supported AZ names for the deploying account.
-  // Only us-east-1 has restricted AZs (3/6 unsupported); all other
-  // AgentCore regions support every AZ, so resolution is skipped and
-  // NetworkStack uses the default maxAzs: 2. For restricted regions,
-  // resolution MUST succeed during a real deploy — a silent fallback
-  // would reintroduce the exact AZ bug this module prevents.
-  //
-  // Skip resolution entirely when CDK_DEFAULT_ACCOUNT is not set (CI
-  // synth without credentials). The synth still validates the template
-  // compiles; AZ pinning only matters for actual deploys.
+  // Resolve AgentCore-supported AZ names for the deploying account. Only us-east-1 has
+  // restricted AZs; other AgentCore regions support every AZ and use the default
+  // maxAzs: 2. Skipped when CDK_DEFAULT_ACCOUNT is not set (credentialless CI synth).
   const deployRegion = process.env.CDK_DEFAULT_REGION ?? "us-east-1";
   const hasCredentials = !!process.env.CDK_DEFAULT_ACCOUNT;
 
-  // Fail fast at synth when a model id — configured or the built-in `us.`
-  // default — is a geographic inference profile the deploy region does not
-  // publish (#1020). Without this, a non-US deploy with no config reaches
-  // CREATE_COMPLETE and every Bedrock call fails at first invoke.
+  // Fail fast at synth when a model id (configured or the built-in `us.` default) is a
+  // geographic inference profile the deploy region does not publish. Otherwise a non-US
+  // deploy with no config reaches CREATE_COMPLETE and every Bedrock call fails.
   assertModelIdsInvocableFromRegion(
     resolveConfiguredModelIds(config),
     deployRegion,
@@ -218,10 +212,8 @@ async function deploy(): Promise<void> {
   const deployAccount = process.env.CDK_DEFAULT_ACCOUNT;
   const cfWebAclParamName = `/${prefix}/edge/cloudfront-web-acl-arn`;
 
-  // OE monitoring alarm action seam. Undefined in round one: alarms are
-  // action-ready but route nowhere until a strategy (SNS/chatbot) is wired
-  // here. Wiring it here propagates to every stack's SclMonitoring with no
-  // per-stack change.
+  // Monitoring alarm action seam. Undefined: alarms are action-ready but route nowhere
+  // until a strategy (SNS/chatbot) is wired here; it propagates to every stack.
   const alarmAction: IAlarmActionStrategy | undefined = undefined;
 
   // ── Foundation stacks ──────────────────────────────────────────────
@@ -315,7 +307,7 @@ async function deploy(): Promise<void> {
       "/namespaces/{namespaceId}/sources/{sourceId}/rescan": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}": `/${prefix}/sources/api-fn-arn`,
-      // Resource-oriented review endpoints (replaces the bulk POST /review god endpoint)
+      // Resource-oriented review endpoints
       "/namespaces/{namespaceId}/sources/{sourceId}/approve": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/reject": `/${prefix}/sources/api-fn-arn`,
       "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/review": `/${prefix}/sources/api-fn-arn`,
@@ -357,8 +349,6 @@ async function deploy(): Promise<void> {
       "/namespaces/{namespaceId}/induce/jobs/{jobId}": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/induce/datasources": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/induce/datasources/induced": `/${prefix}/ontology-engine/api-fn-arn`,
-      // Note: /induce/datasources/induced takes precedence over /induce/datasources
-      // because API GW resolves longer literal paths before greedy ones.
       "/namespaces/{namespaceId}/proposals": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/proposals/{proposalId}": `/${prefix}/ontology-engine/api-fn-arn`,
       "/namespaces/{namespaceId}/proposals/{proposalId}/accept": `/${prefix}/ontology-engine/api-fn-arn`,
@@ -473,11 +463,9 @@ async function deploy(): Promise<void> {
   }
 
   const web = new WebStack(app, `${stackPrefix}-web`, {
-    // Cognito User Pool (and its callback-URL patch) only exists on the
-    // COGNITO/SAML idpType path — see idp-authentication-stack.ts. Derived
-    // from the same SSM config `auth` was built from, not from `auth`'s
-    // construct properties, so this stack has no direct reference into the
-    // auth stack's resource tree (see PR for the export-lock this avoids).
+    // Cognito User Pool (and its callback-URL patch) only exists on the COGNITO/SAML
+    // idpType path, see idp-authentication-stack.ts. Derived from the same SSM config `auth`
+    // was built from, so this stack has no direct reference into the auth stack's resources.
     isCognitoMode: config.idpType !== IdpType.OIDC,
     federatedIdentityProviderNames:
       IdpAuthenticationStack.federatedProviderNames(authProps),
@@ -502,8 +490,6 @@ async function deploy(): Promise<void> {
   web.addDependency(api);
   web.addDependency(serve);
   if (edgeWaf) web.addDependency(edgeWaf);
-
-  // VKG stack created above (vkg variable used by serve stack for endpoint)
 
   // ── Ontology Engine ────────────────────────────────────────────────
   // SSM params are read via valueForStringParameter (CFN dynamic refs);
@@ -531,18 +517,9 @@ async function deploy(): Promise<void> {
   // ApiStack reads /ontology-engine/api-fn-arn via SSM (CFN dynamic ref).
   api.addDependency(ontology);
 
-  // DataLayerStack reads /{prefix}/ontology-engine/api-fn-arn via SSM (CFN
-  // dynamic refs) for its direct-invoke DescribeSchema handler — the same
-  // source MCP's discovery tools read. CDK cannot infer dependency ordering
-  // from ``valueForStringParameter``, so declare it explicitly. Without this,
-  // a fresh-account ``cdk deploy --all`` can resolve dataLayer before the
-  // parent stack publishes its ARN, silently baking a dummy value into
-  // the Lambda env and 502ing schema calls until a redeploy.
+  // DataLayerStack reads /{prefix}/ontology-engine/api-fn-arn via SSM for its
+  // DescribeSchema handler; declare the ordering explicitly (see above).
   dataLayer.addDependency(ontology);
-
-  // TODO: Re-enable other service stacks as they are implemented
-  // const controlPlane = new ControlPlaneStack(app, `${stackPrefix}-control-plane`);
-  // const structured = new StructuredStack(app, `${stackPrefix}-structured`);
 
   const mcp = new McpStack(app, `${stackPrefix}-mcp`, {
     vpc: network.vpc,
@@ -552,11 +529,8 @@ async function deploy(): Promise<void> {
   });
   mcp.addDependency(serve); // needs CM runtime-arn SSM param
   mcp.addDependency(auth); // needs /issuer, /mcp-client-id, /authentication-group-token-name SSM params
-  // web reads ${ssmPrefix}/mcp/runtime-arn (published by mcp) to surface the MCP
-  // endpoint in runtime-config.json for the console's MCP page (#1166). CDK can't
-  // infer the ordering from valueForStringParameter, so declare it explicitly —
-  // otherwise a fresh-account deploy can write runtime-config.json before the
-  // parameter exists.
+  // web reads ${ssmPrefix}/mcp/runtime-arn (published by mcp) for runtime-config.json;
+  // declare the ordering explicitly (see above).
   web.addDependency(mcp);
 
   // Every stack with a VPC Lambda waits for EniWarmStack, so its functions reuse

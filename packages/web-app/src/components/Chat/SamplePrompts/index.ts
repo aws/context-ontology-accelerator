@@ -2,4 +2,3 @@
 // SPDX-License-Identifier: Apache-2.0
 
 export { SamplePrompts } from "./SamplePrompts";
-export type { SamplePromptsProps } from "./SamplePrompts";

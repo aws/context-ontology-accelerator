@@ -1,73 +1,18 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for DNS rebinding SSRF prevention in fetch_ontology_from_source.
-
-Tests the fix for Server-Side Request Forgery via DNS Rebinding.
-
-The vulnerability was a TOCTOU (Time-of-Check-Time-of-Use) race where:
-1. _validate_fetch_url resolved the hostname and validated IPs were public
-2. httpx performed a separate DNS resolution for the actual HTTP request
-3. An attacker controlling authoritative DNS could serve different IPs
-
-The fix: _resolve_and_validate_url resolves DNS once, validates all returned
-IPs are public, then returns a URL pinned to the validated IP. The HTTP
-client connects directly to that IP (eliminating the second DNS query),
-with the original hostname in the Host header for TLS SNI and virtual hosting.
-
-These tests verify the core security logic without importing the full router
-to avoid Smithy model dependencies in unit tests.
-"""
+"""Unit tests for DNS-rebinding SSRF prevention in ``_resolve_and_validate_url``."""
 
 from __future__ import annotations
 
-import ipaddress
 import socket
-import urllib.parse
 from unittest.mock import patch
 
 import pytest
+from coa_ontology.catalog.routers.ontologies import _resolve_and_validate_url
 from fastapi import HTTPException
 
 pytestmark = pytest.mark.unit
-
-# Replicate the fixed function logic inline for testing
-_FETCH_ALLOWED_SCHEMES = {"https"}
-
-
-def _resolve_and_validate_url(url: str) -> tuple[str, str, str]:
-    """The fixed version that eliminates DNS rebinding TOCTOU."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in _FETCH_ALLOWED_SCHEMES:
-        raise HTTPException(400, "source_url must use https://")
-    if not parsed.hostname:
-        raise HTTPException(400, "source_url is missing a hostname")
-    try:
-        infos = socket.getaddrinfo(parsed.hostname, None)
-    except socket.gaierror as e:
-        raise HTTPException(400, f"Cannot resolve source_url host: {e}") from e
-    if not infos:
-        raise HTTPException(400, "source_url hostname resolved to no addresses")
-
-    # Validate ALL returned IPs are globally routable unicast before using any.
-    # NOTE: keep this in sync with the router's _resolve_and_validate_url —
-    # `not ip.is_global or ip.is_multicast` (multicast is not "private", so
-    # is_global is True for it and must be rejected separately).
-    validated_ips: list[str] = []
-    for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global or ip.is_multicast:
-            raise HTTPException(400, f"source_url resolves to non-routable address {ip}")
-        validated_ips.append(sockaddr[0])
-
-    # Use the first validated IP and reconstruct the URL to connect directly to it
-    pinned_ip = validated_ips[0]
-    port = parsed.port or 443
-    # IPv6 addresses need bracket notation in URLs
-    netloc = f"[{pinned_ip}]:{port}" if ":" in pinned_ip else f"{pinned_ip}:{port}"
-    pinned_url = parsed._replace(netloc=netloc).geturl()
-
-    return pinned_url, parsed.hostname, str(port)
 
 
 def test_resolve_and_validate_url_rejects_http_scheme():
@@ -208,18 +153,3 @@ def test_resolve_and_validate_url_missing_hostname():
         _resolve_and_validate_url("https:///path/to/file.ttl")
     assert exc.value.status_code == 400
     assert "missing a hostname" in str(exc.value.detail).lower()
-
-
-def test_dns_rebinding_attack_scenario():
-    """Security test: DNS rebinding cannot bypass validation.
-
-    In the vulnerable version, an attacker's DNS could return different IPs
-    for validation vs. HTTP request. The fix eliminates this by resolving once.
-    """
-    with patch("socket.getaddrinfo") as mock_getaddrinfo:
-        # Attacker's DNS returns private IP (simulating the resolved value)
-        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.1", 0))]
-        with pytest.raises(HTTPException) as exc:
-            _resolve_and_validate_url("https://rebind.attacker.com/steal.ttl")
-        assert exc.value.status_code == 400
-        assert "non-routable" in str(exc.value.detail).lower()

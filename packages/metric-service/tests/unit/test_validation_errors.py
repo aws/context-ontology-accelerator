@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for validation_errors.format_validation_error (issues #488, #489)."""
+"""Unit tests for validation_errors.format_validation_error."""
 
 from __future__ import annotations
 
@@ -26,10 +26,7 @@ class _Dialect(BaseModel):
 
 
 class _Expression(BaseModel):
-    # min_length mirrors the generated MetricExpression
-    # (smithy-generated/.../models/metric_expression.py), so an empty list raises
-    # the too_short error the tests below expect. Without it the stub accepted
-    # `dialects: []` and `_validation_error` failed with "DID NOT RAISE".
+    # min_length mirrors the generated MetricExpression so an empty list raises too_short.
     dialects: Annotated[list[_Dialect], Field(min_length=1)]
 
 
@@ -46,8 +43,7 @@ def _validation_error(body: dict) -> ValidationError:
 
 class TestFormatValidationError:
     def test_missing_expression_field_gets_shape_hint(self):
-        """Flat top-level 'dialects' (no 'expression' wrapper) — the exact
-        the reported mistake."""
+        """Flat top-level 'dialects' (no 'expression' wrapper) gets the shape hint."""
         exc = _validation_error({"name": "m1", "dialects": [{"dialect": "TRINO", "expression": "SUM(x)"}]})
         msg = format_validation_error(exc)
         assert "Field required" in msg
@@ -77,9 +73,7 @@ class TestFormatValidationError:
         assert "must be nested" not in msg
 
     def test_invalid_dialect_enum_athena_gets_trino_hint(self):
-        """An ATHENA dialect value fails Pydantic's enum check
-        BEFORE reaching the handler-level VALID_SQL_DIALECTS check — the hint
-        must be applied here, matched via loc ending in 'dialect'."""
+        """ATHENA fails the enum check before the handler check; the hint is matched on loc ending in 'dialect'."""
         exc = _validation_error(
             {"name": "m1", "expression": {"dialects": [{"dialect": "ATHENA", "expression": "SUM(x)"}]}}
         )
@@ -92,8 +86,6 @@ class TestFormatValidationError:
             {"name": "m1", "expression": {"dialects": [{"dialect": "ORACLE", "expression": "SUM(x)"}]}}
         )
         msg = format_validation_error(exc)
-        # Assert the HINT is absent, not the word "TRINO": Pydantic's own enum
-        # error already enumerates the permitted values ("Input should be
-        # 'POSTGRESQL' or 'TRINO'"), so `"TRINO" not in msg` could never hold.
+        # Pydantic's enum error already lists TRINO, so assert on the hint instead.
         assert "use TRINO" not in msg
         assert "Athena" not in msg

@@ -1,22 +1,13 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Request-shaping for the Playground's `options` object.
- *
- * The Playground page test mocks `usePlaygroundChatSSE` wholesale, so without
- * these the request shape has no coverage at all — and a regression here would
- * silently drop `mode`, which worked before `strategy` existed, not just the new
- * field.
- */
+/** Request-shaping for the Playground's `options` object. The Playground page
+ *  test mocks the hook, so this is the only coverage of the request shape. */
 import { describe, it, expect } from "vitest";
 import { buildOptions } from "./use-playground-chat-sse";
 
 describe("buildOptions", () => {
   it("requests the compiled artifacts even when nothing else is set", () => {
-    // The Playground asks for the SQL/SPARQL so roles allowed to see them get the
-    // "Compiled artifacts" panel by default; serve withholds them from callers
-    // without viewSource/viewOntology (the data-analyst), whatever this flag says.
     expect(buildOptions()).toEqual({ options: { includeDebugInfo: true } });
   });
 
@@ -33,8 +24,6 @@ describe("buildOptions", () => {
   });
 
   it("sends mode + strategy without one clobbering the other", () => {
-    // The reason this is a helper rather than two conditional spreads: two
-    // spreads of `options` would leave only the second.
     expect(buildOptions("standard", "ontop_first")).toEqual({
       options: {
         mode: "standard",

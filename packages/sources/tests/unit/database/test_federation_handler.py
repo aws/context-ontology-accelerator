@@ -15,10 +15,9 @@ import coa_sources.database.pipeline.federation_handler  # noqa: F401
 import pytest
 from coa_sources.database import glue_ownership as _go
 
-from tests.unit.conftest import dao_double  # noqa: E402
+from tests.unit.conftest import dao_double
 
 MODULE = "coa_sources.database.pipeline.federation_handler"
-PROVISIONER = "coa_sources.database.connectors.glue_connection_provisioner"
 
 
 @pytest.fixture(autouse=True)
@@ -104,7 +103,7 @@ class TestFederationHandler:
         assert out == {"provisioned": False, "reason": "glue-native", "queryable": True}
 
     def test_glue_native_grant_is_refused_for_an_unowned_database(self):
-        """F-8: this function runs as a Lake Formation admin and the principal it
+        """This function runs as a Lake Formation admin and the principal it
         grants is the SHARED serve runtime role, so a grant here makes the database
         readable by every namespace's queries. It verifies ownership rather than
         trusting that source-create did — this step is reached from the stored row.
@@ -219,7 +218,6 @@ class TestFederationHandler:
             patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/serve"),
             patch(f"{MODULE}.grant_consumer_select_native", return_value=True),
         ):
-            # Must not raise despite DDB failure.
             out = handler(_EVENT)
         assert out == {"provisioned": False, "reason": "glue-native", "queryable": True}
 
@@ -410,14 +408,8 @@ class TestCustomConnectorBranch:
 class TestDatabricksBranch:
     """The same branch as CUSTOM_CONNECTOR, reached through the shared set.
 
-    This is one of the two switches that FAILED OPEN. Adding the sub-type to
-    ``_HANDLED_SUB_TYPES`` only silences the tripwire below; the write that flips
-    ``queryable`` was a separate exact-equality comparison, and anything else fell
-    through to a ``not JDBC_DATABASE`` no-op returning ``not-jdbc``. Create persists
-    ``queryable: False`` and discovery writes it only for GLUE_DATABASE — so a source
-    that missed this branch would scan cleanly, resolve no catalog at serve, and be
-    skipped by ``sql_namespace_scope``, which also silently defeats the namespace-scope
-    requirement this sub-type depends on.
+    A source that missed this branch would stay ``queryable: False`` and be skipped
+    at serve.
     """
 
     _ITEM = {"sourceSubType": "DATABRICKS_SQL_WAREHOUSE", "athenaDataCatalogName": "coadevds_abc123"}
@@ -432,10 +424,7 @@ class TestDatabricksBranch:
         assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
 
     def test_makes_no_grant_of_any_kind(self):
-        """Not because there is nothing to grant on — there is a credential — but
-        because COA never holds a grant on it. The connector assumes the CUSTOMER's role
-        at request time, so there is nothing to grant here and nothing to revoke at
-        delete."""
+        """The connector assumes the customer's role at request time, so COA makes no grant."""
         from coa_sources.database.pipeline.federation_handler import handler
 
         ctx, _ = _patch_dao(dict(self._ITEM))
@@ -536,8 +525,6 @@ class TestGrantSecretReadToConsumer:
     """The serve runtime's read grant must be namespace-bound."""
 
     def _run(self, namespace_id="ns-1"):
-        import json
-
         from botocore.exceptions import ClientError
         from coa_sources.database.pipeline.federation_handler import _grant_secret_read_to_consumer
 

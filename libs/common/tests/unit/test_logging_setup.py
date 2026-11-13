@@ -114,3 +114,32 @@ class TestStdlibBridge:
         payload = json.loads(capsys.readouterr().err.strip())
         assert payload["event"] == "batch retry ladder detail"
         assert payload["level"] == "debug"
+
+
+class TestExtraProcessors:
+    """``extra_processors`` run last before rendering, on structlog and stdlib lines alike."""
+
+    @staticmethod
+    def _tag(_logger, _method, event_dict):
+        event_dict["tagged"] = True
+        event_dict.pop("secret", None)
+        return event_dict
+
+    def test_extra_processor_runs_on_stdlib_records(self, restore_root_logger, capsys):
+        setup_logging("INFO", extra_processors=[self._tag])
+        logging.getLogger("botocore.endpoint").warning("slow")
+        payload = json.loads(capsys.readouterr().err.strip())
+        assert payload["tagged"] is True
+        assert payload["event"] == "slow"
+
+    @patch("coa_common.logging.structlog.configure")
+    def test_extra_processor_runs_before_the_structlog_renderer(self, mock_configure, restore_root_logger):
+        setup_logging("INFO", extra_processors=[self._tag])
+        processors = mock_configure.call_args.kwargs["processors"]
+        assert processors[-2] is self._tag
+
+    @patch("coa_common.logging.structlog.configure")
+    def test_no_extra_processors_by_default(self, mock_configure, restore_root_logger):
+        setup_logging("INFO")
+        processors = mock_configure.call_args.kwargs["processors"]
+        assert self._tag not in processors

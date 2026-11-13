@@ -73,12 +73,8 @@ export class WafWebAcl extends SCLConstruct {
       },
     ];
 
-    // Per-IP rate-based rule: block a source IP that exceeds
-    // `rateLimit` requests per rolling 5-minute window. This is the only
-    // per-entity throttle that operates *before* the auth layer, so it shields
-    // Cognito/the authorizer from anonymous floods. `block` (not the managed
-    // rules' own actions) because a rate breach is unambiguous abuse.
-    // A rateLimit of 0 disables the rule (caller brings their own limiting).
+    // Per-IP rate-based rule, block on breach since that is unambiguous abuse.
+    // A rateLimit of 0 disables the rule (see the rateLimit prop).
     if (rateLimit > 0) {
       rules.push({
         name: "RateLimitPerIp",
@@ -101,8 +97,7 @@ export class WafWebAcl extends SCLConstruct {
     this.webAcl = new wafv2.CfnWebACL(this, "Resource", {
       name,
       scope: props.scope,
-      // Allow by default; the managed rule group blocks matching malicious
-      // requests. This is the standard "protective, not restrictive" posture.
+      // Allow by default; the managed rule groups block.
       defaultAction: { allow: {} },
       visibilityConfig: {
         cloudWatchMetricsEnabled: true,

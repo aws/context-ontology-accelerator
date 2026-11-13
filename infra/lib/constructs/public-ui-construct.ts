@@ -33,8 +33,7 @@ import { RuntimeConfig, RUNTIME_CONFIG_FILENAME } from "@coa/shared";
  * supply a fully custom policy via `PublicUIConstructProps.contentSecurityPolicy`.
  *
  * @param cognitoDomainPrefix Cognito hosted-UI domain prefix, when the
- *   deployment provisions a user pool. See the `cognitoHostedUiOrigin`
- *   derivation below for why this is required and not merely nice to have.
+ *   deployment provisions a user pool. Required for sign-in: see `cognitoHostedUiOrigin`.
  */
 export function buildContentSecurityPolicy(
   runtimeConfig: RuntimeConfig,
@@ -45,10 +44,8 @@ export function buildContentSecurityPolicy(
 
   const originOf = (url?: string): string | undefined => {
     if (!url) return undefined;
-    // A cross-stack value (e.g. the API Gateway URL from the api stack) is an
-    // unresolved token at synth, so `new URL()` throws on it. Returning
-    // undefined there silently dropped the API origin and fell back to a
-    // blanket `https:` in connect-src. Build the origin in CloudFormation
+    // A cross-stack value (e.g. the API Gateway URL from the api stack) is unresolved
+    // at synth, so `new URL()` throws on it. Build the origin in CloudFormation
     // instead: `https://<host>/<stage>/` split on "/" puts the host at index 2.
     if (cdk.Token.isUnresolved(url)) {
       return `https://${cdk.Fn.select(2, cdk.Fn.split("/", url))}`;
@@ -77,45 +74,25 @@ export function buildContentSecurityPolicy(
     ? `https://cognito-idp.${runtimeConfig.region}.amazonaws.com`
     : undefined;
 
-  // Cognito HOSTED-UI origin — a DIFFERENT host from `cognitoOrigin` above, and
-  // the one the browser actually exchanges the authorization code at. Cognito's
-  // discovery document puts `authorization_endpoint`, `token_endpoint` and
-  // `/oauth2/revoke` on `<prefix>.auth.<region>.amazoncognito.com` while keeping
-  // the issuer and JWKS on `cognito-idp.<region>.amazonaws.com`. Allowlisting
-  // only the latter blocks the PKCE code→token POST and every sign-in fails with
-  // nothing in the app to show it — the violation appears only as a CSP report in
-  // devtools (issue #130).
-  //
-  // Needed in BOTH directives, for two separate flows:
-  //   connect-src — the token exchange and the logout-time refresh-token
-  //     revocation, both `fetch` (see OIDCProvider.revokeRefreshToken).
-  //   frame-src   — `automaticSilentRenew: true` renews in a hidden iframe
-  //     pointed at the hosted-UI authorize endpoint.
-  //
-  // Interpolated rather than parsed: the prefix reaches us as a CFN dynamic
-  // reference from SSM, so `new URL()` on it would throw and `originOf` would
-  // return undefined — silently reintroducing the bug. Region comes from
-  // `runtimeConfig.region` for the same reason `cognitoOrigin` does.
+  // Cognito HOSTED-UI origin: a different host from `cognitoOrigin` above, and the one the
+  // browser exchanges the authorization code at (`<prefix>.auth.<region>.amazoncognito.com`;
+  // the issuer and JWKS stay on `cognito-idp`). Needed in connect-src (code exchange,
+  // refresh revocation) and frame-src (`automaticSilentRenew` iframe). Interpolated
+  // rather than parsed: the prefix is a CFN dynamic reference, so `new URL()` would throw.
   const cognitoHostedUiOrigin =
     cognitoDomainPrefix && runtimeConfig.region
       ? `https://${cognitoDomainPrefix}.auth.${runtimeConfig.region}.amazoncognito.com`
       : undefined;
 
-  // S3 origins for the browser→S3 presigned PUT/GET used by OSI import/export.
-  // Region-scoped, derived from `region` like cognitoOrigin: the OSI bucket lives
-  // in a later service stack (cross-stack), so we scope to the region's S3 rather
-  // than couple the foundation web stack to it. Both the virtual-hosted host
-  // (`<bucket>.s3.<region>.amazonaws.com`, boto3's default) and the path-style
-  // host are allowed. Without this, connect-src blocks the presigned upload and
-  // OSI import via the UI fails with "Failed to fetch" (issue 103).
+  // S3 origins for the browser to S3 presigned PUT/GET used by OSI import/export. The OSI
+  // bucket lives in a later service stack, so scope to the region's S3: both the
+  // virtual-hosted host (boto3's default) and the path-style host.
   const s3Origins = runtimeConfig.region
     ? [
         `https://*.s3.${runtimeConfig.region}.amazonaws.com`,
         `https://s3.${runtimeConfig.region}.amazonaws.com`,
-        // us-east-1 (and some boto3/botocore versions) presign S3 URLs against
-        // the legacy global host `<bucket>.s3.amazonaws.com`, which has no
-        // region segment and so matches neither regional form above. Allowlist
-        // it too, or the browser blocks the presigned proposal fetch (issue #211).
+        // us-east-1 (and some boto3/botocore versions) presign S3 URLs against the legacy
+        // global host `<bucket>.s3.amazonaws.com`, which matches neither regional form above.
         `https://*.s3.amazonaws.com`,
         `https://s3.amazonaws.com`,
       ]
@@ -184,7 +161,7 @@ export interface PublicUIConstructProps {
    * Cognito hosted-UI domain prefix (`<prefix>.auth.<region>.amazoncognito.com`),
    * when the deployment provisions a user pool. Omitted for a direct-OIDC
    * deployment, which has no Cognito hosted UI. Feeds the CSP — without it the
-   * browser blocks the OAuth token exchange and every sign-in fails (issue #130).
+   * browser blocks the OAuth token exchange and every sign-in fails.
    */
   readonly cognitoDomainPrefix?: string;
   /**
@@ -230,7 +207,6 @@ export class PublicUIConstruct extends SCLConstruct {
       autoDeleteObjects: true,
     });
 
-    // Security headers policy
     const responseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(
       this,
       "SecurityHeaders",
@@ -274,7 +250,6 @@ export class PublicUIConstruct extends SCLConstruct {
       },
     );
 
-    // CloudFront distribution with S3 OAC origin
     const s3Origin = origins.S3BucketOrigin.withOriginAccessControl(
       this.uiBucket,
     );
@@ -373,7 +348,6 @@ export class PublicUIConstruct extends SCLConstruct {
         }),
     });
 
-    // Deploy website content + runtime config JSON to S3
     const sources: s3deploy.ISource[] = [
       s3deploy.Source.jsonData(RUNTIME_CONFIG_FILENAME, props.runtimeConfig),
     ];
@@ -388,7 +362,6 @@ export class PublicUIConstruct extends SCLConstruct {
       distributionPaths: ["/*"],
     });
 
-    // Outputs
     new cdk.CfnOutput(this, "DistributionDomainName", {
       value: this.distribution.distributionDomainName,
       description: "CloudFront distribution domain name",

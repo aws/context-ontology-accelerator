@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cross-source foreign key inference (issue #1088).
+"""Cross-source foreign key inference.
 
 The single-source Pass 2 (``relationship_inferrer.py``) only ever sees one
 datasource's tables, so a relationship COA readily infers *within* a database is
@@ -9,7 +9,7 @@ missed when the same tables are split across separately-onboarded sources. This
 pass runs over the tables of MULTIPLE datasources in a namespace at once and
 infers the relationships that cross a source boundary.
 
-Two differences from the within-source pass, both driven by #1088:
+Two differences from the within-source pass:
 
 * **Descriptions are hints.** The prompt carries each table/column description,
   because a cross-source link is frequently spelled out in the metadata
@@ -74,10 +74,8 @@ name the evidence (matching key, description text, shared id space). Do NOT use 
 the dsN aliases in it — refer to tables and columns by name only.
 - If no cross-source relationships can be inferred, return an empty array []."""
 
-# Reviewer-facing note budget. The UI shows the note inline next to a yes/no
-# decision, and a column can carry several relationships; a paragraph per row
-# made review unworkable (0.3.3 feedback). The prompt asks for a clause; this is
-# the guarantee when the model doesn't comply.
+# Reviewer-facing note budget: the UI shows the note inline, so it is capped
+# even when the model ignores the prompt's request for a short clause.
 _NOTE_MAX_CHARS = 160
 
 
