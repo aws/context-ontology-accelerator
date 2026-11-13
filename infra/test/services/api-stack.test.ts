@@ -86,13 +86,9 @@ describe("ApiStack authorizer — ARCHIVED guard wiring", () => {
   });
 
   it("resolves GROUP_CLAIM_NAME from SSM (not a hardcoded Cognito default)", () => {
-    // Regression: this used to be a hardcoded DEFAULT_GROUP_CLAIM
-    // ("cognito:groups") passed from app.ts regardless of idpType, which
-    // silently broke group-based role resolution on the direct-OIDC path
-    // (external IdPs configure their own claim name, e.g. plain "groups").
-    // Must be an SSM dynamic reference resolved from
-    // /authentication-group-token-name (written by idp-authentication-stack.ts
-    // on both the Cognito/SAML and OIDC paths), not a literal string.
+    // External IdPs configure their own claim name (e.g. plain "groups"), so
+    // this must be an SSM dynamic reference to /authentication-group-token-name
+    // (written by idp-authentication-stack.ts on every path), not a literal.
     template.hasResourceProperties("AWS::Lambda::Function", {
       FunctionName: Match.stringLikeRegexp(".*authorizer$"),
       Environment: {
@@ -406,14 +402,12 @@ describe("ApiStack cache invalidation stream handler", () => {
   });
 
   it("creates two DynamoDB event source mappings (Roles + RRM)", () => {
-    // Two EventSourceMappings: one for Roles, one for ResourceRoleMappings
     const mappings = template.findResources("AWS::Lambda::EventSourceMapping", {
       Properties: {
         StartingPosition: "LATEST",
         BatchSize: 10,
       },
     });
-    // The cache-invalidation Lambda should have exactly 2 DDB stream triggers
     expect(Object.keys(mappings).length).toBeGreaterThanOrEqual(2);
   });
 
@@ -501,9 +495,6 @@ describe("ApiStack GET /health", () => {
     specBody(stack).paths["/health"].get;
 
   it("answers from a mock, not the 501 stub Lambda", () => {
-    // The defect: /health had no ssmPathHandlers entry, so the loop over spec
-    // paths gave it an aws_proxy integration pointing at the inline
-    // not-implemented function.
     const integration = healthGet(mkStack())["x-amazon-apigateway-integration"];
     expect(integration.type).toBe("mock");
     expect(integration.uri).toBeUndefined();
@@ -750,10 +741,8 @@ describe("ApiStack 501-stub guard", () => {
   });
 
   it("fails synth when the DescribeSchema wiring is dropped", () => {
-    // /schema sat in INTENTIONALLY_STUBBED as "no backend yet" after the backend
-    // had landed (app.ts routes it to data-layer/api-fn-arn). An allowlist entry
-    // for a wired path is invisible: the guard simply stops covering it. Pinning
-    // the path here means losing the app.ts entry is a synth failure again.
+    // A wired path must not be allowlisted as a stub; dropping its app.ts
+    // wiring must fail synth.
     const schemaPath = "/namespaces/{namespaceId}/schema";
     expect(specPaths()).toContain(schemaPath);
     expect(ALLOWED_STUBS).not.toContain(schemaPath);
@@ -773,7 +762,7 @@ describe("ApiStack access log format", () => {
   // The API authenticates via a custom Lambda authorizer, so
   // $context.identity.caller/user are always "-" even on an authenticated
   // 200/201. The real caller is $context.authorizer.principalId (the validated
-  // token's email). AppSec V2298834436 (CWE-778): the access log must carry it.
+  // token's email). The access log must carry it (CWE-778).
   const mkTemplate = (): Template => {
     const app = new cdk.App({ context: TEST_CONTEXT });
     const depStack = new cdk.Stack(app, "DepStack", {

@@ -36,6 +36,12 @@ dependencies = [
     "cedarpy>=4.8.0",
     # graphrag-lexical-graph — required for the lexical-baseline Tier 3 strategy.
     "graphrag-lexical-graph==3.20.0",
+    # Serve reads its BEDROCK_NO_TEMP_MODELS to omit temperature/top_p, and the toolkit's
+    # response LLM is a BedrockConverse. 0.15.4 is the first release that lists all
+    # three Claude 5.5 models, which reject both.
+    # Upper bound: the image installs without the lockfile, and serve imports a module
+    # constant that a minor release could move.
+    "llama-index-llms-bedrock-converse>=0.15.4,<0.16",
     # Required by graphrag's lexical-baseline retriever (traversal / topic-beam-chunk_only
     # strategies) to build its OpenSearch vector store via LlamaIndex. graphrag treats the
     # OpenSearch backend as an optional extra, so it is NOT pulled in transitively; without

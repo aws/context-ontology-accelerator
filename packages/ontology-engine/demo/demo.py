@@ -114,14 +114,8 @@ def _http_fetch(method: str, url: str, **kwargs) -> dict | list:
 def _download_ontology_turtle(encoded_id: str, timeout: int = 30) -> str:
     """GET /ontologies/{id}/download and return the ontology Turtle.
 
-    ``/download`` no longer inlines the Turtle: it returns
-    ``{"downloadUrl", "expiresInSeconds"}`` pointing at a presigned S3 object,
-    because a 6+ MB ontology would exceed the API Gateway / Lambda response
-    limit (#143). Follow that URL out-of-band. A raw-body fallback keeps the demo
-    working against an ontology-engine that still inlines.
-
-    Raises ``httpx.HTTPError`` (incl. ``HTTPStatusError``) like the direct call it
-    replaces, so existing call-site error handling still applies.
+    ``/download`` returns a presigned ``downloadUrl`` because a large ontology
+    exceeds the API Gateway / Lambda response limit. Raises ``httpx.HTTPError``.
     """
     resp = httpx.get(f"{CATALOG_URL}/ontologies/{encoded_id}/download", timeout=timeout)
     resp.raise_for_status()
@@ -372,11 +366,7 @@ def browse_ontology_catalog() -> list[str] | None:
 def run_induction(datasource_ids: list[str], grounding_ids: list[str] | None) -> dict:
     console.rule("[bold cyan]Step 3 · Ontology Induction")
 
-    # Prompt repeatedly until we get a well-formed absolute URI. An earlier
-    # demo run had a user type 'abdellah/test' which is a relative URI —
-    # the accept handler tried to SPARQL-UPDATE with it and threw 500. Validate
-    # here so the user sees the error immediately rather than 5 minutes later
-    # after induction completes.
+    # A relative URI makes accept fail with a 500 after induction; reject it up front.
     def _looks_like_absolute_uri(s: str) -> bool:
         return s.startswith(("http://", "https://", "urn:")) and len(s) > len("https://") + 2
 
@@ -1113,9 +1103,6 @@ def main():
     job = run_induction(datasource_ids, grounding_ids)
     report = show_results(job)
     if report:
-        # Accept the proposal before Step 4b / validation / export. Without
-        # this, the induced_ontology_id in the report is still a proposal_id
-        # that /ontologies/ can't resolve — 404s on download / validate.
         accept_induced_proposal(report)
         benchmark_against_golden(report, datasource_ids)
         run_validation(report)

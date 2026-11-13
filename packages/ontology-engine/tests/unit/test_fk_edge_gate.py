@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the FK-edge approval gate (#1088).
+"""Unit tests for the FK-edge approval gate.
 
 `_fk_edge_allowed` decides whether a foreign key is materialised as an
 `owl:ObjectProperty`. "Use only approved relationships downstream": inferred FKs

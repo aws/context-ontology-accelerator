@@ -14,7 +14,6 @@ def mock_memory_session():
     """Create a mock MemorySession."""
     session = MagicMock()
     session.get_last_k_turns.return_value = []
-    session.add_turns.return_value = None
     return session
 
 
@@ -71,13 +70,6 @@ class TestCreateOrResume:
             {"role": "user", "content": "What is revenue?"},
             {"role": "assistant", "content": "Revenue is $1M"},
         ]
-
-    async def test_empty_history_for_new_session(self, mock_manager):
-        sm, _, mock_session = mock_manager
-        mock_session.get_last_k_turns.return_value = []
-
-        _, history = await sm.create_or_resume("user-1", "ns-demo")
-        assert history == []
 
     async def test_respects_max_turns(self, mock_manager):
         sm, _, mock_session = mock_manager

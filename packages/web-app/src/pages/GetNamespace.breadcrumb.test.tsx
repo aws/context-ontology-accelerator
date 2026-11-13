@@ -7,10 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// This is the one page test that asserts the REAL published breadcrumb trail,
-// so it opts out of the global vitest-setup mocks that no-op useBreadcrumbTrail
-// and stub useNamespace. Every other page test keeps those mocks; the
-// per-page trail arrays are otherwise only validated by the hook's own tests.
+// Opts out of the vitest-setup no-op mocks to assert the published trail.
 vi.unmock("@api-hooks/use-breadcrumb-trail");
 vi.unmock("@api-hooks/use-namespace");
 
@@ -89,10 +86,6 @@ vi.mock("@coa/control-plane-client", () => ({
   },
 }));
 
-// The mocked useGetNamespace above resolves successfully, so the namespace
-// up-link is not security-trimmed (not asserted here, but keeps the trail
-// link live).
-
 // Capture whatever trail the page publishes through the real useBreadcrumbTrail.
 let captured: BreadcrumbItem[] = [];
 vi.mock("@components/BreadcrumbProvider", () => ({
@@ -137,7 +130,6 @@ describe("GetNamespace breadcrumb trail", () => {
     renderPage();
     expect(captured.map((c) => c.text)).not.toContain("Edit");
 
-    // Click the Edit button that opens the namespace edit modal.
     act(() => {
       screen.getByText("Edit").click();
     });

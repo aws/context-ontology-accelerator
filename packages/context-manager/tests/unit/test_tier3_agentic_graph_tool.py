@@ -688,7 +688,7 @@ class TestEdgeTypedMode:
         # Statement snippets remain available to synthesis through ctx.chunks,
         # but are not emitted as document citations without source provenance.
         assert ctx.chunks
-        assert AgenticRetriever._supporting_content(ctx) == ()
+        assert AgenticRetriever._supporting_content_with_drops(ctx)[0] == ()
 
         graph_context = AgenticRetriever._graph_context(ctx)
         assert {entity["uri"] for entity in graph_context} == {"e:walmart", "e:target"}
@@ -782,7 +782,7 @@ class TestEdgeTypedMode:
         context.add(out)
         result = ResponseAssembler().assemble_tier3(
             synthesized_answer="Amazon competes with Walmart.",
-            supporting_content=AgenticRetriever._supporting_content(context),
+            supporting_content=AgenticRetriever._supporting_content_with_drops(context)[0],
             graph_context=AgenticRetriever._graph_context(context),
             confidence=0.8,
             trace=TraceCollector(),

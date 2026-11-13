@@ -1,34 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bulk approve/reject worker — applies a decision to every PENDING asset.
+"""Bulk approve/reject worker: applies a review decision to every PENDING asset of a source.
 
-Applies a review decision to every PENDING table/column of a source
-asynchronously.
-
-Triggered by an SQS message produced by the Approve/RejectSource API
-handlers. The handler transitions the source's status to APPROVING (for an
-approve) or REJECTING (for a reject) via a conditional DDB update before
-enqueuing, so a duplicate SQS delivery here will find a state that doesn't
-match and bail out cleanly.
-
-Cascade rules are imported from ``coa_common.review_logic`` so
-the synchronous per-table review handler and this async worker stay in sync.
-
-Write-only-when-changed: per-asset DataZone revisions are only written when
-a status actually changes — this keeps the worker fast for sources that
-already have most assets approved.
-
-Concurrency: asset writes are parallelized with a ThreadPoolExecutor. The
-worker iterates pages of search_assets sequentially (DataZone search has its
-own per-account limits) and dispatches the expensive create_asset_revision
-calls to the pool.
-
-Idempotency at worker level: the worker validates that the source is still
-in the matching transient state (APPROVING or REJECTING) before doing any
-DataZone writes. If a duplicate SQS message arrives after the first
-invocation has already finished and transitioned the source to a terminal
-state, the duplicate exits early.
+Triggered by an SQS message from the Approve/RejectSource API handlers, which move the
+source to APPROVING or REJECTING with a conditional update before enqueuing. The worker
+checks the source is still in that transient state before any DataZone write, so a
+duplicate delivery exits early. Cascade rules come from ``coa_common.review_logic``.
+Search pages are read sequentially; revisions are written in a thread pool, and only
+for assets whose status changes.
 """
 
 from __future__ import annotations
@@ -61,13 +41,8 @@ from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
-# Per-invocation table budget. When a source has more assets than this, the
-# worker processes one page of this many, re-enqueues a continuation carrying
-# the search next_token + running approved count, and leaves the source in the
-# transient state until the final page. This is a THROUGHPUT knob, not a silent
-# ceiling: every table is eventually processed across the chained invocations
-# (ceil(N / budget) of them), so a 50k-table source is fully approved with no
-# silent drop. Kept well under what one 5-min Lambda can load+revise.
+# Tables processed per invocation. A larger source re-enqueues a continuation
+# carrying the search next_token and running approved count until the last page.
 # ponytail: fixed per-invocation budget; if a single page's forms-fetch + revise
 # still overruns the timeout, drop this or lower _PAGE_WALL_CLOCK_BUDGET_S.
 _PAGE_TABLE_BUDGET = int(os.environ.get("BULK_REVIEW_PAGE_BUDGET", "1000"))
@@ -97,11 +72,6 @@ def _get_sqs() -> Any:
     if _sqs is None:
         _sqs = boto3.client("sqs", region_name=_AWS_REGION)
     return _sqs
-
-
-# ---------------------------------------------------------------------------
-# Public types
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -135,11 +105,6 @@ class BulkReviewResult:
     tables_failed: list[str]
 
 
-# ---------------------------------------------------------------------------
-# Per-decision lifecycle
-# ---------------------------------------------------------------------------
-
-
 def _lifecycle(decision: str) -> tuple[str, str, str]:
     """Return (transient_status, success_terminal, failure_terminal) for a decision.
 
@@ -155,11 +120,6 @@ def _lifecycle(decision: str) -> tuple[str, str, str]:
     if decision == ReviewDecision.REJECTED:
         return SourceStatus.REJECTING, SourceStatus.REJECTED, SourceStatus.REJECTION_FAILED
     raise ValueError(f"Unsupported decision: {decision}")
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
 
 
 def parse_message(body: str | dict[str, Any]) -> BulkReviewMessage:
@@ -205,17 +165,8 @@ def parse_message(body: str | dict[str, Any]) -> BulkReviewMessage:
     )
 
 
-# ---------------------------------------------------------------------------
-# Worker pipeline
-# ---------------------------------------------------------------------------
-
-
 def _load_one_asset(client: SMUSClient, asset: Any, source_id: str) -> dict[str, Any] | None:
-    """Fetch + deserialize a single asset's table form. Returns None on skip.
-
-    I/O-bound (one get_asset_forms round-trip); dispatched to a thread pool so a
-    page's forms fetch runs concurrently instead of the old serial N+1.
-    """
+    """Fetch + deserialize a single asset's table form. Returns None on skip."""
     try:
         detail = client.get_asset_forms(asset_id=asset.asset_id)
     except Exception:
@@ -442,35 +393,12 @@ def _verify_in_transient(
 def _rejected_key_column_reason(assets: list[dict[str, Any]], source_id: str) -> str | None:
     """Return a denial reason if an approved table would ship without its key columns.
 
-    Runs AFTER the cascade, which is fine — and necessary — because the condition
-    it tests is one the cascade cannot manufacture: a bulk APPROVE never turns a
-    column REJECTED (it flips only ``PENDING_REVIEW`` → ``APPROVED`` and
-    deliberately preserves explicit REJECTED decisions, see
-    ``coa_common.review_logic``). So a REJECTED key column here was rejected by a
-    human, and survives the cascade untouched.
-
-    Why this is the condition that matters: ``catalog_reader`` projects only
-    ``APPROVED`` columns into the induction payload
-    (``_table_to_induction_format``). A REJECTED primary-key column therefore
-    disappears from the catalog while the table itself is APPROVED, and induction
-    mints a subject template with no key to build from — surfacing later as a
-    PK-column-missing error in Ontop, far from the review that caused it. A
-    REJECTED foreign-key column silently drops the relationship instead, so the
-    ontology loses an object property the schema does have.
-
-    This replaces a gate that looked for ``PENDING_REVIEW`` columns *after* the
-    cascade had already flipped every one of them to ``APPROVED`` — structurally
-    unreachable dead code. Checking pending columns pre-cascade is not the fix
-    either: the enricher leaves ALL columns ``PENDING_REVIEW``
-    (``table_enricher.py``), and clearing them is precisely what bulk approve is
-    for, so blocking on pending would reject every normal bulk approval.
-
-    Args:
-        assets: Loaded assets for this page, post-cascade.
-        source_id: Source id, for logging.
-
-    Returns:
-        A human-readable reason when the approval must be blocked, else ``None``.
+    Runs after the cascade, which never turns a column REJECTED, so a REJECTED key
+    column was rejected by a human. ``catalog_reader`` projects only APPROVED columns
+    into the induction payload, so a rejected primary-key column leaves induction
+    with no subject key (a PK-column-missing error in Ontop), and a rejected
+    foreign-key column drops the relationship. Pending columns are not checked: the
+    enricher leaves all columns PENDING_REVIEW and bulk approve exists to clear them.
     """
     offenders: list[tuple[str, str, str]] = []  # (table, column, key kind)
     for asset in assets:
@@ -721,10 +649,6 @@ def process_bulk_review(
          leave the source transient — do NOT write terminal yet.
       5. On the final page (no next_token): write the terminal state with the
          FULL accumulated tablesApproved.
-
-    This replaces the old silent 1000-table cap: every table is processed
-    across ceil(N / budget) chained invocations, so a 50k-table source is
-    fully approved with no silent drop (#853).
     """
     transient, success_terminal, failure_terminal = _lifecycle(msg.decision)
     # A re-scan reject discards the fresh scan and keeps what was already
@@ -771,16 +695,9 @@ def process_bulk_review(
             restore: dict[str, Any] = {
                 k: prior[k] for k in ("discoveredSchemas", "lastScanAt", "lastScanJobId") if k in prior
             }
-            # tablesDiscovered is numeric on the source record and the GetSource
-            # response model requires a number. The backup stores it as a JSON
-            # string, so coerce it back to int (as tablesApproved already is
-            # below); copying the string through makes the detail endpoint fail
-            # model validation and the source page 500s.
+            # The backup stores tablesDiscovered as a string but GetSource requires a
+            # number. A non-numeric value is skipped so the reject still completes.
             if "tablesDiscovered" in prior:
-                # A corrupt or non-numeric backup value must not fail the whole
-                # reject — that would strand the source in REJECTION_FAILED with
-                # no way back. Skip the restore instead, leaving the live count
-                # in place: slightly stale beats both a crash and a wrong zero.
                 try:
                     restore["tablesDiscovered"] = int(prior["tablesDiscovered"])
                 except (TypeError, ValueError):
@@ -803,10 +720,7 @@ def process_bulk_review(
                 decision=msg.decision,
                 is_rescan=msg.is_rescan,
             )
-            # Review resolved (reject applied cleanly) — clear the backup so its
-            # presence reliably signals an OPEN un-approved re-scan to any later
-            # re-scan. Skipped on the failure branch above (state left for manual
-            # intervention; the backup is still needed to retry the restore).
+            # Skipped on the failure branch above so the restore can be retried.
             _delete_backup(msg.source_id)
         return BulkReviewResult(tables_total=len(reject_failed), tables_changed=0, tables_failed=reject_failed)
 
@@ -928,11 +842,7 @@ def process_bulk_review(
         is_rescan=msg.is_rescan,
     )
 
-    # Terminal page of a successful re-scan APPROVE (removals done above with no
-    # failures): the review is resolved, so clear the backup — same signal
-    # hygiene as the reject path. Only here: continuation pages return earlier,
-    # and a failed page (failed non-empty) is excluded so the backup survives
-    # for retry/inspection.
+    # Skipped on a failed page so the backup survives for a retry.
     if msg.is_rescan and msg.decision == ReviewDecision.APPROVED and remaining_token is None and not failed:
         _delete_backup(msg.source_id)
 
@@ -941,11 +851,6 @@ def process_bulk_review(
         tables_changed=len(to_write) - len(failed),
         tables_failed=failed,
     )
-
-
-# ---------------------------------------------------------------------------
-# Lambda entry point (SQS-triggered)
-# ---------------------------------------------------------------------------
 
 
 _SOURCES_TABLE: str = os.environ.get("SOURCES_TABLE", "")
@@ -1000,8 +905,7 @@ def handler(event: dict[str, Any], context: object) -> None:
             msg = parse_message(record["body"])
         except (KeyError, ValueError):
             logger.exception("bulk_review_invalid_message_dropping", extra={"message_id": message_id})
-            # Don't re-raise — SQS will eventually DLQ malformed messages, but
-            # there's no point retrying invalid input.
+            # Dropped: invalid input will never succeed on retry.
             continue
 
         try:
@@ -1036,7 +940,6 @@ def handler(event: dict[str, Any], context: object) -> None:
                 },
             )
         except ClientError:
-            # Transient AWS errors should be retried via SQS redelivery.
             logger.exception(
                 "bulk_review_transient_error",
                 extra={"namespace_id": msg.namespace_id, "source_id": msg.source_id},
@@ -1048,9 +951,4 @@ def handler(event: dict[str, Any], context: object) -> None:
                 extra={"namespace_id": msg.namespace_id, "source_id": msg.source_id},
             )
             _mark_failed(msg.namespace_id, msg.source_id, msg.decision)
-            # Re-raise so SQS marks it failed → goes to DLQ after retries.
             raise
-
-
-# Keep boto3 reference live to avoid linter complaints when only used indirectly.
-_ = boto3

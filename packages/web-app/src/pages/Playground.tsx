@@ -41,12 +41,6 @@ import { scrollToBottom } from "@utils/scroll";
 import { buildQueryEndpoint } from "@utils/build-query-endpoint";
 import { useAppI18n } from "../i18n/LocaleProvider";
 
-/**
- * The execution-mode toggle's options, typed by `ExecutionMode` so the ids sent
- * as `options.mode` and the labels shown to the user stay in one place.
- * `deep-reasoning` was previously labelled "Agentic"; serve still accepts the old
- * wire value, but the UI only ever sends the current one.
- */
 export const Playground: React.FC = () => {
   const { t } = useAppI18n();
   const executionModeOptions: readonly {
@@ -68,8 +62,7 @@ export const Playground: React.FC = () => {
   useBreadcrumbTrail([{ text: t("Serve") }, { text: t("Playground") }]);
 
   const [inputValue, setInputValue] = useState("");
-  // Sent as options.mode on every query. Defaults to "standard" to match serve's
-  // deployment default; deep reasoning (~140s p50 vs ~30s) is opt-in via the toggle.
+  // Defaults to "standard" to match serve's deployment default.
   const [mode, setMode] = useState<ExecutionMode>("standard");
   const [selectedMessage, setSelectedMessage] = useState<
     ChatMessageType | undefined
@@ -82,7 +75,6 @@ export const Playground: React.FC = () => {
     state,
     sessionId,
     isRestoring,
-    showRestoreSpinner: _showRestoreSpinner,
     restoreTimedOut,
     dismissRestoreWarning,
     isStreaming,
@@ -119,7 +111,6 @@ export const Playground: React.FC = () => {
     if (!query || !namespaceId) return;
     sendQuery(query, mode);
     setInputValue("");
-    // Scroll to bottom after sending a query (user expects to see their message)
     requestAnimationFrame(() => {
       scrollToBottom(chatScrollRef.current);
     });
@@ -186,7 +177,6 @@ export const Playground: React.FC = () => {
     t,
   ]);
 
-  // Register the onboarding drawer on the Playground page
   useEffect(() => {
     registerDrawer({
       id: "onboarding",
@@ -206,7 +196,7 @@ export const Playground: React.FC = () => {
   }, [registerDrawer, unregisterDrawer, closePanel, t]);
 
   const isReady = !isRestoring && !isStreaming && !!namespaceId;
-  const canSubmit = isReady && inputValue.trim().length > 0 && !!namespaceId;
+  const canSubmit = isReady && inputValue.trim().length > 0;
 
   return (
     <div
@@ -224,9 +214,7 @@ export const Playground: React.FC = () => {
             <SegmentedControl
               selectedId={mode}
               onChange={({ detail }) => {
-                // Resolve against the typed option list rather than comparing
-                // string literals, so an id and the state setter cannot drift
-                // apart — a mismatch is a compile error, not a dead toggle.
+                // A typed lookup, so an id and the setter cannot drift apart.
                 const picked = executionModeOptions.find(
                   (o) => o.id === detail.selectedId,
                 );
@@ -288,13 +276,13 @@ export const Playground: React.FC = () => {
             inputValue={inputValue}
             onInputChange={setInputValue}
             onSubmit={handleSubmit}
-            inputDisabled={!isReady || !namespaceId}
+            inputDisabled={!isReady}
             submitDisabled={!canSubmit}
             emptyStateContent={
               <SamplePrompts
                 questions={exampleQuestions}
                 onSelect={handleSamplePrompt}
-                disabled={!isReady || !namespaceId}
+                disabled={!isReady}
               />
             }
           >

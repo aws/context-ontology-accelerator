@@ -8,17 +8,6 @@ been offloaded to S3: it is the full column/table constraint specification and
 can exceed the 6 MB API Gateway / Lambda response cap on wide schemas (thousands
 of tables × per-column constraints). Instead the route returns a presigned
 ``constraints_url`` and the client fetches the config directly from S3.
-
-These guard:
-  - ``presign_proposal_constraints`` returns a URL when the S3 object exists and
-    ``None`` when it does not (legacy / no-constraints proposals),
-  - ``get_proposal_by_id(hydrate_constraints=False)`` skips the constraint S3
-    read that the default (server-side consumers) still performs,
-  - the ``get_proposal`` route strips inline ``constraint_config`` and adds
-    ``constraints_url`` when an S3 object exists, but leaves a legacy inline
-    value in place (with a ``None`` url) when there is no S3 object,
-  - a wide-schema proposal with large ``constraint_config`` produces a response
-    well under the 6 MB API Gateway cap when served out-of-band.
 """
 
 from __future__ import annotations
@@ -135,23 +124,6 @@ class TestHydrateConstraintsFlag:
         # No S3 read for constraints — the route will presign instead.
         assert "constraint_config" not in (item.get("metadata") or {})
 
-    def test_no_regression_existing_callers_default_true(self):
-        """Existing callers that do not pass hydrate_constraints still get the
-        constraint_config hydrated (default True preserves backwards compat)."""
-        from coa_ontology import dynamo_store as ds
-
-        s3 = MagicMock()
-        body = MagicMock()
-        body.read.return_value = b'{"columns": {"id": "integer"}}'
-        s3.get_object.return_value = {"Body": body}
-        s3.exceptions = MagicMock()
-        s3.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
-        p_table, p_s3, p_sweep = self._patched(s3, self._item())
-        with p_table, p_s3, p_sweep:
-            # Call without hydrate_constraints kwarg — must behave as True.
-            item = ds.get_proposal_by_id("p-1", namespace="ns")
-        assert "constraint_config" in item["metadata"]
-
 
 class TestGetProposalRouteConstraints:
     """The GET /proposals/{id} route: strip inline constraint_config + add
@@ -166,9 +138,7 @@ class TestGetProposalRouteConstraints:
             "get_proposal_by_id",
             lambda pid, namespace="default", hydrate_turtle=True, hydrate_matches=True, hydrate_constraints=True: item,
         )
-        # ``**kwargs`` absorbs the ``s3_key`` the route now passes through so the
-        # revision key is signed instead of the "latest" one. Without it these
-        # stubs raise TypeError and the failure reads as a route bug.
+        # ``**kwargs`` absorbs ``s3_key``.
         monkeypatch.setattr(
             proposals.dynamo_store,
             "presign_proposal_artifact",

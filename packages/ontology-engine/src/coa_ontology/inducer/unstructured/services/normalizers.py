@@ -78,9 +78,6 @@ def normalize_predicate(s: str) -> str:
     return unicodedata.normalize("NFC", s.strip("_"))
 
 
-# ── XSD type inference ──────────────────────────────────────────────────
-
-# Patterns for type detection (order matters — more specific first)
 _INTEGER_RE = re.compile(r"^[+-]?\d+$")
 _DECIMAL_RE = re.compile(r"^[+-]?\d+\.\d+$")
 _BOOLEAN_RE = re.compile(r"^(true|false)$", re.IGNORECASE)
@@ -136,9 +133,6 @@ def infer_xsd_type(values: list[str]) -> str:
 
     # Mixed types → default to string
     return "xsd:string"
-
-
-# ── Canonical label selection ───────────────────────────────────────────
 
 
 def select_canonical_label(originals: dict[str, int]) -> str:

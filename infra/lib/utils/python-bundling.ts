@@ -62,28 +62,6 @@ function _constraintsPath(opts: PythonBundlingOptions): string {
 }
 
 /**
- * Build the local `uv pip install` command for the bundle, or `null` when there
- * are no dependencies to install.
- *
- * Why uv and not the host `pip`: installing a newer Python on many Linux
- * distributions does NOT repoint the default `python3`/`pip` symlink. Amazon
- * Linux 2023 ships Python 3.9 and keeps `/usr/bin/python3` on it because `dnf`
- * itself depends on that exact version, so `dnf install python3.12` adds
- * `/usr/bin/python3.12` but leaves `python3` (and therefore the `pip`/`pip3` on
- * PATH) bound to 3.9. A `pip`/`pip3` probe then finds the wrong interpreter and
- * the bundle either fails outright or targets the wrong runtime.
- *
- * uv sidesteps the symlink entirely: it is a standalone binary that does not use
- * the system Python to run. `--python-platform` + `--python-version` cross-resolve
- * wheels for the Lambda target from any host (macOS or an older-Python Linux)
- * without executing a 3.12 interpreter, and `--only-binary :all:` forces wheels
- * so a native sdist can never silently build against the host toolchain.
- *
- * The `--target` is `/asset-output`; the caller rewrites it to the real output
- * dir for local bundling (and the requirements path stays an absolute host path,
- * since the local step runs on the host and reads the real file).
- */
-/**
  * True for a hash-pinned lock (`requirements.lock.txt`, written by
  * scripts/relock-python-requirements.sh), which is installed with
  * `--require-hashes` so a deploy can only ship the locked files.
@@ -92,6 +70,19 @@ export function _isHashLocked(requirementsFile: string): boolean {
   return requirementsFile.endsWith(".lock.txt");
 }
 
+/**
+ * Build the local `uv pip install` command for the bundle, or `null` when there
+ * are no dependencies to install.
+ *
+ * uv rather than the host `pip`: Amazon Linux 2023 keeps `/usr/bin/python3` on 3.9
+ * because `dnf` depends on it, so `dnf install python3.12` leaves `pip`/`pip3` bound
+ * to the wrong interpreter. uv is a standalone binary; `--python-platform` +
+ * `--python-version` cross-resolve wheels for the Lambda target from any host, and
+ * `--only-binary :all:` stops a native sdist from building against the host toolchain.
+ *
+ * The `--target` is `/asset-output`; the caller rewrites it to the real output dir
+ * for local bundling.
+ */
 export function _uvInstallCommand(opts: PythonBundlingOptions): string | null {
   const uvPlatform =
     opts.architecture === "arm64"
@@ -229,23 +220,18 @@ function escapeRegExp(s: string): string {
 const PIP_LINE_BREAK = /\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]/;
 
 /**
- * Compute a stable SHA-256 hash over every input that affects this Lambda
- * bundle. Used as a custom CDK asset hash so unrelated repo changes (test
- * outputs, coverage files, …) don't trigger needless re-bundles.
+ * Compute a stable SHA-256 hash over every input that affects this Lambda bundle.
+ * Used as a custom CDK asset hash so unrelated repo changes (test outputs, coverage
+ * files, …) do not trigger needless re-bundles.
  *
- * Hashes ALL files under `srcDirs` — not just `*.py`. The bundle command copies
- * everything (`cp -r ${d}/*`), so JSON/schema/template files shipped alongside
- * the code are part of the output and must invalidate the asset when edited.
+ * Hashes ALL files under `srcDirs`, not just `*.py`: the bundle command copies
+ * everything (`cp -r ${d}/*`), so JSON/schema/template files are part of the output.
  *
- * Also folds in `architecture`, which changes the produced bundle without
- * touching any file: it selects the pip `--platform` tag and therefore which
- * binary wheels land in the bundle, so flipping x86_64 ↔ arm64 reused an asset
- * built for the wrong architecture.
+ * Also folds in `architecture`, which selects the pip `--platform` tag and therefore
+ * which binary wheels land in the bundle, without touching any file.
  *
- * Reads files via Node on every platform. The previous `find … || true` shell
- * pipeline was unquoted and failure-suppressed, so a repo path containing a space
- * degraded every hash to the empty-input hash — permanently disabling
- * invalidation — and any `find` failure passed silently.
+ * Reads files via Node on every platform; a shell `find` pipeline degrades to the
+ * empty-input hash when the repo path contains a space.
  */
 export function _computeSourceHash(opts: PythonBundlingOptions): string {
   const hash = crypto.createHash("sha256");
@@ -308,17 +294,9 @@ export function _computeSourceHash(opts: PythonBundlingOptions): string {
         .createHash("sha256")
         .update(fs.readFileSync(file))
         .digest("hex");
-      // Path is included so a rename alone invalidates the asset — but RELATIVE to
-      // its srcDir, for two reasons:
-      //
-      //  1. Portability. An absolute path made the hash depend on where the repo
-      //     was checked out, so CI, a local clone, and every `git worktree`
-      //     produced a different asset hash for the SAME commit — re-bundling on
-      //     every deploy from a different path, which is exactly what a stable
-      //     hash is supposed to prevent.
-      //  2. It models the bundle. `cp -r ${d}/* /asset-output/` flattens every
-      //     srcDir into one directory, so what determines the asset's content is
-      //     the path WITHIN that output, not which absolute dir it came from.
+      // Path is included so a rename alone invalidates the asset. It is relative to its
+      // srcDir so the hash does not depend on checkout location; `cp -r ${d}/*` flattens
+      // every srcDir into one output dir, so the path within the output is what matters.
       hash.update(`${fileHash}  ${_relative(normalizedDir, file)}\n`);
     }
   }
@@ -333,30 +311,11 @@ export function _computeSourceHash(opts: PythonBundlingOptions): string {
   return hash.digest("hex");
 }
 
-/**
- * `target` relative to `from`, with forward slashes.
- *
- * Forward slashes are forced so Windows and POSIX agree on the hash for an
- * identical tree (they previously could not, since the two platforms took
- * different code paths entirely).
- */
+/** `target` relative to `from`, with forward slashes. */
 function _relative(from: string, target: string): string {
   return toPosix(path.relative(from, target));
 }
 
-/**
- * Recursively collect every file path in a directory.
- *
- * Deliberately NOT limited to `*.py`: the bundle copies the whole tree, so any
- * non-Python file it ships (JSON, schemas, templates, Cedar policies) must
- * invalidate the asset when edited.
- *
- * Build output is skipped — it is not input, and hashing it would make the asset
- * depend on whether tests, mypy, or a setuptools build happened to run first.
- * `*.egg-info` matters in practice: `packages/ontology-engine/src` carries one,
- * it is untracked, and it is regenerated by tooling — so including it made the
- * same commit hash differently in CI than locally.
- */
 const _IGNORED_DIRS = new Set([
   "__pycache__",
   ".mypy_cache",
@@ -372,6 +331,12 @@ function _isBuildArtifactDir(name: string): boolean {
   );
 }
 
+/**
+ * Recursively collect every file path in a directory, skipping build output
+ * (`__pycache__`, tool caches, `*.egg-info`, `*.dist-info`), which is not input and
+ * would make the hash depend on what ran first. Not limited to `*.py`: the bundle
+ * copies the whole tree.
+ */
 function _collectFiles(dir: string): string[] {
   if (!fs.existsSync(dir)) return [];
   const results: string[] = [];
@@ -381,12 +346,9 @@ function _collectFiles(dir: string): string[] {
       if (_isBuildArtifactDir(entry.name)) continue;
       results.push(..._collectFiles(fullPath));
     } else if (entry.isSymbolicLink()) {
-      // `cp -r ${d}/*` expands the glob, so a top-level symlink arrives as a
-      // command-line argument and `cp` DEREFERENCES it — the target's content
-      // lands in the bundle. `isFile()` is false for a symlink, so without this
-      // branch that content shipped without contributing to the hash. Hash the
-      // resolved target (matching what the bundle gets); skip broken links and
-      // directory symlinks, which would otherwise risk a traversal cycle.
+      // `cp -r ${d}/*` expands the glob, so a top-level symlink arrives as an argument and
+      // `cp` dereferences it. `isFile()` is false for a symlink, so hash the resolved target;
+      // skip broken links and directory symlinks, which risk a traversal cycle.
       try {
         if (fs.statSync(fullPath).isFile() && !entry.name.endsWith(".pyc")) {
           results.push(fullPath);

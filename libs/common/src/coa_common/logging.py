@@ -4,6 +4,7 @@
 """Structured logging setup using structlog."""
 
 import logging
+from collections.abc import Sequence
 
 import structlog
 from structlog.typing import Processor
@@ -23,15 +24,23 @@ _SHARED_PROCESSORS: list[Processor] = [
 ]
 
 
-def setup_logging(log_level: str = "INFO", stdlib_log_level: str | None = None) -> None:
+def setup_logging(
+    log_level: str = "INFO",
+    stdlib_log_level: str | None = None,
+    extra_processors: Sequence[Processor] = (),
+) -> None:
     """Bridge stdlib ``logging`` into structlog and configure both.
 
     ``log_level`` is for structlog-native loggers; ``stdlib_log_level`` is for the
     stdlib root logger (third-party libraries) and defaults to WARNING.
+    ``extra_processors`` run after the shared chain and before rendering, on structlog
+    events and stdlib records alike (a service's own redaction policy, for example);
+    stdlib records still carry ``_record`` there.
     """
     structlog.configure(
         processors=[
             *_SHARED_PROCESSORS,
+            *extra_processors,
             structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, log_level.upper(), logging.INFO)),
@@ -46,7 +55,7 @@ def setup_logging(log_level: str = "INFO", stdlib_log_level: str | None = None) 
     # emits the originating module as ``logger``, so third-party output can be
     # filtered by package in CloudWatch Logs Insights.
     formatter = structlog.stdlib.ProcessorFormatter(
-        foreign_pre_chain=[structlog.stdlib.add_logger_name, *_SHARED_PROCESSORS],
+        foreign_pre_chain=[structlog.stdlib.add_logger_name, *_SHARED_PROCESSORS, *extra_processors],
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
             structlog.processors.JSONRenderer(),

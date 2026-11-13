@@ -77,7 +77,6 @@ class TestHandlerMalformedMessage:
     @patch.object(index, "sfn_client")
     def test_drops_invalid_json(self, mock_sfn):
         record = _make_record("not-json")
-        record["body"] = "not-json"
         index.handler(_make_event(record), None)
         mock_sfn.start_execution.assert_not_called()
 
@@ -118,8 +117,6 @@ class TestHandlerMalformedMessage:
 class TestHandlerTransientErrors:
     @patch.object(index, "sfn_client")
     def test_reraises_client_error(self, mock_sfn):
-        from botocore.exceptions import ClientError
-
         mock_sfn.start_execution.side_effect = ClientError(
             {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
             "StartExecution",
@@ -202,7 +199,6 @@ class TestExtractionConfigNormalization:
         index.handler(_make_event(_make_record(body)), None)
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
         ec = call_input["extraction_config"]
-        # JSON-encoded list, decodable by graph_build.py.
         assert ec["preferred_entity_classifications"] == '["Policy", "Claim", "Loss Ratio"]'
         assert json.loads(ec["preferred_entity_classifications"]) == ["Policy", "Claim", "Loss Ratio"]
         assert ec["enable_table_extraction"] == "true"
@@ -274,10 +270,8 @@ class TestNamespaceLanguage:
     @patch.object(index, "DynamoDBDAO")
     @patch.object(index, "sfn_client")
     def test_present_snapshot_is_forwarded_without_reading_the_namespace(self, mock_sfn, mock_dao_cls, snapshot):
-        # An invalid or empty snapshot is forwarded too: the KG-build task
-        # rejects it (fail closed) rather than it being replaced here. The
-        # namespace table is configured and would answer "en", so a trigger
-        # that resolved a present snapshot would fail this test.
+        # An invalid or empty snapshot is forwarded unchanged for the KG-build task
+        # to reject; it is never re-resolved here (the namespace would answer "en").
         mock_dao_cls.return_value = _ns_dao({"language": "en"})
         index.handler(_make_event(_make_record({**_VALID_BODY, "namespace_language": snapshot})), None)
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
@@ -313,10 +307,8 @@ class TestNamespaceLanguage:
     @patch.object(index, "DynamoDBDAO")
     @patch.object(index, "sfn_client")
     def test_null_snapshot_is_forwarded_as_empty_without_reading_the_namespace(self, mock_sfn, mock_dao_cls):
-        # A message that carries the key is not a pre-snapshot message, even
-        # when the value is null: it is forwarded as "" for the KG-build task to
-        # reject, never resolved here. The configured namespace would answer
-        # "ja", so treating null as pre-snapshot would fail this test.
+        # A message carrying the key, even as null, is forwarded as "" for the
+        # KG-build task to reject, never resolved here (the namespace would answer "ja").
         mock_dao_cls.return_value = _ns_dao({"language": "ja"})
         index.handler(_make_event(_make_record({**_VALID_BODY, "namespace_language": None})), None)
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])

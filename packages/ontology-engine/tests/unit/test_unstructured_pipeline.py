@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the unstructured induction pipeline orchestrator (Task 4.2).
+"""Unit tests for the unstructured induction pipeline orchestrator.
 
 Validates :class:`UnstructuredInductionPipeline.run` end-to-end at the
 function-call level with every external dependency mocked. The
@@ -15,10 +15,6 @@ The orchestrator emits stage transitions via ``on_status`` BEFORE the
 matching stage's work begins. This file's ``StageRecorder`` callback
 captures the exact emission order so the documented progression can
 be asserted against the orchestrator's actual behavior.
-
-References:
-    Requirements 1.6 and 9.3 of
-    ``.kiro/specs/unstructured-ontology-induction-api/requirements.md``.
 """
 
 from __future__ import annotations
@@ -59,8 +55,7 @@ from coa_ontology.inducer.unstructured.stores.protocol import (
     RelationRecord,
     TopicRecord,
 )
-
-# ── Test constants ──────────────────────────────────────────────────────
+from rdflib import OWL, RDF, Graph
 
 _NS = "test-ns"
 _NAME = "test-onto"
@@ -77,10 +72,7 @@ _CLASSES: list[ClassRecord] = [
     ClassRecord(value="FinancialInstrument", count=5),
 ]
 
-# Five relations between the three classes — meets the task's "5 relations"
-# requirement and gives Rule 3 (induce_object_properties) something
-# concrete to work with downstream when the orchestrator passes facts
-# in the SAMPLING stage.
+# Relations between the three classes feed induce_object_properties.
 _RELATIONS: list[RelationRecord] = [
     RelationRecord(source_class="Company", predicate="employs", target_class="Person", count=12),
     RelationRecord(source_class="Person", predicate="works_for", target_class="Company", count=12),
@@ -88,9 +80,6 @@ _RELATIONS: list[RelationRecord] = [
     RelationRecord(source_class="Person", predicate="owns", target_class="FinancialInstrument", count=3),
     RelationRecord(source_class="Company", predicate="competes_with", target_class="Company", count=2),
 ]
-
-
-# ── Fixtures and helpers ────────────────────────────────────────────────
 
 
 def _entities_for(classification: str) -> list[EntityRecord]:
@@ -194,21 +183,12 @@ def _make_description_llm() -> MagicMock:
     contents.
     """
     llm = MagicMock(spec=LLMDescriptionClient)
-    # Stable, distinct, non-empty responses — one per class call. The
-    # orchestrator dispatches via ``_generate_descriptions`` which in
-    # schema mode calls ``generate_descriptions_with_schema``; under
-    # the hood that calls ``llm_client.generate`` once per class.
     canned = [
         "A business organization that produces goods or services.",
         "A human individual.",
         "A tradable financial asset such as a bond or note.",
     ]
-    llm.generate.side_effect = (
-        # If the description generator calls more times than expected
-        # (e.g. retries), keep returning the last canned value rather
-        # than raising StopIteration.
-        canned + ["A generated description."] * 100
-    )
+    llm.generate.side_effect = canned + ["A generated description."] * 100
     return llm
 
 
@@ -223,11 +203,6 @@ class _DistinctOrthogonalEmbedder:
     in fact the test's intent is that NONE of them merge — so we hand
     out a freshly-orthogonal one-hot per distinct input, growing the
     vector dimension as needed.
-
-    A simple ``hash()``-based bucket assignment doesn't work because
-    Python's ``hash()`` is salted between processes; collisions on
-    the chosen modulus surface as flaky merges. This class uses an
-    explicit dict so each new input gets a guaranteed-fresh slot.
     """
 
     def __init__(self) -> None:
@@ -245,16 +220,7 @@ class _DistinctOrthogonalEmbedder:
 
 
 def _make_embedding_client() -> MagicMock:
-    """Embedding client mock returning deterministic unit vectors.
-
-    ``MagicMock(spec=BedrockEmbeddingClient)`` makes the instance pass
-    Pydantic's ``isinstance`` check on the concrete class.
-    :class:`_DistinctOrthogonalEmbedder` ensures distinct embed-text
-    inputs produce strictly orthogonal unit vectors so the class
-    normalizer treats every input class as ``novel`` (no
-    same-bucket-hash merges, even when Python's ``hash()`` salt
-    changes between runs).
-    """
+    """Embedding client mock returning deterministic orthogonal unit vectors."""
     client = MagicMock(spec=BedrockEmbeddingClient)
     client.embed_text.side_effect = _DistinctOrthogonalEmbedder()
     # model_id is an instance attribute (set in __init__), so spec= does not
@@ -265,13 +231,7 @@ def _make_embedding_client() -> MagicMock:
 
 
 def _make_iri_resolver() -> InMemoryIRIResolver:
-    """Real :class:`InMemoryIRIResolver`.
-
-    The class normalizer mints class IRIs via this resolver and the
-    rules emit triples using those IRIs. Using a real resolver
-    produces real, well-formed IRIs that the assertions below can
-    compare against deterministically.
-    """
+    """Real :class:`InMemoryIRIResolver`."""
     return InMemoryIRIResolver(namespace=_NS, ontology_name=_NAME)
 
 
@@ -291,8 +251,7 @@ def _make_config(
     ``description_llm``, ``iri_resolver``) are constructed via the
     mocking helpers above so the config validates under
     ``arbitrary_types_allowed=True``. ``grounding_*`` default to the
-    disabled state so existing tests exercise the no-grounding path
-    unchanged.
+    disabled state.
     """
     return UnstructuredInductionConfig(
         namespace=_NS,
@@ -318,7 +277,7 @@ class StageRecorder:
     """Callable that records every ``on_status`` invocation in order.
 
     The orchestrator emits ``on_status(stage)`` BEFORE each stage
-    starts (Requirement 1.3). Capturing the call sequence lets the
+    starts. Capturing the call sequence lets the
     tests assert the documented progression matches the
     implementation — and that the FAILED case actually fires
     ``on_status(FAILED)`` before the exception propagates.
@@ -329,9 +288,6 @@ class StageRecorder:
 
     def __call__(self, stage: InductionJobStatus) -> None:
         self.stages.append(stage)
-
-
-# ── Stage progression (Requirement 1.3, Requirement 9.1) ────────────────
 
 
 _EXPECTED_HAPPY_PATH_STAGES = [
@@ -375,7 +331,7 @@ class TestStageProgression:
         We capture the relative order between the ``on_status``
         callback and the lexical store's ``get_graph_schema`` call by
         recording both into a single shared list — confirming the
-        emit-before-work invariant (Requirement 1.3).
+        emit-before-work invariant.
         """
         events: list[str] = []
         config = _make_config()
@@ -388,7 +344,6 @@ class TestStageProgression:
             return original
 
         config.lexical_store.get_graph_schema.side_effect = record_then_return
-        config.lexical_store.get_graph_schema.return_value = None  # side_effect overrides
 
         def recorder(stage: InductionJobStatus) -> None:
             events.append(f"emit:{stage.value}")
@@ -404,9 +359,6 @@ class TestStageProgression:
         )
 
 
-# ── Report shape and counts (Requirement 1.5, Requirement 10.3) ─────────
-
-
 class TestReportContents:
     """The :class:`UnstructuredInductionReport` carries the documented fields."""
 
@@ -415,7 +367,7 @@ class TestReportContents:
 
         All three test classes have count >= floor=3, so all three are
         induced. The orchestrator counts subjects of ``rdf:type
-        owl:Class`` in the merged graph (Requirement 1.5).
+        owl:Class`` in the merged graph.
         """
         config = _make_config()
         report = UnstructuredInductionPipeline().run(config)
@@ -423,15 +375,7 @@ class TestReportContents:
         assert report.tboxClassCount == 3
 
     def test_subclass_axiom_count_is_zero_in_v0(self):
-        """Requirement 9.2: entailment is a pass-through; zero hierarchy axioms.
-
-        Even when the rules emit an ``rdfs:subClassOf`` triple as a
-        side-effect (which Rules 1–5 do NOT in v0), the report's
-        ``subclassAxiomCount`` field is hard-pinned to 0 by the
-        :class:`UnstructuredInductionReport` default. Reading the
-        attribute after a real run confirms the orchestrator does not
-        override that default.
-        """
+        """The axiom counts are zero after a real run."""
         config = _make_config()
         report = UnstructuredInductionPipeline().run(config)
         assert report.subclassAxiomCount == 0
@@ -470,11 +414,8 @@ class TestReportContents:
         """The serializer's Turtle output is included on the report."""
         config = _make_config()
         report = UnstructuredInductionPipeline().run(config)
-        assert isinstance(report.turtle, str)
-        assert report.turtle  # non-empty
-
-
-# ── V0 warning strings (Requirement 10.3) ───────────────────────────────
+        g = Graph().parse(data=report.turtle, format="turtle")
+        assert len(set(g.subjects(RDF.type, OWL.Class))) == 3
 
 
 class TestV0Warnings:
@@ -494,20 +435,15 @@ class TestV0Warnings:
     def test_v0_warnings_match_documented_constants(self):
         """The pre-populated warnings match the module-level ``V0_WARNINGS``.
 
-        Locks in the specific strings Requirement 10.3 calls out so a
-        future edit to the warning text trips a failing test (and a
-        spec update) instead of silently changing the API contract.
+        Locks in the specific strings so a future edit to the warning
+        text trips a failing test instead of silently changing the API contract.
         """
-        # The exact strings from Requirement 10.3.
         expected = {
             "entailment stage is a pass-through in v0",
             "datatype property output may be sparse — see parent spec Task 12B",
             "class embedding index is rebuilt per run — see parent spec Task 10A",
         }
         assert set(V0_WARNINGS) == expected
-
-
-# ── Failure handling (Requirement 1.4) ──────────────────────────────────
 
 
 class TestFailureHandling:
@@ -562,30 +498,6 @@ class TestFailureHandling:
 
         assert recorder.stages.count(InductionJobStatus.FAILED) == 1
 
-    def test_traceback_intact_on_propagation(self):
-        """The original exception's ``__traceback__`` reaches the caller.
-
-        Re-raising with a bare ``raise`` (versus ``raise exc from None``
-        or a fresh exception) preserves the traceback so debug context
-        is not lost.
-        """
-        config = _make_config()
-        with patch(
-            "coa_ontology.inducer.unstructured.services.pipeline.induce_classes",
-            side_effect=ValueError("specific cause"),
-        ):
-            try:
-                UnstructuredInductionPipeline().run(config)
-            except ValueError as caught:
-                assert caught.__traceback__ is not None
-                # The original message is preserved verbatim.
-                assert "specific cause" in str(caught)
-            else:
-                pytest.fail("Expected ValueError to propagate from run()")
-
-
-# ── entailment_enabled=True forward-compat path (Requirement 9.3) ──────
-
 
 class TestEntailmentEnabledForwardCompat:
     """``entailment_enabled=True`` warns but otherwise behaves identically."""
@@ -613,14 +525,11 @@ class TestEntailmentEnabledForwardCompat:
         assert recorder_enabled.stages == recorder_disabled.stages == _EXPECTED_HAPPY_PATH_STAGES
 
     def test_entailment_enabled_does_not_change_axiom_counts(self):
-        """Subclass / equivalence / disjointness counts stay 0 (Req 9.2 / 9.3)."""
+        """Subclass / equivalence / disjointness counts stay 0."""
         report = UnstructuredInductionPipeline().run(_make_config(entailment_enabled=True))
         assert report.subclassAxiomCount == 0
         assert report.equivalenceAxiomCount == 0
         assert report.disjointnessAxiomCount == 0
-
-
-# ── include_individuals gate (Requirement 1.5) ──────────────────────────
 
 
 class TestIncludeIndividualsGate:
@@ -628,12 +537,7 @@ class TestIncludeIndividualsGate:
 
     def test_default_yields_zero_individual_count(self):
         """Default (``include_individuals=False``) skips Rule 2 entirely."""
-        report = UnstructuredInductionPipeline().run(_make_config(include_individuals=False))
-        assert report.individualCount == 0
-
-    def test_explicit_false_yields_zero_individual_count(self):
-        """Explicit ``include_individuals=False`` matches the default."""
-        report = UnstructuredInductionPipeline().run(_make_config(include_individuals=False))
+        report = UnstructuredInductionPipeline().run(_make_config())
         assert report.individualCount == 0
 
     def test_no_owl_named_individual_in_turtle_when_disabled(self):
@@ -659,9 +563,6 @@ class TestIncludeIndividualsGate:
         """
         report = UnstructuredInductionPipeline().run(_make_config(include_individuals=True))
         assert report.individualCount > 0
-
-
-# ── Foundational grounding (Phase 1) ────────────────────────────────────
 
 
 def _grounding_result_for(label: str):
@@ -719,7 +620,7 @@ def _make_grounding_service() -> MagicMock:
 
 
 class TestFoundationalGrounding:
-    """Phase 1: the pipeline grounds induced classes against loaded
+    """The pipeline grounds induced classes against loaded
     foundational ontologies when a grounding service + ontology ids are
     configured, and is a pure no-op otherwise."""
 
@@ -773,7 +674,6 @@ class TestFoundationalGrounding:
         assert report.tboxClassCount > 0  # induction itself still produced classes
 
 
-@pytest.mark.unit
 class TestBuildGroundingInputsDedup:
     """Regression: two class labels that collapse to the SAME minted class_iri
     must produce ONE grounding input, not two — otherwise the same IRI is

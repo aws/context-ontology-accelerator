@@ -21,11 +21,9 @@ Authorization model (matches the shipped seed policies + Cedar schema):
   UNDER this; Cedar is the coarse admission gate ABOVE it. Cedar runs only as an
   additional deny — it never relaxes a structural firewall deny.
 
-Environment posture (``SCL_ENVIRONMENT``), matching the agreed grant-resolver
-stance: in a non-prod env, a caller with NO resolved roles is allowed through
-(fail-open dev) so the deployment is usable before role provisioning; in prod,
-no-roles → DENY (fail-closed). A genuine evaluator ERROR always denies, in every
-environment.
+No-roles posture: a caller with NO resolved roles is denied unless
+``SCL_CEDAR_FAIL_OPEN_NO_ROLES=true`` opts into the dev/pre-provisioning bypass.
+A genuine evaluator ERROR always denies.
 
 - ``CedarAuthorizer`` — the protocol the firewall depends on.
 - ``CedarDecision`` — allow/deny + reason.
@@ -88,13 +86,7 @@ _DEFAULT_ROLE = "default"
 def _env_seconds(name: str, default: float) -> float:
     """Read a finite, non-negative duration in seconds from the environment.
 
-    Args:
-        name: Environment variable name.
-        default: Value used when the variable is unset, empty or invalid
-            (not a number, negative, ``nan`` or infinite).
-
-    Returns:
-        The parsed duration, or ``default``.
+    Unset, empty or invalid values return ``default``.
     """
     raw = os.environ.get(name, "")
     if not raw:
@@ -151,16 +143,7 @@ class NullCedarAuthorizer:
     """
 
     def authorize(self, *, namespace: str, profile: dict[str, Any], tables: list[str]) -> CedarDecision:
-        """Allow every request unconditionally at the Cedar-policy layer.
-
-        Args:
-            namespace: Namespace the query targets (logged only).
-            profile: Caller's resolved auth context (ignored here).
-            tables: Tables referenced by the query (logged only).
-
-        Returns:
-            A CedarDecision that always allows.
-        """
+        """Allow every request unconditionally at the Cedar-policy layer."""
         logger.debug("cedar_authorize_noop", namespace=namespace, table_count=len(tables))
         return CedarDecision(allowed=True)
 
@@ -193,8 +176,8 @@ _GLOBAL_ROLES_KEY = "globalRoles"
 _RESOURCE_ROLES_KEY = "resourceRoles"  # list[{"role","resourceUID"}] — Cedar shape
 
 _QUERY_ACTION = "query"
-# Schema-visibility actions split out of the overloaded viewNamespace (ADR:
-# decompose-viewnamespace-schema-visibility). viewSource gates raw source
+# Schema-visibility actions split out of viewNamespace so schema visibility is
+# separately grantable. viewSource gates raw source
 # config / table+column names; viewOntology gates ontology classes/properties.
 # A schema-blind role (data-analyst) is denied both while keeping viewNamespace.
 _VIEW_SOURCE_ACTION = "viewSource"
@@ -457,14 +440,6 @@ class RealCedarAuthorizer:
 
         Fails closed for a caller with no resolved roles unless the no-roles
         bypass is opted in; any evaluator error also denies.
-
-        Args:
-            namespace: Namespace the query targets (the Cedar resource).
-            profile: Caller's resolved auth context (user id and roles).
-            tables: Tables referenced by the query (logged for context).
-
-        Returns:
-            A CedarDecision indicating whether the query is allowed.
         """
         return self._evaluate_action(
             action=_QUERY_ACTION,
@@ -474,18 +449,14 @@ class RealCedarAuthorizer:
         )
 
     def can_view_source(self, *, namespace: str, profile: dict[str, Any]) -> bool:
-        """Whether the principal holds ``viewSource`` on ``namespace`` (ADR split).
+        """Whether the principal holds ``viewSource`` on ``namespace``.
 
-        ``viewSource`` gates raw source config and table/column schema (the
-        Sources/Tables view, compiled SQL). Used to decide whether the generated
-        **SQL** artifact may be returned: SQL spells out table and column names,
-        so a caller who cannot see the source schema is denied the SQL artifact
-        even with ``includeDebugInfo=true``, and (via
-        ``coa_serve.schema_visibility.resolve_schema_visibility``) whether the
+        ``viewSource`` gates raw source config and table/column schema, so it
+        decides whether the generated SQL artifact may be returned and whether the
         serve response is scrubbed of source schema. Fail-closed as
-        :meth:`authorize` (evaluator error → deny), and a caller with no resolved
-        roles is denied even under ``SCL_CEDAR_FAIL_OPEN_NO_ROLES``: that bypass
-        admits queries, it must not also hand out schema.
+        :meth:`authorize`, and a caller with no resolved roles is denied even under
+        ``SCL_CEDAR_FAIL_OPEN_NO_ROLES``: that bypass admits queries, it must not
+        also hand out schema.
         """
         return self._evaluate_action(
             action=_VIEW_SOURCE_ACTION,
@@ -496,17 +467,11 @@ class RealCedarAuthorizer:
         ).allowed
 
     def can_view_ontology(self, *, namespace: str, profile: dict[str, Any]) -> bool:
-        """Whether the principal holds ``viewOntology`` on ``namespace`` (ADR split).
+        """Whether the principal holds ``viewOntology`` on ``namespace``.
 
-        ``viewOntology`` gates ontology classes/properties. Used (via
-        ``SQLFirewall.can_view_ontology``) to decide whether the generated
-        **SPARQL** artifact on the serve query path may be returned, and (via
-        ``coa_serve.schema_visibility.resolve_schema_visibility``) whether every
-        serve response — query result, ``translate``, ``graphTraverse``, session
-        replay — is scrubbed of ontology schema. The MCP ``translate_sparql`` /
-        ``graph_traversal`` output suppression is a separate path
-        (``coa_mcp.auth.grant_resolver._schema_visibility``, cached on the
-        profile as ``schemaVisibility``). Fail-closed as :meth:`authorize`, and a
+        ``viewOntology`` gates ontology classes/properties, so it decides whether
+        the generated SPARQL artifact may be returned and whether serve responses
+        are scrubbed of ontology schema. Fail-closed as :meth:`authorize`, and a
         caller with no resolved roles is denied even under the no-roles bypass.
         """
         return self._evaluate_action(
@@ -526,14 +491,7 @@ class RealCedarAuthorizer:
         deny_reason: str,
         allow_no_roles_bypass: bool = True,
     ) -> CedarDecision:
-        """Evaluate ``action`` on ``namespace`` for the principal in ``profile``.
-
-        Shared by :meth:`authorize` (``query``), :meth:`can_view_source`
-        (``viewSource``) and :meth:`can_view_ontology` (``viewOntology``) so role
-        resolution, the no-roles fail-closed policy,
-        the DDB/seed policy source, and the error-denies semantics stay in exactly
-        one place and cannot drift between the actions.
-        """
+        """Evaluate ``action`` on ``namespace`` for the principal in ``profile``."""
         profile = profile or {}
         user_id = str(profile.get(_USER_ID_KEY) or profile.get("sub") or "anonymous")
         global_roles = [str(r) for r in _as_list(profile.get(_GLOBAL_ROLES_KEY))]

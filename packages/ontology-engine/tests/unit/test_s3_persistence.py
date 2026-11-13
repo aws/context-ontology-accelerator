@@ -6,6 +6,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from coa_ontology.inducer.services.data_catalog import CatalogColumn, CatalogConstraint, CatalogTable
 
 pytestmark = pytest.mark.unit
 
@@ -136,13 +137,7 @@ class TestPersistInducedToS3:
     @patch("coa_ontology.stores.neptune_db_graph._gsp_get_turtle")
     @patch("coa_ontology.proposals.dynamo_store")
     def test_raises_on_s3_error(self, mock_dynamo, mock_gsp, mock_s3_client):
-        """#467: an S3 write failure must RAISE, not be swallowed as a warning.
-
-        Previously this returned silently, leaving DDB ``accepted`` + Neptune
-        populated but the VKG ``latest/`` copy stale (a silent Neptune<->S3
-        split-brain). It's now a retried step in the accept pipeline
-        (``_run_accept_step`` → on exhaustion the proposal is ``accept_failed``),
-        so the primitive must surface the failure."""
+        """An S3 write failure raises so the accept step can retry."""
         from coa_ontology.proposals import _persist_induced_to_s3
 
         mock_gsp.return_value = ":X a owl:Class ."
@@ -158,7 +153,7 @@ class TestPersistInducedToS3:
 class TestGenerateSchemaSql:
     """proposals._generate_schema_sql: the three outcomes stay distinct —
     ``None`` for the empty states (no datasources / no tables) and a raised
-    ``SchemaSqlGenerationError`` for a genuine failure (#457).
+    ``SchemaSqlGenerationError`` for a genuine failure.
     """
 
     @patch("coa_ontology.proposals.dynamo_store")
@@ -184,20 +179,18 @@ class TestGenerateSchemaSql:
     @patch("coa_ontology.induce_catalog._fetch_catalog")
     @patch("coa_ontology.proposals.dynamo_store")
     def test_raises_on_catalog_fetch_failure(self, mock_dynamo, mock_fetch):
-        # The regression: a real catalog-fetch error must NOT be masked as the
-        # None "nothing to describe" state — it must raise so the caller can log
-        # it distinctly (#457).
+        # A catalog-fetch error must raise, not look like the None empty state.
         from coa_ontology.proposals import SchemaSqlGenerationError, _generate_schema_sql
 
         mock_dynamo.list_proposals.return_value = [{"metadata": {"datasource_ids": ["ds-a"]}}]
         mock_fetch.side_effect = RuntimeError("catalog endpoint 503")
-        with pytest.raises(SchemaSqlGenerationError, match="catalog endpoint 503"):
+        with pytest.raises(SchemaSqlGenerationError, match="RuntimeError: catalog endpoint 503"):
             _generate_schema_sql("ns", "http://x.org/o#")
 
 
 class TestPersistSchemaSqlFailureIsNonFatalButVisible:
     """A schema.sql generation failure during persist logs at ERROR, writes no
-    schema.sql, and does not crash persist (#457).
+    schema.sql, and does not crash persist.
     """
 
     @patch("coa_ontology.proposals._generate_schema_sql")
@@ -292,7 +285,7 @@ class TestCleanOntologyForVkg:
 <http://ex.org/id> <https://ontology-workbench.local/vocab#definedBy> <http://ex.org/> .
 """
         result = _clean_ontology_for_vkg(turtle)
-        assert "rdf:Property" not in result or "a rdf:Property" not in result
+        assert "a rdf:Property" not in result
         assert "hasKey" not in result
         assert "ontology-workbench" not in result
         assert "owl:Class" in result
@@ -357,7 +350,7 @@ class TestCleanOntologyForVkg:
 """
         result = _clean_ontology_for_vkg(turtle)
         assert "DatatypeProperty" in result
-        assert "xsd:string" in result or "string" in result
+        assert "string" in result
 
     def test_aligns_range_with_r2rml_datatype(self):
         from coa_ontology.proposals import _clean_ontology_for_vkg
@@ -424,14 +417,9 @@ class TestCleanOntologyForVkg:
         assert "parent" in result
 
     def test_canonicalizes_malformed_datatype_token(self):
-        """Accept-time SAFETY NET (proposals.py:261): a malformed/mis-cased token
-        in the ontology must be canonicalized on the VKG copy, so a user who skips
-        Repair can't push an undefined datatype to Ontop.
+        """_clean_ontology_for_vkg canonicalizes a mis-cased datatype token on the VKG copy.
 
-        Asserted via a typed LITERAL (not an rdfs:range) on purpose: the date/time
-        range-normalization step folds canonicalized dateTime/date/time RANGES to
-        xsd:string, which would mask whether the canonicalize actually ran. Literal
-        datatypes are canonicalized but never folded, so they're the honest probe.
+        Probed via a typed literal: date/time ranges are folded to xsd:string, literals are not.
         """
         from coa_ontology.proposals import _clean_ontology_for_vkg
 
@@ -445,11 +433,8 @@ class TestCleanOntologyForVkg:
         assert "datetime" not in result.replace("dateTime", "")
 
     def test_aligns_range_with_canonicalized_malformed_r2rml_datatype(self):
-        """R2RML gap: the range-alignment step (proposals.py:336) canonicalizes a
-        malformed rr:datatype via _canonical_for BEFORE copying it into the ontology
-        range — so a malformed rr:datatype can't re-inject an undefined datatype into
-        the served copy AFTER the graph-level canonicalize already cleaned it.
-        Fails if line 336 copied dt_ref without _canonical_for."""
+        """Range alignment in _clean_ontology_for_vkg canonicalizes a malformed
+        rr:datatype before copying it into the ontology range."""
         from coa_ontology.proposals import _clean_ontology_for_vkg
         from rdflib import RDFS, Graph, URIRef
         from rdflib.namespace import XSD
@@ -528,11 +513,6 @@ class TestTablesToH2Ddl:
     """Tests for proposals._tables_to_h2_ddl."""
 
     def test_generates_ddl_with_types_and_pk(self):
-        from coa_ontology.inducer.services.data_catalog import (
-            CatalogColumn,
-            CatalogConstraint,
-            CatalogTable,
-        )
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         tables = [
@@ -553,18 +533,12 @@ class TestTablesToH2Ddl:
         # Names preserved verbatim (original case), delimited
         assert '"Claim_Id" INTEGER NOT NULL' in ddl
         assert '"Amount" DECIMAL' in ddl
-        # Temporal columns keep their real H2 type. Previously VARCHAR(255),
-        # which forced R2RML rr:datatype and the ontology range to xsd:string to
-        # match, making every date FILTER unsatisfiable in Ontop.
+        # Temporal columns keep their real H2 type so date filters work in Ontop.
         assert '"Filed_Date" TIMESTAMP' in ddl
         assert 'PRIMARY KEY ("Claim_Id")' in ddl
         assert '"Claim"' in ddl
 
     def test_preserves_special_characters_in_columns(self):
-        from coa_ontology.inducer.services.data_catalog import (
-            CatalogColumn,
-            CatalogTable,
-        )
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         tables = [
@@ -591,13 +565,9 @@ class TestTablesToH2Ddl:
         assert '"test_table"' in ddl
 
     def test_qualifies_same_named_tables_across_schemas(self):
-        """#149 A: two same-named tables from different schemas must both
+        """Two same-named tables from different schemas must both
         survive with distinct schema-qualified names (no silent IF NOT EXISTS
         drop), and a CREATE SCHEMA is emitted for each."""
-        from coa_ontology.inducer.services.data_catalog import (
-            CatalogColumn,
-            CatalogTable,
-        )
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         tables = [
@@ -631,11 +601,7 @@ class TestTablesToH2Ddl:
 
     def test_unqualified_when_no_source_schema(self):
         """Back-compat: a table without sourceSchema emits a bare quoted name
-        and no CREATE SCHEMA, byte-identical to the pre-fix behaviour."""
-        from coa_ontology.inducer.services.data_catalog import (
-            CatalogColumn,
-            CatalogTable,
-        )
+        and no CREATE SCHEMA."""
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         tables = [
@@ -653,24 +619,14 @@ class TestTablesToH2Ddl:
         assert '"."orders"' not in ddl
 
     def test_catalog_to_tables_populates_source_schema_end_to_end(self):
-        """#149 A CONTRACT: the schema.sql path must qualify same-named tables
-        when fed a RAW CATALOG (as the live accept pipeline does), not only when
-        a caller pre-sets ``sourceSchema``.
-
-        The original fix patched the DDL EMITTER (_tables_to_h2_ddl) and tested it
-        with sourceSchema already set — but ``_catalog_to_tables`` (the function
-        that actually builds the tables at accept time) never populated
-        sourceSchema, so on live data the guard was silently falsy and the DDL
-        collapsed to two bare colliding ``CREATE TABLE IF NOT EXISTS "claims"``.
-        This test binds the two halves: catalog dict -> _catalog_to_tables ->
-        CatalogTable.sourceSchema -> qualified DDL, so the silent drift cannot
-        recur. Found by live e2e; unit-only coverage missed it.
+        """The schema.sql path must qualify same-named tables when fed a raw
+        catalog (catalog dict -> _catalog_to_tables -> sourceSchema -> qualified DDL),
+        not only when a caller pre-sets ``sourceSchema``.
         """
         from coa_ontology.induce_catalog import _catalog_to_tables
-        from coa_ontology.inducer.services.data_catalog import CatalogTable
         from coa_ontology.proposals import _tables_to_h2_ddl
 
-        # Two schemas, SAME table name — the #149 A collision, as a raw catalog.
+        # Two schemas, SAME table name, as a raw catalog.
         catalog = {
             "databases": [
                 {
@@ -715,7 +671,6 @@ class TestTablesToH2Ddl:
         proves nothing), so the qualification is data-driven, not hard-coded.
         """
         from coa_ontology.induce_catalog import _catalog_to_tables
-        from coa_ontology.inducer.services.data_catalog import CatalogTable
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         catalog = {
@@ -735,50 +690,11 @@ class TestTablesToH2Ddl:
 
 
 class TestSubstepFailureVisibility:
-    """#467, second half: a substep that fails must NOT leave the proposal
-    'accepted' while pretending it succeeded.
+    """A failing accept substep raises instead of swallowing its error.
 
-    Three substeps used to swallow their own exceptions and log a warning, so the
-    accept completed regardless. Each is handled per its actual blast radius:
-
-      - schema.sql generation -> FATAL (Ontop can't validate R2RML without it)
-      - reconcile_counts      -> non-fatal, but checkpointed 'skipped' not 'done'
-      - EventBridge notify    -> non-fatal, but its own retried step + 'skipped'
+    reconcile_counts and the EventBridge notify are non-fatal retried steps;
+    a schema.sql failure is logged at ERROR and does not fail persist.
     """
-
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_schema_sql_generation_error_propagates(self, mock_dynamo):
-        """A BROKEN catalog fetch must raise, not silently yield no schema.sql.
-
-        Regression: this returned None on any exception, indistinguishable from
-        "nothing to generate", so a structured ontology could be accepted with no
-        schema.sql and Tier-2 SQL then failed at query time.
-
-        The failure surfaces as ``SchemaSqlGenerationError`` (#457), which wraps
-        the original error so a caller can tell a genuine failure apart from the
-        ``None`` empty state. Asserting the wrapper — not the inner RuntimeError —
-        is the contract: the whole point is that this type is distinguishable.
-        """
-        from coa_ontology.proposals import SchemaSqlGenerationError, _generate_schema_sql
-
-        mock_dynamo.list_proposals.return_value = [{"metadata": {"datasource_ids": ["ds-1"]}}]
-        with (
-            patch(
-                "coa_ontology.induce_catalog._fetch_catalog",
-                side_effect=RuntimeError("catalog 503"),
-            ),
-            pytest.raises(SchemaSqlGenerationError, match="RuntimeError: catalog 503"),
-        ):
-            _generate_schema_sql("ns", "http://x.org/o#")
-
-    @patch("coa_ontology.proposals.dynamo_store")
-    def test_no_datasources_still_returns_none_not_an_error(self, mock_dynamo):
-        """The legitimate 'nothing to generate' case must stay non-fatal —
-        unstructured proposals have no R2RML and no schema.sql."""
-        from coa_ontology.proposals import _generate_schema_sql
-
-        mock_dynamo.list_proposals.return_value = [{"metadata": {}}]
-        assert _generate_schema_sql("ns", "http://x.org/o#") is None
 
     def test_reconcile_counts_raises_so_the_wrapper_can_retry(self):
         """Must RAISE, not swallow. Non-fatality is the caller's declaration
@@ -851,7 +767,7 @@ class TestSubstepFailureVisibility:
             assert _emit_ontology_published("ns", "v1") is True
 
     def test_persist_no_longer_emits_the_event_itself(self):
-        """notify_vkg is its own retried step now; persist must do S3 writes only,
+        """notify_vkg is its own retried step; persist must do S3 writes only,
         so a lost notification can't be hidden inside a successful persist."""
         from coa_ontology.proposals import _persist_induced_to_s3
 

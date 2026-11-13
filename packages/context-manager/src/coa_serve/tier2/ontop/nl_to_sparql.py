@@ -46,17 +46,9 @@ _MAX_TIMEOUT_S = 600.0
 def _resolve_translation_timeout_s() -> float:
     """Overall translation budget (``SERVE_VKG_TRANSLATION_TIMEOUT_S``), in seconds.
 
-    Clamped to ``[10, 600]`` and never raises: a bad value degrades to the default
-    rather than taking the route down. Unset leaves behaviour exactly as shipped.
-
-    600 is the clamp, not the reachable ceiling — outer budgets bound it and none is
-    lowered into this clamp, because a caller driving the route directly (the
-    benchmark harness does) is under none of them: ``RESOLVE_TIMEOUT_S`` (170s
-    deployed, ≤300s in ``main.py``), half of it when ``OntopStrategy._retry_vkg``
-    re-enters :meth:`translate` with a fresh budget, ``_PARALLEL_STRATEGY_TIMEOUT_S``
-    (90s) under ``strategy="best"``, and ~28s over REST, where the data-layer handler
-    ends the call about 1s under API Gateway's 29s limit.
-    ``external-docs/content/deploying.md`` has the deployment view.
+    Clamped to ``[10, 600]`` and never raises: a bad value degrades to the default.
+    Outer budgets (``RESOLVE_TIMEOUT_S``, the parallel-strategy timeout, the REST
+    ceiling) usually bind first; see ``external-docs/content/deploying.md``.
     """
     raw = os.environ.get("SERVE_VKG_TRANSLATION_TIMEOUT_S")
     if raw is None:
@@ -404,8 +396,8 @@ class TranslationResult:
 
 
 # calibration adjustments (_calibrate_confidence). Conservative defaults,
-# not eval-tuned — the BIRD accuracy work informs tuning (see MR notes). Bounds
-# and magnitudes are deliberately small so the LLM self-rating dominates.
+# not eval-tuned. Bounds and magnitudes are deliberately small so the LLM
+# self-rating dominates.
 _CAL_VALIDATION_BOOST = 0.05
 """Boost for passing syntax + URI + domain/range validation."""
 _CAL_STRONG_HIT_THRESHOLD = 0.8
@@ -476,17 +468,12 @@ class NLtoSPARQL:
             system_prompt: LLM system prompt. Defaults to the Ontop-constrained one;
                 the native SPARQL translator supplies a full SPARQL 1.1 prompt.
         """
-        # pass the Tier-1 MetricResolver to the T-Box builder so metric
-        # hits are enriched with full Neptune metric definitions in the prompt.
         self._tbox_builder = TBoxContextBuilder(graph_client, graph_uri_template, metric_resolver=metric_resolver)
         self._llm = llm_client
         self._guardrail_id = guardrail_id
         self._guardrail_id_provider = guardrail_id_provider
         self._validator = SPARQLValidator(graph_client, graph_uri_template)
         self._timeout_s = _resolve_translation_timeout_s() if timeout_s is None else timeout_s
-        # optional few-shot example loader — when present, namespace-scoped
-        # examples from S3 are injected into the prompt, replacing the generic
-        # hardcoded examples. None / no file → generic examples (graceful fallback).
         self._few_shot_loader = few_shot_loader
         self._backend = backend
         self._system_prompt = system_prompt
@@ -647,7 +634,6 @@ class NLtoSPARQL:
         validation: ValidationResult | None = None
 
         for attempt in range(max_validation_retries + 1):
-            # Step 2: LLM call
             user_prompt = self._build_user_prompt(query, tbox, namespace, few_shot_block)
             if validation_feedback:
                 user_prompt += (
@@ -662,7 +648,7 @@ class NLtoSPARQL:
             # synthesizer pattern). With a guardrail configured, Bedrock
             # scopes the prompt-attack check to just this block; without
             # one, the text still reaches the model
-            # (see `bedrock.py::_build_converse_kwargs`).
+            # (see `bedrock.py::_build_messages`).
             llm_response, ok = await self._traced_step(
                 PipelineStep.LLM_CALL,
                 self._llm.converse(
@@ -670,19 +656,10 @@ class NLtoSPARQL:
                     system=self._system_prompt,
                     guardrail_id=self._effective_guardrail_id(),
                     guard_content=query,
+                    # temperature=0 requests greedy decoding as a best effort: bedrock.py
+                    # omits it for models that reject it, so determinism comes from the
+                    # prompt and the fail-closed sparql_validator, not from sampling params.
                     temperature=0,
-                    # top_p=0 requests greedy decoding for determinism, but treat
-                    # it as BEST-EFFORT, not a guarantee. Newer Anthropic models
-                    # (e.g. claude-sonnet-5) have deprecated BOTH temperature AND
-                    # top_p: bedrock.py strips each on ValidationException
-                    # (_MODELS_REJECTING_TEMPERATURE / _MODELS_REJECTING_TOP_P), so
-                    # on those models NEITHER sampling constraint actually reaches
-                    # Bedrock. The real, model-independent B1 fix is the SEMANTIC
-                    # pinning (LIMIT / COUNT(DISTINCT) / stable descriptive alias) in
-                    # the prompt + sparql_validator fail-closed enforcement; the
-                    # sampling params only remove avoidable variance WHEN the model
-                    # accepts them. Determinism must not depend on them surviving.
-                    top_p=0,
                     model_id=model_id,
                 ),
                 trace_steps,
@@ -745,9 +722,8 @@ class NLtoSPARQL:
             assert isinstance(validation, ValidationResult)
 
             if validation.valid:
-                break  # Success — exit retry loop
+                break
 
-            # Validation failed — retry with feedback if attempts remain
             if attempt < max_validation_retries:
                 validation_feedback.append(validation.error or "validation failed")
                 trace_steps[-1]["status"] = "retry"
@@ -759,11 +735,9 @@ class NLtoSPARQL:
                     namespace=namespace,
                 )
             else:
-                # Final attempt failed
                 trace_steps[-1]["status"] = "miss"
                 trace_steps[-1]["detail"] = validation.error or "failed"
 
-        # After loop: check final validation result
         if validation and not validation.valid:
             return TranslationResult(
                 sparql=sparql,
@@ -776,11 +750,6 @@ class NLtoSPARQL:
             )
 
         trace_steps[-1]["detail"] = "passed"
-        # refine the LLM self-reported confidence with deterministic
-        # signals available here (validation outcome, vector-hit strength, query
-        # complexity). This calibrated score is the value the orchestrator/
-        # NL-to-SQL fallback reads to decide "below threshold → fall back to the
-        # LLM-SQL path"; see _calibrate_confidence.
         calibrated = self._calibrate_confidence(
             confidence, validation_passed=True, vector_hits=vector_hits, sparql=sparql
         )
@@ -859,7 +828,7 @@ class NLtoSPARQL:
         """Build the LLM user prompt: ontology schema (+ optional few-shot) + NL question."""
         context_text = self._tbox_builder.format_for_prompt(tbox, namespace)
         # Log the actual schema context handed to the LLM so the NL→SPARQL INPUT
-        # is observable (previously only the output SPARQL was logged).
+        # is observable.
         # `has_allowed_values` flags whether any sampled enum literals reached the
         # context — the signal that lets the LLM write correct WHERE values.
         logger.info(
@@ -872,16 +841,7 @@ class NLtoSPARQL:
         parts = [context_text]
         if few_shot_block:
             parts.append(few_shot_block)
-        # Prompt-injection scoping via Bedrock guardContent (tier3 pattern):
-        # the untrusted user query is NOT embedded in the prompt text.
-        # Instead it reaches the model as a separate guardContent block on
-        # the converse call at the caller (see `guard_content=query` in
-        # `translate`). That block is the only channel for the untrusted
-        # text and is the segment the Bedrock guardrail evaluates for
-        # prompt attacks — retrieved TBox context + instructions remain
-        # guardrail-exempt. Duplicating the query here would double the
-        # token cost with no additional protection, since the guardrail
-        # can only score the guardContent copy.
+        # The query is not embedded: it reaches the model only as guardContent.
         parts.append("Generate a SPARQL query for the user question.")
         return "\n\n".join(parts)
 
@@ -943,7 +903,7 @@ class NLtoSPARQL:
 
         Bounded to [0,1]. This is the score the NL-to-SQL fallback compares
         against its threshold; the magnitudes are conservative defaults, not
-        eval-tuned (the BIRD accuracy work informs tuning — see MR notes).
+        eval-tuned.
         """
         score = base
         if validation_passed:

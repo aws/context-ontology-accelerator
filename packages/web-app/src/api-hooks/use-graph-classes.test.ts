@@ -56,8 +56,6 @@ describe("useGraphClasses", () => {
   });
 
   it("is disabled when the caller passes enabled=false", () => {
-    // The Graph view holds the query off so it doesn't pay for a class chunk
-    // plus a full-namespace COUNT it never renders.
     const { result } = renderHook(
       () => useGraphClasses(NS, "", undefined, false),
       { wrapper: makeWrapper() },
@@ -121,13 +119,11 @@ describe("useGraphClasses", () => {
       wrapper: makeWrapper(),
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    // A full first chunk with more remaining → another page is available.
     expect(result.current.hasNextPage).toBe(true);
 
     await result.current.fetchNextPage();
     await waitFor(() => expect(result.current.data?.pages).toHaveLength(2));
 
-    // Second call used offset = first chunk length.
     expect(searchEntitiesPaged).toHaveBeenLastCalledWith(
       stableApiClient,
       NS,
@@ -138,7 +134,6 @@ describe("useGraphClasses", () => {
         offset: CLASS_FETCH_CHUNK_SIZE,
       },
     );
-    // All loaded → no further page.
     expect(result.current.hasNextPage).toBe(false);
   });
 

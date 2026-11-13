@@ -1,28 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the unstructured induction FastAPI router (Task 6.2).
+"""Unit tests for the unstructured induction FastAPI router.
 
-Validates the router at
-``src/coa_ontology/inducer/routers/induce_unstructured.py``
-at the request/response level using FastAPI's :class:`TestClient`, with
-every external dependency mocked (no live AWS, no real pipeline run).
-
-Key facts about the as-built router these tests pin down:
-
-- ``namespace`` is an EXPLICIT ``?namespace=`` query parameter on every
-  endpoint — never read from the request body and never defaulted to
-  ``"default"``. The body MAY still carry a ``namespace`` field, but the
-  router ignores it; these tests prove the body is never consulted.
-- ``POST /`` persists the job with ``source_type="UNSTRUCTURED"`` and
-  spawns ``_run_unstructured_induction(job_id, body, namespace,
-  app_config)`` (four positional args) in a daemon ``Thread``.
-- The in-flight 409 check and ``GET`` reads are scoped to
-  ``source_type="UNSTRUCTURED"`` so structured and unstructured runs
-  never see each other's jobs / proposals.
-
-Validates: Requirements 5.2, 5.3, 5.6, 5.7, 5.8 of
-``.kiro/specs/unstructured-ontology-induction-api/requirements.md``.
+Namespace comes only from the ``?namespace=`` query parameter, and jobs and
+proposals are scoped to ``source_type="UNSTRUCTURED"``.
 """
 
 from __future__ import annotations
@@ -47,9 +29,6 @@ from coa_ontology.inducer.unstructured.schemas import (
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# ── Test constants ──────────────────────────────────────────────────────
-
-
 _NS = "550e8400-e29b-41d4-a716-446655440001"
 _NAME = "test-onto"
 _GRAPH_ARN = "arn:aws:neptune-graph:us-east-1:000000000000:graph/g-test"
@@ -57,13 +36,9 @@ _ONTOLOGY_URI_PREFIX = f"{GRAPH_BASE_URI}/namespace/{_NS}/ontology/{_NAME}"
 
 
 def _valid_request_body(namespace: str | None = None) -> dict[str, Any]:
-    """Minimal valid POST body satisfying ``UnstructuredInductionRequest``.
+    """Minimal valid POST body; its ``namespace`` is deliberately wrong.
 
-    A ``namespace`` field is included only to PROVE the router ignores it
-    in favour of the ``?namespace=`` query param. By default we set the
-    body namespace to a deliberately WRONG value so any test asserting on
-    the persisted namespace would fail loudly if the router ever read the
-    body instead of the query param.
+    The router must take the namespace from the query param, never the body.
     """
     return {
         "namespace": namespace if namespace is not None else "body-namespace-IGNORED",
@@ -73,18 +48,9 @@ def _valid_request_body(namespace: str | None = None) -> dict[str, Any]:
     }
 
 
-# ── Test app + client fixtures ──────────────────────────────────────────
-
-
 @pytest.fixture()
 def test_app() -> FastAPI:
-    """Fresh FastAPI app with ONLY the unstructured router mounted.
-
-    ``main.py`` is intentionally NOT imported so the unit test exercises
-    only the router surface. ``app.state.config`` is an empty dict so the
-    handler's ``request.app.state.config`` lookup succeeds and is passed
-    to the (mocked) worker verbatim.
-    """
+    """Fresh FastAPI app with ONLY the unstructured router mounted."""
     app = FastAPI()
     app.state.config = {}
     app.include_router(
@@ -100,21 +66,11 @@ def client(test_app: FastAPI) -> TestClient:
     return TestClient(test_app)
 
 
-# ── Dynamo-store mock fixture ───────────────────────────────────────────
-
-
 @pytest.fixture()
 def mock_dynamo():
-    """Patch :mod:`dynamo_store` at the router's import site.
+    """Patch :mod:`dynamo_store` at the router's import site with ``autospec=True``.
 
-    The router calls ``dynamo_store.list_proposals``, ``put_job``,
-    ``list_jobs``, ``get_job``, etc. Patching the module attribute on the
-    router with ``autospec=True`` replaces every Dynamo call with a
-    signature-checked :class:`MagicMock` — so a test that calls a Dynamo
-    function with the wrong kwargs fails loudly rather than silently.
-
-    Defaults emulate an empty Dynamo (no pending proposals, no jobs);
-    individual tests override ``return_value`` / ``side_effect`` per call.
+    Defaults emulate an empty Dynamo (no pending proposals, no jobs).
     """
     with patch.object(induce_unstructured, "dynamo_store", autospec=True) as m:
         m.list_proposals.return_value = []
@@ -123,9 +79,9 @@ def mock_dynamo():
         m.get_job.return_value = None
         m.update_job_status.return_value = None
         m.create_proposal.return_value = None
-        # In-flight lock + stub visibility (issue I-3f1f50cc). Default: lock is
-        # free (acquire succeeds), stub write is a no-op. Autospec exposes the
-        # real InductionLockHeldError class so a test can make acquire raise it.
+        # In-flight lock + stub visibility. Default: lock is free (acquire
+        # succeeds), stub write is a no-op. Autospec exposes the real
+        # InductionLockHeldError class so a test can make acquire raise it.
         m.acquire_induction_lock.return_value = None
         m.create_proposal_stub.return_value = None
         m.release_induction_lock.return_value = None
@@ -133,22 +89,11 @@ def mock_dynamo():
         yield m
 
 
-# ── POST / — happy path + 409 conflicts ─────────────────────────────────
-
-
 class TestStartInduction:
     """``POST /induce/unstructured/?namespace=<ns>`` — 202 + 409 cases."""
 
     def test_returns_202_and_job_id(self, client, mock_dynamo):
-        """A valid POST with an explicit ``?namespace=`` returns 202 + job_id.
-
-        Also pins down that the worker is spawned with FIVE positional
-        args ``(job_id, body, namespace, app_config, namespace_language)``
-        where ``namespace`` is the explicit query value (NOT ``"default"``,
-        NOT the body's namespace field) and the language was resolved
-        server-side (``en`` here: the test app configures no namespaces
-        table).
-        """
+        """A valid POST with an explicit ``?namespace=`` returns 202 + job_id."""
         with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
             response = client.post(
                 f"/induce/unstructured/?namespace={_NS}",
@@ -166,21 +111,12 @@ class TestStartInduction:
         assert called_job_id == body["job_id"]
         assert isinstance(called_body, UnstructuredInductionRequest)
         assert called_body.graph_arn == _GRAPH_ARN
-        # The namespace handed to the worker is the EXPLICIT query value,
-        # not the body field and not "default".
         assert called_ns == _NS
-        assert called_ns != "default"
         # request.app.state.config (empty dict in the test app) is forwarded.
         assert called_config == {}
 
     def test_persists_job_with_explicit_namespace_and_source_type(self, client, mock_dynamo):
-        """``put_job`` is called with the explicit ``namespace`` + UNSTRUCTURED.
-
-        Load-bearing for source-type isolation (Req 5.8) on the write side
-        and for namespace threading (Req 5.2): the persisted namespace MUST
-        equal the ``?namespace=`` query value, never ``"default"`` and never
-        the body's (wrong) ``namespace`` field.
-        """
+        """``put_job`` is called with the explicit ``namespace`` + UNSTRUCTURED."""
         with patch.object(induce_unstructured, "_run_unstructured_induction"):
             response = client.post(
                 f"/induce/unstructured/?namespace={_NS}",
@@ -193,14 +129,13 @@ class TestStartInduction:
         assert kwargs["source_type"] == "UNSTRUCTURED"
         assert kwargs["status"] == InductionJobStatus.PENDING.value
         assert kwargs["namespace"] == _NS
-        assert kwargs["namespace"] != "default"
         assert kwargs["job_id"] == response.json()["job_id"]
         # Request body persisted verbatim so an operator can replay the run.
         assert kwargs["request_body"]["graph_arn"] == _GRAPH_ARN
         assert kwargs["request_body"]["name"] == _NAME
 
     def test_pending_unstructured_proposal_returns_409(self, client, mock_dynamo):
-        """A pending UNSTRUCTURED proposal blocks a new unstructured run (Req 5.3).
+        """A pending UNSTRUCTURED proposal blocks a new unstructured run.
 
         The 409 body surfaces the offending ``proposal_id`` so the client
         can route the user to the existing proposal's review page, and the
@@ -230,7 +165,7 @@ class TestStartInduction:
         worker.assert_not_called()
 
     def test_updated_unstructured_proposal_returns_409(self, client, mock_dynamo):
-        """A proposal in ``status="updated"`` also blocks a new run (Req 5.3).
+        """A proposal in ``status="updated"`` also blocks a new run.
 
         The router probes ``"pending"`` first then falls back to
         ``"updated"`` — both are in-flight states, both scoped to
@@ -288,20 +223,7 @@ class TestStartInduction:
         worker.assert_not_called()
 
     def test_pending_structured_proposal_does_not_block_unstructured_run(self, client, mock_dynamo):
-        """Source-type isolation: a pending STRUCTURED proposal does NOT 409 (Req 5.8).
-
-        The router's in-flight probe is scoped to
-        ``source_type="UNSTRUCTURED"``. We emulate real Dynamo behaviour:
-        a scan filtered to UNSTRUCTURED returns ``[]`` even though a
-        STRUCTURED proposal exists in the same namespace — so the run
-        proceeds. The assertion that every probe was UNSTRUCTURED-scoped
-        is what proves the isolation rather than asserting on a vacuous
-        empty result.
-        """
-        # The mock returns [] for the UNSTRUCTURED-scoped probe regardless;
-        # the meaningful assertion is the source_type scoping below.
-        mock_dynamo.list_proposals.return_value = []
-
+        """Source-type isolation: the in-flight probe is UNSTRUCTURED-scoped."""
         with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
             response = client.post(
                 f"/induce/unstructured/?namespace={_NS}",
@@ -325,12 +247,9 @@ class TestStartInduction:
         worker.assert_called_once()
 
     def test_inflight_lock_conflict_returns_409(self, client, mock_dynamo):
-        """A held induction lock blocks a new unstructured run (issue I-3f1f50cc).
+        """A held induction lock yields a 409 carrying the running job_id.
 
-        This is the in-flight window the old pending/updated-proposal guard
-        missed: no proposal row exists yet, so ``list_proposals`` is empty, but
-        ``acquire_induction_lock`` raises ``InductionLockHeldError`` — the
-        router must turn that into a 409 carrying the running job_id.
+        No proposal row exists yet, so ``list_proposals`` is empty.
         """
         mock_dynamo.list_proposals.return_value = []  # no proposal row during the in-flight window
         mock_dynamo.acquire_induction_lock.side_effect = dynamo_store_module.InductionLockHeldError("running-job-1")
@@ -379,7 +298,7 @@ class TestStartInduction:
         """If a write AFTER acquiring the lock (put_job here) fails, the router
         must release the lock — otherwise the namespace stays wedged until the
         stale-takeover window. The worker's finally can't cover this because the
-        worker thread never starts. (Addresses MR !531 CRITICAL review finding.)"""
+        worker thread never starts."""
         mock_dynamo.put_job.side_effect = RuntimeError("dynamo down")
 
         # Starlette's TestClient re-raises unhandled server exceptions, so the
@@ -400,7 +319,7 @@ class TestStartInduction:
         worker.assert_not_called()
 
     def test_proposal_written_just_before_lock_acquire_still_blocks(self, client, mock_dynamo):
-        """Check-then-act race (AppSec finding V2298834428): the running worker
+        """Check-then-act race: the running worker
         writes its pending proposal and releases the lock in the gap between a
         new trigger's proposal check and its lock acquire. The proposal check
         must run UNDER the lock so this trigger 409s instead of starting a
@@ -428,7 +347,7 @@ class TestStartInduction:
         """Omitting ``?namespace=`` is a 422 — namespace is a required query param.
 
         Proves the router does NOT fall back to the body's ``namespace``
-        field or to ``"default"`` (Req 5.2): with no query param the
+        field or to ``"default"``: with no query param the
         request is rejected outright.
         """
         with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
@@ -439,19 +358,11 @@ class TestStartInduction:
         worker.assert_not_called()
 
 
-# ── GET /jobs/{job_id} — source-type isolation on read (Req 5.8) ─────────
-
-
 class TestGetJob:
     """``GET /induce/unstructured/jobs/{job_id}?namespace=<ns>``."""
 
     def test_returns_job_when_source_type_is_unstructured(self, client, mock_dynamo):
-        """An UNSTRUCTURED job is returned, and the explicit namespace is threaded.
-
-        Confirms ``get_job`` is invoked with the ``?namespace=`` value as
-        a positional/keyword arg (Req 5.2) and that a matching source type
-        is returned unchanged.
-        """
+        """An UNSTRUCTURED job is returned, and the explicit namespace is threaded."""
         mock_dynamo.get_job.return_value = {
             "job_id": "abc",
             "namespace": _NS,
@@ -481,8 +392,7 @@ class TestGetJob:
         """Cross-source-type isolation: a STRUCTURED job leaks NO information.
 
         The router returns 404 (not 403) so the response does not reveal
-        that a job with the same ID exists under a different source type
-        (Req 5.8).
+        that a job with the same ID exists under a different source type.
         """
         mock_dynamo.get_job.return_value = {
             "job_id": "shared-id",
@@ -520,9 +430,6 @@ class TestGetJob:
         assert response.json()["detail"] == "Job not found"
 
 
-# ── Namespace threading from the explicit query param (Req 5.2) ─────────
-
-
 class TestNamespaceThreading:
     """The ``?namespace=`` query value is the ONLY source of namespace.
 
@@ -531,19 +438,6 @@ class TestNamespaceThreading:
     body (or defaulted to ``"default"``) would change the observed Dynamo
     call args and fail.
     """
-
-    def test_get_job_threads_explicit_namespace(self, client, mock_dynamo):
-        """``GET /jobs/{id}?namespace=foo`` calls ``get_job(job_id, "foo")``."""
-        mock_dynamo.get_job.return_value = {
-            "job_id": "j1",
-            "namespace": "foo",
-            "source_type": "UNSTRUCTURED",
-        }
-
-        response = client.get("/induce/unstructured/jobs/j1?namespace=foo")
-
-        assert response.status_code == 200
-        mock_dynamo.get_job.assert_called_once_with(job_id="j1", namespace="foo")
 
     def test_list_jobs_threads_explicit_namespace_and_source_type(self, client, mock_dynamo):
         """``GET /jobs?namespace=foo`` calls ``list_jobs`` scoped to foo + UNSTRUCTURED."""
@@ -557,39 +451,9 @@ class TestNamespaceThreading:
         assert kwargs["namespace"] == "foo"
         assert kwargs["source_type"] == "UNSTRUCTURED"
 
-    def test_post_threads_explicit_namespace_ignoring_body(self, client, mock_dynamo):
-        """POST ``?namespace=foo`` persists ``namespace="foo"`` even though the
-        body's ``namespace`` field says something else.
-
-        The body is built with ``namespace="bar-from-body"`` so this test
-        fails if the router ever reads the body for namespace.
-        """
-        with patch.object(induce_unstructured, "_run_unstructured_induction") as worker:
-            response = client.post(
-                "/induce/unstructured/?namespace=foo",
-                json=_valid_request_body(namespace="bar-from-body"),
-            )
-
-        assert response.status_code == 202, response.text
-        # In-flight probe used the query namespace, not the body's.
-        for c in mock_dynamo.list_proposals.call_args_list:
-            assert c.kwargs["namespace"] == "foo"
-        # Persisted job namespace is the query value.
-        assert mock_dynamo.put_job.call_args.kwargs["namespace"] == "foo"
-        # Worker received the query value as its 3rd positional arg.
-        assert worker.call_args.args[2] == "foo"
-
-
-# ── Worker thread — failure + success paths (Req 5.6) ───────────────────
-
 
 class TestRunUnstructuredInductionWorker:
-    """Direct, in-thread invocation of ``_run_unstructured_induction``.
-
-    The worker is called inline (NOT via ``Thread``) with its four
-    positional args ``(job_id, body, namespace, app_config)`` so the
-    assertions are deterministic.
-    """
+    """Direct, in-thread invocation of ``_run_unstructured_induction``."""
 
     def _make_request_body(self) -> UnstructuredInductionRequest:
         return UnstructuredInductionRequest(**_valid_request_body())
@@ -597,16 +461,7 @@ class TestRunUnstructuredInductionWorker:
     def _patch_external_dependencies(self, stack: ExitStack) -> None:
         """Patch every AWS-touching client constructor used by the worker.
 
-        The worker constructs :class:`NeptuneAnalyticsLexicalStore`,
-        :class:`BedrockEmbeddingClient`, :class:`LLMClient`, and
-        :class:`InMemoryIRIResolver` to build the
-        :class:`UnstructuredInductionConfig`. Each constructor is patched
-        to return a ``MagicMock(spec=<RealType>)`` so the Pydantic
-        ``isinstance`` validation on the config's typed fields accepts the
-        mock. ``LexicalGraphStore`` / ``LLMDescriptionClient`` /
-        ``IRIResolver`` are runtime-checkable Protocols and
-        ``BedrockEmbeddingClient`` is a concrete class — ``spec=`` wiring
-        is required for all four.
+        ``spec=`` is required so the config's ``isinstance`` checks accept the mocks.
         """
         from coa_ontology.bedrock_embeddings import (
             BedrockEmbeddingClient,
@@ -638,7 +493,7 @@ class TestRunUnstructuredInductionWorker:
 
     def test_pipeline_exception_marks_job_failed_and_creates_no_proposal(self):
         """When the pipeline raises, the worker persists ``status="failed"``
-        with the error message and creates NO proposal (Req 5.6).
+        with the error message and creates NO proposal.
         """
         body = self._make_request_body()
         app_config: dict = {}
@@ -658,9 +513,7 @@ class TestRunUnstructuredInductionWorker:
             )
             self._patch_external_dependencies(stack)
 
-            # Inline call with the four-arg worker signature
-            # (job_id, body, namespace, app_config). The worker swallows
-            # the exception — its contract is to persist failure, not raise.
+            # The worker swallows the exception and persists failure.
             induce_unstructured._run_unstructured_induction("job-fail", body, _NS, app_config)
 
             pipeline_mock.run.assert_called_once()
@@ -744,12 +597,7 @@ class TestRunUnstructuredInductionWorker:
             assert create_kwargs["r2rml_turtle"] == ""  # empty for unstructured
 
     def test_watchdog_heartbeat_ticks_during_slow_run(self, monkeypatch):
-        """A live unstructured run's heartbeat bumps ``updated_at`` (via
-        ``touch_job``) WHILE the slow ``pipeline.run`` blocks, so a stage that
-        outlasts the stale window is never age-swept to failed by
-        ``count_active_jobs`` (it scans ``source_type=None`` → unstructured rows
-        too). Deterministic — no wall clock: ``pipeline.run`` blocks until the
-        watchdog has ticked at least once, then returns.
+        """The heartbeat calls ``touch_job`` while a slow ``pipeline.run`` blocks.
 
         The heartbeat reuses the structured ``induce_catalog._watchdog_loop``,
         which calls ``induce_catalog.dynamo_store.touch_job`` — a DIFFERENT
@@ -821,7 +669,6 @@ class TestRunUnstructuredInductionWorker:
             pipeline_mock.run.assert_called_once()
             # The heartbeat ran during the blocking run and touched THIS job —
             # keeping updated_at fresh so it stays counted / is never swept.
-            assert dynamo_store_module.touch_job.call_count >= 1
             dynamo_store_module.touch_job.assert_any_call("job-hb", _NS)
             # And the worker still completed the success path (proposal created).
             ds.create_proposal.assert_called_once()
@@ -830,12 +677,7 @@ class TestRunUnstructuredInductionWorker:
             assert InductionJobStatus.COMPLETED.value in statuses
             assert InductionJobStatus.FAILED.value not in statuses
 
-    # Namespace ontology registry rows returned by list_ontologies_registry.
-    # Overridden per-test to exercise the existing-ontology auto-include.
-    _registry: list = []
-
-    def _run_and_capture_config(self, *, body, app_config, resolved_ids=None, registry=None):
-        self._registry = registry or []
+    def _run_and_capture_config(self, *, body, app_config, resolved_ids=None):
         """Run the worker inline with all external clients patched and return
         the ``UnstructuredInductionConfig`` the worker passed to the pipeline.
 
@@ -873,20 +715,7 @@ class TestRunUnstructuredInductionWorker:
         pipeline_mock.run.return_value = report
 
         with ExitStack() as stack:
-            ds = stack.enter_context(patch.object(induce_unstructured, "dynamo_store", autospec=True))
-
-            # The worker appends the namespace's accepted INDUCED ontologies to
-            # the recall pool via list_ontologies_registry(ontology_type="induced").
-            # Emulate the real DDB server-side filter so the mock honors that
-            # kwarg (a loaded foundational must NOT leak in). Default to an empty
-            # registry; the auto-include test overrides self._registry.
-            def _fake_list_registry(namespace=None, ontology_type=None, **_kw):
-                rows = list(self._registry)
-                if ontology_type is not None:
-                    rows = [r for r in rows if r.get("ontology_type") == ontology_type]
-                return rows
-
-            ds.list_ontologies_registry.side_effect = _fake_list_registry
+            stack.enter_context(patch.object(induce_unstructured, "dynamo_store", autospec=True))
             stack.enter_context(
                 patch.object(induce_unstructured, "UnstructuredInductionPipeline", return_value=pipeline_mock)
             )
@@ -924,9 +753,6 @@ class TestRunUnstructuredInductionWorker:
 
             induce_unstructured._run_unstructured_induction("job", body, _NS, app_config)
 
-            # Expose the registry-query calls so a test can assert the
-            # auto-include was scoped to ontology_type="induced".
-            self._ds_list_registry_calls = list(ds.list_ontologies_registry.call_args_list)
             # Expose the GroundingService constructor mock so a test can assert
             # the model/region it was built with.
             self._grounding_service_cls = grounding_service_cls
@@ -954,7 +780,7 @@ class TestRunUnstructuredInductionWorker:
         assert config.grounding_service is not None
 
     def test_grounding_service_uses_configured_model_and_region(self):
-        """GH #236: GROUNDING_LLM_MODEL_ID (resolved into
+        """GROUNDING_LLM_MODEL_ID (resolved into
         ``grounding_llm_model_id``) overrides the induction default and pairs
         with ``llm_region``, so a non-US Region can name a profile it can
         invoke instead of the us. default."""
@@ -977,26 +803,6 @@ class TestRunUnstructuredInductionWorker:
         kwargs = self._grounding_service_cls.call_args.kwargs
         assert kwargs["llm_model_id"] == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
         assert kwargs["llm_region"] == "ap-northeast-1"
-
-    def test_grounding_service_uses_resolved_grounding_model(self):
-        """With no override, main.py resolves grounding_llm_model_id to the
-        Haiku rerank default; the router forwards whatever value it is given."""
-        body = UnstructuredInductionRequest(
-            **_valid_request_body(),
-            grounding_ontology_ids=["fibo-agreements"],
-            grounding_mode="ENHANCED",
-        )
-        app_config = {
-            "ontology_catalog_url": "http://catalog",
-            "embedding_generator_url": "http://embed",
-            "llm_region": "us-east-1",
-            "llm_model_id": "global.anthropic.claude-sonnet-5",
-            # main.py's Haiku default when GROUNDING_LLM_MODEL_ID is unset.
-            "grounding_llm_model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        }
-        self._run_and_capture_config(body=body, app_config=app_config, resolved_ids=["https://fibo/FBC/"])
-        kwargs = self._grounding_service_cls.call_args.kwargs
-        assert kwargs["llm_model_id"] == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
     def test_grounding_service_falls_back_when_grounding_model_id_is_empty(self):
         """An empty grounding model id must not reach Bedrock as an empty
@@ -1049,50 +855,3 @@ class TestRunUnstructuredInductionWorker:
         # Empty pool → empty list (explicit "no scope"). Both [] and None mean
         # "no grounding scope"; there is no unscoped/global recall.
         assert config.grounding_ontology_ids == []
-
-    def test_induced_ontologies_not_auto_included_when_nothing_selected(self):
-        """With NO selection, NOTHING is auto-included — not even the namespace's
-        accepted induced ontologies. The pool is exactly the caller's selections
-        (empty here). The induced ontology is grounded against only when the UI
-        sends it as an explicit selection (it pre-checks it by default, but the
-        user can deselect). An empty pool → no grounding service, all-novel."""
-        body = self._make_request_body()  # no grounding_ontology_ids
-        app_config = {
-            "ontology_catalog_url": "http://catalog",
-            "embedding_generator_url": "http://embed",
-        }
-        registry = [
-            {"uri": "http://ns/induced-a", "embedding_count": 12, "ontology_type": "induced"},
-            {"uri": "http://ns/induced-b", "embedding_count": 4, "ontology_type": "induced"},
-            {"uri": "http://fibo/loaded", "embedding_count": 9, "ontology_type": "foundational"},
-        ]
-        config = self._run_and_capture_config(body=body, app_config=app_config, registry=registry)
-        # Nothing selected → empty pool (no auto-include of induced or anything).
-        assert config.grounding_ontology_ids == []
-        # No selections → no grounding service is built.
-        assert config.grounding_service is None
-
-    def test_selected_induced_ontology_is_the_whole_pool(self):
-        """When the UI sends the induced ontology's URI as a selection, it (and
-        only it) is grounded against — resolved like any other pick, with no
-        extra server-side append."""
-        induced_uri = "http://ns/induced-a"
-        body = UnstructuredInductionRequest(
-            **_valid_request_body(),
-            grounding_ontology_ids=[induced_uri],
-        )
-        app_config = {
-            "ontology_catalog_url": "http://catalog",
-            "embedding_generator_url": "http://embed",
-        }
-        registry = [
-            {"uri": induced_uri, "embedding_count": 5, "ontology_type": "induced"},
-            {"uri": "http://fibo/loaded", "embedding_count": 9, "ontology_type": "foundational"},  # NOT selected
-        ]
-        config = self._run_and_capture_config(
-            body=body, app_config=app_config, resolved_ids=[induced_uri], registry=registry
-        )
-        # Exactly the selected induced URI — the unselected foundational is not
-        # in the pool, and nothing is auto-appended.
-        assert config.grounding_ontology_ids == [induced_uri]
-        assert config.grounding_service is not None

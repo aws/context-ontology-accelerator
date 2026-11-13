@@ -20,13 +20,8 @@ const BASE_PROPS = {
 };
 
 /**
- * Regression coverage for the ExplicitAuthFlows drift bug: the
- * UpdateCognitoCallbacks custom resource calls Cognito's updateUserPoolClient,
- * which is a FULL REPLACEMENT of the client's auth flows. If this list doesn't
- * mirror idp-authentication-stack.ts's addClient() config, a dev deploy of the
- * web stack silently strips ALLOW_USER_PASSWORD_AUTH after the auth stack
- * correctly enabled it — breaking integ-test/CLI Cognito sign-in with no
- * CloudFormation error (the custom resource "succeeds").
+ * updateUserPoolClient fully replaces the client's auth flows, so the UpdateCognitoCallbacks
+ * list must mirror idp-authentication-stack.ts's addClient() config.
  */
 describe("WebStack (Cognito ExplicitAuthFlows parity)", () => {
   /**
@@ -88,12 +83,6 @@ describe("WebStack (Cognito ExplicitAuthFlows parity)", () => {
   });
 
   test("customDomain still patches Cognito callbacks with the custom UI domain (auth flows unaffected)", () => {
-    // NOTE: unlike the pre-customDomain-feature behavior (a bare string that
-    // short-circuited all patching), WebStack now always patches Cognito
-    // callbacks — customDomain only changes the *siteUrl* used in those
-    // callbacks (custom UI domain vs. generated CloudFront domain). This test
-    // guards that ExplicitAuthFlows parity (this suite's actual concern)
-    // still holds when a custom domain is configured, not just the default path.
     const app = new cdk.App({
       context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "dev" },
     });
@@ -439,9 +428,6 @@ describe("WebStack runtime-config.json artifact (end-to-end)", () => {
   );
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// WebStack — CSP allowlists the Cognito hosted-UI domain (issue #130)
-// ═══════════════════════════════════════════════════════════════════
 describe("WebStack (CSP hosted-UI origin)", () => {
   /** The synthesized CSP header value from the Response Headers Policy. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -527,9 +513,6 @@ describe("WebStack (CSP hosted-UI origin)", () => {
   });
 
   test("the content_security_policy context key replaces the derived policy", () => {
-    // The override prop existed but reached nothing, so an operator hitting a CSP
-    // gap had to patch CDK source. Wired now — this asserts the wiring, not the
-    // prop's existence.
     const custom = "default-src 'none'; script-src 'self'";
     const app = new cdk.App({
       context: {

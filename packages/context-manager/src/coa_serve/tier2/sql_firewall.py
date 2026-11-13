@@ -17,7 +17,7 @@ Authorization (table/column enforcement from the principal's grant profile):
   denied columns cannot be proven excluded.
 - Fail-closed: queries that cannot be parsed/analyzed are denied. Namespace
   and action-level authorization is enforced upstream (API Gateway authorizer).
-- Row-level filtering is post-MVP (Row Filter Injector).
+- Row-level filtering is not done here.
 
 Uses sqlglot for AST-based validation and table/column extraction.
 """
@@ -179,8 +179,6 @@ def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | Non
 
     ``is not None``, not truthiness: an ABSENT allowlist means "no table
     constraint", but an explicitly EMPTY one means "no tables permitted".
-    Collapsing the two made a deny-all grant fail OPEN — the empty list was
-    falsy, so the restriction was dropped and every table was allowed.
 
     Raises:
         TypeError: If a member cannot be converted (callers fail closed).
@@ -198,8 +196,7 @@ _ROOT_CATALOG = "awsdatacatalog"
 def _grant_table_key(entry: Any) -> str:
     """One ``tableAllowlist`` / ``columnDenylist`` table entry, as references are matched against it.
 
-    A bare entry (``customers``) is only lower-cased, exactly as it was always
-    compared, so an existing grant behaves as before. A ``database.table`` entry
+    A bare entry (``customers``) is only lower-cased. A ``database.table`` entry
     is lower-cased with each part unquoted, and ``awsdatacatalog.database.table``
     reads as ``database.table``.
     """
@@ -369,7 +366,7 @@ class SQLFirewall:
     Authorization enforces table/column access from the caller's grant profile
     (``tableAllowlist`` / ``columnDenylist``) and fails closed on parse errors.
 
-    a ``CedarAuthorizer`` adds a namespace-level policy gate that runs
+    A ``CedarAuthorizer`` adds a namespace-level policy gate that runs
     AFTER the structural checks pass (an additional deny, never a relaxation).
     The default is the REAL ``cedarpy``-backed ``RealCedarAuthorizer`` (evaluates
     ``query`` on the namespace vs the caller's Roles-table role policies, and
@@ -472,9 +469,7 @@ class SQLFirewall:
         carries no data-access restrictions the query is allowed (namespace and
         action authorization is enforced upstream at the API Gateway authorizer).
 
-        Comparisons are case-insensitive (SQL identifiers are case-insensitive
-        for unquoted names across Athena/Postgres/MySQL/etc.); both the profile
-        and the extracted query refs are lower-cased before set operations.
+        Comparisons are case-insensitive (see ``_normalized_table_allowlist``).
 
         Args:
             sql: The SQL statement to evaluate.
@@ -499,8 +494,7 @@ class SQLFirewall:
         # A statement that reads no table (``SELECT 'a' UNION ALL SELECT 'b'``),
         # or projects only constants (``SELECT 'customer_id' FROM orders``),
         # answers no data question; for a schema-blind caller it is only a way to
-        # return schema names from the generation prompt as row values (ADR:
-        # decompose-viewnamespace-schema-visibility). Refused unless the caller
+        # return schema names from the generation prompt as row values. Refused unless the caller
         # holds viewSource — checked first, so a source viewer pays nothing.
         # The one exception is the writer's NOT_ANSWERABLE refusal row, matched
         # by its exact statement shape: its message is a constant result column,
@@ -531,15 +525,8 @@ class SQLFirewall:
                     return self._deny(f"Invalid columnDenylist format for table '{table}': expected list")
                 denylist[_grant_table_key(table)] = {str(c).lower() for c in cols}
 
-        # No table/column restrictions on this grant — the structural allowlist/
-        # denylist is "sparse opt-in" (an authorization miss returns a
-        # FirewallResult, never raises; the terminal-deny at the
-        # orchestration boundary only bites on a RESTRICTIVE profile). The Cedar
-        # policy gate below still runs regardless, since it is namespace/role
-        # based rather than keyed off the sparse table profile.
-        #
-        # ``allowlist is None`` rather than ``not allowlist``: an empty allowlist is
-        # a restriction (deny every table), not the absence of one.
+        # No table/column restrictions on this grant (an empty allowlist is a
+        # restriction); the Cedar gate below still runs.
         if allowlist is None and not denylist:
             logger.info("sql_firewall_evaluate", decision="allow", restricted=False)
             return self._apply_cedar(sql, namespace, profile)
@@ -595,7 +582,7 @@ class SQLFirewall:
         isolated ``kbSearch`` / ``graphTraverse`` / ``translate`` actions and the
         Tier-3 retrieval/synthesis path. This is their ONLY namespace
         authorization point; without it any authenticated IdP user could read any
-        namespace's chunks, graph and synthesized answers (F-2, CWE-862).
+        namespace's chunks, graph and synthesized answers (CWE-862).
 
         Fails CLOSED: an evaluator error denies, and (in prod) a caller with no
         resolved roles denies — the posture is owned by the ``CedarAuthorizer``.
@@ -604,22 +591,19 @@ class SQLFirewall:
         ns = namespace or str((profile or {}).get("namespace", ""))
         reason = self._cedar_gate(ns, profile or {}, tables=[])
         if reason is not None:
-            # Logged here rather than via ``_deny`` so the event name reflects the
-            # namespace-admission path — ``_deny`` emits ``sql_firewall_evaluate``,
-            # which would be misleading when no SQL was evaluated at all.
             logger.warning("namespace_authorize_denied", namespace=ns, reason=reason)
             return FirewallResult(denied=True, authorized_sql="", reason=reason)
         return FirewallResult(denied=False, authorized_sql="")
 
     def can_view_source(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
-        """Whether the principal holds ``viewSource`` (gates the SQL artifact) (ADR)."""
+        """Whether the principal holds ``viewSource`` (gates the SQL artifact)."""
         # A lambda so a missing method surfaces inside the probe (and fails closed).
         return self._probe_view(
             lambda **kw: self._cedar.can_view_source(**kw), "cedar_view_source_error", namespace, profile
         )
 
     def can_view_ontology(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
-        """Whether the principal holds ``viewOntology`` (gates the SPARQL artifact) (ADR)."""
+        """Whether the principal holds ``viewOntology`` (gates the SPARQL artifact)."""
         return self._probe_view(
             lambda **kw: self._cedar.can_view_ontology(**kw), "cedar_view_ontology_error", namespace, profile
         )
@@ -655,10 +639,8 @@ class SQLFirewall:
     def _apply_cedar(self, sql: str, namespace: str, profile: dict[str, Any]) -> FirewallResult:
         """Apply the Cedar policy gate as a final authorization step.
 
-        Runs AFTER structural checks pass. With the default NullCedarAuthorizer
-        this is a no-op allow. Fails CLOSED: any evaluator exception denies
-        (never silently allows). Namespace is taken from the profile when not
-        passed (evaluate() does not currently receive it as a parameter).
+        Runs AFTER structural checks pass. Fails CLOSED: any evaluator exception
+        denies (never silently allows).
         """
         ns = namespace or str(profile.get("namespace", ""))
         reason = self._cedar_gate(ns, profile, tables=_cedar_table_names(self.extract_tables(sql)))
@@ -669,13 +651,8 @@ class SQLFirewall:
     def _cedar_gate(self, namespace: str, profile: dict[str, Any], tables: list[str]) -> str | None:
         """Run the Cedar policy decision. Returns a deny REASON, or None if allowed.
 
-        The single call site for the Cedar authorizer, shared by the SQL path
-        (:meth:`_apply_cedar`) and the SQL-free namespace gate
-        (:meth:`authorize_namespace`) so the fail-closed error handling exists
-        exactly once. Returns the reason string rather than a ``FirewallResult``
-        so each caller keeps its own ``authorized_sql`` and emits its own log
-        event (the SQL path's ``sql_firewall_evaluate`` would misdescribe the
-        namespace-admission path).
+        Shared by :meth:`_apply_cedar` and :meth:`authorize_namespace`; fails
+        closed on evaluator error.
         """
         try:
             decision = self._cedar.authorize(namespace=namespace, profile=profile, tables=tables)
@@ -777,10 +754,7 @@ class SQLFirewall:
                 else:
                     allowed = bool(database) and (effective_catalog, database) in federated_catalog_schemas
             if not allowed:
-                # Name the specific rejected reference so a denial is diagnosable
-                # from the caller's log (the caller records the authorized scope
-                # alongside it). This is a policy statement about the query, not
-                # sensitive data, so it is safe to carry in the internal message.
+                # Name the rejected reference so the denial is diagnosable.
                 rejected = (
                     f'"{database}"."{table.name.lower()}"'
                     if schema_only and not catalog
@@ -824,10 +798,8 @@ class SQLFirewall:
         Returns None when the statement cannot be parsed (caller fails closed).
         CTE names are excluded so they are not mistaken for source tables.
 
-        All identifiers are normalized to lower-case so downstream comparisons
-        with the (also lower-cased) grant profile are case-insensitive — SQL
-        identifiers are case-insensitive for unquoted names and the firewall
-        must not be bypassed by varying case in either the query or profile.
+        All identifiers are normalized to lower-case so comparisons with the
+        grant profile are case-insensitive.
 
         Args:
             sql: The statement to analyze.
@@ -904,7 +876,6 @@ class SQLFirewall:
     def extract_tables(sql: str) -> list[str]:
         """Extract table names referenced in a SQL statement via AST parsing.
 
-        Uses sqlglot to parse the SQL and walk the AST for Table nodes.
         Returns a deduplicated list of fully-qualified table names (schema.table
         or just table depending on the SQL).
 
@@ -920,7 +891,6 @@ class SQLFirewall:
         tables: list[str] = []
         seen: set[str] = set()
         for table_node in parsed.find_all(sqlglot.exp.Table):
-            # Build qualified name: schema.table or just table
             parts = []
             if table_node.catalog:
                 parts.append(table_node.catalog)

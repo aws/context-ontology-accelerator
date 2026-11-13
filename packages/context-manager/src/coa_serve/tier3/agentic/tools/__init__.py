@@ -8,14 +8,14 @@ This subpackage defines the uniform :class:`Tool` contract
 :class:`ToolRegistry` (:mod:`~coa_serve.tier3.agentic.tools.registry`)
 the reasoning controller uses to discover and invoke Tools.
 
-Import discipline (Requirement 12.3): module load of anything under
+Import discipline: module load of anything under
 ``tier3.agentic`` — including this tool layer — MUST NOT import
 ``graphrag_toolkit``. The base contract and the registry are dependency-free
 (stdlib/typing + structlog only); concrete tools that touch the toolkit keep
 that access lazy, inside their ``invoke`` methods.
 
-The registry and the Tools it holds are never exposed outside the Serve_Layer
-(Requirement 2.7): there is no transport or route that lists or invokes Tools.
+The registry and the Tools it holds are never exposed outside the Serve_Layer:
+there is no transport or route that lists or invokes Tools.
 """
 
 from __future__ import annotations

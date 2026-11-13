@@ -17,7 +17,7 @@ dev = [
     "mypy==1.20.1",
     "types-requests>=2.32.0",
     "types-PyYAML>=6.0",
-    "boto3-stubs>=1.35",
+    "boto3-stubs[bedrock-runtime]>=1.35",
     "moto[dynamodb,sqs]>=5.0",
     # Real-PDF unit tests for the sources preprocessing module (parse + render)
     "pypdfium2>=4.30.0",
@@ -74,6 +74,7 @@ members = [
     "packages/vkg",
     "packages/mcp-server",
     "packages/sources",
+    "coa-ai/workflow-agents",
     "libs/common",
     "smithy-generated/control-plane-python-server",
     "smithy-generated/data-layer-python-server",

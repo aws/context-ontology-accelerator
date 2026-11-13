@@ -21,7 +21,11 @@ import { Construct } from "constructs";
 import { SCLStack } from "../../constructs/scl-stack";
 import { SclMonitoring } from "../../constructs";
 import { fromRoot, Paths } from "../../paths";
-import { resolveContext, guardrailProfileResources } from "../../context";
+import {
+  resolveContext,
+  guardrailProfileResources,
+  resolvePreferIpv4BuildArgs,
+} from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import {
   GRAPH_SOURCES_ENV,
@@ -64,7 +68,7 @@ export interface OntologyStackProps extends cdk.StackProps {
   /** Shared Cloud Map private DNS namespace for service discovery. */
   readonly serviceNamespace: servicediscovery.IPrivateDnsNamespace;
   /**
-   * Bedrock model IDs, resolved from the SSM deploy config (#94). Omitted →
+   * Bedrock model IDs, resolved from the SSM deploy config. Omitted →
    * the shared defaults apply, so a deployment that configures nothing behaves
    * exactly as before. Set these to deploy outside the US, where the default
    * `us.` inference profiles are not invocable.
@@ -110,13 +114,8 @@ export class OntologyStack extends SCLStack {
     const vpc = props.network.vpc;
     const ecsSecurityGroup = props.network.ecsSecurityGroup;
 
-    // ── Bedrock model IDs (#94) ────────────────────────────────────────
-    // Resolved ONCE here so the container environment, the IAM grants, and the
-    // cost dashboard's ModelId dimensions all derive from the same value. They
-    // used to be independent literals in this file, so changing the model for a
-    // non-US deploy left the dashboard querying a model nothing invokes (empty
-    // widgets). Config wins when set; otherwise the shared defaults apply, so a
-    // deployment configuring nothing is unchanged.
+    // Bedrock model IDs are resolved once so the container environment, the IAM grants,
+    // and the dashboard ModelId dimensions share the value: config wins, else shared defaults.
     const embedModelId = props.bedrockEmbedModelId ?? DEFAULT_BEDROCK_MODEL_ID;
     const embedDimensions = String(props.bedrockEmbedDimensions ?? 1024);
     const inductionModelId =
@@ -127,7 +126,6 @@ export class OntologyStack extends SCLStack {
     // reranker — matching the ontology-engine GROUNDING_LLM_MODEL_ID default.
     const groundingModelId = props.bedrockGroundingLlmModelId ?? chatModelId;
 
-    // ── OpenSearch config via SSM ──────────────────────────────────────
     const opensearchEndpoint = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/opensearch/endpoint`,
@@ -155,7 +153,6 @@ export class OntologyStack extends SCLStack {
 
     const namespace = props.serviceNamespace;
 
-    // ── Cross-stack table names via SSM ──────────────────────────────
     // We avoid direct construct prop refs (which create CloudFormation
     // cross-stack exports) and instead read the table names from SSM
     // parameters published by NamespaceStack and SourcesStack.
@@ -184,9 +181,7 @@ export class OntologyStack extends SCLStack {
       projectAccessRoleArn,
     );
 
-    // ================================================================
     // DynamoDB Table (single-table PK/SK design)
-    // ================================================================
     this.table = new dynamodb.Table(this, "OntologyEngineTable", {
       tableName: this.prefixed("ontology-engine"),
       partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
@@ -200,17 +195,13 @@ export class OntologyStack extends SCLStack {
           : cdk.RemovalPolicy.DESTROY,
     });
 
-    // ================================================================
     // ECS Cluster
-    // ================================================================
     this.cluster = new ecs.Cluster(this, "OntologyCluster", {
       clusterName: this.prefixed("ontology-cluster"),
       vpc,
     });
 
-    // ================================================================
     // Task Definition
-    // ================================================================
     const taskDef = new ecs.FargateTaskDefinition(this, "OntologyTaskDef", {
       family: this.prefixed("ontology-engine"),
       cpu,
@@ -224,7 +215,6 @@ export class OntologyStack extends SCLStack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // ── Container image ──────────────────────────────────────────────
     const imageUri = this.node.tryGetContext("ontology_engine_image_uri") as
       | string
       | undefined;
@@ -247,6 +237,12 @@ export class OntologyStack extends SCLStack {
       );
     }
 
+    const preferIpv4BuildArgs = resolvePreferIpv4BuildArgs(
+      this,
+      imageUri && ecrRepositoryArn && ecrRepositoryName
+        ? "ontology_engine_image_uri"
+        : undefined,
+    );
     let containerImage: ecs.ContainerImage;
     if (imageUri && ecrRepositoryArn && ecrRepositoryName) {
       const ecrRepo = cdk.aws_ecr.Repository.fromRepositoryAttributes(
@@ -262,6 +258,7 @@ export class OntologyStack extends SCLStack {
       containerImage = ecs.ContainerImage.fromAsset(Paths.root, {
         file: "packages/ontology-engine/Dockerfile",
         platform: cdk.aws_ecr_assets.Platform.LINUX_AMD64,
+        buildArgs: preferIpv4BuildArgs,
       });
     }
 
@@ -291,7 +288,7 @@ export class OntologyStack extends SCLStack {
         BEDROCK_CHAT_MODEL_ID: chatModelId,
         // Grounding reranker model (ontology-engine). Defaults to the chat
         // (Haiku-class) model; override via bedrockGroundingLlmModelId for a
-        // region-valid profile on a non-US deploy (GH #236).
+        // region-valid profile on a non-US deploy.
         GROUNDING_LLM_MODEL_ID: groundingModelId,
         LLM_REGION: cdk.Aws.REGION,
         // SSM path to the Bedrock guardrail id — the app resolves it at runtime
@@ -339,9 +336,7 @@ export class OntologyStack extends SCLStack {
       },
     });
 
-    // ================================================================
     // IAM Permissions
-    // ================================================================
 
     // Neptune DB — read/write/delete for SPARQL queries + Graph Store Protocol
     taskDef.taskRole.addToPrincipalPolicy(
@@ -451,7 +446,7 @@ export class OntologyStack extends SCLStack {
     // When a task invokes a Marketplace-sourced Bedrock model for the first time in an
     // account, Bedrock completes an account-wide subscription automatically. Without
     // these permissions, the first InvokeModel call fails with AccessDeniedException
-    // and induction proposals error at the Fetch metadata stage (issue #814).
+    // and induction proposals error at the Fetch metadata stage.
     // These actions have no resource-level ARN (IAM limitation, not a design choice).
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
@@ -515,7 +510,7 @@ export class OntologyStack extends SCLStack {
 
     // CloudWatch — publish custom induction metrics (Bedrock rerank latency,
     // token usage, per-job cost) under the COA/Ontology namespace, plus
-    // guardrail allow/block decisions under COA/Guardrails (#111 AC10).
+    // guardrail allow/block decisions under COA/Guardrails.
     // PutMetricData exposes no resource-level ARN, so least-privilege is
     // enforced with the ``cloudwatch:namespace`` condition key instead.
     taskDef.taskRole.addToPrincipalPolicy(
@@ -530,9 +525,7 @@ export class OntologyStack extends SCLStack {
       }),
     );
 
-    // ================================================================
     // Fargate Service with Cloud Map service discovery
-    // ================================================================
     // Uses ``cloudMapOptions`` (not ``serviceConnectConfiguration``) so the
     // task IPs are published as real Route 53 A records under
     // ontology-engine.<namespace>.local. Service Connect's namespace DNS is
@@ -569,9 +562,7 @@ export class OntologyStack extends SCLStack {
       "Allow ontology-engine API from api-proxy Lambda",
     );
 
-    // ================================================================
     // OE monitoring (cdk-monitoring-constructs)
-    // ================================================================
     new SclMonitoring(this, "Monitoring", {
       alarmNamePrefix: this.prefixed("ontology"),
       alarmAction: props.alarmAction,
@@ -579,16 +570,8 @@ export class OntologyStack extends SCLStack {
       .monitorFargateService(this.service)
       .monitorTable(this.table);
 
-    // ================================================================
-    // Out-of-process OOM observability (#784)
-    // ================================================================
-    // A 50k induction OOM-killed the 32GB task (exit 137). The observability
-    // was blind: the SIGKILL runs neither `except` nor `finally`, so the
-    // single terminal PutMetricData never fired (blank dashboard); the facade
-    // 90% memory alarm missed the 81%-then->100% between-sample ramp; and the
-    // OOM label lived only in the ECS `stoppedReason`, queried by nothing.
-    // Two out-of-process signals close the gap (the third, per-tick heartbeat
-    // metrics, lives in the induction container's watchdog).
+    // Out-of-process OOM observability: a SIGKILL runs neither `except` nor `finally`, so the
+    // app's terminal PutMetricData never fires; an EventBridge rule and a memory alarm cover it.
 
     // (b) Memory alarm at 85% Maximum, 1 period. 85 < the facade's 90% (which
     // sampled 81% and never breached); Maximum (not the facade's Average)
@@ -618,10 +601,8 @@ export class OntologyStack extends SCLStack {
 
     // (a) EventBridge rule on ECS OOM. The exit-137/OutOfMemory label lives only
     // in the ECS Task State Change event, so route it to a durable metric.
-    // Target choice (laziest that works): rule → Logs log group + a metric
-    // filter emitting COA/Ontology InductionTaskOOMKilled, then an alarm on it.
-    // A native two-hop (no Lambda) — cheaper and simpler than a custom emitter,
-    // and the log group also keeps the raw stop events for post-mortems.
+    // rule → Logs log group + metric filter emitting COA/Ontology InductionTaskOOMKilled → alarm;
+    // the log group also keeps the raw stop events for post-mortems.
     const oomLogGroup = new logs.LogGroup(this, "OomEventLogGroup", {
       logGroupName: `/aws/events/${this.prefixed("ontology-oom")}`,
       retention: logs.RetentionDays.ONE_MONTH,
@@ -688,18 +669,10 @@ export class OntologyStack extends SCLStack {
       action: props.alarmAction,
     });
 
-    // ================================================================
-    // CloudWatch Dashboard — Induction Performance, Load & Cost
-    // ================================================================
-    // The single consolidated induction dashboard. The induction container
-    // emits ALL custom metrics under the COA/Ontology namespace via
-    // PutMetricData (NOT EMF-stdout — that is never extracted on this Fargate
-    // task with a plain awsLogs driver), dimensioned by NamespaceId (and Stage
-    // for the per-stage token counts). NamespaceId is per-induction-namespace
-    // and unbounded (load-test namespaces are ephemeral), so every custom-metric
-    // widget uses a CloudWatch SEARCH() MathExpression that auto-discovers all
-    // NamespaceId dimensions live instead of pinning one. `usingMetrics` is
-    // intentionally empty for SEARCH exprs.
+    // CloudWatch Dashboard — Induction Performance, Load & Cost. The container emits all
+    // custom metrics under COA/Ontology via PutMetricData (EMF is not extracted on this task).
+    // NamespaceId is unbounded (ephemeral load-test namespaces), so custom-metric widgets use
+    // SEARCH() MathExpressions; `usingMetrics` is intentionally empty for them.
     const inductionNamespace = "COA/Ontology";
     const defaultPeriod = cdk.Duration.minutes(5);
     const metricRegion = cdk.Aws.REGION;
@@ -772,11 +745,6 @@ export class OntologyStack extends SCLStack {
         label: `${modelId} ${metricName}`,
       });
 
-    // Dashboard ModelId dimensions come from the SAME resolved values as the
-    // container environment above (#94) — they used to be duplicate literals, so
-    // a model change for a non-US deploy left these widgets querying a
-    // dimension with no data.
-    //
     // Three DISTINCT Bedrock invokers feed these widgets, each priced on its
     // own tier — never overload one slot across two models, or a token series
     // gets double-counted / mispriced (grounding is Haiku-class, induction is
@@ -930,9 +898,8 @@ export class OntologyStack extends SCLStack {
       new cloudwatch.GraphWidget({
         title: "Bedrock rerank",
         left: [
-          // This branch's emitter publishes RerankInvocations (Sum) and
-          // RerankLatencyMs as a StatisticSet (Average + Maximum). It does NOT
-          // emit a rerank-errors metric, so no errors series here.
+          // The emitter publishes RerankInvocations (Sum) and RerankLatencyMs as a StatisticSet
+          // (Average + Maximum), and no rerank-errors metric, so no errors series here.
           inductionSearch("RerankInvocations", "Sum", "Invocations"),
         ],
         right: [
@@ -1062,8 +1029,6 @@ export class OntologyStack extends SCLStack {
       new cloudwatch.SingleValueWidget({
         title: "Errors & throttles (Sum)",
         metrics: [
-          // Rerank errors are intentionally absent — the emitter publishes no
-          // rerank-errors metric (out of scope for this consolidation).
           inductionSearch("InductionJobErrors", "Sum", "Job errors"),
           bedrockModelMetric("InvocationThrottles", sonnetModelId),
           bedrockModelMetric("InvocationThrottles", haikuModelId),
@@ -1077,9 +1042,7 @@ export class OntologyStack extends SCLStack {
       }),
     );
 
-    // ================================================================
     // SSM Parameters
-    // ================================================================
     new ssm.StringParameter(this, "SsmOntologyClusterArn", {
       parameterName: `${ssmPrefix}/ontology-engine/cluster-arn`,
       stringValue: this.cluster.clusterArn,
@@ -1090,12 +1053,8 @@ export class OntologyStack extends SCLStack {
       stringValue: this.service.serviceName,
     });
 
-    // Republishing the Cloud Map namespace ARN keeps the network-stack
-    // export consumed across the SC → cloudMapOptions migration. Without
-    // this, switching off ``serviceConnectConfiguration`` would orphan the
-    // exported ARN and CFN would refuse to drop it (deployed ontology stack
-    // still imports it). Real consumers can also discover the ARN here
-    // instead of creating new cross-stack exports.
+    // Republishing the Cloud Map namespace ARN keeps the network-stack export: the deployed
+    // ontology stack still imports it, and CFN refuses to drop an imported export.
     new ssm.StringParameter(this, "SsmServiceNamespaceArn", {
       parameterName: `${ssmPrefix}/ontology-engine/service-namespace-arn`,
       stringValue: namespace.namespaceArn,
@@ -1113,9 +1072,7 @@ export class OntologyStack extends SCLStack {
       stringValue: this.table.tableName,
     });
 
-    // ================================================================
     // API Proxy Lambda (forwards API Gateway → ECS via Cloud Map DNS)
-    // ================================================================
     const apiProxyFn = new lambda.Function(this, "ApiProxyFn", {
       functionName: this.prefixed(ONTOLOGY_API_PROXY_FUNCTION_NAME),
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -1182,9 +1139,7 @@ export class OntologyStack extends SCLStack {
       stringValue: apiProxyFn.functionArn,
     });
 
-    // ================================================================
     // Outputs
-    // ================================================================
     new cdk.CfnOutput(this, "OntologyServiceEndpoint", {
       value: `http://ontology-engine.${namespace.namespaceName}:${this.containerPort}`,
       description: "Ontology Engine internal endpoint via Cloud Map DNS",

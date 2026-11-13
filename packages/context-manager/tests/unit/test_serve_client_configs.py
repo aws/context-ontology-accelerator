@@ -52,10 +52,7 @@ def test_sparql_example_loader_s3_uses_sync_config():
 
 
 def test_opensearch_proxy_lambda_uses_sync_config(monkeypatch):
-    # The direct AOSS client (and its transient-fault retry) now lives in the
-    # shared coa_common.opensearch.AossVectorClient. The only
-    # boto3 client serve builds here is the optional proxy-invoke Lambda client,
-    # which must carry the sync fail-fast config.
+    # Serve builds only the proxy-invoke Lambda client here; it must use the sync config.
     monkeypatch.setenv("OPENSEARCH_PROXY_LAMBDA_ARN", "arn:aws:lambda:us-east-1:123456789012:function:proxy")
 
     from coa_serve.clients import opensearch as osmod

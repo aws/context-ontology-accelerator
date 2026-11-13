@@ -122,14 +122,6 @@ class ConsistencyValidator(OntologyValidator):
 
         Strips ``owl:imports`` and substitutes OWL 2-unsupported datatypes on a
         reasoner-only copy of the graph before invoking HermiT.
-
-        Args:
-            graph: The ontology graph to check for logical consistency.
-            **kwargs: Unused; accepted for interface compatibility.
-
-        Returns:
-            Findings flagging each unsatisfiable class, or a single info finding
-            when the ontology is consistent; a REASONER_ERROR finding on failure.
         """
         findings: list[ValidationFinding] = []
         try:
@@ -217,16 +209,7 @@ class TaxonomyCycleValidator(OntologyValidator):
     """Detect circular rdfs:subClassOf chains."""
 
     def validate(self, graph: Graph, **kwargs) -> list[ValidationFinding]:
-        """Walk the subclass graph via DFS and report the first taxonomy cycle found.
-
-        Args:
-            graph: The ontology graph whose ``rdfs:subClassOf`` edges are checked.
-            **kwargs: Unused; accepted for interface compatibility.
-
-        Returns:
-            A single finding naming a class on a circular subclass chain, or an
-            info finding when no cycles exist.
-        """
+        """Walk the subclass graph via DFS and report the first taxonomy cycle found."""
         findings: list[ValidationFinding] = []
         # Build adjacency: child → parents
         children: dict[str, set[str]] = {}
@@ -288,14 +271,6 @@ class ConnectivityValidator(OntologyValidator):
 
         Builds an undirected graph from ``rdfs:subClassOf`` and object-property
         domain/range edges, then enumerates every connected component.
-
-        Args:
-            graph: The ontology graph whose class connectivity is analyzed.
-            **kwargs: Unused; accepted for interface compatibility.
-
-        Returns:
-            An info finding when all classes are connected, otherwise a partition
-            summary plus a warning finding per disconnected component.
         """
         findings: list[ValidationFinding] = []
         classes = set()
@@ -419,17 +394,7 @@ class SHACLValidator(OntologyValidator):
     """Validate against SHACL shapes."""
 
     def validate(self, graph: Graph, **kwargs) -> list[ValidationFinding]:
-        """Validate the ontology graph against caller-supplied SHACL shapes via pyshacl.
-
-        Args:
-            graph: The data graph to validate.
-            **kwargs: Expects ``shacl_shapes_turtle`` (str); returns no findings
-                when it is absent.
-
-        Returns:
-            A finding describing SHACL violations (with truncated results text),
-            a pass finding when conformant, or an error finding on failure.
-        """
+        """Validate the ontology graph against caller-supplied SHACL shapes via pyshacl."""
         shapes_turtle = kwargs.get("shacl_shapes_turtle")
         if not shapes_turtle:
             return []

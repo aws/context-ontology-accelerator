@@ -84,9 +84,7 @@ class TestRealCedarAuthorizer:
         def _boom(**kwargs):
             raise RuntimeError("cedar engine exploded")
 
-        monkeypatch.setattr(mod, "evaluate", _boom, raising=False)
-        # patch the symbol the method imports lazily
-        monkeypatch.setattr("coa_authorization.policy_evaluator.evaluate", _boom)
+        monkeypatch.setattr(mod, "evaluate", _boom)
         auth = RealCedarAuthorizer(fail_open_no_roles=True)
         d = auth.authorize(
             namespace=_NS,
@@ -110,10 +108,10 @@ _ANALYST = {"userId": "u", "resourceRoles": [{"role": "data-analyst", "resourceU
 @pytest.mark.unit
 @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
 class TestCanViewSchema:
-    """``can_view_source`` / ``can_view_ontology`` against the REAL seed policies
-    (ADR: decompose-viewnamespace-schema-visibility). Every role that read schema
-    before the split keeps it — including the two enumerated seeds that needed new
-    permits (data-steward, platform-viewer) — and data-analyst is schema-blind."""
+    """``can_view_source`` / ``can_view_ontology`` against the real seed policies.
+
+    Schema-viewer roles may view; data-analyst may not.
+    """
 
     @pytest.mark.parametrize("profile", _SCHEMA_VIEWERS)
     def test_schema_viewer_roles_may_view(self, probe, profile):
@@ -145,8 +143,7 @@ class TestCanViewSchema:
         def _boom(**kwargs):
             raise RuntimeError("cedar engine exploded")
 
-        monkeypatch.setattr(mod, "evaluate", _boom, raising=False)
-        monkeypatch.setattr("coa_authorization.policy_evaluator.evaluate", _boom)
+        monkeypatch.setattr(mod, "evaluate", _boom)
         auth = RealCedarAuthorizer(fail_open_no_roles=True)
         assert getattr(auth, probe)(namespace=_NS, profile={"userId": "a", "globalRoles": ["platform-admin"]}) is False
 

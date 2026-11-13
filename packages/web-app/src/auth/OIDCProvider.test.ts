@@ -64,10 +64,8 @@ describe("OIDCProvider", () => {
     // Reset cached user between tests to avoid singleton leakage
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockUM.events as any)._emit("userUnloaded");
-    // Default to an IdP that advertises an end-session endpoint (e.g.
-    // Cognito's hosted-UI logout) so existing signOut tests exercise the
-    // signoutRedirect path unless a test explicitly overrides this to
-    // simulate an IdP without one (e.g. Amazon Federate).
+    // Default to an IdP that advertises an end-session endpoint, so signOut
+    // tests exercise signoutRedirect unless a test overrides it.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockUM.metadataService as any).getEndSessionEndpoint.mockResolvedValue(
       "https://mock-authority/logout",
@@ -151,10 +149,7 @@ describe("OIDCProvider", () => {
     });
 
     it("refreshes when the ID token is expired even if the access token is still valid", async () => {
-      // Gates on the ID token's own exp (profile.exp), NOT expires_at (the
-      // access-token lifetime): a still-valid access token must not suppress
-      // renewal of an expired ID token — that skew was the "403s, no refresh
-      // request" report.
+      // Gates on the ID token's own exp (profile.exp), not expires_at.
       const expiringUser = mockUser({
         id_token: "old-token",
         expires_at: Date.now() / 1000 + 3600, // access token still valid
@@ -181,9 +176,7 @@ describe("OIDCProvider", () => {
       await expect(provider.getIdToken()).rejects.toThrow(
         "Token refresh failed. Please sign in again.",
       );
-      // #136: the ad-hoc renewal path must drop the user so `UserUnloaded`
-      // fires and the Auth gate flips to unauthenticated — otherwise the UI
-      // keeps showing "signed in" while every call throws.
+      // Dropping the user fires `UserUnloaded`, which flips the Auth gate.
       expect(mockUM.removeUser).toHaveBeenCalled();
     });
 
@@ -254,7 +247,6 @@ describe("OIDCProvider", () => {
       await expect(provider.getAccessToken()).rejects.toThrow(
         "Token refresh failed. Please sign in again.",
       );
-      // #136: drop the user on ad-hoc renewal failure (see getIdToken).
       expect(mockUM.removeUser).toHaveBeenCalled();
     });
 
@@ -298,7 +290,7 @@ describe("OIDCProvider", () => {
       );
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (mockUM.metadataService as any).getTokenEndpoint.mockResolvedValue(
-        "https://coa-pentest-auth.auth.us-east-1.amazoncognito.com/oauth2/token",
+        "https://example.auth.us-east-1.amazoncognito.com/oauth2/token",
       );
       const fetchMock = vi
         .fn()
@@ -310,7 +302,7 @@ describe("OIDCProvider", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, init] = fetchMock.mock.calls[0];
       expect(url).toBe(
-        "https://coa-pentest-auth.auth.us-east-1.amazoncognito.com/oauth2/revoke",
+        "https://example.auth.us-east-1.amazoncognito.com/oauth2/revoke",
       );
       const body = String((init as RequestInit).body);
       expect(body).toContain("token=rt-secret");
@@ -352,12 +344,8 @@ describe("OIDCProvider", () => {
       vi.unstubAllGlobals();
     });
 
-    it("falls back to a local redirect when the IdP has no end_session_endpoint (Federate)", async () => {
-      // Amazon Federate's discovery document has no end_session_endpoint —
-      // there's no IdP-hosted logout page to redirect through. Without this
-      // fallback, signoutRedirect() throws "No end session endpoint"
-      // uncaught: local state is cleared but the browser never navigates,
-      // so sign-out silently appears to do nothing.
+    it("falls back to a local redirect when the IdP has no end_session_endpoint", async () => {
+      // signoutRedirect() throws "No end session endpoint" without one.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (mockUM.metadataService as any).getEndSessionEndpoint.mockResolvedValue(
         undefined,
@@ -380,9 +368,6 @@ describe("OIDCProvider", () => {
 
       expect(mockUM.removeUser).toHaveBeenCalled();
       expect(mockUM.signoutRedirect).not.toHaveBeenCalled();
-      // logoutRedirectUri is computed once at construction time as
-      // `${origin}${onLogoutRedirectPath ?? "/"}` — assert the fallback
-      // navigates there, not to some other URL.
       expect(hrefSetter).toHaveBeenCalledWith(expect.stringMatching(/\/$/));
     });
 

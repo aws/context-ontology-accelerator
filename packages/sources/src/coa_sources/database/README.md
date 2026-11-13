@@ -28,8 +28,7 @@ reason.
 
 All three are `frozenset`s of sub-type **values**, and all three are tested as
 **membership**. Never as equality against one member: that shape fails open for every
-other member of the same set, which is exactly how the `queryable` write and the federated
-teardown broke when a second connector-backed sub-type arrived.
+other member of the same set.
 
 ### `CONNECTOR_BACKED_SUB_TYPES`
 
@@ -67,8 +66,7 @@ Members: `JDBC_DATABASE`, `CUSTOM_CONNECTOR`, `DATABRICKS_SQL_WAREHOUSE`.
 Create derives a platform catalog name for these and claims it in the ownership record;
 delete must release that claim. The set has to stay in step with the create path, which
 claims for every sub-type that derives a name. A member missing here leaves its derived
-name permanently owned by a source that no longer exists, which is what happened when the
-branch covered two of the three.
+name permanently owned by a source that no longer exists.
 
 `GLUE_DATABASE` is deliberately absent: it is given no derived name, so adding it would
 make every Glue delete try to release a claim that never existed.
@@ -95,9 +93,7 @@ answer fails the suite rather than a deploy.
    `sources_handler`'s delete path run. Read them rather than assuming.
 
 Memberships are deliberately **positive**, so a branch nobody has considered for a new
-sub-type fails closed. A `!= X` guard admits every future sub-type by default, and that is
-how delete's federated teardown came to run a Glue teardown against a Lambda-backed
-catalog, report success, and leak the registration.
+sub-type fails closed. A `!= X` guard admits every future sub-type by default.
 
 ## What an absent `sourceSubType` means, per set
 

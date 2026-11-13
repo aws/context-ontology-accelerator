@@ -16,6 +16,7 @@ import {
   resolveContext,
   namespaceTagKey,
   guardrailProfileResources,
+  resolvePreferIpv4BuildArgs,
 } from "../../context";
 import { agentCoreSupportedSubnets } from "../../utils/agentcore-az";
 import { retainAgentCoreSecurityGroup } from "../../utils/agentcore-teardown";
@@ -85,7 +86,7 @@ export interface ServeStackProps extends cdk.StackProps {
   /** Bedrock embedding model ID for query embedding + the graphrag lexical
    *  retriever. MUST match what doc-kg-build ingested with; resolved from the
    *  SSM deploy config so a non-US deploy can set a region-appropriate model
-   *  (#94). Falls back to the shared default when omitted. */
+   *  Falls back to the shared default when omitted. */
   readonly bedrockEmbedModelId?: string;
 
   /** Comma-separated list of model IDs allowed for per-request override.
@@ -389,19 +390,13 @@ export class ServeStack extends SCLStack {
       ]),
     });
 
-    // ================================================================
     // OE monitoring (cdk-monitoring-constructs). Covers the AOSS search
-    // proxy Lambda. AgentCore Runtime internal health is out of round one
-    // (no native facade support); the WebSocket ALB was removed from this
-    // stack in the WebSocket-cleanup migration, so there is no ALB to cover.
-    // ================================================================
+    // proxy Lambda; AgentCore Runtime internal health is not monitored (no native facade support).
     const monitoring = new SclMonitoring(this, "Monitoring", {
       alarmNamePrefix: this.prefixed("serve"),
       alarmAction: props.alarmAction,
     });
     monitoring.monitorLambda(aossProxyFn);
-
-    // ── AgentCore Runtime (L2 alpha construct) ──────────────────────────
 
     // ── Session Metadata Table (DynamoDB) ────────────────────────────────
     // Lightweight index for session discovery (most-recent lookup).
@@ -435,6 +430,10 @@ export class ServeStack extends SCLStack {
       "context_manager_image_uri",
     ) as string | undefined;
 
+    const preferIpv4BuildArgs = resolvePreferIpv4BuildArgs(
+      this,
+      explicitImageUri ? "context_manager_image_uri" : undefined,
+    );
     let imageUri: string;
     let dockerAsset: DockerImageAsset | undefined;
     if (explicitImageUri) {
@@ -444,6 +443,7 @@ export class ServeStack extends SCLStack {
         directory: Paths.root,
         file: "packages/context-manager/Dockerfile",
         platform: Platform.LINUX_ARM64,
+        buildArgs: preferIpv4BuildArgs,
       });
       imageUri = dockerAsset.imageUri;
     }
@@ -498,8 +498,7 @@ export class ServeStack extends SCLStack {
             // access-token-only claim — setting it would reject ID tokens.
             // We validate the standard OIDC `aud` claim instead, which is
             // IdP-agnostic and present on ID tokens from any compliant IdP.
-            // The web-app sends the ID token (carries email + groups) on both
-            // the WebSocket and REST (via data-layer) paths.
+            // The web-app sends the ID token (carries email + groups) on the REST (via data-layer) path.
             undefined,
             // allowedAudience: accept ID tokens from web app AND MCP proxy
             [clientId, mcpClientId], // allowedAudience — ID token `aud` == app client id
@@ -557,12 +556,7 @@ export class ServeStack extends SCLStack {
           // `options.mode: "deep-reasoning"` still engages the loop.
           //
           // Within standard, the engine is "lexical-baseline" running topic_beam
-          // (LEXICAL_RETRIEVER_STRATEGY below) rather than the older "hand-rolled"
-          // VectorRetriever + GraphTraverser path. topic_beam is the strongest
-          // single-shot strategy on the SEC-10-Q benchmark (45.13% strict vs 34.36%
-          // hand-rolled, 195 questions), so hand-rolled was leaving ~11pp on the
-          // table for every caller that did not know to pass
-          // options.retrieverStrategy. Override with TIER3_STRATEGY context to get
+          // (LEXICAL_RETRIEVER_STRATEGY below). Override with TIER3_STRATEGY context to get
           // back to "hand-rolled" (or "deep-reasoning") deployment-wide.
           TIER3_STRATEGY:
             (this.node.tryGetContext("tier3_strategy") as string) ??
@@ -577,21 +571,13 @@ export class ServeStack extends SCLStack {
           // BOTH Bedrock guardrail ids from SSM. Needed because the primary
           // guardrail anonymizes PII on input, and a text-to-SQL question's
           // literals are the query — a question naming a person or place reaches
-          // the model as "{NAME}" and the generated WHERE clause matches nothing,
-          // worth ~1pp of execution accuracy on every Tier-2 BIRD run (1.6-3.2% of
-          // questions hit, 98% of those scored wrong). Absent unless passed, so a
+          // the model as "{NAME}" and the generated WHERE clause matches nothing. Absent unless passed, so a
           // normal deployment sets no variable and is guarded; when it IS passed,
           // serve logs `guardrails_disabled_by_configuration` at ERROR on every
           // cold start. Refused outright in prod, like
           // SCL_CEDAR_FAIL_OPEN_NO_ROLES below: the primary guardrail is the
           // prompt-attack boundary, so this is a lab switch and synth is the last
           // place it can be stopped by review rather than by an alarm.
-          //
-          // Note the interaction with ALLOW_NO_GUARDRAIL below: with no guardrail
-          // id, the Tier-3 Synthesizer refuses to construct in a non-local
-          // environment unless that bypass is also true (it is, for every env but
-          // prod). A Tier-2 benchmark never reaches Tier-3, so this matters only if
-          // you point document questions at the same stack.
           ...(this.node.tryGetContext("serve_guardrails_disabled") !==
             undefined && {
             SERVE_GUARDRAILS_DISABLED: (() => {
@@ -708,17 +694,13 @@ export class ServeStack extends SCLStack {
           // Whole-translation budget for the NL->SPARQL->SQL route (T-Box build, LLM
           // call, validation and every validate-and-retry attempt), clamped 10..600 in
           // nl_to_sparql. Unset => the shipped 60s, so no deployment moves. Raising it
-          // matters on wide namespaces, where 60s was the binding constraint rather
-          // than a backstop: over 727 translations p50 29.1s, p90 44.7s, max 59.6s,
-          // 6.9% already returning translation_timed_out.
+          // matters on wide namespaces, where 60s was the binding constraint rather than a backstop.
           //
           // Outer budgets bound this one and it cannot raise them: RESOLVE_TIMEOUT_S
           // above, half of it if the request retries translation, 90s under
           // strategy="best", and ~29s over REST. See
           // nl_to_sparql._resolve_translation_timeout_s.
           //
-          // Presence-checked with !== undefined, not truthiness, so an explicit "0" is
-          // still passed through and clamped-with-a-warning rather than dropped here.
           ...(this.node.tryGetContext("serve_vkg_translation_timeout_s") !==
             undefined && {
             SERVE_VKG_TRANSLATION_TIMEOUT_S: String(
@@ -754,7 +736,7 @@ export class ServeStack extends SCLStack {
           BEDROCK_MODEL_ID:
             props.bedrockLlmModelId ?? DEFAULT_BEDROCK_LLM_MODEL_ID,
           // Query embedding + graphrag lexical retriever MUST use the same model
-          // doc-kg-build ingested with. Config-resolved (#94) so a non-US deploy
+          // doc-kg-build ingested with. Config-resolved so a non-US deploy
           // can set a region-appropriate model; shared ts-shared constant is the
           // fallback, keeping producers and consumers on one value.
           BEDROCK_EMBED_MODEL_ID:
@@ -837,7 +819,7 @@ export class ServeStack extends SCLStack {
       //      (registration accepts only a cluster of the deployment's region).
       //      Cross-account Neptune is out of scope. The SPARQL firewall keeps every
       //      such query read-only.
-      // Off, only the first exists, without a sid (main's statement).
+      // Off, only the first exists, without a sid, so the deployed policy is unchanged.
       runtime.addToRolePolicy(
         new iam.PolicyStatement({
           ...(graphSources && { sid: "ServeNeptuneOntologyRead" }),
@@ -1052,7 +1034,7 @@ export class ServeStack extends SCLStack {
       // Both resources live in the CUSTOMER's account and are unknown at deploy
       // time, so neither can be resource-enumerated. Containment is by condition
       // key plus the customer's own resource policies, which must independently
-      // name this role — see the custom-connectors LLD §6.
+      // name this role.
       //
       // `aws:CalledVia` is populated on forward access sessions, so these Allows
       // match only while Athena is executing a statement for this role, never a
@@ -1109,13 +1091,7 @@ export class ServeStack extends SCLStack {
       // role makes legitimately (the AOSS proxy Lambda, granted an unconditioned
       // grantInvoke); Athena has no reason to invoke one of our own functions.
       //
-      // NOT scoped to our name prefix. It was, and that made a naming convention
-      // load-bearing for security while silently refusing any connector deployed
-      // into this account under the prefix — which is what the reference
-      // connector's own deploy script does. The tag exemption below expresses the
-      // real intent directly, so the prefix is gone and the statement is now
-      // account-wide and region-wide. Breadth is the safe direction for a Deny,
-      // and region breadth guards a future region-widened Allow.
+      // NOT scoped to our name prefix: account-wide and region-wide, exempting tagged connector functions.
       runtime.addToRolePolicy(
         new iam.PolicyStatement({
           sid: "DenyAthenaInvokeOfUntaggedFunctions",
@@ -1151,42 +1127,16 @@ export class ServeStack extends SCLStack {
           },
         }),
       );
-      // Spill reads. Above 6 MB a connector's response is written to ITS OWN
-      // spill bucket and Athena — acting for this role — fetches it to assemble
-      // results. Spill is automatic and connector-side; the only choice here is
-      // whether Orion can read the result, and withholding it fails ordinary
-      // queries rather than exotic ones (a connector that advertises no limit
-      // pushdown makes Athena request the whole table and apply the LIMIT
-      // itself, so even a trivial SELECT ... LIMIT 1000 can spill).
-      //
-      // The bucket cannot be pinned — the customer owns it — so the KEY PREFIX is
-      // what bounds this grant. Every connector is required to spill under
-      // CONNECTOR_SPILL_KEY_GLOB (`connectors/{connectorId}/spills/...`), which is
-      // what lets the statement span every account INCLUDING this one without
-      // becoming a general S3 read: a bucket in our account is reachable only at
-      // that path, which nothing else of ours writes to.
-      //
-      // Spanning our own account is deliberate. It is the one topology the earlier
-      // `aws:ResourceAccount` exclusion could not serve — a connector deployed
-      // alongside Orion could never spill — and excluding an account bought nothing
-      // that a key prefix does not, because cross-account S3 already requires the
-      // bucket's own policy to name this role.
-      //
-      // `aws:RequestedRegion` is kept, since S3 ARNs carry no region.
-      //
-      // Only the serve role gets this: spill is a record-path mechanism, and
-      // discovery's entire Athena surface (SHOW/DESCRIBE) is metadata traffic that
-      // never spills.
-      //
-      // Getting the prefix wrong fails in the worst way available: every small
-      // result set works, and the first query to cross 6 MB returns AccessDenied.
-      // Hence the onboarding guide states the required value rather than leaving it
-      // to the connector's `spill_prefix` default.
-      //
-      // Note `*` spans `/` inside an S3 relative id, so this is not anchored at the
-      // start of the key — it matches the segments appearing anywhere in it. It
-      // still turns an account-wide read primitive into a spill-shaped one, which is
-      // the point, but it is not a containment boundary on its own.
+      // Spill reads. Above 6 MB a connector's response is written to its own spill bucket
+      // and Athena, acting for this role, fetches it to assemble results; withholding this
+      // fails ordinary queries (a connector with no limit pushdown can spill even on
+      // `SELECT ... LIMIT 1000`).
+      // The bucket belongs to the customer and cannot be pinned, so the key prefix bounds the
+      // grant: every connector must spill under CONNECTOR_SPILL_KEY_GLOB
+      // (`connectors/{connectorId}/spills/...`). `*` spans `/` in an S3 relative id, so the
+      // glob is spill-shaped but not a containment boundary on its own. `aws:RequestedRegion`
+      // is used because S3 ARNs carry no region. Only the serve role gets this; discovery
+      // issues metadata queries that never spill.
       //
       // The bucket-level half of this grant lives in the two statements below.
       // Cross-account S3 authorizes on both sides, and a spill read fails without
@@ -1206,30 +1156,10 @@ export class ServeStack extends SCLStack {
           },
         }),
       );
-      // Bucket-level companions to the read above. Both are separate statements
-      // rather than extra actions on it, for two independent reasons:
-      //
-      //  * The resource differs. GetObject takes an object ARN, these take the
-      //    bucket ARN, so the spill-prefix path pattern cannot scope them.
-      //  * `s3:prefix` applies to ListBucket only. Folded into one statement it
-      //    would also gate GetBucketLocation, where the key is absent — and
-      //    `StringLike` against an absent key is false, denying the very call
-      //    this exists to allow.
-      //
-      // ListBucket carries the prefix condition because on a wildcard bucket it is
-      // otherwise an enumeration primitive. Scoped this way it can only list under a
-      // connector's spill prefix, via Athena — and for a bucket in another account
-      // the bucket's own policy must still name this role.
-      //
-      // GetBucketLocation cannot be scoped at all: it takes a bucket ARN, has no
-      // `s3:prefix`, and now spans this account too. It reveals only a bucket's
-      // region, which is the least sensitive thing S3 will answer, and Athena calls
-      // it to resolve the endpoint before reading a spilled object.
-      //
-      // Residual risk, stated because it is the likely next failure: if Athena ever
-      // lists without supplying a prefix, `s3:prefix` is absent and this denies it.
-      // The symptom would be an identical 403 with GetObject and GetBucketLocation
-      // both simulating `allowed`.
+      // Bucket-level companions to the read above, as separate statements: they take the
+      // bucket ARN rather than an object ARN, and `s3:prefix` applies to ListBucket only.
+      // Folded into one statement it would also gate GetBucketLocation, where the key is
+      // absent, and `StringLike` against an absent key is false.
       runtime.addToRolePolicy(
         new iam.PolicyStatement({
           sid: "AthenaFederationSpillBucketLocation",
@@ -1272,48 +1202,17 @@ export class ServeStack extends SCLStack {
           actions: ["kms:Decrypt"],
           resources: [`arn:aws:kms:${region}:*:key/*`],
           conditions: {
-            // Both keys live in ONE StringEquals object: a second `StringEquals`
-            // property would overwrite the first in the object literal, silently
-            // dropping kms:ViaService and widening this grant to any KMS caller.
-            //
-            // Scoped by a resource TAG on the key, not by excluding this account.
-            // The spill key prefix is not expressible here — S3 Bucket Keys put the
-            // BUCKET arn in kms:EncryptionContext, not the object's — so a tag is
-            // the only per-resource handle KMS offers, and it is a better one than
-            // an account exclusion in both directions: it stops this reaching
-            // Orion's own keys, AND it stops it reaching arbitrary FOREIGN keys,
-            // which an exclusion left wide open.
-            //
-            // This is why SSE-KMS on a connector's spill bucket is REQUIRED rather
-            // than one shape among several. The SDK already encrypts spilled content
-            // with its own ephemeral AES-GCM key, so bucket encryption is not what
-            // protects the data — mandating it is what puts a kms:Decrypt check on
-            // EVERY spilled read. Without the mandate the check is skipped for the
-            // common case (SSE-S3, or no bucket encryption) and spill authorization
-            // rests on the key prefix alone; with it, a bucket Athena was induced to
-            // read from fails closed unless its key was deliberately tagged.
-            //
-            // Spans every account including this one, which is what lets a connector
-            // deployed alongside Orion spill at all — the previous exclusion made
-            // that impossible.
-            //
-            // Cannot regress the managed-JDBC path: Orion's own spill bucket is
-            // S3_MANAGED, so it never calls KMS.
+            // Both keys live in ONE StringEquals object: a second `StringEquals` property would
+            // overwrite the first, dropping kms:ViaService and widening this grant to any KMS caller.
+            // Scoped by a resource tag on the key: S3 Bucket Keys put the bucket ARN, not the
+            // object ARN, in kms:EncryptionContext, so the spill key prefix is not expressible here.
+            // The managed-JDBC path is unaffected: its spill bucket is S3_MANAGED and never calls KMS.
             StringEquals: {
               "kms:ViaService": `s3.${region}.amazonaws.com`,
               [`aws:ResourceTag/${CONNECTOR_SPILL_KMS_TAG_KEY}`]:
                 CONNECTOR_SPILL_KMS_TAG_VALUE,
             },
           },
-        }),
-      );
-
-      // Lake Formation — data access vending for federated catalog queries.
-      // lakeformation:GetDataAccess does not support resource-level restrictions.
-      runtime.addToRolePolicy(
-        new iam.PolicyStatement({
-          actions: ["lakeformation:GetDataAccess"],
-          resources: ["*"],
         }),
       );
 

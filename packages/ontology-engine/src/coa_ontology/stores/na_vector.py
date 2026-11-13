@@ -23,12 +23,7 @@ class NeptuneAnalyticsVectorStore(VectorStore):
     """Vector upsert + k-NN search against the NA native vector index."""
 
     def __init__(self, namespace: str | None = None):
-        """Bind the store to a namespace and the NA vector dimension.
-
-        Args:
-            namespace: Default namespace for reads/writes; a per-call
-                namespace overrides it.
-        """
+        """Bind the store to a namespace and the NA vector dimension."""
         self.dimensions = na_store.VSS_DIMENSION
         self._namespace = namespace
 
@@ -38,15 +33,7 @@ class NeptuneAnalyticsVectorStore(VectorStore):
 
     # Writes -----------------------------------------------------------
     def store_embedding(self, data):
-        """Upsert a single embedding node into the NA vector index.
-
-        Args:
-            data: Embedding fields; a ``namespace`` key overrides the bound one.
-
-        Returns:
-            The na_store store result.
-        """
-        # Pull namespace from data, call-site, or bound (in that order)
+        """Upsert a single embedding node into the NA vector index."""
         ns = data.get("namespace") or self._namespace
         return na_store.store_embedding(data, namespace=ns)
 
@@ -60,7 +47,6 @@ class NeptuneAnalyticsVectorStore(VectorStore):
         Returns:
             The na_store batch-store result.
         """
-        # Inject bound namespace into items that don't already specify one
         if self._namespace:
             items = [({**it, "namespace": it.get("namespace") or self._namespace}) for it in items]
         return na_store.store_embeddings_batch(items, namespace=self._namespace)

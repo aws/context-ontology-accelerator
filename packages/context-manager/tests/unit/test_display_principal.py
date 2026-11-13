@@ -75,14 +75,8 @@ class TestEmailReachesTheProfile:
 
 
 class TestNoRawSubReachesTheUI:
-    """Drift guard: the bug was five call sites that each re-derived the label.
-
-    Asserting the behaviour of one helper does not stop a new tier from writing
-    ``profile.get("userId")`` into user-facing metadata again — that is exactly
-    how Tier 3 ended up on the raw sub while Tier 1 and 2 were fixed. This walks
-    the AST of every serve module and fails on a ``principal`` value that is not
-    a ``display_principal(...)`` call.
-    """
+    """Drift guard: walks the AST of every serve module and fails on a ``principal``
+    value that is not a ``display_principal(...)`` call."""
 
     _ALLOWED_NAMES = {"principal_label", "principal_id"}
 

@@ -49,15 +49,7 @@ _TENANT_ID_HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 
 
 class NeptuneDatabaseLexicalStore:
-    """LexicalGraphStore backed by a Neptune DB cluster (openCypher via neptunedata API).
-
-    Args:
-        endpoint: Neptune DB cluster endpoint.
-        port: Neptune port (default 8182).
-        region: AWS region for SigV4 signing.
-        tenant_id: Tenant ID suffix for multi-tenant label scoping (e.g. "389030abe759468eb64ae200f").
-            Must be hex-only or empty; non-hex input raises ``ValueError``.
-    """
+    """LexicalGraphStore backed by a Neptune DB cluster (openCypher via neptunedata API)."""
 
     def __init__(self, endpoint: str, port: int = 8182, region: str = "us-east-1", tenant_id: str = "") -> None:
         """Set up the neptunedata openCypher client for the given Neptune DB cluster.
@@ -115,8 +107,6 @@ class NeptuneDatabaseLexicalStore:
                 ) from e
 
         raise RuntimeError(f"Neptune DB query failed after {_MAX_RETRIES} attempts")
-
-    # ── Protocol implementation ─────────────────────────────────────────
 
     def get_class_nodes(self) -> list[ClassRecord]:
         """Return all class nodes with their occurrence counts, most frequent first.

@@ -162,7 +162,7 @@ def check_backends() -> bool:
     except Exception as e:
         console.print("[red]✗[/]")
         console.print(f"  [red]Bedrock error: {e}[/]")
-        console.print("  [yellow]Check AWS credentials (ada credentials update) and region.[/]")
+        console.print("  [yellow]Check AWS credentials and region.[/]")
         return False
 
 
@@ -598,10 +598,6 @@ def generate_property_embeddings(registered: list[dict]):
         curated = cfg.get("sample_properties", [])
         auto_extracted = item.get("extracted_properties", []) or []
 
-        # Normalize auto-extracted props to the same shape as config's
-        # sample_properties: {property_uri, labels, comments, domain, range}
-        # (Engine already emits this shape via PropertyExtract.)
-
         # Merge: curated wins over auto-extracted for the same URI, so
         # hand-written entries in config.yaml can override an auto-extract.
         by_uri: dict[str, dict] = {}
@@ -647,16 +643,6 @@ def generate_property_embeddings(registered: list[dict]):
 # ── Step 5 — Structural embeddings (not yet supported) ───────────
 
 
-def generate_structural_embeddings(registered: list[dict]):
-    console.rule("[bold cyan]Step 5 · Structural Embeddings (skipped)")
-    console.print(
-        "  [yellow]Structural (RDF2Vec) embeddings aren't yet wired through the "
-        "consolidated engine's embedding API. Lexical matching works end-to-end; "
-        "structural fusion will light up in a future MR.[/]"
-    )
-    console.print()
-
-
 # ── main ─────────────────────────────────────────────────────────
 
 
@@ -688,7 +674,6 @@ def main():
     registered = load_ontologies(config)
     generate_embeddings(registered)
     generate_property_embeddings(registered)
-    generate_structural_embeddings(registered)
 
     elapsed = time.perf_counter() - t0
     console.rule("[bold green]Setup Complete")

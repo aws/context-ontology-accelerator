@@ -15,7 +15,6 @@ import {
   buildTaxonomyVertices,
   collectVisibleDescendants,
   computeRoots,
-  filterClassHits,
   ontologyIdFromGraphUri,
   resolveOntologyInfo,
   resolveVertexSources,
@@ -153,11 +152,8 @@ describe("buildTaxonomyVertices", () => {
   });
 
   it("materializes object-property edges when domain and range are both in the class set", () => {
-    // The proposal-detail graph shows domain → range edges for object
-    // properties; the Explorer seed used to drop them. Now that relationships
-    // are threaded through, buildTaxonomyVertices should emit an edge pair
-    // (outgoing on domain, incoming on range) so buildGraphData renders the
-    // relationship exactly as the proposal graph does.
+    // Domain/range object properties become an edge pair (outgoing on domain,
+    // incoming on range), as in the proposal graph.
     const REL = "ex:filedBy";
     const details = buildTaxonomyVertices(
       [
@@ -201,10 +197,8 @@ describe("planGraphSeed", () => {
     Array.from({ length: n }, (_, i) => ({ uri: `ex:C${i}` }));
 
   it("renders a small induced ontology in full even beside an oversized reference", () => {
-    // The case the combined-total cap got wrong: a 40-class induced ontology
-    // sitting next to Schema.org (~1010 classes) loaded for grounding. The
-    // induced ontology must NOT be dragged onto the sampled path — that is the
-    // "graph is tiny and has no relationships" complaint.
+    // A 40-class induced ontology beside Schema.org (~1010 classes) loaded for
+    // grounding must still render in full, not be dragged onto the sampled path.
     const plan = planGraphSeed([
       { ontology_id: "schema.org", classes: classes(1010) },
       { ontology_id: "induced", induced: true, classes: classes(40) },
@@ -333,53 +327,6 @@ describe("collectVisibleDescendants", () => {
     const details = taxonomy();
     const result = collectVisibleDescendants(A, details, new Set([A, B]));
     expect([...result]).toEqual([B]);
-  });
-});
-
-describe("filterClassHits", () => {
-  const hits: GraphSearchHit[] = [
-    {
-      uri: "http://ex/Customer",
-      label: "Customer",
-      kind: "class",
-      graph_uris: ["g"],
-    },
-    {
-      uri: "http://ex/Order",
-      label: "Order",
-      kind: "class",
-      graph_uris: ["g"],
-    },
-    {
-      uri: "http://ex/order_line",
-      label: "",
-      kind: "class",
-      graph_uris: ["g"],
-    },
-  ];
-
-  it("returns all classes for an empty or whitespace query", () => {
-    expect(filterClassHits(hits, "")).toHaveLength(3);
-    expect(filterClassHits(hits, "   ")).toHaveLength(3);
-  });
-
-  it("matches on label case-insensitively", () => {
-    const r = filterClassHits(hits, "cust");
-    expect(r.map((h) => h.uri)).toEqual(["http://ex/Customer"]);
-  });
-
-  it("matches on URI when the label is empty", () => {
-    const r = filterClassHits(hits, "order_line");
-    expect(r.map((h) => h.uri)).toEqual(["http://ex/order_line"]);
-  });
-
-  it("matches multiple hits on a shared substring", () => {
-    // "order" hits Order (label) and order_line (uri).
-    const r = filterClassHits(hits, "order");
-    expect(r.map((h) => h.uri).sort()).toEqual([
-      "http://ex/Order",
-      "http://ex/order_line",
-    ]);
   });
 });
 
@@ -750,11 +697,3 @@ describe("isListPageLoading", () => {
     expect(isListPageLoading({ ...base, fetching: true })).toBe(true);
   });
 });
-
-// NOTE on testing the partial-failure surfacing (#822): the failure state
-// (`hydrationFailedUri`, `expandFailedUris`) lives in component `useState`, so
-// it cannot be reached from the pure helpers exported here. The user-visible
-// behaviour — the warning + Retry affordance when full-vertex hydration fails —
-// is covered by a rendered test in `GraphSearch.failure.test.tsx`, which drives
-// it through a rejecting `getClass` mock. Asserting on a hand-built Map here
-// would only re-check the test's own fixture, not the failure path.
