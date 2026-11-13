@@ -66,13 +66,9 @@ class TestXXEProtection:
         assert result["class_count"] >= 1
 
     def test_internal_entities_allowed(self):
-        """Internal string entities — namespace-prefix macros used by BFO/IOF/
-        OBO OWL ontologies — must parse. They carry no SYSTEM/PUBLIC identifier,
-        so they read no files and make no network calls (not an XXE vector).
+        """Internal string entities (namespace-prefix macros in BFO/IOF/OBO) must parse.
 
-        Regression test for defuse_stdlib()'s blanket entity ban
-        rejected these (EntitiesForbidden), making real ontologies like the IOF
-        SupplyChain ontology un-ingestable.
+        They carry no SYSTEM/PUBLIC identifier, so they are not an XXE vector.
         """
         internal_entities = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE rdf:RDF [
@@ -91,12 +87,7 @@ class TestXXEProtection:
         assert result["class_count"] >= 1
 
     def test_xxe_file_disclosure_blocked(self):
-        """Verify that XXE payloads attempting file disclosure are blocked.
-
-        This payload attempts to read /etc/passwd (or /proc/self/environ in
-        containers) and inject it into an RDF triple literal. defusedxml
-        must raise an exception before entity resolution occurs.
-        """
+        """An XXE payload reading /etc/passwd is blocked before entity resolution."""
         xxe_payload = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE rdf:RDF [
   <!ENTITY xxe SYSTEM "file:///etc/passwd">
@@ -119,11 +110,7 @@ class TestXXEProtection:
         assert "Forbidden" in str(exc_info.value) or "entity" in str(exc_info.value).lower()
 
     def test_xxe_ssrf_blocked(self):
-        """Verify that XXE payloads attempting SSRF are blocked.
-
-        This payload attempts to fetch the EC2 instance metadata endpoint
-        (IMDSv1) to exfiltrate IAM credentials. defusedxml must block it.
-        """
+        """An XXE payload fetching the EC2 instance metadata endpoint (SSRF) is blocked."""
         ssrf_payload = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE rdf:RDF [
   <!ENTITY ssrf SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/">

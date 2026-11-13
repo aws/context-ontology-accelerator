@@ -5,12 +5,7 @@ The serve layer uses a three-tier resolution system. The live path is a
 answer and, if it produces no usable result, control falls through to the next.
 Two deterministic, fail-open **capability pruners** run ahead of the tiers to skip
 work that provably cannot contribute (see *Tier pruning* below); they never change
-an answer, only which tiers run.
-
-> Note: this is capability-based fall-through, **not** score-threshold tier
-> selection. Tiers are pruned only when they provably cannot contribute (see
-> *Tier pruning*); similarity score alone is a poor proxy for which tier can
-> actually answer, so it is not used to pick a tier.
+an answer, only which tiers run. Similarity score is not used to pick a tier.
 
 ## Tier Overview
 
@@ -79,9 +74,8 @@ Design notes that are easy to get wrong when touching this path:
 
 - **Not routed through `evidence`.** That parameter is labelled `<user_context>` "treat as untrusted" and truncated to 500 chars by default (the deep-reasoning `sqlWithEvidence` option raises it internally to at most 20,000 for the document evidence it adds). A governed metric is first-party and must be neither discounted by the label nor clipped by the cap, so it gets its own block, placed ahead of the untrusted one.
 - **Only a residual decline forwards a definition.** A miss, a multi-metric bypass, and a Tier-1 *execution* failure all forward `None`. `_run_tier1` returns `tuple[InvokeResponse | None, DeclinedMetricContext | None]` to make that explicit at every exit.
-- **The gate itself is unchanged by this.** It still fires on exactly the same inputs; only the fall-through carries more context.
 - **`StrategyContext` is rebuilt field-by-field in `_resolve_parallel`.** Any new field must be copied there or the parallel path silently loses what the sequential path gets. `declined_metric` is a frozen dataclass, so sharing the reference is race-free.
-- **No namespace-name special case.** The namespace's own name survives as residual like any other token (e.g. `"How many open claims does AnyCompany have?"` leaves `anycompany`). Consuming it would assume the token names the whole dataset rather than filtering it, which the gate cannot verify — it has no schema. Tier 2 does, and receives the token alongside the formula, so the decision is made where the information is. Rejected alternative, recorded so it isn't re-proposed from the diff alone.
+- **No namespace-name special case.** The namespace's own name survives as residual like any other token (e.g. `"How many open claims does AnyCompany have?"` leaves `anycompany`). Consuming it would assume the token names the whole dataset rather than filtering it, which the gate cannot verify — it has no schema. Tier 2 does, and receives the token alongside the formula, so the decision is made where the information is.
 
 The `t1.metric_match` trace step reports `governedDefinitionForwarded` (bool) alongside `unhandledQualifier` and `matchedText`, so whether the definition reached Tier 2 is answerable from the trace without reading Tier-2's prompt.
 
@@ -126,9 +120,9 @@ Both fail **open** — any uncertainty runs the tier.
 
 Tier 3 supports two retrieval strategies, selected via the `TIER3_STRATEGY` environment variable:
 
-- **`lexical-baseline`** (default): Uses the graphrag-toolkit's built-in retrievers against the lexical knowledge graph that `kg-build` produces — the same graph the unstructured document ingestion pipeline writes to. The deployment-default sub-strategy is `topic_beam` (strongest single-shot on the SEC-10-Q benchmark: 45.13% strict vs 34.36% for hand-rolled, 195 questions). The published ontology graph (`urn:coa:{namespace}:published`) is not consulted — this strategy serves as the baseline against which future ontology-aware retrieval will be measured.
+- **`lexical-baseline`** (default): Uses the graphrag-toolkit's built-in retrievers against the lexical knowledge graph that `kg-build` produces — the same graph the unstructured document ingestion pipeline writes to. The deployment-default sub-strategy is `topic_beam` (strongest single-shot on the SEC-10-Q benchmark: 45.13% strict vs 34.36% for hand-rolled, 195 questions). The published ontology graph (`urn:coa:{namespace}:published`) is not consulted.
 
-- **`hand-rolled`**: Uses VectorRetriever (OpenSearch k-NN on `chunk_{ns}` index) + GraphTraverser (Neptune SPARQL 1-2 hop traversal). The original implementation, now selectable via `TIER3_STRATEGY=hand-rolled`.
+- **`hand-rolled`**: Uses VectorRetriever (OpenSearch k-NN on `chunk_{ns}` index) + GraphTraverser (Neptune SPARQL 1-2 hop traversal).
 
 ### Selectable graphrag retriever strategy
 
@@ -138,7 +132,7 @@ The graphrag retrieval approach is selectable from a named set (single source of
 |----------|---------------|-------|
 | `topic_beam` | `for_semantic_guided_search` | **The `lexical-baseline` deployment default** (`LEXICAL_RETRIEVER_STRATEGY`). Strongest single-shot on the SEC-10-Q benchmark. |
 | `chunk_based_semantic` | `for_traversal_based_search` | Fast traversal-based search; the safety fallback when an invalid strategy is configured. |
-| `traversal` | `for_traversal_based_search` | The previously-hardcoded weighted set (ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5). |
+| `traversal` | `for_traversal_based_search` | A weighted set (ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5). |
 
 The lexical retriever is built on every deployment (when the Neptune + OpenSearch endpoints are set), so a request can engage graphrag **on-demand** by passing `options.retrieverStrategy`, regardless of `TIER3_STRATEGY`. The strategy is resolved once per request with precedence **request > deployment default**:
 

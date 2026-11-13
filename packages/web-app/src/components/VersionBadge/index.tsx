@@ -10,15 +10,12 @@ import { RuntimeConfigContext } from "../RuntimeContext";
  * which CDK writes from the repo-root VERSION file at deploy time — so the badge
  * always reflects what is actually deployed, with no rebuild.
  *
- * Renders nothing when the version is absent (older config, or local dev before
- * `fetch-runtime-config.sh` has run) so it never shows a broken `v`.
+ * Renders nothing when the version is absent or blank, so it never shows a
+ * broken `v`.
  * `pointer-events: none` keeps it from intercepting clicks on the nav beneath it.
  */
 export const VersionBadge: React.FC = () => {
   const runtime = useContext(RuntimeConfigContext);
-  // Trim so a hand-edited runtime-config.json with a whitespace-only version
-  // renders nothing rather than a bare "v". readRepoVersion already trims on the
-  // deploy path; this guards the local-dev/manual path too.
   const version = runtime?.version?.trim();
   if (!version) return null;
 

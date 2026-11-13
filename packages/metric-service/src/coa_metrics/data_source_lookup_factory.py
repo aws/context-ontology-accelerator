@@ -33,7 +33,7 @@ logger = structlog.get_logger(__name__)
 def _resolve_project_id(namespace_id: str, namespaces_table: str, region: str) -> str | None:
     """Resolve the DataZone project ID for a namespace.
 
-    Uses DynamoDBDAO from common library. A missing row or project ID is a
+    A missing row or project ID is a
     legitimate unprovisioned namespace and returns None. DynamoDB failures
     propagate so callers can distinguish an outage from that state.
     """

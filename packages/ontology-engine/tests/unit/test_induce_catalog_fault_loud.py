@@ -4,17 +4,6 @@
 """Job-runner chain test: an AOSS transport fault at ``match_concepts`` must
 propagate through the REAL strategy all the way up to ``_run_induction``, which
 then marks the job FAILED and persists NO proposal.
-
-The unit tests (``test_column_match_correctness.py``,
-``test_inducer.py``) prove each link re-raises in isolation. This closes the
-seam at the top: it drives the real ``_run_induction`` with the real
-``TableToOntologyStrategy`` (``get_strategy`` is NOT mocked), injecting the raise
-only at the fake pipeline's ``match_concepts`` seam. The anti-corruption half is
-``create_proposal.assert_not_called()`` — a swallowed error would silently
-persist an all-novel (corrupt) proposal instead.
-
-Mirrors the drive pattern in ``test_induce_catalog_cost_metrics.py`` and the
-transport/non-transport parametrization in ``test_column_match_correctness.py``.
 """
 
 from __future__ import annotations
@@ -138,15 +127,6 @@ def test_grounding_rerank_failure_fails_job_loud_and_persists_no_proposal() -> N
     INFRASTRUCTURE failure — Bedrock error after retries, a truncating/blocked
     stopReason, or unparseable output) propagates through the real strategy to
     ``_run_induction``, which marks the job FAILED and creates NO proposal.
-
-    This is the end-to-end regression guard for the enhanced-grounding defect
-    (issue #59): a rerank failure used to be swallowed into a silent all-novel
-    proposal with a COMPLETED status. It exercises the load-bearing
-    ``except GroundingRerankError: raise`` branch in the strategy — distinct from
-    the transport branch above (GroundingRerankError is NOT an OpenSearch/httpx
-    error) and ahead of the broad ``except Exception`` all-novel fallback. Test A
-    (``test_rerank_converse_error_fails_loud_not_novel``) proves the real
-    ``_llm_rerank`` body RAISES this; this proves the raise reaches a FAILED job.
     """
     from coa_ontology.induce_catalog import (
         WorkbenchInductionRequest,

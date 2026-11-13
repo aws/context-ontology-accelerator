@@ -5,12 +5,8 @@
 
 Enumerates installed distributions via ``importlib.metadata`` and normalizes each
 one's declared license into a canonical SPDX-ish token. The inventory backs the
-root NOTICE (ORR PAK-A-3): every redistributed third-party component is listed
-with its version and normalized license.
-
-Pure functions (``normalize_license``) are unit-tested; the ``importlib.metadata``
-enumeration is isolated in ``iter_installed`` so tests can inject synthetic
-distributions.
+root NOTICE: every redistributed third-party component is listed with its
+version and normalized license.
 """
 
 from __future__ import annotations
@@ -125,7 +121,6 @@ def normalize_license(raw: str | None, classifiers: Iterable[str] = ()) -> str:
     ``License`` field), then falls back to alias-matching the raw string. Returns
     ``UNKNOWN`` when nothing matches.
     """
-    # 1. Trove classifiers are the most reliable signal.
     for c in classifiers:
         if "License ::" not in c:
             continue
@@ -134,7 +129,6 @@ def normalize_license(raw: str | None, classifiers: Iterable[str] = ()) -> str:
         if token != UNKNOWN:
             return token
 
-    # 2. Free-text License field.
     if raw:
         raw_stripped = raw.strip()
         # Exact SPDX token (e.g. "Apache-2.0", "MIT") — accept verbatim, canonical-cased.

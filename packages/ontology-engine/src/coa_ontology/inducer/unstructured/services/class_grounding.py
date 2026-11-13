@@ -35,8 +35,8 @@ Design notes:
   that class is left un-grounded (novel), never failing the whole run. But a
   ``GroundingRerankError`` (LLM rerank infrastructure failure — Bedrock error
   after retries, truncated/blocked stopReason, unparseable output) is re-raised
-  so the job fails loud instead of silently grounding every class novel — the
-  documented fail-loud guarantee (issue #59), matching the structured path. A
+  so the job fails loud instead of silently grounding every class novel,
+  matching the structured path. A
   ``GroundingLookupError`` (the lexical metadata listing failed or exceeded a
   bound) is re-raised for the same reason.
 - **No-op when disabled.** Empty/None ``ontology_ids`` or a ``None`` service
@@ -225,13 +225,8 @@ def ground_classes(
                 exclude_entity_uri=item.class_iri,
             )
         except GroundingRerankError:
-            # NOT an abstention: an LLM rerank infrastructure failure (Bedrock
-            # error after retries, truncated/blocked stopReason, or unparseable
-            # output). Re-raise so the induction job fails loud instead of
-            # silently leaving every class novel — the enhanced-grounding defect
-            # (issue #59). The broad handler below would otherwise swallow it,
-            # which is exactly the silent all-novel degradation the documented
-            # fail-loud guarantee forbids. Must precede the broad except.
+            # Rerank infrastructure failure, not an abstention. Must precede
+            # the broad except.
             raise
         except GroundingLookupError:
             # The lexical metadata listing failed or exceeded a bound, so the
@@ -283,12 +278,6 @@ def ground_classes(
     return g, grounded, matches
 
 
-# ── Grounding-axiom emission (shared by initial induction + override save) ──
-
-# The complete set of class→foundational grounding predicates this module
-# emits. Used both to WRITE axioms and to REMOVE the prior ones before a
-# steward's override re-writes them (so an override is a clean replace, never
-# an append that leaves a stale mapping behind).
 # Every class→foundational grounding predicate this module may emit. Used by
 # apply_overrides_to_turtle to strip prior grounding before re-emitting. MUST
 # include every SKOS relationship _emit_grounding_axioms can produce (incl.
@@ -360,9 +349,7 @@ def _emit_grounding_axioms(
     Returns True when a grounding link was asserted (i.e. the class counts as
     grounded), False for novel.
     """
-    # #2 defensive guard: never ground a class to ITSELF, even if recall
-    # exclusion was bypassed (belt-and-suspenders to the exclude_entity_uri
-    # filter in GroundingService).
+    # Never ground a class to itself, even if recall exclusion was bypassed.
     if str(class_uri).rstrip("/") == str(target).rstrip("/"):
         return False
 

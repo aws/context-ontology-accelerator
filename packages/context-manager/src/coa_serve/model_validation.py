@@ -1,10 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-request model ID validation for LLM override.
-
-Extracted to a lightweight module to avoid heavy import chains in tests.
-"""
+"""Per-request model ID validation for LLM override."""
 
 from __future__ import annotations
 

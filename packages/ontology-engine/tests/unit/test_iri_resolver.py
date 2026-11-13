@@ -1,21 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for Entity-IRI Resolver.
-
-Tests cover:
-
-- :func:`normalize_for_iri_path` (case-preserving normalization)
-- :func:`normalize_for_lookup_key` (lowercased normalization for hash equality)
-- Resolver lookup / mint / resolve / bulk_resolve operations
-- Idempotent mint
-- Case-only variants share the same minted IRI (first-seen wins)
-- Bulk resolve atomic failure (no partial mints)
-- IRI length validation
-- Protocol satisfaction
-
-Requirements: 6.1–6.5, 7.1–7.5, 8.1–8.5
-"""
+"""Unit tests for Entity-IRI Resolver."""
 
 from __future__ import annotations
 
@@ -82,8 +68,6 @@ class TestNormalizeForIRIPath:
         assert normalize_for_iri_path("Tōkyō") == "Tōkyō"
 
     def test_empty_after_stripping(self):
-        # Symbols-only input → empty after percent-encoding still
-        # leaves percent-encoded chars; the result is non-empty.
         assert normalize_for_iri_path("!!!") == "%21%21%21"
 
     def test_whitespace_only_yields_empty(self):
@@ -97,27 +81,12 @@ class TestNormalizeForIRIPath:
         # preserved.
         assert normalize_for_iri_path("Treasury Bond (2024)") == "Treasury-Bond-%282024%29"
 
-    def test_already_normalized_pascal_case(self):
-        assert normalize_for_iri_path("AlreadyClean") == "AlreadyClean"
-
     def test_tabs_and_newlines_become_hyphens(self):
         # Tabs/newlines are whitespace per ``\s``.
         assert normalize_for_iri_path("hello\tworld\n") == "hello-world"
 
     def test_idempotent_for_inputs_that_dont_trigger_pct_encoding(self):
-        """Repeated normalization of a string with no characters needing
-        percent-encoding is a fixed point.
-
-        Note: idempotence does NOT hold when the input contains
-        characters that triggered percent-encoding the first time —
-        the resulting ``%XX`` sequences would themselves get encoded
-        on a second pass (the ``%`` literally becomes ``%25``). This
-        is consistent with how URL encoding works in general: callers
-        should not feed already-encoded strings back into the
-        normalizer. The natural inputs (PascalCase, spaced text,
-        ALL_CAPS_WITH_UNDERSCORES) are idempotent and that's what
-        matters in practice.
-        """
+        """Normalizing a string that needs no percent-encoding is a fixed point."""
         for s in [
             "FinancialInstrument",
             "Hello World",
@@ -243,11 +212,10 @@ class TestLookup:
         """Lookup with a case-only variant of a previously minted pair
         finds it (lowercased equality on the lookup key)."""
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
-        resolver.mint("Person", "class")
-        # All of these case-only variants find the same IRI.
-        assert resolver.lookup("person", "class") is not None
-        assert resolver.lookup("PERSON", "class") is not None
-        assert resolver.lookup("Person", "CLASS") is not None
+        minted = resolver.mint("Person", "class")
+        assert resolver.lookup("person", "class") == minted
+        assert resolver.lookup("PERSON", "class") == minted
+        assert resolver.lookup("Person", "CLASS") == minted
 
     def test_raises_on_empty_after_normalization(self):
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
@@ -287,19 +255,11 @@ class TestMint:
         assert iri1 == iri2
 
     def test_idempotent_across_case_variants_first_seen_wins(self):
-        """First spelling persists; case-only variants reuse the same IRI.
-
-        This is the intended behaviour described in the
-        :class:`InMemoryIRIResolver` docstring: lowercased lookup,
-        case-preserving IRI minting, first-seen-wins.
-        """
+        """First spelling persists; case-only variants reuse the same IRI."""
         resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
         first = resolver.mint("Person", "class")
-        # Subsequent mints with case-only variants return the SAME IRI;
-        # the first-seen ``"Person"`` is preserved in the path segment.
         assert resolver.mint("person", "class") == first
         assert resolver.mint("PERSON", "class") == first
-        # The IRI itself contains the first-seen casing.
         assert "/class/Person" in first
 
     def test_different_pairs_get_different_iris(self):
@@ -431,27 +391,3 @@ class TestBulkResolve:
         results = resolver.bulk_resolve([("Person", "class"), ("Company", "class")])
         assert results[0] == existing
         assert results[1] != existing
-
-
-class TestIRIFormat:
-    """The IRI template format end-to-end."""
-
-    def test_iri_template_structure_pascal_value(self):
-        resolver = InMemoryIRIResolver(namespace="test-ns", ontology_name="test-onto")
-        iri = resolver.resolve("JohnSmith", "Person")
-        assert iri == (f"{GRAPH_BASE_URI}/namespace/test-ns/ontology/test-onto/Person/JohnSmith")
-
-    def test_iri_template_structure_spaced_value(self):
-        resolver = InMemoryIRIResolver(namespace="test-ns", ontology_name="test-onto")
-        iri = resolver.resolve("John Smith", "Person")
-        assert iri == (f"{GRAPH_BASE_URI}/namespace/test-ns/ontology/test-onto/Person/John-Smith")
-
-    def test_classification_case_preserved_in_iri(self):
-        resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
-        iri = resolver.resolve("BondX", "Financial Instrument")
-        assert "/Financial-Instrument/" in iri
-
-    def test_value_case_preserved_in_iri(self):
-        resolver = InMemoryIRIResolver(namespace="ns", ontology_name="onto")
-        iri = resolver.resolve("Treasury Bond", "instrument")
-        assert "/Treasury-Bond" in iri

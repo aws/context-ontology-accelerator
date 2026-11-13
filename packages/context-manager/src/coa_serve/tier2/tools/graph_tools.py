@@ -21,7 +21,7 @@ name the agent chose, called when the agent decides to), while
 retrieval already returned and fires unconditionally — the flat NL→SQL path has
 no agent to call a tool.
 
-Structure of the deployed graph (verified against the reingested Spider 2.0 graph):
+Structure of the deployed graph:
 
   * table  → ``:Db_Table a owl:Class ; rdfs:label "table"``
   * column → ``:db_table_col a owl:DatatypeProperty ; rdfs:domain :Db_Table``
@@ -36,7 +36,7 @@ request-scoped tool), so hop count, node-type filtering, ordering and truncation
 are exact and cheap; recursive SPARQL over reified domain/range property nodes
 would be both awkward and unbounded.
 
-Labels (namespace-language LLD §2.2.5). A table or column class can carry an
+Labels. A table or column class can carry an
 untagged physical-name label and, from a trusted artifact or a later induction,
 tagged labels too. ``table`` / ``column`` stay the PHYSICAL identifier the SQL
 writer executes against — the untagged label when there is one, chosen the same
@@ -44,15 +44,6 @@ way on every request — and are never replaced by a display label. When the
 namespace-language preference picks a different label it is added alongside as
 ``table_label`` / ``column_label``. Grouping is by IRI, so a table with several
 labels is still one node, and a language never hides a table.
-
-Every query here is bound to the namespace's named graphs, which a cheap probe
-resolves once per request (:meth:`OntologyGraphTool._resolve_graph_iris`). The
-scoping matters for cost, not just correctness — see
-:func:`~coa_serve.query_utils.graph_scoped_body`.
-
-Like the other tools here this is transport-agnostic: :class:`OntologyGraphTool`
-is a plain async capability, so the in-process agent and any future MCP tool or
-HTTP route call the same code.
 """
 
 from __future__ import annotations
@@ -88,11 +79,8 @@ logger = structlog.get_logger(__name__)
 _SAFE_URI_RE = re.compile(r"^https?://[^\s<>\"{}|\\^`;]+$|^urn:[a-zA-Z0-9][a-zA-Z0-9._:-]*$")
 
 # Gate on a seed passed as a bare table name (the fallback when no IRI is known).
-# DENY-list, not an allow-list: an earlier ``^[a-z0-9][a-z0-9_ .-]{0,127}$`` allowed
-# only Latin, so a table labelled 会員 or 회원 failed validation and traversal
-# reported "seed table not found" — a silent no-op on any non-Latin schema. What
-# actually has to be excluded is the characters that could break out of a SPARQL
-# string literal, plus control characters; everything else is a legitimate label.
+# A deny-list of characters that could break out of a SPARQL string literal, plus
+# control characters, so non-Latin labels pass.
 _UNSAFE_LABEL_CHARS = frozenset('"\\<>{}')
 _MAX_LABEL_CHARS = 128
 
@@ -166,8 +154,6 @@ class OntologyGraphTool:
         """True when a named-graph URI template is configured (else traversal is a no-op)."""
         return bool(self._graph_uri_template)
 
-    # ── SPARQL loaders ──────────────────────────────────────────────────────
-
     async def _query(self, sparql: str, *, what: str) -> list[dict[str, str]]:
         """Run a bounded SPARQL query, logging a timeout distinctly from other failures.
 
@@ -220,16 +206,9 @@ class OntologyGraphTool:
         """Load every FK object-property (domain/range table + labels + comment)."""
         if self._fk_edges is not None:
             return self._fk_edges
-        # SHARED with the Tier-2 T-Box context builder — same edges, one definition
-        # (``query_utils.object_properties_sparql``). Differences from that caller are
-        # arguments, not a different query: no mapped-gate (traversal may cross into a
-        # class Ontop cannot resolve, since it returns facts rather than authoring
-        # SQL), a higher limit, ``?comment`` for the FK provenance string, and the
-        # resolved named graphs (the T-Box builder now resolves them too, so both
-        # callers are on the scoped form). NOT anchored on ``domain_iris``: this
-        # caller wants the whole FK graph to walk, so it is unaffected by the
-        # one-sided ?domain narrowing described in ``object_properties_sparql``.
-        # The SQL backend gate keeps a graph source's classes (answered by SPARQL only) out of the walk.
+        # Shared with the Tier-2 T-Box builder (``query_utils.object_properties_sparql``).
+        # No mapped-gate: traversal returns facts rather than authoring SQL. The SQL
+        # backend gate keeps a graph source's classes (answered by SPARQL only) out of the walk.
         graphs = await self._resolve_graph_iris(prefix)
         sparql = object_properties_sparql(
             prefix,
@@ -248,15 +227,7 @@ class OntologyGraphTool:
         return rows
 
     async def _load_columns(self, prefix: str, class_iris: list[str]) -> dict[str, list[dict[str, str]]]:
-        """Load datatype-property columns for the given (already-safe) class IRIs.
-
-        NOT shared with ``ontop/tbox_context._fetch_class_context``, which reads the
-        same datatype properties: that one is a multi-branch UNION over class-driven
-        and property-driven patterns and also pulls ``coa:distinctValues`` and parent
-        classes, while this is a flat ``VALUES ?class`` lookup of column + label +
-        range. A common builder would have to carry both shapes, so they are kept
-        apart deliberately — unlike the FK query above, which really was a copy.
-        """
+        """Load datatype-property columns for the given (already-safe) class IRIs."""
         safe = [u for u in class_iris if _SAFE_URI_RE.match(u)]
         if not safe:
             return {}
@@ -274,7 +245,7 @@ class OntologyGraphTool:
         }}"""
         rows = await self._query(sparql, what="columns")
         # One entry per (class, column) however many labels/comments the column
-        # carries; first-seen order is kept so a single-label graph reads as before.
+        # carries, in first-seen order.
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for r in rows:
             cls = r.get("class", "")
@@ -352,8 +323,6 @@ class OntologyGraphTool:
                 return iri
         return ""
 
-    # ── traversal ────────────────────────────────────────────────────────────
-
     async def expand_from(
         self,
         seed_iris: list[str],
@@ -363,23 +332,15 @@ class OntologyGraphTool:
     ) -> list[dict[str, Any]]:
         """Tables an FK walk reaches from an ALREADY-CHOSEN set of classes.
 
-        The flat-arm analogue of :meth:`explore_graph`. There is no agent to seed
-        a walk on the flat NL→SQL path, so the seeds are the classes vector retrieval
-        already returned, and the result is the ranked, *schema-bearing* set of
-        tables one to ``hops`` FK hops beyond them. This is the only way that path
-        can reach a table similarity did not rank in its top-k: it retrieves **once**
-        and has no tools — its 2-shot ``correct()`` re-generates on an execution
-        error but never re-retrieves — so a join table whose name and description
-        look nothing like the question is otherwise unreachable.
+        The flat-arm analogue of :meth:`explore_graph`: the seeds are the classes
+        vector retrieval already returned, and the result is the ranked,
+        *schema-bearing* set of tables one to ``hops`` FK hops beyond them, so the
+        flat NL→SQL path can reach a table similarity did not rank.
 
-        Seeds are class IRIs, never labels. 77 of the pooled Spider 2.0 namespace's
-        412 classes share a bare label, so seeding by name walks out of the wrong
-        database and returns a plausible schema for tables that cannot be joined. A
-        seed IRI absent from the graph simply reaches nothing.
-
-        The seeds themselves are excluded: the caller already holds their retrieved
-        text, which is richer than what the graph can rebuild (it carries the sampled
-        allowed-values block; see :func:`_schema_text`).
+        Seeds are class IRIs, never labels: many classes share a bare label, so
+        seeding by name can walk out of the wrong database. A seed IRI absent from
+        the graph reaches nothing. The seeds themselves are excluded, since the
+        caller already holds their richer retrieved text (see :func:`_schema_text`).
 
         Args:
             seed_iris: Class IRIs to walk out from; unsafe ones are dropped.
@@ -390,10 +351,9 @@ class OntologyGraphTool:
         Returns:
             One dict per reached table (``iri``, ``table``, ``hop``, ``direction``,
             ``via``, ``schema``), nearest hop first then by label. ``[]`` for every
-            degenerate case — no graph template, no safe seed, nothing reached — so a
-            walk that finds nothing leaves the caller's prompt byte-identical to
-            baseline. Load failures propagate: the caller decides whether a slow
-            graph should degrade or fail the query.
+            degenerate case — no graph template, no safe seed, nothing reached.
+            Load failures propagate: the caller decides whether a slow graph should
+            degrade or fail the query.
         """
         validate_namespace(self._namespace)
         if not self._graph_uri_template:
@@ -471,11 +431,6 @@ class OntologyGraphTool:
             return {"error": "graph traversal unavailable (GRAPH_URI_TEMPLATE unset)"}
 
         seed = str(table_name).strip().lower()
-        # Clamp into range: the caller's value wins, the bounds only stop a
-        # pathological one (0, negative, 999). MAX_HOPS / MAX_NODE_LIMIT are the
-        # ceilings; the 1s are floors, NOT defaults — the defaults are in the
-        # signature (hops=1, limit=DEFAULT_NODE_LIMIT) and the caller may ask for
-        # up to MAX_HOPS on any call.
         hops = max(1, min(int(hops), MAX_HOPS))
         limit = max(1, min(int(limit), MAX_NODE_LIMIT))
         types = _normalize_node_types(node_types)
@@ -554,17 +509,11 @@ def _normalize_node_types(node_types: list[str] | None) -> tuple[str, ...]:
 def _schema_text(label: str, cols: list[dict[str, str]], display_label: str = "") -> str:
     """One table as the ``"Table: … | Columns: …"`` line the SQL writer reads.
 
-    Deliberately the same shape as the class text the ingest pipeline stores in the
-    vector index, so a table a walk found can be handed to the writer through the
-    existing context builder instead of a second code path. The ontology supplies
-    the column name, its XSD type and the ingest-time description; what it cannot
-    supply is the sampled allowed-values block, so a walk-derived schema is thinner
-    than a retrieved one — which is why the caller never overwrites a retrieved one.
-
-    ``label`` and each column's ``column`` are the physical identifiers the writer
-    must use. A namespace-language display label that differs is appended as a
-    hint (``(label: …)`` / ``[label: …]``); when there is none the line is exactly
-    what it was before labels were ranked.
+    The same shape as the class text the ingest pipeline stores in the vector
+    index, minus the sampled allowed-values block. ``label`` and each column's
+    ``column`` are the physical identifiers the writer must use; a differing
+    namespace-language display label is appended as a hint (``(label: …)`` /
+    ``[label: …]``).
     """
     head = f"Table: {label}"
     if display_label and display_label != label:

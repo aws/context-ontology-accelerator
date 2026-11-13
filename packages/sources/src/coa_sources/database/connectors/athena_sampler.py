@@ -58,21 +58,16 @@ def _int_env(name: str, default: int) -> int:
 
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-# Max Athena queries in flight at once across the whole discovery. Sampling is
-# I/O-bound (blocking boto3 submit + 1s poll-waits per query); boto3 has no
-# native async, so we fan out with a ThreadPoolExecutor — the GIL releases
-# during the socket wait, so threads overlap the poll-waits (the entire win).
-# Athena enforces a per-account concurrent-DML limit (default ~20-25), and each
-# thread holds one column across BOTH of its queries, so this cap bounds total
-# concurrent queries.
+# Max Athena queries in flight across the whole discovery. Athena enforces a
+# per-account concurrent-DML limit (default ~20-25), and each thread holds one
+# column across both of its queries, so this cap bounds total concurrent queries.
 # ponytail: fixed cap tuned under the default Athena DML limit; raise the env
 # var if the account has a higher concurrent-query quota.
 ATHENA_SAMPLING_CONCURRENCY = _int_env("ATHENA_SAMPLING_CONCURRENCY", 16)
 
 # String/categorical types worth sampling (Glue/Trino type names). Numeric,
 # temporal, and binary columns are excluded — their values are not useful enum
-# hints and are more likely high-cardinality/PII. Mirrors
-# JdbcConnector._SAMPLEABLE_TYPE_PREFIXES.
+# hints and are more likely high-cardinality/PII.
 _SAMPLEABLE_TYPE_PREFIXES = ("char", "varchar", "text", "string")
 
 # Athena query settling — discovery runs in a 15-min Lambda; keep the per-query
@@ -143,7 +138,7 @@ class AthenaSampler:
     ) -> dict[str, list[str]]:
         """Sample enum-like values for one table's ``(name, data_type)`` columns.
 
-        Sync entry point (unchanged signature). Delegates to :meth:`sample_all`
+        Delegates to :meth:`sample_all`
         so the per-column sampling fans out on the shared thread pool. Returns
         ``{column_name: [values]}`` only for columns that pass the cardinality +
         repetition gate. Non-string columns are skipped up front.
@@ -216,9 +211,7 @@ class AthenaSampler:
         where = f"WHERE {q_col} IS NOT NULL AND CAST({q_col} AS VARCHAR) <> ''"
 
         # Gate query: total non-null rows + distinct count, over a capped prefix.
-        # Shares probe_gate_sql with the JDBC dialects so Glue-backed sources get
-        # the same bound as direct connections — the two paths ran the same
-        # heuristic with separately written SQL, and only one of them was bounded.
+        # Shares probe_gate_sql with the JDBC dialects so both paths get the same bound.
         rows = self._run(probe_gate_sql(q_col, q_table, where, row_cap=PROBE_MAX_ROWS))
         if not rows or not rows[0]:
             return []

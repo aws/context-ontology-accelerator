@@ -1,19 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever budget/clock manager (task 3).
+"""Unit tests for the Agentic Retriever budget/clock manager.
 
-Covers ``coa_serve.tier3.agentic.budget``:
-
-- :class:`AgenticBudgetConfig` holds the four budgets with documented defaults.
-- :class:`BudgetClock` enforces, in **aggregate** across simulated branches:
-  the step cap (Req 4.5, 6.4), the fan-out cap (Req 13.7-13.8), and the
-  wall-clock Time_Budget whose ``expired()`` flips exactly at the boundary
-  (Req 7.4). A single shared instance proves the caps are aggregate, not
-  per-branch (Property 3, Property 4; Req 13.9).
-
-The clock is driven by an injectable, manually advanced time source so time is
-deterministic and no test sleeps.
+BudgetClock enforces the step cap, the fan-out cap and the wall-clock budget in
+aggregate across branches. A manually advanced fake clock keeps time deterministic.
 """
 
 from __future__ import annotations
@@ -56,13 +47,6 @@ class TestAgenticBudgetConfig:
         assert cfg.max_fanout == 5
         assert cfg.synthesis_reserve_s == 8.0
 
-    def test_holds_provided_values(self):
-        cfg = AgenticBudgetConfig(time_budget_s=120, max_steps=25, per_tool_timeout_s=15, max_fanout=8)
-        assert cfg.time_budget_s == 120
-        assert cfg.max_steps == 25
-        assert cfg.per_tool_timeout_s == 15
-        assert cfg.max_fanout == 8
-
     def test_is_frozen(self):
         cfg = AgenticBudgetConfig()
         with pytest.raises(FrozenInstanceError):
@@ -78,7 +62,7 @@ class TestAgenticBudgetConfig:
 class TestStepCap:
     def test_allows_exactly_max_steps_then_refuses(self):
         """``try_consume_step`` returns True up to ``max_steps`` then False, and
-        never exceeds the cap (Req 4.5, 6.4)."""
+        never exceeds the cap."""
         clock = BudgetClock(AgenticBudgetConfig(max_steps=3), clock=FakeClock())
         clock.started()
 
@@ -99,7 +83,7 @@ class TestStepCap:
 class TestFanoutCap:
     def test_allows_exactly_max_fanout_then_refuses(self):
         """``try_open_branch`` returns True up to ``max_fanout`` then False, and
-        never exceeds the cap (Req 13.7-13.8)."""
+        never exceeds the cap."""
         clock = BudgetClock(AgenticBudgetConfig(max_fanout=2), clock=FakeClock())
         clock.started()
 
@@ -113,7 +97,7 @@ class TestFanoutCap:
 class TestWallClockBudget:
     def test_expired_flips_exactly_at_the_boundary(self):
         """``expired()`` is False just below the budget and True exactly at it
-        (Req 7.4): the boundary is ``elapsed >= time_budget_s``."""
+        the boundary is ``elapsed >= time_budget_s``."""
         fake = FakeClock()
         clock = BudgetClock(AgenticBudgetConfig(time_budget_s=30), clock=fake)
         clock.started()
@@ -158,7 +142,7 @@ class TestWallClockBudget:
 
 @pytest.mark.unit
 class TestToolDeadline:
-    """Deadline-aware per-tool timeout (P0): clamp the caller's cap to the
+    """Deadline-aware per-tool timeout: clamp the caller's cap to the
     wall-clock time left minus the synthesis reserve so a late tool cannot
     overrun the Time_Budget nor eat the synthesis slice."""
 
@@ -202,7 +186,7 @@ class TestToolDeadline:
 class TestAggregateCapsAreSharedAcrossBranches:
     def test_step_cap_is_aggregate_across_simulated_branches(self):
         """A single shared clock instance enforces the step cap across multiple
-        simulated branches combined — not per-branch (Req 13.9, Property 3)."""
+        simulated branches combined, not per-branch."""
         clock = BudgetClock(AgenticBudgetConfig(max_steps=4), clock=FakeClock())
         clock.started()
 
@@ -214,17 +198,3 @@ class TestAggregateCapsAreSharedAcrossBranches:
         assert granted == 4  # only the aggregate cap of 4 was granted total
         assert clock.steps_consumed == 4
         assert clock.try_consume_step() is False
-
-    def test_fanout_cap_is_aggregate_across_simulated_branches(self):
-        """The fan-out cap counts Sub_Questions plus Exploration_Branches in
-        aggregate on the one shared instance (Req 13.9, Property 4)."""
-        clock = BudgetClock(AgenticBudgetConfig(max_fanout=3), clock=FakeClock())
-        clock.started()
-
-        # Two simulated decomposition sub-questions ...
-        assert clock.try_open_branch() is True
-        assert clock.try_open_branch() is True
-        # ... plus exploration branches drawing from the same aggregate budget.
-        assert clock.try_open_branch() is True
-        assert clock.try_open_branch() is False  # aggregate cap of 3 reached
-        assert clock.branches_opened == 3

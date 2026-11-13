@@ -1,33 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever session orchestration (task 13).
-
-Covers ``coa_serve.tier3.agentic.retriever`` with a mocked
-controller, decomposer, synthesizer, and an injected (manually advanced) budget
-clock so the whole session is deterministic — no Bedrock, no tools, no graph, no
-sleeping on the wall clock:
-
-- Same result contract as ``KnowledgeRetriever`` (Req 1.4): a ``Tier3Result``
-  whose ``synthesized_answer``/``supporting_content``/``graph_context``/
-  ``confidence``/``guardrail_blocked``/``degraded_sources`` are all present.
-- Aggregate budget stop → partial (Req 7.4-7.7): the wall-clock Time_Budget
-  expiring mid-session ends the loop with unprocessed work, the terminal stop
-  reason is ``time_budget_expired``, and the result is flagged partial.
-- Queue-drained stop (Req 6.6 / session): the queue draining records a
-  ``queue_drained`` terminal stop.
-- Synthesis failure → partial, empty answer, confidence 0.0, traced (Req 8.6).
-- Guardrail block → ``guardrail_blocked`` true with the blocked content excluded
-  (Req 8.3-8.4).
-- All-tools-fail with no context → partial, no Best_Effort_Answer, no source
-  succeeded, synthesis skipped (Req 9.7); with context → partial best-effort
-  (Req 9.6).
-- ``supporting_content`` / ``graph_context`` populated from the accumulated
-  context, empty when none (Req 8.2).
-- Namespace scoping: every Sub_Question / branch loop is driven with the request
-  Namespace (Req 1.5).
-- The lazy-import invariant (Req 12.3).
-"""
+"""Unit tests for Agentic Retriever session orchestration with a fake controller, decomposer, synthesizer and clock."""
 
 from __future__ import annotations
 
@@ -47,9 +21,6 @@ from coa_serve.tier3.vector_retriever import ChunkResult
 from coa_serve.trace import TraceCollector
 
 NS = "acme"
-
-
-# ── deterministic test doubles ─────────────────────────────────────
 
 
 class FakeClockSource:
@@ -144,10 +115,7 @@ def make_retriever(
         synthesizer=synthesizer,
         budget=budget or AgenticBudgetConfig(),
         clock_source=clock_source,
-        # These tests isolate the session orchestration (decompose → loop →
-        # synthesize) with a fake controller and a stub registry; the guaranteed
-        # final semantic search needs a real registry and is covered by its own
-        # tests (TestFinalSemanticSearch), so disable it here.
+        # The final semantic search needs a real registry; TestFinalSemanticSearch covers it.
         final_semantic_search=False,
     )
 
@@ -177,9 +145,6 @@ def synth_steps(trace: TraceCollector) -> list:
     return [s for s in trace.steps if s.step == "llm_synthesize"]
 
 
-# ── guaranteed final semantic search (graph exploration + semantic) ─
-
-
 class _FinalTool:
     """Minimal Tool implementing the four-field contract, for final-search tests."""
 
@@ -200,8 +165,6 @@ class _FinalTool:
 
 
 def _final_result(chunk_id: str = "final-sem"):
-    from coa_serve.tier3.agentic.tools.base import ToolResult
-
     chunk = make_chunk(chunk_id)
     return ToolResult(
         chunks=(chunk,), items=({"type": "chunk", "chunk_id": chunk_id},), detail="chunk_based_semantic: 1 chunk"
@@ -315,10 +278,8 @@ class TestFinalSemanticSearch:
         assert result.synthesized_answer == "ans"
 
     async def test_launched_before_loop_so_budget_expiry_does_not_waste_it(self):
-        """P1: the final search is LAUNCHED before the loop and its I/O overlaps it,
-        so a loop that later expires the budget does NOT discard it — its result is
-        still incorporated (the whole point of overlapping). This supersedes the
-        pre-P1 behavior where an expired session skipped the final search."""
+        """The final search is LAUNCHED before the loop, so a loop that later expires
+        the budget does NOT discard it; its result is still incorporated."""
         sem = _FinalTool("strategy:chunk_based_semantic", _final_result())
         src = FakeClockSource()
         # A controller loop that advances the injected clock past the time budget.
@@ -367,18 +328,9 @@ class TestFinalSemanticSearch:
         assert "agentic_final_semantic_search" not in [s.step for s in trace.steps]
 
 
-# ── result contract (Req 1.4) ──────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestSupportingContentProvenanceSignal:
-    """Filtering provenance-less chunks must be observable, like the other paths.
-
-    The hand-rolled and lexical Tier-3 paths both count the chunks they filter, mark
-    the step degraded and add a ``degradedSources`` entry. This path filtered
-    silently, so a chunk that should have carried a document id but did not simply
-    disappeared from the citation list.
-    """
+    """Filtering provenance-less chunks must be observable, like the other paths."""
 
     @staticmethod
     def _resolve(chunks):
@@ -464,7 +416,7 @@ class TestResultContract:
         result = await retriever.resolve("the question", NS, trace=trace)
 
         assert result.synthesized_answer == "An answer"
-        assert 0.0 <= result.confidence <= 1.0 and result.confidence == 0.77
+        assert result.confidence == 0.77
         assert result.guardrail_blocked is False
         assert result.partial is False  # context gathered, no degraded, no expiry
         # supporting_content / graph_context populated from accumulated context.
@@ -474,7 +426,7 @@ class TestResultContract:
             "sourceDocumentId": "aws:tenant:source:c1",
             "sourceDocumentName": "doc.pdf",
             "relevanceScore": 0.9,
-            # Deprecated aliases kept for one release (see #984).
+            # Deprecated aliases, kept for one release for older clients.
             "sourceDoc": "aws:tenant:source:c1",
             "label": "L",
         }
@@ -522,7 +474,7 @@ class TestResultContract:
         assert result.partial is True
 
     async def test_no_context_yields_empty_supporting_and_graph(self):
-        # Nothing gathered, queue drains; synthesis still runs (Req 7.8 shape).
+        # Nothing gathered, queue drains; synthesis still runs.
         controller = FakeController(stops=[None])
         synthesizer = FakeSynthesizer(result=SynthesisResult(answer="best effort", confidence=0.3, duration_ms=3))
         retriever = make_retriever(
@@ -535,12 +487,9 @@ class TestResultContract:
 
         assert result.supporting_content == ()
         assert result.graph_context == ()
-        # No context gathered → partial best-effort answer (Req 7.8).
+        # No context gathered → partial best-effort answer.
         assert result.partial is True
         assert result.synthesized_answer == "best effort"
-
-
-# ── aggregate budget stop → partial (Req 7.4-7.7) ──────────────────
 
 
 @pytest.mark.unit
@@ -596,9 +545,6 @@ class TestAggregateBudgetStop:
         assert str(StopReason.max_steps_reached) in str(stop_steps(trace)[0].detail)
 
 
-# ── queue-drained stop ─────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestQueueDrainedStop:
     async def test_queue_drained_records_terminal_stop(self):
@@ -620,12 +566,9 @@ class TestQueueDrainedStop:
         assert str(StopReason.queue_drained) in str(stop_steps(trace)[0].detail)
 
 
-# ── parallel sub-questions (P2) ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestParallelSubQuestions:
-    """P2: independent Sub_Questions run in forked sub-contexts, merged back with
+    """Independent Sub_Questions run in forked sub-contexts, merged back with
     dedup, under one shared aggregate BudgetClock."""
 
     async def test_forked_results_merge_deduped_into_final_context(self):
@@ -686,9 +629,6 @@ class TestParallelSubQuestions:
         assert clock_seen[0] == clock_seen[1]
 
 
-# ── synthesis failure (Req 8.6) ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestSynthesisFailure:
     async def test_synthesizer_error_yields_partial_empty_answer_conf_zero(self):
@@ -734,9 +674,6 @@ class TestSynthesisFailure:
         assert result.partial is True
 
 
-# ── guardrail block (Req 8.3-8.4) ──────────────────────────────────
-
-
 @pytest.mark.unit
 class TestGuardrailBlock:
     async def test_guardrail_block_sets_flag_and_excludes_content(self):
@@ -756,11 +693,8 @@ class TestGuardrailBlock:
         result = await retriever.resolve("q", NS)
 
         assert result.guardrail_blocked is True
-        assert result.synthesized_answer == ""  # blocked content excluded (Req 8.3)
+        assert result.synthesized_answer == ""  # blocked content excluded
         assert result.confidence == 0.0
-
-
-# ── all-tools-fail tolerance (Req 9.6-9.7) ─────────────────────────
 
 
 @pytest.mark.unit
@@ -784,7 +718,7 @@ class TestAllToolsFail:
 
         result = await retriever.resolve("q", NS, trace=trace)
 
-        # Req 9.7: no Best_Effort_Answer, partial, no source succeeded, synthesis skipped.
+        # No Best_Effort_Answer, partial, no source succeeded, synthesis skipped.
         assert result.synthesized_answer == ""
         assert result.confidence == 0.0
         assert result.partial is True
@@ -810,14 +744,11 @@ class TestAllToolsFail:
         )
         result = await retriever.resolve("q", NS)
 
-        # Req 9.6: best-effort answer over the available context, flagged partial.
+        # Best-effort answer over the available context, flagged partial.
         assert result.synthesized_answer == "best effort answer"
         assert result.partial is True
         assert result.degraded_sources == ({"source": "graph_traversal", "reason": "timeout"},)
         assert result.supporting_content[0]["chunkId"] == "c1"
-
-
-# ── namespace scoping (Req 1.5) ────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -852,9 +783,6 @@ class TestNamespaceScoping:
         )
         with pytest.raises(ValueError):
             await retriever.resolve("q", "bad namespace!")
-
-
-# ── lazy-import invariant (Req 12.3) ───────────────────────────────
 
 
 @pytest.mark.unit

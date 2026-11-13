@@ -40,17 +40,9 @@ _MAX_PDF_PAGES = 1000
 # (a 100000x100000 pt page would be ~173,000 MP).
 _MAX_RENDER_MEGAPIXELS = 50
 
-# Concurrent Textract DetectDocumentText calls per document. Textract sync APIs
-# allow concurrent requests up to an account TPS quota (default ~10 TPS); boto3
-# clients are thread-safe for calls, so we fan the per-page OCR calls out over a
-# thread pool. Tunable via env; keep <= the account Textract TPS to avoid
-# throttling (boto retries throttles, but staying under is cheaper).
+# Concurrent Textract DetectDocumentText calls per document. Keep <= the account
+# Textract TPS quota (default ~10) to avoid throttling.
 _TEXTRACT_CONCURRENCY = int(os.environ.get("TEXTRACT_CONCURRENCY", "10"))
-
-
-# ---------------------------------------------------------------------------
-# Pass-through processors
-# ---------------------------------------------------------------------------
 
 
 def process_txt(content_bytes: bytes, filename: str) -> tuple[str, str]:
@@ -61,11 +53,6 @@ def process_txt(content_bytes: bytes, filename: str) -> tuple[str, str]:
 def process_md(content_bytes: bytes, filename: str) -> tuple[str, str]:
     """Pass through ``.md`` files (UTF-8 decode only)."""
     return content_bytes.decode("utf-8", errors="replace"), ".md"
-
-
-# ---------------------------------------------------------------------------
-# DOCX processor
-# ---------------------------------------------------------------------------
 
 
 def process_docx(content_bytes: bytes, filename: str) -> tuple[str, str]:
@@ -85,11 +72,6 @@ def process_docx(content_bytes: bytes, filename: str) -> tuple[str, str]:
         extra={"doc_filename": filename, "elements": len(elements), "char_count": len(text)},
     )
     return text, ".md"
-
-
-# ---------------------------------------------------------------------------
-# PDF processor (auto-detects scanned vs text-native)
-# ---------------------------------------------------------------------------
 
 
 def process_pdf(
@@ -513,11 +495,6 @@ def _blocks_to_markdown(blocks: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Element-to-Markdown conversion
-# ---------------------------------------------------------------------------
-
-
 def elements_to_markdown(elements: list) -> str:
     """Convert unstructured ``Element`` objects to a Markdown string."""
     lines: list[str] = []
@@ -540,11 +517,6 @@ def elements_to_markdown(elements: list) -> str:
     return "\n\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Page count helper
-# ---------------------------------------------------------------------------
-
-
 def get_page_count(content_bytes: bytes, ext: str) -> int:
     """Return the page count for PDFs; 0 for other formats."""
     if ext != ".pdf":
@@ -565,10 +537,6 @@ def get_page_count(content_bytes: bytes, ext: str) -> int:
     finally:
         doc.close()
 
-
-# ---------------------------------------------------------------------------
-# Processor dispatch table
-# ---------------------------------------------------------------------------
 
 _PROCESSORS: dict[str, Any] = {
     ".txt": process_txt,

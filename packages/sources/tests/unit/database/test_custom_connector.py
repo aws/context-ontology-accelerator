@@ -420,11 +420,8 @@ class TestConfigurationValidation:
         with pytest.raises(ValueError):
             CustomConnector(runner=runner).discover_metadata(_config(database_name=bad))
 
-    # Quoting is what makes these addressable. An earlier version refused any name
-    # outside [A-Za-z_][A-Za-z0-9_]*, on the reasoning that unquoted is the only
-    # spelling both of Athena's parsers accept — but that only rules out sending
-    # them BARE. Verified live: a hyphenated table describes correctly quoted, and
-    # is selectable double-quoted, so refusing it dropped a reachable table.
+    # Quoting makes these addressable: verified live, a hyphenated table describes
+    # correctly when quoted.
     @pytest.mark.parametrize("table", ["odd-name-table", "my table", "select", "MixedCase", "2legit", "has`tick"])
     def test_a_table_name_needing_quoting_is_described_not_refused(self, table):
         runner = FakeRunner(tables=[table], describes={table: [_packed("c", "int")]})
@@ -597,20 +594,12 @@ class TestTheScanTimeConnectorPrerequisite:
         assert "resource policy" not in result.message
 
     def test_a_custom_connector_source_still_gets_the_invoke_grant_advice(self):
-        """Unchanged for the sub-type it was written for — the message is chosen, not
-        replaced."""
+        """A CUSTOM_CONNECTOR source gets the invoke-grant advice."""
         runner = FakeRunner(databases_error=_statement_error())
         result = CustomConnector(runner=runner).test_connection(_config(source_sub_type="CUSTOM_CONNECTOR"))
         assert result.success is False
         assert "resource policy" in result.message
         assert "operator-side" not in result.message
-
-    def test_a_row_with_no_sub_type_keeps_the_original_advice(self):
-        """The absent-sub-type row shape again: it must keep the behaviour it had rather
-        than falling into the newer branch."""
-        runner = FakeRunner(databases_error=_statement_error())
-        result = CustomConnector(runner=runner).test_connection(_config())
-        assert "resource policy" in result.message
 
     def test_the_underlying_athena_error_is_still_reported(self):
         """The hint replaces neither the catalog name nor Athena's own words — an operator

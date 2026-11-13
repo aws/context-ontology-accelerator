@@ -63,7 +63,7 @@ def _httpx_client(get_map: dict[str, MagicMock]) -> MagicMock:
 
 
 def test_fetch_ontology_turtle_follows_presigned_download_url() -> None:
-    """#143: /download returns {"downloadUrl"}; the Turtle is fetched out-of-band."""
+    """/download returns {"downloadUrl"}; the Turtle is fetched out-of-band."""
     meta = MagicMock()
     meta.json.return_value = {"ontology_type": "induced"}
     meta.raise_for_status = MagicMock()

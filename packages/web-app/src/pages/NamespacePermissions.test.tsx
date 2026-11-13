@@ -169,9 +169,6 @@ describe("NamespacePermissions", () => {
 
   it("renders grant restrictions as chips and unrestricted grants as muted state labels", async () => {
     render(<NamespacePermissions />, { wrapper });
-    await act(async () => {
-      screen.getByRole("tab", { name: /Members/i }).click();
-    });
     // alice's restricted grant → values render as individual badges/chips.
     expect(screen.getByText("orders")).toBeInTheDocument(); // allowed table
     expect(screen.getByText("revenue_total")).toBeInTheDocument(); // allowed metric
@@ -184,9 +181,6 @@ describe("NamespacePermissions", () => {
 
   it("renders a declared-empty allowlist as a deny-all 'None' badge, not 'All'", async () => {
     render(<NamespacePermissions />, { wrapper });
-    await act(async () => {
-      screen.getByRole("tab", { name: /Members/i }).click();
-    });
     // carol's grant declares tableAllowlist: [] — a deny-all restriction the
     // SQL firewall enforces. Rendering the unrestricted "All" label for it
     // would tell a reviewer the exact opposite of what the grant does.
@@ -201,9 +195,6 @@ describe("NamespacePermissions", () => {
 
   it("revokes every selected member and clears the selection after success", async () => {
     render(<NamespacePermissions />, { wrapper });
-    await act(async () => {
-      screen.getByRole("tab", { name: /Members/i }).click();
-    });
 
     // Select both member rows (skip the header select-all at index 0).
     const rowCheckboxes = screen.getAllByRole("checkbox").slice(1);
@@ -232,8 +223,7 @@ describe("NamespacePermissions", () => {
       modalRevoke().click();
     });
 
-    // All three grants are revoked via mutateAsync (the single-observer bug
-    // would have left promises unresolved).
+    // All three revokes resolve.
     await waitFor(() => {
       expect(deleteGrantMock.mutateAsync).toHaveBeenCalledTimes(3);
     });

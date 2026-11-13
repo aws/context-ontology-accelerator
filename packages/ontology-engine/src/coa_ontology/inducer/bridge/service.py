@@ -788,9 +788,6 @@ def run_bridge(
     return report
 
 
-# ── Wiring to the deployed stores ──────────────────────────────────────
-
-
 def app_config() -> dict:
     """The running app's config (lazy import: ``main`` imports the routers that import this)."""
     from coa_ontology.main import app

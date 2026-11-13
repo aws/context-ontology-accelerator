@@ -4,7 +4,7 @@
 """Unit tests for the bulk review worker logic.
 
 Tests are scoped to the pure-logic helpers in worker.py (parse_message,
-_apply_decision_to_table, process_bulk_review). The Lambda entry point
+process_bulk_review). The Lambda entry point
 ``handler`` is exercised indirectly via process_bulk_review.
 """
 
@@ -33,7 +33,6 @@ from coa_common.domain_models import (  # noqa: E402
     PrimaryKey,
     Table,
 )
-from coa_common.review_logic import apply_decision_to_table  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -56,17 +55,10 @@ _SOURCE_ID = "src-db-001"
 class _RecordingCall:
     """Thread-safe stand-in for a mocked client method.
 
-    ``unittest.mock`` records ``call_count`` / ``call_args_list`` WITHOUT a
-    lock. The worker fans ``create_asset_revision`` across a
-    ``ThreadPoolExecutor``, so under real thread contention (a loaded CI
-    runner) the mock's ``call_count += 1`` / ``call_args_list.append`` race and
-    lose increments — the mock undercounts and tests asserting an EXACT call
-    count flake (#853, ``AssertionError: assert 2433 == 2500``). This records
-    every call under a lock and exposes the same ``call_count`` /
-    ``call_args_list`` / ``call_args`` surface the assertions already use, so
-    the count is exact regardless of contention. Production ``worker.py`` is
-    unchanged — only the test's accounting is made atomic, and the assertion
-    still fails (undercounts) if the worker genuinely drops a table.
+    ``unittest.mock`` counts calls without a lock, and the worker fans
+    ``create_asset_revision`` across a ``ThreadPoolExecutor``, so this records
+    each call under a lock and exposes the same ``call_count`` /
+    ``call_args_list`` / ``call_args`` surface.
     """
 
     def __init__(self, return_value: Any = None) -> None:
@@ -121,11 +113,6 @@ def _make_table(
     )
 
 
-# ===================================================================
-# parse_message
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestParseMessage:
     def test_valid_json_string(self):
@@ -160,80 +147,6 @@ class TestParseMessage:
         base = {"namespaceId": "ns", "sourceId": "src"}
         assert worker.parse_message({**base, "decision": "APPROVED", "isRescan": True}).is_rescan is True
         assert worker.parse_message({**base, "decision": "REJECTED", "isRescan": "true"}).is_rescan is True
-
-
-# ===================================================================
-# apply_decision_to_table — cascade rules + change tracking
-# (Helper moved to libs/common/coa_common.review_logic;
-# tests imported via the explicit import at the top of this file so
-# both the worker and the per-table review handler share one source.)
-# ===================================================================
-
-
-@pytest.mark.unit
-class TestApplyDecisionToTable:
-    def test_bulk_approve_flips_table_and_preserves_rejected_columns(self):
-        # This is the worker's mode: bulk approve is a default and keeps a
-        # deliberate per-column rejection.
-        table = _make_table(status="PENDING_REVIEW", columns=[("c1", "APPROVED"), ("c2", "REJECTED")])
-        changed = apply_decision_to_table(table, "APPROVED", bulk=True)
-        assert changed is True
-        assert table.business_metadata.review_status == "APPROVED"
-        assert table.columns[0].business_metadata.review_status == "APPROVED"
-        assert table.columns[1].business_metadata.review_status == "REJECTED"
-
-    def test_per_asset_approve_re_approves_rejected_columns(self):
-        # The per-table PUT .../review path re-approves what a table-level reject
-        # cascaded, so approve -> reject -> approve does not strand children.
-        table = _make_table(status="PENDING_REVIEW", columns=[("c1", "APPROVED"), ("c2", "REJECTED")])
-        apply_decision_to_table(table, "APPROVED", bulk=False)
-        assert [c.business_metadata.review_status for c in table.columns] == ["APPROVED", "APPROVED"]
-
-    def test_approve_cascades_pending_columns(self):
-        table = _make_table(status="PENDING_REVIEW", columns=[("c1", "PENDING_REVIEW"), ("c2", "APPROVED")])
-        apply_decision_to_table(table, "APPROVED")
-        assert table.business_metadata.review_status == "APPROVED"
-        statuses = {c.name: c.business_metadata.review_status for c in table.columns}
-        assert statuses == {"c1": "APPROVED", "c2": "APPROVED"}
-
-    def test_bulk_approve_preserves_terminal_column_decisions(self):
-        table = _make_table(
-            status="PENDING_REVIEW",
-            columns=[("c1", "APPROVED"), ("c2", "REJECTED"), ("c3", "APPROVED")],
-        )
-        apply_decision_to_table(table, "APPROVED", bulk=True)
-        statuses = {c.name: c.business_metadata.review_status for c in table.columns}
-        assert statuses == {"c1": "APPROVED", "c2": "REJECTED", "c3": "APPROVED"}
-
-    def test_reject_cascades_to_all_non_rejected(self):
-        table = _make_table(
-            status="APPROVED",
-            columns=[("c1", "APPROVED"), ("c2", "REJECTED"), ("c3", "PENDING_REVIEW")],
-        )
-        apply_decision_to_table(table, "REJECTED")
-        statuses = {c.name: c.business_metadata.review_status for c in table.columns}
-        assert all(s == "REJECTED" for s in statuses.values())
-
-    def test_no_change_when_already_in_target_state(self):
-        table = _make_table(status="APPROVED", columns=[("c1", "APPROVED")])
-        changed = apply_decision_to_table(table, "APPROVED")
-        assert changed is False
-
-    def test_reapprove_cascades_pending_column(self):
-        # Re-approving cascades a newly-PENDING column to APPROVED.
-        table = _make_table(status="APPROVED", columns=[("c1", "PENDING_REVIEW")])
-        assert apply_decision_to_table(table, "APPROVED") is True
-        assert table.columns[0].business_metadata.review_status == "APPROVED"
-
-    def test_invalid_decision_raises(self):
-        table = _make_table()
-        with pytest.raises(ValueError):
-            apply_decision_to_table(table, "MAYBE")
-
-
-# ===================================================================
-# process_bulk_review — full pipeline (mocked SMUSClient + DAO)
-# ===================================================================
 
 
 def _mock_smus_with_assets(tables: list[Table]) -> MagicMock:
@@ -442,11 +355,7 @@ class TestProcessBulkReview:
         assert written.name == "t2"
         assert written.business_metadata.review_status == "APPROVED"
 
-        # Terminal status — not all tables approved (t1 still REJECTED), so
-        # the source goes to APPROVAL_FAILED rather than APPROVED... actually
-        # no: failure-terminal is only on per-asset write failure, not on
-        # surviving REJECTED tables. The terminal is APPROVED with
-        # tablesApproved = 1 (just t2).
+        # Surviving REJECTED tables do not fail the approval: APPROVED, tablesApproved=1.
         final_update = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
         assert final_update.args[1] == {"status": "APPROVED", "tablesApproved": 1}
 
@@ -573,11 +482,6 @@ class TestProcessBulkReview:
         # Empty source should still leave APPROVING — advance to APPROVED for approve
         final_update = next(c for c in mock_dao.update.call_args_list if "tablesApproved" in c.args[1])
         assert final_update.args[1] == {"status": "APPROVED", "tablesApproved": 0}
-
-
-# ===================================================================
-# Continuation paging — no silent drop past the old 1000-table cap (#853)
-# ===================================================================
 
 
 def _make_paginated_client(tables: list[Table]) -> MagicMock:
@@ -793,11 +697,6 @@ class TestBulkReviewPaging:
         mock_client.search_assets.assert_not_called()
 
 
-# ===================================================================
-# Rejected key-column gate
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestRejectedKeyColumnGate:
     """An approved table must not ship with a REJECTED primary/foreign key column.
@@ -807,12 +706,6 @@ class TestRejectedKeyColumnGate:
     APPROVED — induction then has no key to build a subject template from and the
     failure surfaces as a PK-column-missing error in Ontop, far from the review
     that caused it.
-
-    This gate replaced one that scanned for PENDING_REVIEW columns *after* the
-    bulk cascade had already flipped every one of them to APPROVED (unreachable),
-    and which could not be moved pre-cascade either: the enricher leaves all
-    columns PENDING_REVIEW, so blocking on pending would reject every normal bulk
-    approval.
     """
 
     _DAO_PATCH = "coa_sources.database.bulk_review.worker.DynamoDBDAO"
@@ -906,11 +799,7 @@ class TestRejectedKeyColumnGate:
         assert result.tables_failed == []
 
     def test_pending_columns_do_not_block_the_normal_case(self):
-        """The regression the previous gate would have caused if moved pre-cascade.
-
-        The enricher leaves every column PENDING_REVIEW; clearing them is the
-        entire point of bulk approve.
-        """
+        """The enricher leaves every column PENDING_REVIEW, and approving them must not be blocked."""
         result = self._run(
             [
                 self._table_with_keys(
@@ -970,11 +859,6 @@ class TestRejectedKeyColumnGate:
                 scan_jobs_table="test-scan-jobs",
             )
         assert result.tables_failed == []
-
-
-# ===================================================================
-# Re-scan approve / reject (B5.2 delete-removed, B5.3 restore)
-# ===================================================================
 
 
 def _mock_smus_for_rescan(tables: list[Table]) -> MagicMock:
@@ -1203,10 +1087,8 @@ class TestRescanReview:
         """A corrupt count must not fail the whole reject.
 
         ``tablesDiscovered`` is stored as a string in the backup and coerced back
-        to int. An unparseable value used to raise straight out of the reject,
-        stranding the source in REJECTION_FAILED with no route back. It is now
-        skipped instead, so the reject completes and the live count stands —
-        stale beats both a crash and a wrong zero.
+        to int. An unparseable value is skipped, so the reject completes and the
+        live count stands.
         """
         backup = {
             "removed_tables": [],
@@ -1376,11 +1258,6 @@ class TestRescanReview:
         ):
             worker._delete_backup(_SOURCE_ID)  # must not raise
         mock_client.delete_object.assert_called_once()
-
-
-# ===================================================================
-# REVIEW event rows — the Scan History audit trail (store-backed)
-# ===================================================================
 
 
 @pytest.mark.unit

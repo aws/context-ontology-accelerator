@@ -281,13 +281,6 @@ function AppShell() {
   // identity. Keep the array stable across AppShell re-renders.
   const topNavUtilities: TopNavigationProps["utilities"] = useMemo(
     () => [
-      // The namespace switcher only makes sense once the user has
-      // navigated _into_ a namespace-scoped section. On the namespace
-      // list and create routes there is no "current" namespace, and
-      // surfacing the dropdown there confuses users into thinking
-      // they are viewing a namespace nested inside another. Hide it
-      // there to match the side-nav, which is also empty on those
-      // routes.
       ...(isNamespaceListRoute
         ? []
         : [

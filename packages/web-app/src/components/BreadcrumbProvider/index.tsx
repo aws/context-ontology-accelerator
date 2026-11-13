@@ -2,19 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * BreadcrumbProvider — lets a page publish dynamic breadcrumb items into the
- * AppLayout `breadcrumbs` slot (the bar below the top nav, next to the side-nav
- * toggle). Pages that don't set any render no breadcrumb.
- *
- * Mirrors the SplitPanelProvider pattern: shell reads `items` and renders a
- * Cloudscape BreadcrumbGroup; pages call `setBreadcrumbs`/`clearBreadcrumbs`.
+ * Lets a page publish breadcrumb items into the AppLayout `breadcrumbs` slot
+ * via `setBreadcrumbs`/`clearBreadcrumbs`.
  */
 import React, { createContext, useCallback, useContext, useState } from "react";
 
 /** A single breadcrumb crumb. `onClick` runs instead of navigation when set. */
 export interface BreadcrumbItem {
   text: string;
-  /** Optional handler; when present the crumb acts as an in-page action. */
   onClick?: () => void;
 }
 

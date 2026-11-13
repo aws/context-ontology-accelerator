@@ -48,21 +48,18 @@ async def _decide(ev, *, embedding=None) -> Tier2SkipDecision:
 
 @pytest.mark.unit
 class TestAossProvenanceEvaluator:
-    @pytest.mark.asyncio
     async def test_all_topk_unmapped_but_provenance_present_skips(self):
         """Top-k all unmapped AND a mapped class exists deeper in results → SKIP."""
         hits = [_hit("", name=f"D{i}") for i in range(10)] + [_hit("src-db", name="M")]
         ev, _, _ = _make_evaluator(hits)
         assert await _decide(ev) is Tier2SkipDecision.SKIP
 
-    @pytest.mark.asyncio
     async def test_any_mapped_in_topk_runs(self):
         """A mapped class within the top-k decision window → RUN (Tier 2 may answer)."""
         hits = [_hit("", name="D1"), _hit("src-db", name="M"), _hit("", name="D2")]
         ev, _, _ = _make_evaluator(hits)
         assert await _decide(ev) is Tier2SkipDecision.RUN
 
-    @pytest.mark.asyncio
     async def test_no_provenance_anywhere_abstains(self):
         """All hits empty data_source_id (field never stamped) → ABSTAIN, not SKIP.
 
@@ -73,12 +70,10 @@ class TestAossProvenanceEvaluator:
         ev, _, _ = _make_evaluator(hits)
         assert await _decide(ev) is Tier2SkipDecision.ABSTAIN
 
-    @pytest.mark.asyncio
     async def test_empty_results_abstains(self):
         ev, _, _ = _make_evaluator([])
         assert await _decide(ev) is Tier2SkipDecision.ABSTAIN
 
-    @pytest.mark.asyncio
     async def test_non_mixed_namespace_abstains_without_search(self):
         """Pure namespaces are handled by namespace-level gating — evaluator must not even search."""
         for comp in ("structured_only", "doc_only", "unknown"):
@@ -86,19 +81,16 @@ class TestAossProvenanceEvaluator:
             assert await _decide(ev) is Tier2SkipDecision.ABSTAIN
             vector.search.assert_not_awaited()
 
-    @pytest.mark.asyncio
     async def test_no_embedding_abstains_without_search(self):
         ev, vector, _ = _make_evaluator([_hit("", name="D")])
         assert await ev.should_skip_tier2("q", "ns", None, trace=TraceCollector()) is Tier2SkipDecision.ABSTAIN
         vector.search.assert_not_awaited()
 
-    @pytest.mark.asyncio
     async def test_search_error_abstains(self):
         ev, vector, _ = _make_evaluator([])
         vector.search.side_effect = RuntimeError("aoss boom")
         assert await _decide(ev) is Tier2SkipDecision.ABSTAIN
 
-    @pytest.mark.asyncio
     async def test_decision_cached_single_search(self):
         hits = [_hit("", name=f"D{i}") for i in range(10)] + [_hit("src-db", name="M")]
         ev, vector, _ = _make_evaluator(hits)
@@ -106,7 +98,6 @@ class TestAossProvenanceEvaluator:
         assert await _decide(ev) is Tier2SkipDecision.SKIP
         vector.search.assert_awaited_once()
 
-    @pytest.mark.asyncio
     async def test_skip_records_routing_trace(self):
         hits = [_hit("", name=f"D{i}") for i in range(10)] + [_hit("src-db", name="M")]
         ev, _, _ = _make_evaluator(hits)
@@ -120,10 +111,8 @@ class TestAossProvenanceEvaluator:
         assert step.detail["probeK"] == 50
         assert step.detail["decisionK"] == 10
 
-    @pytest.mark.asyncio
     async def test_decision_cache_is_bounded(self):
-        """The decision cache is a bounded LRU — it cannot grow without bound under
-        high query cardinality (regression guard for the reviewed memory leak)."""
+        """The decision cache is a bounded LRU under high query cardinality."""
         from coa_serve.tier2.skip import aoss_provenance as mod
 
         hits = [_hit("", name=f"D{i}") for i in range(10)] + [_hit("src-db", name="M")]

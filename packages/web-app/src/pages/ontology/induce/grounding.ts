@@ -174,13 +174,8 @@ export function extractUri(body: string, pred: string): string | null {
 
 /**
  * Friendly ontology label from a (possibly long) ontology id/URI.
- *
- * NOTE: this is presentation-only — it maps a known ontology id to a short
- * human-readable name for the UI. The substring tests below are deliberately
- * loose pattern matching over well-known ontology namespaces, NOT a security
- * check: nothing is trusted, authorized, or fetched based on the result, and an
- * unrecognised id falls through to the last path segments. Do not reuse this
- * helper to validate or sanitize a URL.
+ * Presentation-only pattern matching over well-known namespaces, not URL
+ * validation.
  */
 export function ontologyLabel(ontologyId: string | null | undefined): string {
   if (!ontologyId) return "";
@@ -203,26 +198,15 @@ export function ontologyLabel(ontologyId: string | null | undefined): string {
   return ontologyId.split("/").slice(-2).join("/");
 }
 
-// ─── Class-row → ConceptMatch resolution ────────────────────────────
-//
-// Grounding candidates are keyed per-TABLE (``ConceptMatch.source_table``,
-// e.g. ``clinical_trial``) but the review table renders one row per CLASS
-// (``ind:ClinicalTrial``). The inducer derives the class local name from the
-// table via ``to_pascal(table.name)`` (``clinical_trial`` → ``ClinicalTrial``),
-// so a class row's match must be recovered by inverting that link.
-//
-// The naive "same R2RML block carries both rr:class and rr:tableName" scan
-// FAILS on real inductions: rdflib serializes ``rr:class`` on the
-// ``#TriplesMap_X/SubjectMap`` IRI and ``rr:tableName`` on the
-// ``rr:logicalTable`` blank node of ``#TriplesMap_X`` in SEPARATE
-// blank-line-delimited blocks, so they never co-occur. Two complementary,
-// layout-independent strategies replace it:
-//   1. When R2RML provenance exists, a TriplesMap-id join over the WHOLE
+// Grounding candidates are keyed per table (``ConceptMatch.source_table``) but
+// the review table renders one row per class. The inducer derives the class
+// local name from the table via ``to_pascal``, so a class row's match is
+// recovered by inverting that link, with two layout-independent strategies:
+//   1. When R2RML provenance exists, a TriplesMap-id join over the whole
 //      document resolves class→datasource/schema/table→match. This exact link
-//      must take precedence when same-named tables collide.
-//   2. Without R2RML provenance, normalize BOTH the class local name and every
-//      ``source_table`` to a canonical key (strip non-alphanumerics, lowercase)
-//      and join only when that key is unique.
+//      takes precedence when same-named tables collide.
+//   2. Otherwise compare ``normalizeNameKey`` of the class local name and of
+//      every ``source_table``, joining only when that key is unique.
 
 /**
  * Extract the class local name from a (possibly prefixed / full-IRI) subject.
@@ -384,32 +368,18 @@ export function normalizeNameKey(name: string): string {
 }
 
 /**
- * Turn an R2RML ``rr:tableName`` Turtle string literal into the bare table
- * name. The inducer wraps identifiers as SQL delimited identifiers
- * (``sql_ident("clinical_trial")`` → ``"clinical_trial"``), which in Turtle is
- * serialized double-escaped, so the whole literal (INCLUDING its Turtle
- * delimiters) reads ``"\"clinical_trial\""``.
- *
- * Peel the layers in order:
- *   1. Strip the outer Turtle string delimiters (``"…"``).
- *   2. Turtle-unescape the content (``\"`` → ``"``, ``\\`` → ``\``).
- *   3. Split into SQL identifier segments — the mapping schema-qualifies a table
- *      name that two datasources share (``"public"."customers"``) — dropping the
- *      SQL delimiters and un-doubling embedded ``""`` as it goes.
- *
- * :func:`unquoteSqlIdent` then keeps the trailing segment, because every
- * consumer that JOINS on this value joins on the bare name a ConceptMatch
- * carries; :func:`qualifiedSqlIdent` keeps the whole path, for display.
- *
- * A plain (un-delimited) value such as ``"policies"`` yields ``["policies"]``.
+ * Turn an R2RML ``rr:tableName`` Turtle string literal (e.g.
+ * ``"\"clinical_trial\""``) into its SQL identifier segments. Strips the Turtle
+ * delimiters and escapes, then splits the schema-qualified path
+ * (``"public"."customers"``), dropping SQL delimiters and un-doubling ``""``.
+ * ``unquoteSqlIdent`` keeps the trailing segment (the bare name a ConceptMatch
+ * carries); ``qualifiedSqlIdent`` keeps the whole path, for display.
  */
 function sqlIdentSegments(turtleLiteral: string): string[] {
-  // 1. Outer Turtle delimiters.
   let s = turtleLiteral;
   if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
     s = s.slice(1, -1);
   }
-  // 2. Turtle escapes.
   s = s.replace(/\\(.)/g, "$1");
   // 3. Split on the dots BETWEEN delimited identifiers only. A table
   // legitimately named ``q1.results`` is ONE delimited identifier, so splitting
@@ -582,8 +552,6 @@ function classToTableRefFromR2rml(
       triplesMapToClass.set(currentTriplesMap, classLocalName(classMatch[1]));
     }
 
-    // Capture the whole Turtle string literal (allowing backslash-escaped
-    // quotes) then unescape + strip SQL-delimiter quotes.
     const tableMatch = line.match(/rr:tableName\s+("(?:\\.|[^"\\])*")/);
     if (tableMatch && currentTriplesMap) {
       const segments = sqlIdentSegments(tableMatch[1]);
@@ -630,24 +598,9 @@ function classToTableRefFromR2rml(
   return result;
 }
 
-// ─── R2RML mapping table (per class) ────────────────────────────────
-//
-// The class-detail panel renders a "Mapping: {table}" section with a
-// Source-column / Property / Type sub-table. The old per-class R2RML
-// slice (``ProposalEntitiesPanel.r2rmlByClass`` split on blank lines and
-// grabbed the block that carried ``rr:class``, then ``parseR2rml`` ran
-// ``rr:tableName`` over that slice) is PERMANENTLY broken: rdflib splits
-// a TriplesMap into several standalone subject statements, so the block
-// carrying ``rr:class`` (the ``…/SubjectMap``) does NOT carry
-// ``rr:tableName`` (a ``rr:logicalTable`` blank node on the TriplesMap
-// header) and does NOT carry the ``rr:predicate`` / ``rr:column`` maps
-// (separate ``…/POM_X`` + ``…/POM_X/ObjectMap`` statements). The result is
-// a permanent "Mapping: Unknown" with an empty column list.
-//
-// The real serialization (verified against the inducer's ``build_r2rml``)
-// keys every artifact by the ``TriplesMap_X`` token embedded in its
-// subject IRI, and links a predicate to its column via the shared
-// ``POM_Y`` token:
+// R2RML mapping table (per class). The real serialization keys every artifact
+// by the ``TriplesMap_X`` token in its subject IRI and links a predicate to its
+// column via the shared ``POM_Y`` token:
 //
 //   ind:TriplesMap_ClinicalTrial
 //       rr:logicalTable [ rr:tableName "\"clinical_trial\"" ] ;
@@ -658,12 +611,9 @@ function classToTableRefFromR2rml(
 //   …/POM_Title/ObjectMap  rr:column "\"title\"" ; rr:datatype xsd:string .
 //   …/SubjectMap           rr:class ind:ClinicalTrial ; rr:template … .
 //
-// So we JOIN across the WHOLE document by ``TriplesMap_X`` (table + class)
-// and by ``POM_Y`` (predicate ↔ column/type). This is layout-independent
-// and also handles the compact inline form (one ``<#Map>`` statement with
-// nested ``[ … ]`` blank nodes) used in unit fixtures, because there the
-// class/table/predicate/column all co-occur in the single statement and
-// fall through to a per-statement scan.
+// So we join across the whole document by ``TriplesMap_X`` (table + class) and
+// ``POM_Y`` (predicate ↔ column/type). The compact inline form (one statement
+// with nested blank nodes) falls through to a per-statement scan.
 
 export interface R2rmlColumnMapping {
   column: string;
@@ -677,7 +627,7 @@ export interface R2rmlMapping {
   columnMappings: R2rmlColumnMapping[];
 }
 
-/** All matches of ``rr:column``/inline SQL-delimited literal in a chunk. */
+/** First ``rr:column`` literal in a chunk, or null. */
 function matchColumn(text: string): string | null {
   const m = text.match(/rr:column\s+("(?:\\.|[^"\\])*")/);
   return m ? unquoteSqlIdent(m[1]) : null;
@@ -725,9 +675,6 @@ function readObjectMap(text: string): ObjectMapInfo | null {
   return {
     column: column ?? "",
     type: parentMatch ? "relationship" : "attribute",
-    // FK target renders as the parent CLASS name (``Sponsor``), NOT the raw
-    // ``TriplesMap_Sponsor`` id token. ``classLocalName`` also handles the
-    // ``rr:datatype`` case (``xsd:string`` → ``string``).
     target: parentMatch
       ? fkTargetClassName(parentMatch[1])
       : datatypeMatch

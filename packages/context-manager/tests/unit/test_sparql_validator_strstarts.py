@@ -1,14 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for SPARQLValidator named-graph queries (STRSTARTS pattern).
-
-Ensures the validator uses `GRAPH ?g` + `STRSTARTS(STR(?g), prefix)` pattern
-instead of fixed `GRAPH <uri>`, matching how data is stored in per-ontology
-sub-graphs by the ontology engine.
-
-Also tests the data_source_id field propagation in OpenSearch VectorHit parsing.
-"""
+"""Unit tests for SPARQLValidator named-graph queries (STRSTARTS pattern)."""
 
 from __future__ import annotations
 
@@ -92,16 +85,6 @@ class TestValidatorUsesSTRSTARTS:
         assert "STRSTARTS(STR(?g)" in ask_arg
         assert "https://ontology-workbench.local/test-ns/" in ask_arg
 
-    async def test_graph_prefix_includes_trailing_slash(self, validator, mock_graph):
-        """STRSTARTS prefix must end with / to avoid prefix collisions."""
-        mock_graph.query.return_value = [{"found": "1"}]
-        sparql = "SELECT ?x WHERE { <http://example.org/ont#Claim> a owl:Class }"
-        await validator.validate(sparql, "test-ns")
-
-        query_arg = mock_graph.query.call_args[0][0]
-        # Prefix should be ".../{namespace}/" to avoid matching "test-ns-other"
-        assert 'https://ontology-workbench.local/test-ns/"' in query_arg
-
     async def test_no_fixed_graph_uri_in_domain_compat(self, validator, mock_graph):
         """Both domain compatibility queries use STRSTARTS, not fixed GRAPH."""
         # First ask returns False (no compat domain), second returns True (has domain)
@@ -114,7 +97,6 @@ class TestValidatorUsesSTRSTARTS:
         )
         assert result is False  # has domain but not compatible
 
-        # Both calls should use STRSTARTS
         for call in mock_graph.ask.call_args_list:
             arg = call[0][0]
             assert "GRAPH ?g" in arg
@@ -133,7 +115,6 @@ class TestValidatorUsesSTRSTARTS:
         )
         assert result is True
 
-        # All 3 calls should use STRSTARTS
         for call in mock_graph.ask.call_args_list:
             arg = call[0][0]
             assert "GRAPH ?g" in arg

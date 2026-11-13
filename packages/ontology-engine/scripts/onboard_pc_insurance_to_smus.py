@@ -8,11 +8,11 @@ Creates DataZone assets from the pc_insurance.json fixture so the
 benchmark can run end-to-end against SMUS without the mock sidecar.
 
 Usage:
-    export AWS_PROFILE=coa-dev
+    export AWS_PROFILE=<profile>
     export AWS_REGION=us-east-1
-    export SMUS_DOMAIN_ID=dzd-4trek2qis4cp9j
-    export SMUS_PROJECT_ID=5c26k57l8qpauf
-    export DATASOURCES_TABLE=coa-dev-datasource-connectors
+    export SMUS_DOMAIN_ID=<domain-id>
+    export SMUS_PROJECT_ID=<project-id>
+    export DATASOURCES_TABLE=<datasource-connectors-table>
 
     uv run python scripts/onboard_pc_insurance_to_smus.py
 

@@ -8,7 +8,6 @@ import {
   listProposals,
   listProposalsPage,
   listAllProposals,
-  LIST_ALL_MAX_PAGES,
   getProposal,
   getProposalUploadUrls,
   updateProposal,
@@ -29,6 +28,7 @@ import {
   fetchJsonFromUrl,
   putToPresignedUrl,
 } from "./ontology-engine";
+import { LIST_ALL_MAX_PAGES } from "@utils/pagination";
 import type { ApiClient } from "@components/ApiClientProvider";
 
 describe("ontology-engine API wrappers", () => {
@@ -285,12 +285,8 @@ describe("ontology-engine API wrappers", () => {
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  // ── ListOntologies wire contract ──
-  // The mirror of packages/ontology-engine/tests/unit/test_list_ontologies_wire_shape.py.
-  // The endpoint used to return a bare snake_case array while Smithy declared a
-  // camelCase `{ontologies: [...]}` envelope, so the client read `undefined`,
-  // `?? []` swallowed it, and the UI silently showed nothing. These pin the
-  // client half of that contract, using the exact JSON the backend now emits.
+  // Client side of the ListOntologies camelCase {ontologies} envelope; the
+  // backend side is test_list_ontologies_wire_shape.py.
 
   it("listOntologies unwraps the {ontologies} envelope", async () => {
     get.mockResolvedValue({
@@ -306,8 +302,7 @@ describe("ontology-engine API wrappers", () => {
 
   it("listOntologies surfaces the camelCase fields the UI depends on", async () => {
     // parseStatus drives the Ingesting/Ready/Failed indicator; deleteError tells
-    // a stuck teardown from one still running. Both were absent from the old
-    // contract, so both are asserted here rather than assumed.
+    // a stuck teardown from one still running.
     get.mockResolvedValue({
       ontologies: [
         {
