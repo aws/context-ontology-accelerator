@@ -7,17 +7,6 @@ demo.py and setup.py aren't regular Python packages (they live in demo/ not
 src/), so we load them via importlib.util.spec_from_file_location. Each test
 mocks the minimum external surface (httpx, Prompt.ask, Bedrock) needed to
 exercise a helper in isolation.
-
-What's covered:
-  demo.py
-    _prompt_selection — "all"/"none"/comma list/invalid re-prompt
-    _http_fetch       — TimeoutException, ConnectError, HTTPStatusError paths
-
-  setup.py
-    _build_class_text    — label+comment concatenation
-    _build_property_text — label+comment+domain/range concatenation
-    _find_existing_ontology — miss vs hit
-    _register_ontology      — idempotent short-circuit when already present
 """
 
 from __future__ import annotations
@@ -37,13 +26,7 @@ _DEMO_DIR = Path(__file__).parent.parent.parent / "demo"
 
 
 def _load_module(name: str, path: Path):
-    """Load a Python file as a module without requiring it on sys.path.
-
-    Both demo.py and setup.py do module-level work (read config.yaml, set
-    CATALOG_URL etc.) that would normally side-effect. We provide a stub
-    config before import by monkey-patching CONFIG_PATH's parent or
-    preloading sys.modules as appropriate.
-    """
+    """Load a Python file as a module without requiring it on sys.path."""
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader, f"couldn't load {path}"
     module = importlib.util.module_from_spec(spec)
@@ -75,9 +58,6 @@ induction_defaults:
 foundational_ontologies: []
 """)
     return tmp_path
-
-
-# ── demo.py helpers ─────────────────────────────────────────────
 
 
 class TestPromptSelection:
@@ -174,9 +154,6 @@ class TestHttpFetch:
             pytest.raises(SystemExit),
         ):
             demo_module._http_fetch("GET", "http://fake/x")
-
-
-# ── setup.py helpers ────────────────────────────────────────────
 
 
 class TestBuildClassText:
@@ -315,7 +292,6 @@ class TestRegisterOntology:
 
         assert result == created
         mock_post.assert_called_once()
-        # Verify we sent the right body
         call_body = mock_post.call_args.kwargs["json"]
         assert call_body["uri"] == "https://schema.org/"
         assert call_body["title"] == "Schema.org"
@@ -331,9 +307,7 @@ class TestRegisterOntology:
 
 
 class TestServerSideFetch:
-    """Tests for setup._server_side_fetch — primarily that it URL-encodes
-    ontology IDs correctly (the PROV-O '#' fragment bug).
-    """
+    """Tests for setup._server_side_fetch — it URL-encodes ontology IDs."""
 
     @pytest.fixture
     def setup_module(self, stub_config):
@@ -341,7 +315,7 @@ class TestServerSideFetch:
 
     def test_url_encodes_ontology_id(self, setup_module):
         """PROV-O's URI contains '#' which HTTP clients treat as a fragment
-        boundary unless escaped. Previously broke /fetch with a 405.
+        boundary unless escaped.
         """
         captured_url = {"url": None}
 

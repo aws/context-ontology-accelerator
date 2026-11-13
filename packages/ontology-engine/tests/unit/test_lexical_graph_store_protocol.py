@@ -1,15 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for LexicalGraphStore protocol type-checking.
-
-Validates:
-- The Protocol is runtime-checkable (isinstance works)
-- A minimal mock implementation satisfies the Protocol
-- A class missing methods does NOT satisfy isinstance check
-
-Requirements: 1.1, 1.6
-"""
+"""Unit tests for LexicalGraphStore protocol type-checking."""
 
 import pytest
 

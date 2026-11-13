@@ -14,7 +14,7 @@ and URI validation, via the translator) and the PER-SOURCE data endpoint (the A-
 only for execution).
 
 Every way this strategy declines is a ``None`` with a distinct log event and trace
-reason (LLD §5), so the runner can fall through while an operator can still tell a
+reason, so the runner can fall through while an operator can still tell a
 graph namespace whose ontology was never imported (``sparql_strategy_misconfigured``)
 from an unverified source, a rejected query or an endpoint failure.
 """
@@ -214,8 +214,6 @@ class SparqlStrategy:
             self._fail(context, "sparql_access_denied")
             raise AccessDeniedError(decision.reason or "Access denied by policy")
 
-    # ── routing ──────────────────────────────────────────────────────────
-
     @staticmethod
     def _pick_source_id(options: dict[str, Any], hits: list[VectorHit] | None) -> str:
         """Which source to execute against: pin > top graph class hit > ``"default"``.
@@ -318,8 +316,6 @@ class SparqlStrategy:
             return f"the cluster's claim could not be read ({type(e).__name__})"
         return graph_cluster_refusal(claim, str(item.get("namespaceId", "")))
 
-    # ── safety ───────────────────────────────────────────────────────────
-
     def _gate(
         self,
         sparql: str,
@@ -354,8 +350,6 @@ class SparqlStrategy:
         )
         return safe
 
-    # ── execution ────────────────────────────────────────────────────────
-
     async def _execute(
         self,
         client: SparqlEndpointClient,
@@ -370,7 +364,7 @@ class SparqlStrategy:
         try:
             rows, columns = await asyncio.wait_for(_run(client, safe), timeout=timeout)
         except Exception as e:  # endpoint boundary: connectivity, auth, SPARQL errors, deadline
-            # MC-1: the error text names the endpoint (and can carry more), so it goes to the log only; the
+            # The error text names the endpoint (and can carry more), so it goes to the log only; the
             # caller-visible trace step gets the type and a correlation id that finds this log line (CWE-209).
             error_ref = uuid.uuid4().hex[:12]
             logger.warning(
@@ -424,8 +418,6 @@ class SparqlStrategy:
 
     def _fail(self, context: StrategyContext, reason: str) -> None:
         context.trace.record(StepId.T2_SPARQL_FAILED, "error", 0, detail={"strategy": self.name, "reason": reason})
-
-    # ── retrieval ────────────────────────────────────────────────────────
 
     async def _fetch_vector_hits(self, embedding: list[float], namespace: str) -> list[VectorHit] | None:
         """Graph-class hits (backend-filtered) plus property hits.

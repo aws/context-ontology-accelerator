@@ -3,7 +3,7 @@
 
 /**
  * Synth-time check that every Bedrock model id a deployment will use can be
- * invoked from the region it is being deployed to (#1020).
+ * invoked from the region it is being deployed to.
  *
  * The default model ids are `us.` cross-region inference profiles. Bedrock only
  * publishes a geography's profiles inside that geography, so a deploy to
@@ -68,7 +68,7 @@ export interface ResolvedModelId {
 }
 
 /**
- * Normalize the four model-id fields before they reach either validation or
+ * Normalize the model-id fields before they reach either validation or
  * the stacks. Empty values are treated as unset, matching the runtime fallback
  * used by Serve; non-empty values containing whitespace are rejected
  * rather than deployed as an identifier Bedrock cannot resolve.

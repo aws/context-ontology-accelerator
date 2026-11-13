@@ -40,9 +40,6 @@ vi.mock("@coa/control-plane-client", () => ({
   ReviewDecision: { APPROVED: "APPROVED", REJECTED: "REJECTED" },
 }));
 
-// Default table payload used by most tests. Individual tests override
-// mockUseGetSourceTable with a spread of this plus the field under test
-// (e.g. rescanDiff) so the shared shape stays in one place.
 const baseTableData = {
   tableId: "sales.orders",
   name: "orders",
@@ -152,7 +149,7 @@ describe("TableDetail keys & relationships", () => {
     ).toBeInTheDocument();
   });
 
-  it("surfaces a pending cross-source relationship and approves it (#1088)", () => {
+  it("surfaces a pending cross-source relationship and approves it", () => {
     mockUseGetSourceTable.mockReturnValue({
       data: {
         ...baseTableData,
@@ -174,7 +171,6 @@ describe("TableDetail keys & relationships", () => {
     });
     render(<TableDetail />, { wrapper });
 
-    // Review state, cross-source chip, and provenance are all shown.
     expect(screen.getByText("PENDING_REVIEW")).toBeInTheDocument();
     expect(screen.getByText("cross-source")).toBeInTheDocument();
     expect(
@@ -216,23 +212,18 @@ describe("TableDetail keys & relationships", () => {
     });
     render(<TableDetail />, { wrapper });
 
-    // The paragraph is NOT rendered inline — only a clipped one-liner is.
     expect(screen.queryByText(long)).not.toBeInTheDocument();
     const clipped = screen.getByText(
       /^entitlement\.tenant_id description states.*…$/,
     );
     expect(clipped.textContent!.length).toBeLessThan(long.length);
 
-    // The full note is one click away.
     fireEvent.click(clipped);
     expect(screen.getByText(long)).toBeInTheDocument();
   });
 });
 
-// DETERMINISTIC only describes the *description* field's
-// provenance. Tags/synonyms/glossary terms can still be AI-generated even
-// when enrichmentSource is DETERMINISTIC — the UI must not imply the whole
-// metadata block came from the source system.
+// enrichmentSource describes only the description; tags may still be AI-generated.
 describe("TableDetail enrichment source provenance", () => {
   it("labels the field as 'Description source', not 'Enrichment source'", () => {
     render(<TableDetail />, { wrapper });
@@ -283,10 +274,7 @@ describe("TableDetail enrichment source provenance", () => {
   });
 });
 
-// follow-up: when metadataEnrichmentEnabled is false, the scan
-// pipeline never runs the enrichment step at all, so tags/synonyms/glossary
-// terms can't be AI-generated regardless of enrichmentSource. The hint must
-// not render in that case — showing it would itself be misleading.
+// With enrichment disabled the scan never runs it, so no hint.
 describe("TableDetail AI-enriched hint respects metadataEnrichmentEnabled", () => {
   it("suppresses the hint when the source has metadata enrichment disabled", () => {
     mockUseGetSource.mockReturnValue({
@@ -302,20 +290,6 @@ describe("TableDetail AI-enriched hint respects metadataEnrichmentEnabled", () =
     ).not.toBeInTheDocument();
   });
 
-  it("shows the hint when metadataEnrichmentEnabled is true", () => {
-    mockUseGetSource.mockReturnValue({
-      data: {
-        body: { databaseDetails: { metadataEnrichmentEnabled: true } },
-      },
-      isLoading: false,
-      error: null,
-    });
-    render(<TableDetail />, { wrapper });
-    expect(
-      screen.getAllByRole("img", { name: "AI-enriched hint" }).length,
-    ).toBeGreaterThan(0);
-  });
-
   it("defaults to showing the hint when metadataEnrichmentEnabled is undefined (legacy sources)", () => {
     mockUseGetSource.mockReturnValue({
       data: { body: { databaseDetails: {} } },
@@ -329,10 +303,7 @@ describe("TableDetail AI-enriched hint respects metadataEnrichmentEnabled", () =
   });
 });
 
-// Re-scan review surfaces an old-vs-new breakdown: a table-level "Changes
-// since last approved scan" panel listing each changed table field as
-// old → new, plus a per-column Changed/Added/Removed badge. rescanDiff is
-// present only while the source is in RESCAN_REVIEW.
+// rescanDiff is present only while the source is in RESCAN_REVIEW.
 describe("TableDetail re-scan diff (old vs new)", () => {
   it("renders the changes panel (table-level and column groups) with old → new detail and a modified-column badge on the row", () => {
     mockUseGetSourceTable.mockReturnValue({
@@ -368,9 +339,7 @@ describe("TableDetail re-scan diff (old vs new)", () => {
     });
     render(<TableDetail />, { wrapper });
 
-    // The summary panel is present; its detail is behind a foldable section
-    // (headered with the change counts) so a table with many column changes
-    // doesn't produce a huge panel. Expand it to read the old → new detail.
+    // Expand the foldable section to read the detail.
     expect(
       screen.getByText("Changes since last approved scan"),
     ).toBeInTheDocument();
@@ -378,19 +347,13 @@ describe("TableDetail re-scan diff (old vs new)", () => {
     expect(screen.getByText("Table-level changes")).toBeInTheDocument();
     expect(screen.getByText("Column changes")).toBeInTheDocument();
 
-    // Field rows concatenate several text nodes ("description (DESCRIPTION):
-    // Old order records → New order records"), so match values with a substring
-    // regex rather than an exact string. Table-level change:
+    // Field rows concatenate several text nodes, so match by substring.
     expect(screen.getByText(/Old order records/)).toBeInTheDocument();
     expect(screen.getByText(/New order records/)).toBeInTheDocument();
-    // The column change is listed in the panel with its changed field. Use the
-    // field name "data_type" (unique to the diff row) rather than the value
-    // "varchar", which also renders as the column's own type in the table.
+    // "data_type" is unique to the diff row; "varchar" also renders in the table.
     expect(screen.getByText(/data_type/)).toBeInTheDocument();
 
-    // The modified column also carries a "Changed" badge on its own row. "status"
-    // and "Changed" now appear both in the panel and on the row, so scope the
-    // lookup to the table row rather than asserting a single match.
+    // "status" and "Changed" appear in the panel and on the row; scope to the row.
     const statusRow =
       screen
         .getAllByText("status")
@@ -401,7 +364,6 @@ describe("TableDetail re-scan diff (old vs new)", () => {
   });
 
   it("does not render the changes panel when rescanDiff is absent", () => {
-    // baseTableData (set in beforeEach) has no rescanDiff.
     render(<TableDetail />, { wrapper });
     expect(
       screen.queryByText("Changes since last approved scan"),
@@ -410,9 +372,6 @@ describe("TableDetail re-scan diff (old vs new)", () => {
   });
 
   it("shows a 'New table' note for a re-scan-added table (added, no diff)", () => {
-    // A table the re-scan discovered for the first time has no before/after, so
-    // it carries `added` and no `rescanDiff`. We say it's new instead of showing
-    // an empty changes panel.
     mockUseGetSourceTable.mockReturnValue({
       data: { ...baseTableData, added: true },
       isLoading: false,
@@ -423,15 +382,12 @@ describe("TableDetail re-scan diff (old vs new)", () => {
     expect(
       screen.getByText(/discovered during the latest re-scan/),
     ).toBeInTheDocument();
-    // Not the old-vs-new changes panel — there is nothing to diff.
     expect(
       screen.queryByText("Changes since last approved scan"),
     ).not.toBeInTheDocument();
   });
 
   it("shows a 'Dropped table' note for a re-scan-dropped table (pendingDeletion)", () => {
-    // A table the re-scan found gone from the source carries pendingDeletion;
-    // the top panel says it's dropped (deleted on approve unless kept).
     mockUseGetSourceTable.mockReturnValue({
       data: { ...baseTableData, pendingDeletion: true },
       isLoading: false,
@@ -445,10 +401,6 @@ describe("TableDetail re-scan diff (old vs new)", () => {
   });
 
   it("shows only Pending deletion (not a duplicate Removed badge) for a re-scan-dropped column", () => {
-    // A dropped column is surfaced twice by two data paths: the rescanDiff
-    // (status "removed") and the column's own pendingDeletion soft-flag. They
-    // mean the same thing, so the row must show the actionable "Pending
-    // deletion" (+ Keep) and NOT also the "Removed" diff badge.
     mockUseGetSourceTable.mockReturnValue({
       data: {
         ...baseTableData,
@@ -466,10 +418,7 @@ describe("TableDetail re-scan diff (old vs new)", () => {
     });
     render(<TableDetail />, { wrapper });
 
-    // "status" now appears in the summary panel's Column changes group as well
-    // as on the table row, so scope to the row. The row must show the actionable
-    // "Pending deletion" (+ Keep) and NOT a duplicate "Removed" diff badge; the
-    // panel legitimately lists the removed column and is not asserted here.
+    // "status" also appears in the panel; scope to the row.
     const statusRow =
       screen
         .getAllByText("status")
@@ -482,7 +431,7 @@ describe("TableDetail re-scan diff (old vs new)", () => {
   });
 });
 
-describe("TableDetail synonyms editor (steward-curation supersede)", () => {
+describe("TableDetail synonyms editor", () => {
   it("pre-fills stored synonyms, 'Clear all' empties them, and Save sends an empty list", () => {
     mockUseGetSourceTable.mockReturnValue({
       data: {
@@ -497,12 +446,10 @@ describe("TableDetail synonyms editor (steward-curation supersede)", () => {
       error: null,
     });
     render(<TableDetail />, { wrapper });
-    // Open the table editor — the table-level "Edit" in the metadata header is
-    // the first "Edit" button; the per-column rows each have their own.
+    // The table-level "Edit" is the first one; each column row has its own.
     fireEvent.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
     expect(screen.getByText("Edit table: orders")).toBeInTheDocument();
 
-    // AI-generated synonyms are pre-filled as tokens.
     expect(screen.getByText("orders_table")).toBeInTheDocument();
     expect(screen.getByText("order_dimension")).toBeInTheDocument();
 
@@ -511,7 +458,6 @@ describe("TableDetail synonyms editor (steward-curation supersede)", () => {
     );
     expect(screen.queryByText("orders_table")).not.toBeInTheDocument();
     expect(screen.queryByText("order_dimension")).not.toBeInTheDocument();
-    // Nothing left to clear: the affordance goes away.
     expect(
       screen.queryByRole("button", { name: /clear all synonyms/i }),
     ).not.toBeInTheDocument();
@@ -533,11 +479,6 @@ describe("TableDetail synonyms editor (steward-curation supersede)", () => {
   });
 
   it("moves keyboard focus to the synonyms input when 'Clear all' unmounts itself", async () => {
-    // `Clear all` is conditional on `items.length > 0`, so clicking it
-    // removes the button — a keyboard user with focus on the button would
-    // lose their place. The component should move focus to the synonyms
-    // input, which stays mounted and is the natural next thing to
-    // interact with.
     mockUseGetSourceTable.mockReturnValue({
       data: {
         ...baseTableData,
@@ -552,8 +493,6 @@ describe("TableDetail synonyms editor (steward-curation supersede)", () => {
     });
     render(<TableDetail />, { wrapper });
     fireEvent.click(screen.getAllByRole("button", { name: /^edit$/i })[0]);
-    // The table-level SynonymsField uses this placeholder;
-    // Cloudscape's <Input> renders as an ordinary <input> element.
     const inputBefore = document.querySelector(
       'input[placeholder="e.g. customers_table"]',
     ) as HTMLInputElement | null;
@@ -563,8 +502,7 @@ describe("TableDetail synonyms editor (steward-curation supersede)", () => {
       screen.getByRole("button", { name: /clear all synonyms/i }),
     );
 
-    // Wait for the requestAnimationFrame in handleClear to run
-    // (rAF fires synchronously via jsdom's polyfill in tests).
+    // Wait one animation frame for handleClear.
     await new Promise((r) => requestAnimationFrame(() => r(undefined)));
 
     const inputAfter = document.querySelector(

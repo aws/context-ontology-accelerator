@@ -3,9 +3,6 @@
 
 """Data source and ontology lookup implementations for metric validation.
 
-Extracted from validator.py per review feedback — keeps the validator focused
-on orchestrating checks while concrete lookup logic lives here.
-
 Contains:
   - Base interfaces: DataSourceLookup, ColumnMetadata, OntologyLookup
   - Production: SmusCatalogDataSourceLookup (SMUS/DataZone)
@@ -34,18 +31,12 @@ TABLE_UNAPPROVED = "unapproved"
 TABLE_NO_METADATA = "no_metadata"
 
 
-# ── Data types ──────────────────────────────────────────────────────────
-
-
 @dataclass
 class ColumnMetadata:
     """Metadata for a single column in a table."""
 
     name: str
     data_type: str  # e.g., "varchar", "integer", "decimal", "date", "timestamp"
-
-
-# ── Abstract interfaces ─────────────────────────────────────────────────
 
 
 class DataSourceLookup:
@@ -68,31 +59,21 @@ class DataSourceLookup:
         raise NotImplementedError
 
     def catalog_available(self, data_source_id: str) -> bool:
-        """Whether table metadata could actually be read for this source (#161).
+        """Whether table metadata could actually be read for this source.
 
         ``table_exists`` fails OPEN — it returns False both for a table that is
         genuinely absent and for a catalog that could not be read. Callers that
-        turn absence into a hard rejection must consult this first.
-
-        Args:
-            data_source_id: The data source id to check.
-
-        Returns:
-            True by default: an implementation that cannot tell is assumed
-            available, and ``known_tables`` (empty by default) is what keeps
-            absence unprovable.
+        turn absence into a hard rejection must consult this first. True by
+        default: ``known_tables`` (empty by default) is what keeps absence
+        unprovable.
         """
         return True
 
     def known_tables(self, data_source_id: str) -> set[str]:
-        """The lower-cased table names this lookup can enumerate (#161).
+        """The lower-cased table names this lookup can enumerate.
 
-        Args:
-            data_source_id: The data source id to enumerate.
-
-        Returns:
-            An empty set by default — "I cannot enumerate", which makes a
-            missing table unprovable and so never hard-blocking.
+        Empty by default ("cannot enumerate"), which makes a missing table
+        unprovable and so never hard-blocking.
         """
         return set()
 
@@ -100,15 +81,9 @@ class DataSourceLookup:
         """Why the last ``table_exists`` call for this name returned False.
 
         Only meaningful after ``table_exists(data_source_id, table_name)`` returned
-        False for a name the catalog resolved to one asset.
-
-        Args:
-            data_source_id: The data source id owning the table.
-            table_name: The name ``table_exists`` was called with.
-
-        Returns:
-            ``TABLE_UNAPPROVED`` or ``TABLE_NO_METADATA`` when this lookup knows,
-            else None (the default: the reason is not recorded).
+        False for a name the catalog resolved to one asset. Returns
+        ``TABLE_UNAPPROVED`` or ``TABLE_NO_METADATA`` when this lookup knows, else
+        None (the default).
         """
         return None
 
@@ -141,7 +116,6 @@ class OntologyLookup:
         raise NotImplementedError
 
 
-# ── Declared sourceTable: acceptance rule and rejection wording ─────────
 # Shared by the create/update gate (``source_status.check_source_table_exists``)
 # and ValidateMetric's ``table_reference`` check, so validate-before-create gives
 # the same verdict and the same words as the write.
@@ -156,16 +130,8 @@ def declared_source_table_exists(
     the documented ``schema.table`` form, so a qualified name falls back to its
     bare name, but only when that bare name is itself in the raw catalog. It is
     never synthesized from another qualified asset, which would let
-    ``sales.orders`` resolve to ``archive.orders``.
-
-    Args:
-        lookup: The data source lookup.
-        data_source_id: The data source id owning the table.
-        source_table: The declared table name.
-        known: ``lookup.known_tables(data_source_id)``, lower-cased.
-
-    Returns:
-        True when the table (or its legacy bare entry) is an approved table.
+    ``sales.orders`` resolve to ``archive.orders``. ``known`` is
+    ``lookup.known_tables(data_source_id)``, lower-cased.
     """
     if lookup.table_exists(data_source_id, source_table):
         return True
@@ -195,17 +161,9 @@ def source_table_rejection(lookup: DataSourceLookup, data_source_id: str, source
     sent callers looking for a missing table that was sitting in the list of known
     tables. The catalog lists the asset but it is not approved, or it has no SCL
     metadata form (or the form can't be parsed); a bare name matches several
-    assets; or there is no such asset.
-
-    Args:
-        lookup: The lookup that rejected the table; asked why when the name
-            resolved to exactly one catalog entry.
-        data_source_id: The data source id owning the table.
-        source_table: The declared table name.
-        known: ``lookup.known_tables(data_source_id)``, lower-cased.
-
-    Returns:
-        A message that names the cause and what to do about it.
+    assets; or there is no such asset. ``lookup`` is asked why when the name
+    resolved to exactly one catalog entry; ``known`` is
+    ``lookup.known_tables(data_source_id)``, lower-cased.
     """
     declared = source_table.lower()
     looked_up = declared
@@ -243,9 +201,6 @@ def source_table_rejection(lookup: DataSourceLookup, data_source_id: str, source
     )
 
 
-# ── Production: SMUS Catalog Lookup ─────────────────────────────────────
-
-
 class SmusCatalogDataSourceLookup(DataSourceLookup):
     """Look up data source / table / column metadata from the SMUS catalog.
 
@@ -267,23 +222,13 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         datasources_table: str,
         region: str = "us-east-1",
     ) -> None:
-        """Configure the SMUS/DataZone catalog lookup and its caches.
-
-        Args:
-            domain_id: DataZone domain id owning the catalog.
-            project_id: DataZone project id scoping the assets.
-            namespace_id: Namespace the lookup serves.
-            datasources_table: DynamoDB table mapping data sources.
-            region: AWS region for catalog reads.
-        """
+        """Configure the SMUS/DataZone catalog lookup and its caches."""
         self._domain_id = domain_id
         self._project_id = project_id
         self._namespace_id = namespace_id
         self._datasources_table = datasources_table
         self._region = region
-        self._tables_by_source: dict[str, dict[str, list[ColumnMetadata]]] = {}
         self._source_present: dict[str, bool] = {}
-        self._load_failed: dict[str, bool] = {}
         # Cheap path: table name → asset id, from search pages only.
         self._names_by_source: dict[str, dict[str, str]] = {}
         self._names_load_failed: dict[str, bool] = {}
@@ -328,7 +273,7 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         """Asset id for a table, accepting a bare or ``database.table`` name.
 
         The index is keyed on the database-qualified name so same-named tables in
-        different databases stay distinct (see ``_qualified_name_from_asset``). An
+        different databases stay distinct (see ``_qualified_name_from_asset``). A
         qualified name resolves only by exact match. A bare name resolves only
         when exactly ONE raw catalog entry has that name, whether the entry is
         itself bare or database-qualified. A mixed legacy catalog such as
@@ -361,12 +306,10 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         ``None`` covers the source having no such asset, the asset's form being
         missing/unparseable, or the table not being steward-approved. For the last
         two, :meth:`table_rejection_reason` says which. A *transient*
-        read failure is handled separately — it is not cached as absence and flips
-        catalog_available() to False (see below) so callers can distinguish an
-        outage from a definitive rejection. The approval check is what keeps this
-        equivalent to the previous approved-catalog index — the name index alone
-        cannot see review status, so the ONE candidate's form is fetched to check
-        it. One call, not one per table.
+        read failure is not cached as absence and flips catalog_available() to
+        False so callers can distinguish an outage from a definitive rejection.
+        The name index cannot see review status, so the one candidate's form is
+        fetched to check approval.
         """
         key = (data_source_id, table_name.lower())
         if key in self._table_cache:
@@ -388,12 +331,8 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
                 table=table_name,
                 error=str(exc),
             )
-            # A transient read failure is NOT provable absence (#161): don't cache
-            # it, and flip the source to unavailable so catalog_available() returns
-            # False. Callers can then return an operational error rather than a
-            # definitive table rejection, and a later lookup retries the fetch.
-            # This keeps the name-index and per-asset reads failing together, as
-            # the old single whole-catalog read did.
+            # A transient read failure is not provable absence: don't cache it, so
+            # a later lookup retries, and mark the source unavailable.
             self._names_load_failed[data_source_id] = True
             return None
 
@@ -414,12 +353,11 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         can answer. Only the OSI-import paths call it, so the O(tables) cost stays
         off metric creation. Do not reintroduce it into the existence checks below.
         """
-        if data_source_id in self._tables_by_source:
+        if data_source_id in self._source_present:
             return
 
         from coa_common.metadata_store.catalog_reader import read_approved_catalog
 
-        tables_index: dict[str, list[ColumnMetadata]] = {}
         present = False
 
         try:
@@ -438,125 +376,54 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
                 namespace=self._namespace_id,
                 error=str(exc),
             )
-            self._tables_by_source[data_source_id] = tables_index
             self._source_present[data_source_id] = False
-            self._load_failed[data_source_id] = True
             return
 
         for source in catalog.get("sources", []):
             if source.get("datasourceId") != data_source_id:
                 continue
             present = True
-            for db in source.get("databases", []):
-                for tbl in db.get("tables", []):
-                    name = tbl.get("name", "")
-                    if not name:
-                        continue
-                    columns = [
-                        ColumnMetadata(
-                            name=col.get("name", ""),
-                            data_type=(col.get("type") or "unknown"),
-                        )
-                        for col in tbl.get("columns", [])
-                        if col.get("name")
-                    ]
-                    tables_index[name.lower()] = columns
 
-        self._tables_by_source[data_source_id] = tables_index
         self._source_present[data_source_id] = present
-        self._load_failed[data_source_id] = False
 
     def data_source_exists(self, data_source_id: str) -> bool:
-        """Return whether the data source is present in the approved catalog.
-
-        Args:
-            data_source_id: The data source id to check.
-
-        Returns:
-            True if the catalog contains the data source, else False.
-        """
+        """Return whether the data source is present in the approved catalog."""
         self._ensure_loaded(data_source_id)
         return self._source_present.get(data_source_id, False)
 
     def table_exists(self, data_source_id: str, table_name: str) -> bool:
-        """Return whether the named approved table exists in the source's catalog.
-
-        Args:
-            data_source_id: The data source id owning the table.
-            table_name: The table name (matched case-insensitively).
-
-        Returns:
-            True if the approved catalog contains the table, else False.
-        """
+        """Return whether the named approved table exists (matched case-insensitively)."""
         return self._approved_table(data_source_id, table_name) is not None
 
     def table_rejection_reason(self, data_source_id: str, table_name: str) -> str | None:
         """Why :meth:`table_exists` rejected a table that resolved to one asset.
 
-        Args:
-            data_source_id: The data source id owning the table.
-            table_name: The name ``table_exists`` was called with.
-
-        Returns:
-            ``TABLE_UNAPPROVED`` when the asset's form was read and it is not
-            steward-approved, ``TABLE_NO_METADATA`` when the asset has no SCL
-            metadata form or the form could not be parsed, else None.
+        ``TABLE_UNAPPROVED`` when the asset is not steward-approved,
+        ``TABLE_NO_METADATA`` when it has no SCL metadata form or the form could
+        not be parsed, else None.
         """
         return self._rejection_reason.get((data_source_id, table_name.lower()))
 
     def catalog_available(self, data_source_id: str) -> bool:
-        """Whether the approved catalog was read successfully for this source.
-
-        Args:
-            data_source_id: The data source id to check.
-
-        Returns:
-            False only when the catalog read raised — in that case an absent
-            table proves nothing (see ``DataSourceLookup.catalog_available``).
-        """
+        """Whether the catalog was read successfully; False means absence proves nothing."""
         self._ensure_names_loaded(data_source_id)
         return not self._names_load_failed.get(data_source_id, False)
 
     def known_tables(self, data_source_id: str) -> set[str]:
-        """Return the lower-cased table names the source's catalog knows.
+        """Return the raw lower-cased catalog table names, approved or not.
 
-        Args:
-            data_source_id: The data source id to enumerate.
-
-        Returns:
-            The set of table names in the catalog (empty when the source is
-            unknown or its read failed).
-
-        Note:
-            Counts every table asset, approved or not — the previous
-            implementation counted approved ones only. Callers use this raw
-            inventory to distinguish an empty/not-yet-populated catalog from a
-            catalog that can definitively resolve or reject a name. Approval is
-            always checked separately through :meth:`table_exists`.
-
-            Returns the names exactly as indexed by the catalog. Do not synthesize
-            bare names from qualified names: doing so makes ``sales.orders`` appear
-            present when the only asset is ``archive.orders``. Callers that accept
-            bare names must resolve them through :meth:`table_exists`, which rejects
-            ambiguous matches and checks the selected asset's approval status.
+        Unqualified names are not synthesized from qualified ones: that would make
+        ``sales.orders`` appear present when the only asset is ``archive.orders``.
+        Approval is checked separately through :meth:`table_exists`.
         """
         self._ensure_names_loaded(data_source_id)
         return set(self._names_by_source.get(data_source_id, {}))
 
     def get_table_columns(self, data_source_id: str, table_name: str) -> list[ColumnMetadata] | None:
-        """Return the approved column metadata for a table.
+        """Return the approved column metadata, or None if the source or table is unknown.
 
-        Args:
-            data_source_id: The data source id owning the table.
-            table_name: The table name (matched case-insensitively).
-
-        Returns:
-            The list of column metadata, or None if the source or table is
-            unknown.
-
-        Shares :meth:`_approved_table`'s per-table cache with :meth:`table_exists`,
-        so the validator's usual sequence — exists? then columns, on the same
-        ``sourceTable`` — costs ONE ``get_asset_forms`` call in total.
+        Shares :meth:`_approved_table`'s cache with :meth:`table_exists`, so
+        exists-then-columns costs one ``get_asset_forms`` call.
         """
         table = self._approved_table(data_source_id, table_name)
         if table is None:
@@ -566,9 +433,6 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
             for col in table.columns
             if col.name and col.business_metadata.review_status == ReviewStatus.APPROVED
         ]
-
-
-# ── Production: Neptune Ontology Lookup ─────────────────────────────────
 
 
 class NeptuneOntologyLookup(OntologyLookup):

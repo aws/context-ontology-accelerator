@@ -133,13 +133,6 @@ def _build_user_prompt(class_label: str, labels: list[str]) -> str:
 
     Caps the number of labels included at ``MAX_PROMPT_LABELS`` to keep prompts
     bounded. Labels are taken in the order received (stable sampler ordering).
-
-    Args:
-        class_label: The classification string (e.g. ``"Financial Instrument"``).
-        labels: Entity surface-form labels for the class.
-
-    Returns:
-        A user-prompt string suitable for ``LLMDescriptionClient.generate``.
     """
     capped = labels[:MAX_PROMPT_LABELS]
     bullet_lines = "\n".join(f"- {label}" for label in capped)
@@ -181,13 +174,6 @@ def _post_process_response(text: str) -> str:
     Strips leading/trailing whitespace and a single pair of surrounding double
     quotes if present (a common LLM artifact when the model echoes the
     description as a quoted string).
-
-    Args:
-        text: Raw text returned by the LLM.
-
-    Returns:
-        The cleaned response, or the empty string if nothing remained after
-        stripping.
     """
     cleaned = text.strip()
     if len(cleaned) >= 2 and cleaned.startswith('"') and cleaned.endswith('"'):
@@ -496,8 +482,7 @@ def generate_descriptions_with_context(
 # Note: this mode currently uses ONLY inter-class predicate aggregates
 # (the __SYS_RELATION__ layer). Extracting "attribute-style" predicate types
 # (i.e. owl:DatatypeProperty candidates) from per-entity predicate-only
-# facts requires more sophisticated parsing — see the optional task in
-# tasks.md ("Edge-type predicate summarization and embedding").
+# facts is not implemented.
 
 
 _SCHEMA_SYSTEM_PROMPT = (
@@ -636,15 +621,6 @@ def generate_descriptions_with_schema(
       :func:`_schema_fallback_description`.
     - Empty schema (no outgoing AND no incoming edges) bypasses the LLM
       and uses the fallback directly.
-
-    Args:
-        class_schemas: Mapping from class label to its
-            :class:`ClassSchemaContext`.
-        llm_client: Any object satisfying :class:`LLMDescriptionClient`.
-        namespace_language: Namespace language, as for :func:`generate_descriptions`.
-
-    Returns:
-        Mapping from each input class label to a non-empty description.
     """
     log.info(
         "Generating schema-context class descriptions: %d classes (total outgoing edges in input: %d, incoming: %d)",

@@ -1,17 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for memory reducers (Workstream B).
-
-B1 — incremental channel fusion in ``InductionPipeline.embed_concepts``:
-     fused vectors must stay byte-identical to the old 3-channel-dict math,
-     the returned model_id must come from the dtype channel, and at most one
-     channel's result list may be resident at a time.
-
-B2 — ``TableToOntologyStrategy.induce`` clears ``concept.vector`` after
-     matching: vectors are empty afterwards, yet matches / proposal graph /
-     novel-table set are unaffected.
-"""
+"""Unit tests for memory reducers: embed_concepts channel fusion and induce vector clearing."""
 
 from __future__ import annotations
 
@@ -20,12 +10,14 @@ import pytest
 pytestmark = pytest.mark.unit
 
 import httpx
+from coa_common.bedrock_metrics import CostTracker
 from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogColumn, CatalogTable
 from coa_ontology.inducer.services.pipeline import InductionPipeline, SourceConcept
 from coa_ontology.inducer.strategies.table_to_ontology import TableToOntologyStrategy
 from opensearchpy.exceptions import OpenSearchException
 from rdflib import OWL, RDF
+from rdflib.compare import isomorphic
 
 # Channel → per-column vector. NON-round values on purpose: with 1.0/0.0 the
 # weighted sum is associativity-invariant and the byte-equality test is vacuous.
@@ -108,9 +100,6 @@ def _reference_fused() -> list[float]:
     return fused
 
 
-# ── B1 ─────────────────────────────────────────────────────────────────
-
-
 def test_embed_concepts_fusion_is_byte_identical_to_reference():
     """Incremental fusion must produce byte-for-byte the same fused vector as
     the old dict-based 3-channel weighted sum (float add is not associative)."""
@@ -153,9 +142,6 @@ def test_embed_concepts_holds_at_most_one_channel_list_alive():
     assert tracker.max_live == 1
 
 
-# ── B2 ─────────────────────────────────────────────────────────────────
-
-
 def _make_table(name: str = "orders") -> CatalogTable:
     return CatalogTable(
         id=f"test.{name}",
@@ -194,7 +180,7 @@ class _FakePipeline:
 
 
 def test_induce_clears_vectors_after_match_without_affecting_output():
-    """B2: after match, every concept.vector is empty, yet matches, the proposal
+    """After match, every concept.vector is empty, yet matches, the proposal
     graph, and the novel-table set are unaffected."""
     table = _make_table()
     matches = [
@@ -224,12 +210,11 @@ def test_induce_clears_vectors_after_match_without_affecting_output():
     assert out_matches == matches
     assert dropped == []  # table_to_ontology never drops tables
     assert "orders" in novel_tables
-    orders_cls = next(graph.subjects(RDF.type, OWL.Class))
-    assert orders_cls is not None
+    next(graph.subjects(RDF.type, OWL.Class))
 
 
 def test_induce_clears_vectors_on_all_novel_fallback():
-    """B2 must also hold on the all-novel fallback (match_concepts raised)."""
+    """Vector clearing must also hold on the all-novel fallback (match_concepts raised)."""
 
     class _RaisingPipeline(_FakePipeline):
         def match_concepts(self, concepts, *a, **k):
@@ -250,19 +235,6 @@ def test_induce_clears_vectors_on_all_novel_fallback():
     assert fake.seen_concepts is not None
     assert all(c.vector == [] for c in fake.seen_concepts)
     assert dropped == []
-
-
-# ── B3: table-batch streaming fusion ─────────────────────────────────────
-#
-# induce() must process tables in fixed-size batches through embed→match→free
-# so resident column vectors are O(batch), not O(catalog). These tests prove:
-#   1. peak resident vectors are FLAT as the table count grows (the core bound)
-#   2. batched output is IDENTICAL to a single-batch (whole-catalog) run
-#   3. per-batch fail-loud semantics are preserved (transport → raise, other →
-#      all-novel for that batch only)
-#   4. every vector is freed after induce (B2 still holds under batching)
-
-from rdflib.compare import isomorphic  # noqa: E402
 
 
 def _make_tables(n: int) -> list[CatalogTable]:
@@ -365,9 +337,6 @@ class _BatchFakePipeline:
 
 
 def _induce(tables, pipeline):
-    # induce() returns (graph, novel_tables, matches, dropped_tables); these
-    # tests assert only on the first three, so drop dropped_tables here rather
-    # than updating every call site to a 4-tuple.
     graph, novel, matches, _dropped = TableToOntologyStrategy().induce(
         tables=tables,
         ontology_uri_prefix="http://ex.org/induced#",
@@ -450,15 +419,6 @@ def test_batched_induce_plain_exception_falls_back_that_batch_only(monkeypatch):
     assert mm[("table_6", "")].matched_class_uri is None
     assert {f"table_{i}" for i in range(5, 10)} <= novel
     assert "table_0" not in novel  # grounded batch-1 table preserved
-
-
-# ── extract/embed failures obey the SAME per-batch policy as match ─────────
-#
-# extract_concepts/embed_concepts used to run OUTSIDE the try, so a Bedrock
-# throttle or transport error mid-catalog escaped the loop with a partially
-# filled all_matches — and the caller built an ontology from it, silently
-# yielding a corrupt partial result. They now share the match try/except:
-# transport → raise the whole job, other → all-novel for that batch only.
 
 
 class _StageFailPipeline(_BatchFakePipeline):
@@ -557,7 +517,7 @@ def test_batched_induce_memory_error_propagates(monkeypatch, stage):
 
 
 def test_batched_induce_frees_all_vectors(monkeypatch):
-    """B2 under batching: every concept's vector is empty after induce, across
+    """Under batching, every concept's vector is empty after induce, across
     all batches (including a final short batch)."""
     monkeypatch.setenv("INDUCER_TABLE_BATCH_SIZE", "4")
     fake = _BatchFakePipeline()
@@ -566,18 +526,6 @@ def test_batched_induce_frees_all_vectors(monkeypatch):
 
     assert fake.all_seen
     assert all(c.vector == [] for c in fake.all_seen)
-
-
-# ── ColumnMatch stage duration aggregated across fusion batches ────────────
-#
-# match_concepts records the ColumnMatch stage duration into the per-job
-# CostTracker once per call (a `finally` in pipeline.py), and
-# record_stage_duration is LAST-WRITER-WINS (stores, never sums). Streaming
-# fusion calls match_concepts once per batch, so each batch OVERWRITES the prior
-# ColumnMatch value — the emitted ColumnMatchDurationMs would report only the
-# LAST batch (~1/N of the true aggregate). induce() must aggregate to the SUM.
-
-from coa_common.bedrock_metrics import CostTracker  # noqa: E402
 
 
 class _ColumnMatchTimingPipeline:

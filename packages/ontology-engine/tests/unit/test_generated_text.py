@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reviewed fixed-text templates (namespace-language LLD, section 2.2.6)."""
+"""Fixed-text templates that COA emits in each namespace language."""
 
 from __future__ import annotations
 

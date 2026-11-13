@@ -12,8 +12,7 @@ import { useNamespace } from "./use-namespace";
 import { useGetNamespace } from "./use-get-namespace";
 
 // The hook reads only `data`, `isSuccess`, and `isLoading` off the query
-// result, so the mock returns a partial of the real return type — no `as`
-// assertion, per .claude/rules/frontend-typescript.md.
+// result, so the mock returns a partial of the real return type (no `as`).
 type NamespaceQueryResult = ReturnType<typeof useGetNamespace>;
 
 vi.mock("./use-get-namespace", () => ({
@@ -78,17 +77,7 @@ describe("useNamespace", () => {
   });
 
   it("grants access via GetNamespace success regardless of grant type (platform-admin regression)", () => {
-    // Regression guard for the bug that motivated this hook: the old
-    // useNamespaceAccess derived access by enumerating grant types
-    // (namespace grants, then platform grants) and still missed any
-    // namespace reachable only through a grant kind it didn't enumerate
-    // (e.g. a group grant) — a platform-admin or group-granted user saw
-    // every such namespace's breadcrumb trimmed to plain text. This hook
-    // asks GetNamespace directly instead of reasoning about grant types at
-    // all, so it has no such category to miss: any namespace the server
-    // lets this user open resolves access, independent of *which*
-    // authorization path (namespace grant, platform grant, group grant, or
-    // anything the server adds later) made that true.
+    // Access comes from GetNamespace succeeding, not from enumerating grant types.
     mockGetNamespace.mockReturnValue(nsResult(true, { name: "sales-ns" }));
 
     const { result } = renderHook(() => useNamespace("ns-a"));

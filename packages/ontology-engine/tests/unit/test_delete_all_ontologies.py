@@ -1,5 +1,4 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for DELETE /ontologies/ (delete all ontologies in namespace)."""
@@ -85,17 +84,7 @@ class TestDeleteAllOntologies:
     @patch("coa_ontology.dynamo_store.list_ontologies_registry")
     @patch("coa_ontology.dynamo_store.delete_all_namespace_items")
     def test_index_delete_failure_is_a_hard_gate(self, mock_delete_all, mock_list, client):
-        """An AOSS index delete failure must NOT be swallowed.
-
-        The caller (namespace deletion pipeline) deletes the namespace record
-        after this returns, so a swallowed failure orphans the index forever —
-        nothing can target a namespace that no longer exists — until the
-        collection hits its hard 1000-index cap and every embedding write in
-        the deployment fails with index_limit_breached. Failing loudly makes
-        the pipeline retry and, on exhaustion, land a recoverable
-        DELETE_FAILED. Contrast test_graph_failure_is_suppressed: a dropped
-        graph is bad but consumes no quota that can wedge the deployment.
-        """
+        """An AOSS index delete failure must propagate; a swallowed one orphans the index."""
         test_client, mock_graph, mock_vector = client
         mock_list.return_value = [{"ontology_id": "http://ex.org/ont1"}]
         mock_graph.delete_ontology.return_value = True
@@ -414,7 +403,6 @@ class TestDeleteSingleOntology:
         mock_upd_reg.assert_any_call("test-ns", oid, status="deleting", delete_error="")
         err_calls = [c for c in mock_upd_reg.call_args_list if "delete_error" in c.kwargs and c.kwargs["delete_error"]]
         assert err_calls, "expected a delete_error to be recorded on graph-delete failure"
-        assert "Graph delete failed" in err_calls[0].kwargs["delete_error"]
         # Returned by ListOntologies as deleteError: the type, never the backend's message.
         assert err_calls[0].kwargs["delete_error"] == "Graph delete failed: RuntimeError"
         # Hard gate: registry row NOT removed, embeddings + proposals not touched.
@@ -461,9 +449,7 @@ class TestDeleteSingleOntology:
     def test_embedding_delete_incomplete_keeps_registry_row(
         self, mock_get_reg, mock_del_reg, mock_upd_reg, mock_list_props, mock_del_prop, client
     ):
-        """A delete that stalls with embeddings still matching is a teardown
-        failure too: it used to return normally, so the row was removed with the
-        embeddings left behind. Now it trips the same hard gate."""
+        """A delete that stalls with embeddings still matching trips the same hard gate."""
         from coa_common.opensearch import AossVectorClient
         from coa_common.opensearch import client as oss_client
 

@@ -8,10 +8,6 @@ from __future__ import annotations
 import pytest
 from coa_common.constants import EXTRACTION_DEFAULTS
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 
 class _FakeConfig:
     """Minimal Pydantic-like model stub with model_dump."""
@@ -23,11 +19,6 @@ class _FakeConfig:
         if exclude_none:
             return {k: v for k, v in self._data.items() if v is not None}
         return dict(self._data)
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -43,7 +34,6 @@ class TestMergeExtractionConfigNone:
 
         result = merge_extraction_config(None)
         result["extraction_mode"] = "mutated"
-        # Calling again should still return the original defaults
         result2 = merge_extraction_config(None)
         assert result2["extraction_mode"] == EXTRACTION_DEFAULTS["extraction_mode"]
 
@@ -110,7 +100,6 @@ class TestMergeExtractionConfigDict:
         from coa_sources.utils import merge_extraction_config
 
         result = merge_extraction_config({"extraction_mode": "separated"})
-        # All other defaults should still be present
         for key in EXTRACTION_DEFAULTS:
             assert key in result
 
@@ -136,7 +125,6 @@ class TestMergeExtractionConfigPydanticModel:
 
         model = _FakeConfig({"extraction_mode": None, "use_batch_inference": True})
         result = merge_extraction_config(model)
-        # None value should be excluded, so extraction_mode stays as default
         assert result["extraction_mode"] == EXTRACTION_DEFAULTS["extraction_mode"]
         assert result["use_batch_inference"] is True
 
@@ -153,7 +141,6 @@ class TestMergeExtractionConfigUnknownType:
     def test_unknown_type_returns_defaults(self):
         from coa_sources.utils import merge_extraction_config
 
-        # An object that is neither None, dict, nor has model_dump
         result = merge_extraction_config(42)
         assert result == dict(EXTRACTION_DEFAULTS)
 

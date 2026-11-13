@@ -91,7 +91,6 @@ describe("NamespaceStack", () => {
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
-    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-namespace-api", "-grants-api"]);
   });
 
@@ -189,26 +188,12 @@ describe("NamespaceStack", () => {
     expect(domains[domainKey].Properties).not.toHaveProperty("SingleSignOn");
   });
 
-  // ── DataZone teardown ─────────────────────────────────────
-
   test("every native DataZone L1 resource has RemovalPolicy.RETAIN", () => {
-    // DataZone rejects deleting these directly via CFN: a FormType must
-    // be DISABLED before DeleteFormType succeeds; a domain's native
-    // DeleteDomain has no force/cascade option and fails outright with
-    // "Domain cannot be deleted because there are existing projects
-    // under this domain" — and a namespace-created project always
-    // exists under this domain while any namespace does, so that's not
-    // an edge case (confirmed against a real stuck stack — see PR
-    // discussion). The native CfnDomain/CfnFormType/CfnProject/... L1
-    // resources have no delete hook to handle any of this, so cdk
-    // destroy fails and leaves the stack DELETE_FAILED. RETAIN means CFN
-    // never attempts to delete these itself; destroy.sh instead calls
-    // DataZone's own delete-domain --skip-deletion-check directly, which
-    // does support a full cascading force-delete at the domain level
-    // (unlike DeleteProject's cascade, which stops at cross-project
-    // asset-type references). This does not apply to CoaRelationalTable
-    // (AWS::DataZone::AssetType has no native CFN resource at all, so it
-    // must remain a custom resource regardless).
+    // DataZone rejects direct CFN deletes: a FormType must be DISABLED
+    // before DeleteFormType, and DeleteDomain fails while any project exists.
+    // The L1 resources have no delete hook, so RETAIN keeps CFN from trying;
+    // destroy.sh calls delete-domain --skip-deletion-check instead.
+    // CoaRelationalTable is a custom resource (no native CFN AssetType).
     const RETAINED_TYPES = [
       "AWS::DataZone::Domain",
       "AWS::DataZone::UserProfile",

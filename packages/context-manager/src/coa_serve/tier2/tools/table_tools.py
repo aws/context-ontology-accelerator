@@ -229,8 +229,3 @@ class TableCatalog:
     def known_tables(self) -> list[str]:
         """Sorted names of every table cached so far."""
         return sorted(self._hits_by_table.keys())
-
-    @property
-    def hits(self) -> list[VectorHit]:
-        """Every hit seen so far, in the order retrieved."""
-        return list(self._all_hits)

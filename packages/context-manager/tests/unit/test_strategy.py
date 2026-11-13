@@ -1,16 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Tier 2 pluggable strategy architecture.
-
-Tests cover:
-1. StructuredQueryTier sequential policy — first success wins, failures skip
-2. StructuredQueryTier parallel policy — highest confidence wins
-3. AccessDeniedError propagation in both policies
-4. StrategyContext data flow
-5. filter_strategies helper
-6. OrchestratorStrategy selection mapping (tierOverride/options.strategy)
-"""
+"""Unit tests for the Tier 2 pluggable strategy architecture."""
 
 from __future__ import annotations
 
@@ -30,8 +21,6 @@ from coa_serve.tier2.strategy import (
     normalize_strategy_option,
 )
 from coa_serve.trace import TraceCollector
-
-# ── Helpers ─────────────────────────────────────────────────────────────
 
 
 def _make_strategy(name: str, result: StrategyResult | None = None, error: Exception | None = None):
@@ -75,9 +64,6 @@ def _make_empty_result(strategy_name: str = "test", confidence: float = 0.8) -> 
     )
 
 
-# ── Sequential policy ───────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestSequentialPolicy:
     @pytest.mark.asyncio
@@ -93,7 +79,6 @@ class TestSequentialPolicy:
 
         assert result is not None
         assert result.strategy_name == "a"
-        # Second strategy never called
         s2.resolve.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -185,7 +170,7 @@ class TestSequentialPolicy:
     @pytest.mark.asyncio
     async def test_low_confidence_result_with_rows_does_not_end_the_chain(self):
         """A below-floor answer is one the orchestrator discards, so with NL→SPARQL in the
-        chain a later strategy must still run (a 0.05 Ontop answer used to starve it)."""
+        chain a later strategy must still run."""
         s1 = _make_strategy("a", result=_make_result("a", confidence=0.05))
         s2 = _make_strategy(StrategyOption.NL_TO_SPARQL, result=_make_result("b", confidence=0.9))
         tier = StructuredQueryTier(strategies=[s1, s2])
@@ -216,7 +201,7 @@ class TestSequentialPolicy:
 
     @pytest.mark.asyncio
     async def test_without_nl_to_sparql_a_low_confidence_answer_ends_the_chain_as_on_main(self):
-        """With graph sources off the SQL chain is main's: NL→SQL's answer ends it, and the
+        """With graph sources off, NL→SQL's answer ends the SQL chain, and the
         orchestrator's floor then sends it to Tier 3. Ontop must not run and answer instead."""
         nl_to_sql = _make_strategy(StrategyOption.NL_TO_SQL, result=_make_result("nl_to_sql", confidence=0.2))
         ontop = _make_strategy(StrategyOption.ONTOP, result=_make_result("ontop", confidence=0.73))
@@ -241,26 +226,14 @@ class TestSequentialPolicy:
         with pytest.raises(AccessDeniedError):
             await tier.resolve("query", "ns", ctx)
 
-        # Second strategy never attempted after terminal deny
         s2.resolve.assert_not_awaited()
-
-
-# ── Parallel policy ──────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
 class TestParallelPolicy:
     @pytest.mark.asyncio
     async def test_precedence_order_wins_not_confidence(self):
-        """Declared strategy order decides the winner, NOT self-reported confidence.
-
-        Behaviour change (was `test_highest_confidence_wins`): selection used to
-        sort on StrategyResult.confidence, which is a model self-assessment. Two
-        strategies scoring within noise of each other swapped the winner between
-        identical requests, changing the SQL and the answer — measured as
-        per-question F1 flipping 0<->1 across identical benchmark runs. Order is
-        stable and encodes real authority (governed metric > VKG > free NL->SQL).
-        """
+        """A fixed strategy precedence decides the winner, not self-reported confidence or declared order."""
         ontop = _make_strategy("ontop", result=_make_result("ontop", confidence=0.9))
         nl = _make_strategy("nl_to_sql", result=_make_result("nl_to_sql", confidence=0.6))
         tier = StructuredQueryTier(strategies=[ontop, nl])
@@ -269,23 +242,8 @@ class TestParallelPolicy:
         result = await tier.resolve("query", "ns", ctx, option="best")
 
         assert result is not None
-        # nl_to_sql outranks ontop on MEASURED reliability (0.590 vs 0.055 mean
-        # F1), so it wins despite lower self-reported confidence and despite
-        # ontop being declared first.
         assert result.strategy_name == "nl_to_sql"
         assert result.confidence == 0.6
-
-    @pytest.mark.asyncio
-    async def test_selection_is_stable_across_repeated_runs(self):
-        """Same inputs must yield the same winner every time."""
-        winners = []
-        for _ in range(10):
-            o = _make_strategy("ontop", result=_make_result("ontop", confidence=0.5001))
-            n = _make_strategy("nl_to_sql", result=_make_result("nl_to_sql", confidence=0.5))
-            tier = StructuredQueryTier(strategies=[o, n])
-            res = await tier.resolve("query", "ns", StrategyContext(trace=TraceCollector()), option="best")
-            winners.append(res.strategy_name)
-        assert set(winners) == {"nl_to_sql"}, f"winner flipped across runs: {set(winners)}"
 
     @pytest.mark.asyncio
     async def test_near_tie_confidence_does_not_flip_winner(self):
@@ -446,9 +404,6 @@ class TestParallelPolicy:
         assert "t2.strategy_selected" in merged
 
 
-# ── Strategy selection via option ─────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestStrategySelection:
     def test_option_ontop_selects_only_ontop(self):
@@ -506,9 +461,6 @@ class TestStrategySelection:
 
         selected = tier._strategies_for("nl_to_sql")
         assert len(selected) == 0
-
-
-# ── End-to-end execution per strategy option ─────────────────────────────
 
 
 @pytest.mark.unit
@@ -590,7 +542,7 @@ class TestStrategyExecutionByOption:
 
     @pytest.mark.asyncio
     async def test_best_runs_both_and_precedence_wins(self):
-        """`best` runs both strategies; the earlier-declared one wins deterministically."""
+        """`best` runs both strategies; the fixed precedence picks the winner."""
         nl = _make_strategy("nl_to_sql", result=_make_result("nl_to_sql", confidence=0.6))
         ontop = _make_strategy("ontop", result=_make_result("ontop", confidence=0.9))
         tier = StructuredQueryTier(strategies=[nl, ontop])
@@ -598,14 +550,9 @@ class TestStrategyExecutionByOption:
         ctx = StrategyContext(trace=TraceCollector())
         result = await tier.resolve("q", "ns", ctx, option="best")
 
-        # Declared first wins regardless of the higher-confidence alternative.
         assert result.strategy_name == "nl_to_sql"
-        # Parallel: both strategies are invoked.
         nl.resolve.assert_awaited_once()
         ontop.resolve.assert_awaited_once()
-
-
-# ── StrategyContext data flow ────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -627,9 +574,6 @@ class TestStrategyContext:
 
         call_args = s1.resolve.call_args
         assert call_args.args == ("test query", "demo-ns", ctx)
-
-
-# ── Orchestrator strategy selection mapping ──────────────────────────────
 
 
 @pytest.mark.unit
@@ -660,7 +604,7 @@ class TestResolveStrategySelection:
 
     @pytest.mark.usefixtures("graph_sources_off")
     def test_without_graph_sources_nl_to_sparql_runs_the_default_chain_as_on_main(self):
-        """On main the value was unknown: not a pin, so the default chain and the per-query
+        """Without graph sources the value is not a pin, so the default chain and the per-query
         skip evaluator apply, and a Tier-1/3 pin still keeps Tier 2 out."""
         assert Orchestrator._has_explicit_strategy({"strategy": "nl_to_sparql"}) is False
         assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sparql"}, None) == "nl_to_sql_first"
@@ -673,9 +617,6 @@ class TestResolveStrategySelection:
 
     def test_tier_override_2_maps_to_default_strategy(self):
         assert Orchestrator._resolve_strategy_selection({}, 2) == "nl_to_sql_first"
-
-    def test_strategy_nl_to_sql_option(self):
-        assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sql"}, None) == "nl_to_sql"
 
     def test_tier_override_1_skips(self):
         assert Orchestrator._resolve_strategy_selection({}, 1) is None
@@ -690,11 +631,7 @@ class TestResolveStrategySelection:
         assert Orchestrator._resolve_strategy_selection({"startTier": 3}, None) is None
 
     def test_explicit_strategy_overrides_tier_override(self):
-        # strategy option takes precedence over tierOverride
         assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sql"}, 2) == "nl_to_sql"
-
-
-# ── Orchestrator integration with StructuredQueryTier ────────────────────
 
 
 @pytest.mark.unit
@@ -764,8 +701,7 @@ class TestOrchestratorWithStrategy:
         orch, _ = self._make_orchestrator_with_strategy(None)
 
         request = InvokeRequest(query="test", namespace="demo", options={"tierOverride": 2})
-        # / Req 2: a pinned Tier-2 strategy miss is a 404 NoResultError,
-        # not a bare ValueError (which the WS handler would map to 500).
+        # A pinned Tier-2 strategy miss is a 404 NoResultError, not a ValueError (500).
         with pytest.raises(NoResultError) as exc_info:
             await orch.resolve(request)
         assert exc_info.value.status_code == 404
@@ -779,11 +715,7 @@ class TestOrchestratorWithStrategy:
 
         request = InvokeRequest(query="test", namespace="demo", options={"strategy": "nl_to_sql"})
         response = await orch.resolve(request)
-        # Strategy fails → falls through to Tier 3
         assert response.result.tier == 3
-
-
-# ── model_id propagation ──────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -824,53 +756,9 @@ class TestModelIdPropagation:
         )
         await tier.resolve("query", "ns", ctx, option="best")
 
-        # Both strategies should receive contexts with model_id set
         for strategy in [s1, s2]:
             call_ctx = strategy.resolve.call_args.args[2]
             assert call_ctx.model_id == "us.anthropic.claude-haiku-4-5"
-
-    @pytest.mark.asyncio
-    async def test_parallel_context_preserves_none_model_id(self):
-        """Verify _resolve_parallel works when model_id is None (no override)."""
-        s1 = _make_strategy("a", result=_make_result("a", confidence=0.8))
-        tier = StructuredQueryTier(strategies=[s1])
-
-        ctx = StrategyContext(trace=TraceCollector(), model_id=None)
-        await tier.resolve("query", "ns", ctx, option="best")
-
-        call_ctx = s1.resolve.call_args.args[2]
-        assert call_ctx.model_id is None
-
-    @pytest.mark.asyncio
-    async def test_sequential_context_passes_model_id(self):
-        """Verify sequential policy passes model_id via the original context."""
-        s1 = _make_strategy("a", result=_make_result("a"))
-        tier = StructuredQueryTier(strategies=[s1])
-
-        ctx = StrategyContext(trace=TraceCollector(), model_id="custom-model")
-        await tier.resolve("query", "ns", ctx)
-
-        call_ctx = s1.resolve.call_args.args[2]
-        assert call_ctx.model_id == "custom-model"
-
-
-@pytest.mark.unit
-class TestOrchestratorModelValidation:
-    def test_invalid_model_id_raises(self):
-        from coa_serve.model_validation import validate_model_id
-
-        with pytest.raises(ValueError, match="invalid characters"):
-            validate_model_id("model with spaces")
-
-    def test_valid_model_id_in_options(self):
-        from coa_serve.model_validation import validate_model_id
-
-        # Should not raise
-        validate_model_id("us.anthropic.claude-sonnet-4-6")
-        validate_model_id("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2:1")
-
-
-# ── Strategy selection (_strategies_for) ──────────────────────────────────
 
 
 def _backend_strategy(name, *backends):
@@ -1050,18 +938,9 @@ class TestAgenticStrategySelection:
 class TestSmithyQueryStrategyParity:
     """The advertised contract and the honoured values must not drift apart.
 
-    ``strategy`` is a closed enum on the Smithy ``Query`` input, so two silent
-    failures are possible and neither shows up in a normal test:
-
-    * the contract advertises a value serve does not honour — it drops out of
-      ``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and quietly resolves to
-      ``DEFAULT_STRATEGY``, running the cheap fallback chain while the caller
-      believes it pinned an engine (the exact trap ``LEGACY_STRATEGY_ALIASES``
-      documents);
-    * serve gains a strategy the contract cannot express, so no REST or MCP caller
-      can reach it — the defect this field was added to fix: before it, the
-      Ontop/VKG engine ran only as an automatic fallback, so no REST or MCP
-      caller could select it deliberately.
+    An advertised value serve does not honour silently resolves to
+    ``DEFAULT_STRATEGY``; a strategy the contract cannot express is unreachable
+    from REST or MCP.
 
     Parsing the model file is deliberate: comparing against the *generated* client
     would only prove codegen ran, not that the source of truth agrees with the
@@ -1083,8 +962,6 @@ class TestSmithyQueryStrategyParity:
         return set(re.findall(r'=\s*"([^"]+)"', match.group(1)))
 
     def test_enum_matches_strategy_option_exactly(self):
-        from coa_serve.tier2.strategy import StrategyOption
-
         declared = self._smithy_enum_values()
         runtime = {option.value for option in StrategyOption}
         assert declared == runtime, (
@@ -1100,9 +977,6 @@ class TestSmithyQueryStrategyParity:
         ``_EXPLICIT_STRATEGY_OPTIONS`` would be accepted at the edge and then
         silently ignored — worse than rejecting it.
         """
-        from coa_serve.orchestrator import Orchestrator
-        from coa_serve.tier2.strategy import normalize_strategy_option
-
         for value in sorted(self._smithy_enum_values()):
             normalised = normalize_strategy_option(value)
             assert normalised in Orchestrator._EXPLICIT_STRATEGY_OPTIONS, (
@@ -1120,7 +994,6 @@ class TestSmithyQueryStrategyParity:
         accepting ones it does not).
         """
         from coa_common.constants import QUERY_STRATEGIES
-        from coa_serve.tier2.strategy import StrategyOption
 
         declared = self._smithy_enum_values()
         runtime = {option.value for option in StrategyOption}

@@ -112,9 +112,6 @@ describe("TokenInput", () => {
     expect(screen.getByText("No spaces allowed")).toBeInTheDocument();
   });
 
-  // Committing several entries at once. Before this was supported, pasting a
-  // comma-separated list produced ONE token containing the commas, which passed
-  // validation and silently gave the caller a nonsense value.
   describe("committing several entries at once", () => {
     /** Type `value` into the input and commit it with the add button. */
     const commit = (value: string) => {
@@ -133,11 +130,7 @@ describe("TokenInput", () => {
       expect(onChange).toHaveBeenCalledWith(["orders", "customers", "refunds"]);
     });
 
-    // A single-line <input> runs the HTML value sanitization algorithm, which
-    // strips CR and LF. A newline-separated list therefore arrives with its
-    // separators already gone — there is nothing left to split on, and no code
-    // in this component can recover the boundaries. Pinned so nobody "fixes"
-    // the regex expecting it to help: only a <textarea> can accept such a paste.
+    // A single-line <input> strips CR and LF (see TokenInput.tsx).
     it("cannot recover entries from a newline-separated list", () => {
       const onChange = vi.fn();
       render(<TokenInput value={[]} onChange={onChange} ariaLabel="Tables" />);

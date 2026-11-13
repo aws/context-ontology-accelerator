@@ -44,10 +44,7 @@ ConnHandle = Any
 
 @dataclass(frozen=True)
 class DBCredentials:
-    """Resolved connection credentials + metadata for a source database.
-
-    Immutable — prevents accidental mutation of credentials after creation.
-    """
+    """Resolved connection credentials + metadata for a source database."""
 
     username: str
     password: str
@@ -173,8 +170,6 @@ class EngineAdapter(ABC):
         except sqlglot.errors.SqlglotError:
             return self._limit_fallback(sql, max_rows)
 
-        # Root-level limit only — a nested/subquery LIMIT must NOT be treated as the
-        # statement's cap (see docstring).
         limit_node = parsed.args.get("limit") if isinstance(parsed, sqlglot.exp.Expression) else None
         if limit_node is None:
             parsed.set("limit", sqlglot.exp.Limit(expression=sqlglot.exp.Literal.number(max_rows)))

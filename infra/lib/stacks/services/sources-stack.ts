@@ -35,6 +35,7 @@ import {
   resolveContext,
   resolveLambdaReservedConcurrency,
   guardrailProfileResources,
+  resolvePreferIpv4BuildArgs,
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
@@ -63,7 +64,7 @@ export interface SourcesStackProps extends cdk.StackProps {
   readonly storage: StorageStack;
   readonly allowedOrigin?: string;
   /**
-   * Bedrock model IDs, resolved from the SSM deploy config (#94). Omitted →
+   * Bedrock model IDs, resolved from the SSM deploy config. Omitted →
    * shared defaults, so a deployment configuring nothing is unchanged. Set for
    * non-US deploys, where the default `us.` inference profiles are not
    * invocable.
@@ -71,23 +72,11 @@ export interface SourcesStackProps extends cdk.StackProps {
   readonly bedrockChatModelId?: string;
   readonly bedrockEmbedModelId?: string;
   readonly bedrockEmbedDimensions?: number;
-  /** Optional OE alarm action strategy (undefined in round one). */
+  /** Optional OE alarm action strategy. */
   readonly alarmAction?: IAlarmActionStrategy;
 }
 
-/**
- * Service stack: Unified source registry for the SemanticContext platform.
- *
- * Provisions:
- *   - sources-table DDB: unified registry of all sources (DATABASE + DOCUMENTS)
- *       PK = NS#{namespaceId}, SK = SRC#{sourceId}
- *   - source-scan-jobs DDB: scan job history for database sources
- *       PK = SRC#{sourceId}, SK = <ISO timestamp>
- *   - sources-data S3 bucket: raw uploads and pre-processed staging for document sources
- *   - Database pipeline: ConnectorFn (discovery) + EnrichmentECS + DbScanStateMachine + DbScanQueue
- *   - Documents pipeline: PreprocessingFn + KgBuildECS + DocIngestionStateMachine + DocDeletionStateMachine + DocIngestionQueue
- *   - SourcesApiFn Lambda: unified REST API for all source types
- */
+/** Service stack: unified source registry for database and document sources. */
 export class SourcesStack extends SCLStack {
   /** Unified sources DynamoDB table. */
   public readonly sourcesTable: dynamodb.Table;
@@ -95,27 +84,18 @@ export class SourcesStack extends SCLStack {
   /** Source scan jobs DynamoDB table. */
   public readonly sourceScanJobsTable: dynamodb.Table;
 
-  /** Sources API Lambda function ARN. */
-  public readonly sourcesApiFnArn: string;
-
   constructor(scope: Construct, id: string, props: SourcesStackProps) {
     super(scope, id, props);
     this.addComponentTag("sources");
 
     const { ssmPrefix, envName } = resolveContext(this.node);
-    // Parameter-Store home for the Databricks sub-type, split into two subtrees
-    // with a different writer each. `sources/` holds one parameter per source, which
-    // the shared connector resolves from the catalog name it was invoked under.
-    // `deployment/` holds the connector's own function ARN, written by the
-    // connector's own CDK app and read by the sources API at source-create.
-    //
-    // Split deliberately: a single prefix would let the sources API overwrite the
-    // ARN it later reads. Nothing here may be widened to `…/connectors/databricks/*`.
-    //
-    // `${envName}` is explicit because `ssmPrefix` is `/${prefix}` with NO environment
-    // segment while physical names are `{prefix}-{env}-{name}`, and environments share
-    // an account. Without it a dev registration would resolve PROD's connector ARN and
-    // create a catalog pointing at prod's connector.
+    // Parameter-Store home for the Databricks sub-type, split into two subtrees with
+    // a different writer each: `sources/` (one parameter per source, written here) and
+    // `deployment/` (the connector ARN, written by the connector's own CDK app). Do not
+    // widen to `…/connectors/databricks/*`, or this API could overwrite the ARN it reads.
+    // `${envName}` is explicit because `ssmPrefix` has no environment segment while
+    // environments share an account; without it a dev registration would resolve
+    // prod's connector ARN.
     // CloudWatch namespace for this service's custom metrics. Declared here rather
     // than beside the dashboard because the parameter-write detection below emits into
     // it too, and both must name the same namespace.
@@ -138,7 +118,7 @@ export class SourcesStack extends SCLStack {
     const nsTagKey = namespaceTagKey(this.node);
     const allowedOrigin = props.allowedOrigin ?? "*";
 
-    // ── Bedrock model IDs (#94) ────────────────────────────────────────
+    // ── Bedrock model IDs ────────────────────────────────────────
     // Resolved once so the doc-ingestion inference-profile ARN, the KG-build
     // container env, and the scan dashboard's ModelId dimension all derive from
     // the same value. Config wins; shared defaults otherwise.
@@ -190,9 +170,7 @@ export class SourcesStack extends SCLStack {
       namespacesTableName,
     );
 
-    // ================================================================
     // DynamoDB Tables
-    // ================================================================
 
     // ── sources-table ────────────────────────────────────────────────
     // PK = NS#{namespaceId}, SK = SRC#{sourceId}
@@ -255,9 +233,7 @@ export class SourcesStack extends SCLStack {
     });
     this.sourceScanJobsTable = sourceScanJobsConstruct.table;
 
-    // ================================================================
     // S3 Bucket — raw uploads + pre-processed staging (documents)
-    // ================================================================
     const sourcesAccessLogs = new AccessLogsBucket(this, "SourcesAccessLogs", {
       nameSuffix: "sources-logs",
     });
@@ -292,9 +268,7 @@ export class SourcesStack extends SCLStack {
       ],
     });
 
-    // ================================================================
     // ECR repo context (shared between database enrichment + documents)
-    // ================================================================
     const ecrRepositoryArn = this.node.tryGetContext("ecr_repository_arn") as
       | string
       | undefined;
@@ -309,9 +283,7 @@ export class SourcesStack extends SCLStack {
           })
         : undefined;
 
-    // ================================================================
     // Database Pipeline — Connector Lambda + Enrichment ECS + SFN
-    // ================================================================
 
     // ── Connector Service Lambda ─────────────────────────────────────
     const dbConnectorDlq = new sqs.Queue(this, "DbConnectorDLQ", {
@@ -335,35 +307,13 @@ export class SourcesStack extends SCLStack {
       .replace(/[^a-z0-9]/g, "");
     const fedResourcePrefix = `${safeResourcePrefix}ds_`;
 
-    // Catalog-name uniqueness is a SECURITY invariant for the Databricks sub-type,
-    // not a cosmetic one: one connector Lambda serves every Databricks source, and it
-    // resolves which warehouse and which credential secret to use from the Athena
-    // catalog name it was invoked under. Two sources aliasing to one catalog name
-    // therefore alias to one credential.
-    //
+    // The catalog name selects the warehouse and credential secret in the shared
+    // Databricks connector, so two sources aliasing to one name alias to one credential.
     // `build_catalog_name` builds `{safe_prefix}ds_{16-hex}` and truncates to
-    // `_CATALOG_NAME_MAX` = 41 AFTER concatenation, so the DIGEST is what gets cut. It
-    // prepends a second `ds_` only when the result does not start with a letter — and
-    // since `safe_prefix` is `[a-z0-9]*`, that means only when the prefix starts with a
-    // DIGIT. So the digest kept is min(16, 38 - S) for a letter-leading prefix and
-    // min(16, 35 - S) for a digit-leading one, and `safeResourcePrefix` is a synth-time
-    // string, so the figure below is this deployment's rather than the worst case.
-    //
-    // 41 is self-imposed by `_CATALOG_NAME_MAX` in
-    // `packages/sources/.../glue_connection_provisioner.py` — Athena itself allows 127.
-    // Nothing ties the two constants together, so a change to either must change both.
-    //
-    // A WARNING, not a throw, because the collision-prone range cannot be entered: the
-    // longest prefixed physical name in this stack is an `iam.Role`, IAM caps a role name
-    // at 64 characters, so len(prefix) + len(env) <= 27 and the digest keeps at least
-    // 8 characters even in the digit-leading branch. A deployment long enough to lose the
-    // digest outright fails synth on `InvalidRoleName` first, naming the role.
-    //
-    // And a collision that did occur would be caught loudly: registration creates the
-    // catalog with `require_absent=True` and writes the parameter with `Overwrite=False`,
-    // so the SECOND source's create fails instead of inheriting the first's credential.
-    // Those two runtime controls are what hold — `scripts/deploy.sh` pipes synth to
-    // `/dev/null`, so this annotation reaches CI rather than an operator deploying.
+    // `_CATALOG_NAME_MAX` = 41 after concatenation, so the digest is what gets cut; a
+    // second `ds_` is prepended when the prefix starts with a digit. Keep CATALOG_NAME_MAX
+    // in step with `_CATALOG_NAME_MAX` in the Python provisioner. This is a synth-time
+    // warning only: `scripts/deploy.sh` pipes synth to /dev/null, so it reaches CI.
     const CATALOG_NAME_MAX = 41;
     const DIGEST_LEN = 16;
     // 3 for `build_catalog_name`'s own `ds_`, plus 3 more for the second one it
@@ -501,41 +451,12 @@ export class SourcesStack extends SCLStack {
         resources: ["*"],
       }),
     );
-    // Mutating ENI actions — MUST be `*`, not resource-scoped.
-    //
-    // Glue's managed connector runs a PRE-FLIGHT authorization check before it
-    // touches any real ENI: it dry-runs CreateNetworkInterface,
-    // DescribeNetworkInterfaces and DeleteNetworkInterface. That check authorizes
-    // against the WILDCARD resource `arn:aws:ec2:<region>:<account>:*/*`, which no
-    // enumeration of concrete resource types can satisfy. Captured from CloudTrail
-    // in a failing account (2026-08-06):
-    //
-    //   ec2:DeleteNetworkInterface  Client.UnauthorizedOperation
-    //   "...is not authorized to perform: ec2:DeleteNetworkInterface on resource:
-    //    arn:aws:ec2:us-east-1:<acct>:*/* because no identity-based policy allows
-    //    the ec2:DeleteNetworkInterface action"
-    //
-    // The connection is then reported as
-    //   "Unable to access VPC provided in the connection. Please check SubnetId and
-    //    SecurityGroup passed in the request and the policies and trust
-    //    relationships on the IAM role."
-    // — a generic message that names the subnet and SG and never mentions which
-    // action was denied, which is why this was repeatedly misdiagnosed as a
-    // networking problem. It is not: the SG, subnet, route table and peering are
-    // all irrelevant to this failure. Verified by experiment in the failing
-    // account: 4 consecutive connections FAILED with the scoped policy, and one
-    // created ~10s after adding these actions on `*` reached READY.
-    //
-    // AWS's own managed policy for Glue (`AWSGlueServiceRole`) grants
-    // CreateNetworkInterface / DeleteNetworkInterface / DescribeNetworkInterfaces
-    // on `Resource: ["*"]` for exactly this reason, so this matches the documented
-    // service contract rather than loosening past it.
-    //
-    // CAUTION when tightening: Glue CACHES a successful validation per
-    // (role, VPC, subnet, security group). After one success, later connections
-    // skip the pre-flight and keep succeeding even if the policy is narrowed
-    // again — so a narrowing looks safe in a warm account and only breaks the
-    // next environment built from scratch. Test any change here in a fresh VPC.
+    // Mutating ENI actions must be `*`: Glue's managed connector pre-flight dry-runs
+    // CreateNetworkInterface, DescribeNetworkInterfaces and DeleteNetworkInterface and
+    // authorizes against `arn:aws:ec2:<region>:<account>:*/*`, which no resource-scoped
+    // statement satisfies (AWSGlueServiceRole grants the same). Glue caches the validation,
+    // so a narrowing looks safe in a warm account and breaks the next fresh one. Test any
+    // change here in a fresh VPC.
     federatedCatalogRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "Ec2NetworkInterfaceManagement",
@@ -548,21 +469,10 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // ec2:CreateNetworkInterfacePermission is REQUIRED for Glue managed/VPC
-    // connections: after creating the ENI, Glue must grant its managed service
-    // account permission to attach it. Without it the connection fails at
-    // validation with "Unable to access VPC provided in the connection ... check
-    // ... the policies and trust relationships on the IAM role" — even when the
-    // subnet routes to the source and the SG is correct (confirmed live 2026-07-29:
-    // MySQL/SQLServer federated connections FAILED with that message while the
-    // connector subnet had an active peering route to the DB VPC and a valid
-    // self-referencing SG).
-    //
-    // This action's grantee is NOT expressible via the resource ARN, so it lives
-    // in its own statement with an `ec2:AuthorizedService` condition confining the
-    // grant to Glue — least-privilege: the role cannot hand ENI-attach permission
-    // to an arbitrary service/account. Glue managed connections are the only
-    // consumer, so scoping to glue.amazonaws.com preserves the verified flow.
+    // ec2:CreateNetworkInterfacePermission is required for Glue managed/VPC connections:
+    // after creating the ENI, Glue grants its managed service account permission to attach
+    // it. The grantee is not expressible via the resource ARN, so the statement is
+    // confined to Glue with an `ec2:AuthorizedService` condition.
     federatedCatalogRole.addToPolicy(
       new iam.PolicyStatement({
         sid: "Ec2CreateNetworkInterfacePermissionForGlue",
@@ -719,7 +629,7 @@ export class SourcesStack extends SCLStack {
           // Nested/federated Glue catalogs (catalogId "account:catalogName")
           // authorize GetDatabase/GetTables against the nested-catalog resource
           // itself, not just its children — without these a federated source
-          // fails discovery with AccessDenied on `catalog/<name>` (issue 118).
+          // fails discovery with AccessDenied on `catalog/<name>`.
           "glue:GetCatalog",
           "glue:GetCatalogs",
           // Reads the `coa:namespace` tag by which a database owner declares
@@ -774,23 +684,12 @@ export class SourcesStack extends SCLStack {
         ],
       }),
     );
-    // Invoke a customer-authored Athena federation connector — but only when
-    // Athena is the one doing it. The connector Lambda lives in the CUSTOMER's
-    // account and its ARN is unknown at deploy time, so the resource cannot be
-    // enumerated; containment is by condition key plus the customer's own
-    // Lambda resource policy, which must independently name this role.
-    //
-    // `aws:CalledVia` is populated on forward access sessions, so this Allow
-    // matches only while Athena is executing a statement for this role and
-    // never for a direct `lambda:Invoke` from discovery code. It is multi-valued
-    // and its order cannot be constrained, hence ForAnyValue — AWS documents
-    // "somewhere in the chain" as the intended semantics. Evaluation fails
-    // CLOSED: an absent key does not match, so a bug here denies rather than
-    // widens.
-    //
-    // Region-pinned by choice, not by necessity: Athena CAN invoke a connector
-    // in another region when given its full ARN, but we do not support that
-    // topology, and the control-plane rejects such an ARN at source-create.
+    // Invoke a customer-authored Athena federation connector, only when Athena is the
+    // caller. The connector lives in the customer's account, so its ARN cannot be
+    // enumerated; containment is the condition key plus the customer's own Lambda resource
+    // policy. `aws:CalledVia` is populated only on forward access sessions and is
+    // multi-valued, hence ForAnyValue; an absent key does not match, so it fails closed.
+    // Region-pinned: cross-region connectors are unsupported and rejected at source-create.
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "AthenaFederationConnectorInvoke",
@@ -811,29 +710,13 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
-    // The escalation the Allow above would otherwise open, closed explicitly.
-    //
-    // `aws:CalledVia` is satisfied by an Athena UDF
-    // (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`), which needs only
-    // StartQueryExecution — already granted above — plus lambda:InvokeFunction. A
-    // same-account invoke also needs no resource policy, so without this Deny the
-    // Allow reaches every in-region Lambda in THIS account, including the
-    // federation provisioner that holds Lake Formation admin.
-    //
-    // A same-account Deny rather than an `aws:ResourceAccount` exclusion on the
-    // Allow, because excluding the account would also rule out a connector deployed
-    // alongside this stack — which is how the reference connector and its
-    // integration test are deployed.
-    //
-    // Conditioned on `aws:CalledVia` so it cannot affect direct invokes; Athena has
-    // no reason to invoke one of ours.
-    //
-    // NOT scoped to our name prefix. It was, and that made a naming convention
-    // load-bearing for security while silently refusing any connector deployed into
-    // this account under the prefix — which is what the reference connector's own
-    // deploy script does. The tag exemption below expresses the real intent
-    // directly, so the prefix is gone and the statement is now account-wide and
-    // region-wide. Breadth is the safe direction for a Deny.
+    // Closes the escalation the Allow above would open: `aws:CalledVia` is also satisfied
+    // by an Athena UDF (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`), which needs only
+    // StartQueryExecution plus lambda:InvokeFunction. Without this Deny the Allow reaches
+    // every in-region Lambda in this account, including the federation provisioner that
+    // holds Lake Formation admin. A same-account Deny (not an `aws:ResourceAccount`
+    // exclusion on the Allow) keeps a connector deployed alongside this stack working.
+    // Conditioned on `aws:CalledVia` so direct invokes are unaffected.
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "DenyAthenaInvokeOfUntaggedFunctions",
@@ -1202,19 +1085,8 @@ export class SourcesStack extends SCLStack {
         principals: [dbConnectorFn.role!],
       }),
     );
-    // Secrets Manager: credential secrets provided at source creation time.
-    //
-    // There used to be a second, UNCONDITIONED statement here granting
-    // GetSecretValue on `{prefix}datasource-*` for "accelerator-managed" secrets.
-    // It has been removed rather than tag-gated: its resource set is a strict
-    // subset of the tag-gated statement below (same account, narrower name), so
-    // the only thing it added was an exemption from the namespace-tag requirement
-    // — for exactly the naming convention the platform's own credential secrets
-    // use. IAM statements are additive, so its presence meant the condition below
-    // governed every in-account secret EXCEPT the ones most likely to hold tenant
-    // database credentials. Verified against a live account: with that statement
-    // attached, an untagged secret and a secret tagged for another namespace were
-    // both readable.
+    // Secrets Manager: credential secrets provided at source creation time. The tag
+    // condition below governs every in-account secret, including `{prefix}datasource-*`.
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "SecretsManagerCustomerProvided",
@@ -1292,6 +1164,12 @@ export class SourcesStack extends SCLStack {
     const dbEnrichmentImageUri = this.node.tryGetContext(
       "sources_db_enrichment_image_uri",
     ) as string | undefined;
+    const dbEnrichmentBuildArgs = resolvePreferIpv4BuildArgs(
+      this,
+      dbEnrichmentImageUri && ecrRepo
+        ? "sources_db_enrichment_image_uri"
+        : undefined,
+    );
     const dbEnrichmentImage =
       dbEnrichmentImageUri && ecrRepo
         ? ecs.ContainerImage.fromEcrRepository(
@@ -1300,14 +1178,10 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/database/enrichment/Dockerfile",
-            // Pin to amd64 to match this image's design: the Dockerfile is
-            // `FROM --platform=linux/amd64`, CI builds it `--custom-platform
-            // linux/amd64`, and the Fargate task def is x86_64. Without this
-            // explicit pin, a Docker build on an arm64 host (Apple Silicon)
-            // silently produces an arm64 image the x86_64 task cannot exec
-            // ("exec format error"). The pin makes the arch independent of the
-            // build host's Docker default.
+            // Pin to amd64: the task def is x86_64, and an arm64 build host would otherwise
+            // produce an image that fails with "exec format error".
             platform: Platform.LINUX_AMD64,
+            buildArgs: dbEnrichmentBuildArgs,
           });
 
     dbEnrichmentTaskDef.addContainer("DbEnrichmentContainer", {
@@ -1329,11 +1203,10 @@ export class SourcesStack extends SCLStack {
         BEDROCK_REGION: cdk.Aws.REGION,
         // Without this the enrichment task's Bedrock calls run UNGUARDED —
         // table_enricher._resolve_guardrail_id() reads this param name to look
-        // up the guardrail id. Same param the ontology task reads (#111 AC5).
+        // up the guardrail id. Same param the ontology task reads.
         GUARDRAIL_SSM_PARAM: `${ssmPrefix}/bedrock/retrieval-guardrail-id`,
-        // Model for table enrichment. The container previously set NO model id,
-        // so the shared BedrockClient default (a `us.` profile) always won and
-        // enrichment was unreachable from a non-US deploy (#94).
+        // Model for table enrichment; without it the shared BedrockClient
+        // default (a `us.` profile) wins and enrichment fails outside the US.
         BEDROCK_CHAT_MODEL_ID: chatModelId,
       },
       logging: ecs.LogDrivers.awsLogs({
@@ -1357,7 +1230,7 @@ export class SourcesStack extends SCLStack {
       }),
     );
     // Guardrail enforcement on enrichment prompts, plus the SSM read that
-    // resolves the guardrail id from GUARDRAIL_SSM_PARAM above (#111 AC6).
+    // resolves the guardrail id from GUARDRAIL_SSM_PARAM above.
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:ApplyGuardrail"],
@@ -1375,8 +1248,8 @@ export class SourcesStack extends SCLStack {
         ],
       }),
     );
-    // Guardrail decision metrics (#111 AC10) go out via PutMetricData, matching
-    // how this task publishes its other custom metrics, so it needs the grant.
+    // Guardrail decision metrics go out via PutMetricData, matching how this task
+    // publishes its other custom metrics, so it needs the grant.
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["cloudwatch:PutMetricData"],
@@ -1417,7 +1290,7 @@ export class SourcesStack extends SCLStack {
           "glue:GetDatabase",
           "glue:GetConnection",
           // Nested/federated catalogs authorize against the catalog resource
-          // itself — same gap as discovery (issue 118).
+          // itself — same gap as discovery.
           "glue:GetCatalog",
           "glue:GetCatalogs",
         ],
@@ -1784,7 +1657,7 @@ export class SourcesStack extends SCLStack {
     // APPROVED/queryable or SCAN_FAILED. One queue and one Lambda serve every
     // SPARQL engine — a new engine is a new probe in the handler.
     //
-    // Built only with `-c graph_sources=on`: off, the stack is main's.
+    // Built only with `-c graph_sources=on`; nothing graph-related is synthesized otherwise.
     let graphVerify:
       | { fn: lambda.Function; queue: sqs.Queue; dlq: sqs.Queue }
       | undefined;
@@ -1954,7 +1827,7 @@ export class SourcesStack extends SCLStack {
         BULK_REVIEW_PARALLELISM: "10",
         // Self-continuation: a source larger than one invocation can process
         // is paged by re-enqueuing to this same queue with a nextToken. Every
-        // table is eventually approved with no silent drop (#853).
+        // table is eventually approved with no silent drop.
         REVIEW_QUEUE_URL: bulkReviewQueue.queueUrl,
         // Re-scan finalize: the worker reads the pre-rescan backup blob to
         // delete removed items (approve) or restore the pre-rescan state
@@ -1976,10 +1849,6 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // Worker IAM — least-privilege:
-    // - Read+write the sources table (status transitions + tablesApproved counter)
-    // - Read namespaces table (resolve dataZoneProjectId)
-    // - Assume the shared project access role for DataZone calls
     this.sourcesTable.grantReadWriteData(bulkReviewWorkerFn);
     // Append a REVIEW audit row to the scan-jobs table on each terminal
     // approve/reject so the console's Scan History tab shows real events.
@@ -1987,7 +1856,7 @@ export class SourcesStack extends SCLStack {
     namespacesTable.grantReadData(bulkReviewWorkerFn);
     projectAccessRole.grantAssumeRole(bulkReviewWorkerFn.role!);
     // Self-continuation: the worker re-enqueues to its own queue to page a
-    // large source across invocations (#853).
+    // large source across invocations.
     bulkReviewQueue.grantSendMessages(bulkReviewWorkerFn);
     // Re-scan finalize reads/writes the pre-rescan backup blob (delete removed
     // on approve; restore modified + delete added on reject).
@@ -1996,9 +1865,7 @@ export class SourcesStack extends SCLStack {
     // The API Lambda needs to push to the bulk review queue.
     // (Granted later, after sourcesApiFn is constructed.)
 
-    // ================================================================
     // Source Deletion Worker — unbounded teardown off the request path
-    // ================================================================
     // A database source's teardown includes one DataZone delete_asset per
     // discovered table, so it scales with source size and cannot fit the
     // 30-second sources-api timeout. The API does the bounded part (catalog /
@@ -2080,20 +1947,13 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // Worker IAM — least-privilege:
-    // - Read+write the sources table (DELETE_FAILED transitions, row delete,
-    //   platform catalog-claim release)
-    // - Read namespaces table (resolve dataZoneProjectId)
-    // - Read+write scan jobs (delete this source's scan-job records)
     // - Assume the shared project access role for DataZone delete_asset
     this.sourcesTable.grantReadWriteData(sourceDeleteWorkerFn);
     namespacesTable.grantReadData(sourceDeleteWorkerFn);
     this.sourceScanJobsTable.grantReadWriteData(sourceDeleteWorkerFn);
     projectAccessRole.grantAssumeRole(sourceDeleteWorkerFn.role!);
 
-    // ================================================================
     // Documents Pipeline — Preprocessing Lambda + KgBuild ECS + SFN
-    // ================================================================
 
     // ── Pre-Processing Lambda ────────────────────────────────────────
     const preprocessingImageUri = this.node.tryGetContext(
@@ -2250,6 +2110,10 @@ export class SourcesStack extends SCLStack {
     const kgBuildImageUri = this.node.tryGetContext(
       "sources_kg_build_image_uri",
     ) as string | undefined;
+    const kgBuildBuildArgs = resolvePreferIpv4BuildArgs(
+      this,
+      kgBuildImageUri && ecrRepo ? "sources_kg_build_image_uri" : undefined,
+    );
     const kgBuildImage =
       kgBuildImageUri && ecrRepo
         ? ecs.ContainerImage.fromEcrRepository(
@@ -2258,11 +2122,9 @@ export class SourcesStack extends SCLStack {
           )
         : ecs.ContainerImage.fromAsset(Paths.root, {
             file: "packages/sources/documents/kg-build/Dockerfile",
-            // Pin to amd64 (see DbEnrichment note): Dockerfile is
-            // `FROM --platform=linux/amd64`, CI builds `--custom-platform
-            // linux/amd64`, task def is x86_64. Prevents an arm64 build host
-            // from producing an unrunnable arm64 image.
+            // Pin to amd64: see the DbEnrichment image.
             platform: Platform.LINUX_AMD64,
+            buildArgs: kgBuildBuildArgs,
           });
 
     const batchInferenceRole = new iam.Role(this, "SourcesBatchInferenceRole", {
@@ -2306,13 +2168,13 @@ export class SourcesStack extends SCLStack {
         // Doc-KG-build embeds chunks. Without these the container fell back to
         // the PYTHON constants (coa_common.constants.DEFAULT_EMBED_MODEL_ID /
         // coa_common.bedrock.DEFAULT_MODEL_ID), so editing only the TypeScript
-        // side left this path on the US models (#94). Embedding model MUST match
+        // side left this path on the US models. Embedding model MUST match
         // what serve queries with, hence the single resolved value.
         BEDROCK_EMBED_MODEL_ID: embedModelId,
         BEDROCK_EMBED_DIMENSIONS: embedDimensions,
         BEDROCK_CHAT_MODEL_ID: chatModelId,
         // Content screening: retrieval guardrail for ingestion-time ApplyGuardrail
-        // (SDO-188). Empty string disables screening gracefully.
+        // Empty string disables screening gracefully.
         RETRIEVAL_GUARDRAIL_ID: ssm.StringParameter.valueForStringParameter(
           this,
           `${ssmPrefix}/bedrock/retrieval-guardrail-id`,
@@ -2376,7 +2238,7 @@ export class SourcesStack extends SCLStack {
         ],
       }),
     );
-    // ApplyGuardrail for ingestion-time content screening (SDO-188).
+    // ApplyGuardrail for ingestion-time content screening.
     kgBuildTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:ApplyGuardrail"],
@@ -2386,8 +2248,8 @@ export class SourcesStack extends SCLStack {
         ],
       }),
     );
-    // Guardrail decision metrics (#111 AC10) go out via PutMetricData, matching
-    // how this task publishes its other custom metrics, so it needs the grant.
+    // Guardrail decision metrics go out via PutMetricData, matching how this task
+    // publishes its other custom metrics, so it needs the grant.
     kgBuildTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ["cloudwatch:PutMetricData"],
@@ -2541,7 +2403,7 @@ export class SourcesStack extends SCLStack {
         resultPath: "$.preprocessResult",
         // Trim Lambda output to avoid States.DataLimitExceeded (256KB limit).
         // Only pass the summary fields needed by downstream states. The full
-        // per-file issues list is bounded IN THE LAMBDA (issue 104) — the raw
+        // per-file issues list is bounded IN THE LAMBDA — the raw
         // Lambda payload is size-checked before this selector runs, so the
         // handler returns a capped preview + an S3 pointer, not the whole array.
         resultSelector: {
@@ -2994,7 +2856,7 @@ export class SourcesStack extends SCLStack {
         }),
         environment: {
           STATE_MACHINE_ARN: docIngestionStateMachine.stateMachineArn,
-          // Built from the resolved chat model ID (#94) — an inlined `us.`
+          // Built from the resolved chat model ID — an inlined `us.`
           // profile assembled an ARN that does not exist outside the US, and the
           // trigger hands this string to the KG-build container via Step
           // Functions state, so the whole ingestion path inherited it. The helper
@@ -3034,9 +2896,7 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // ================================================================
     // Sources API Lambda — unified CRUD for all source types
-    // ================================================================
     const sourcesApiFn = new lambda.Function(this, "SourcesApiFn", {
       functionName: this.prefixed("sources-api"),
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -3165,11 +3025,6 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // Federation teardown on delete-source runs under the federation
-    // provisioner's Lake Formation admin role, which sources-api assumes (see
-    // above). The sources-api role therefore needs no Glue/Lake Formation
-    // catalog permissions of its own — with one exception below.
-
     // Read-only tag lookup for the Glue namespace-ownership check at
     // source-create. `catalogId`/`databaseName` arrive from the caller and decide
     // what discovery will read, so create refuses a database whose owner has not
@@ -3251,34 +3106,16 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // Per-source Databricks configuration: the ONLY write scope on this subtree in
-    // the deployment. Integrity, not confidentiality, is the property — the
-    // parameter holds coordinates and a secret ARN, no credential, but it tells the
-    // shared connector which secret and which warehouse to use, so repointing one
-    // repoints a source at another source's credential with the catalog name
-    // unchanged.
-    //
-    // TWO actions, and both omissions are deliberate. NOT `DeleteParameters`
-    // (plural), a distinct IAM action covering the batch API: nothing calls it, and
-    // granting it as headroom would be an unused write action on the one path where
-    // integrity is the whole point. NOT `AddTagsToResource`: the parameter is not
-    // tagged, because `GetParameter` does not return tags, so the source, namespace
-    // and deployment ids live in the parameter's BODY instead — and delete needs no
-    // tag to verify ownership, the name being a pure function of the source id with
-    // `Overwrite=False` making the sole writer the sole deleter.
-    //
-    // Scoped to `…/sources/*` and NOT to `…/databricks/*`: widening it by one
-    // segment would let this role overwrite the connector ARN under `deployment/`
-    // that it later reads to build the catalog, which is precisely the integrity
-    // problem the two subtrees were split to avoid. Note the SSM ARN shape — the
-    // resource is `parameter` immediately followed by a name that already begins
-    // with `/`, so `parameter/${ssmPrefix}/...` matches nothing.
-    //
-    // THIS SCOPE IS THE PRIMARY CONTROL, not a backstop, because a repointed
-    // parameter resolves SUCCESSFULLY: nothing at runtime distinguishes a repointed
-    // source from a healthy one. `UnexpectedConnectorParameterWrite` further down
-    // detects the write, but it needs a CloudTrail trail logging management events in
-    // this account and region, and this repo creates none.
+    // Per-source Databricks configuration: the only write scope on this subtree in the
+    // deployment. Integrity matters here: the parameter tells the shared connector which
+    // secret and warehouse to use, so repointing it repoints a source at another source's
+    // credential. Only PutParameter and DeleteParameter are granted (not the plural
+    // `DeleteParameters`, not tagging): nothing calls them, and the name is a pure function
+    // of the source id with `Overwrite=False`, so the sole writer is the sole deleter.
+    // The scope is `sources/*`, not `databricks/*`: the connector ARN lives under
+    // `deployment/`. SSM parameter ARNs have no slash after `parameter`. The
+    // UnexpectedConnectorParameterWrite alarm detects the write but needs a CloudTrail
+    // trail logging management events in this account and region; this repo creates none.
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "DatabricksSourceConfigWrite",
@@ -3345,27 +3182,16 @@ export class SourcesStack extends SCLStack {
     }
     cfnSourcesApiRole.roleName = this.prefixed("sources-api-role");
 
-    // ================================================================
     // UnexpectedConnectorParameterWrite — the only detection for a repoint
-    // ================================================================
     //
-    // The sole detection for its threat, for a structural reason: a repointed
-    // parameter resolves SUCCESSFULLY, so `ConnectorConfigResolutionFailures` is
-    // silent by construction and the narrow write scope above is otherwise the only
-    // control.
-    //
-    // PREREQUISITE: a CloudTrail trail logging management events in this account and
-    // region. `ssm:PutParameter` is a management event, and EventBridge only receives
-    // it as `AWS API Call via CloudTrail` where such a trail exists. This repo creates
-    // none — a trail is account-wide and needs its own bucket, encryption and
-    // retention decisions, so it belongs to the account's baseline. In an account
-    // without one this rule matches nothing, which is what the alarm description says,
-    // so an operator can tell "quiet" from "blind".
-    //
-    // TWO rules rather than one, because `DeleteParameters` (plural) is a distinct
-    // CloudTrail event name AND carries a different request shape: `names`, a LIST,
-    // where the singular forms carry `name`. A single pattern naming both keys under
-    // `requestParameters` would require both to be present and so match nothing.
+    // The sole detection for its threat: a repointed parameter resolves successfully, so
+    // `ConnectorConfigResolutionFailures` stays silent. Requires a CloudTrail trail logging
+    // management events in this account and region (EventBridge only sees
+    // `ssm:PutParameter` via CloudTrail); this repo creates none, and without one the rule
+    // matches nothing, as the alarm description says.
+    // Two rules, because `DeleteParameters` (plural) is a distinct event name whose
+    // request carries `names`, a list, where the singular forms carry `name`; one pattern
+    // naming both keys would match nothing.
     const parameterAuditLogGroup = new logs.LogGroup(
       this,
       "DatabricksParameterAuditLogGroup",
@@ -3495,7 +3321,7 @@ export class SourcesStack extends SCLStack {
       },
     );
     // Records and alarms today; notifies the moment a deployment supplies an action.
-    // `alarmAction` is undefined in `bin/app.ts` (round one), and blocking a detection
+    // `alarmAction` is undefined in `bin/app.ts`, and blocking a detection
     // on a notification channel that does not exist yet would leave the gap open.
     if (props.alarmAction) {
       props.alarmAction.addAlarmActions({
@@ -3604,20 +3430,11 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // S3 reports a missing key as NoSuchKey only to a caller that also holds
-    // ListBucket on the bucket; without it, GetObject on an absent key returns
-    // AccessDenied instead. An absent backup blob is a NORMAL state — a re-scan
-    // that finds no drift writes none, yet still lands the source in
-    // RESCAN_REVIEW — so the read helper's absent-key branch has to be able to
-    // fire. Lacking this grant, that branch is unreachable in a deployed
-    // environment and the tables page 500s for every no-drift re-scan.
-    //
-    // Scoped to the bucket ARN with no s3:prefix condition on purpose: the
-    // condition governs ListObjects calls, and GetObject's 403-vs-404 choice is
-    // not guaranteed to honour it, so a prefix-scoped grant risks looking like a
-    // fix while leaving the 500 in place. The grant conveys only "may list this
-    // bucket", which the two other roles touching this bucket already hold via
-    // grantReadWrite.
+    // Without ListBucket, GetObject on an absent key returns AccessDenied instead of
+    // NoSuchKey. An absent backup blob is a normal state (a no-drift re-scan writes none),
+    // so the read helper's absent-key branch must be able to fire. No `s3:prefix`
+    // condition: it governs ListObjects, and the 403-vs-404 choice for GetObject is not
+    // guaranteed to honour it.
     sourcesApiFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["s3:ListBucket"],
@@ -3825,11 +3642,7 @@ export class SourcesStack extends SCLStack {
     );
     sourcesApiFn.addEnvironment("GLUE_EVENT_RULE_PREFIX", glueEventRulePrefix);
 
-    this.sourcesApiFnArn = sourcesApiFn.functionArn;
-
-    // ================================================================
     // OE monitoring (cdk-monitoring-constructs)
-    // ================================================================
     const monitoring = new SclMonitoring(this, "Monitoring", {
       alarmNamePrefix: this.prefixed("sources"),
       alarmAction: props.alarmAction,
@@ -3871,9 +3684,7 @@ export class SourcesStack extends SCLStack {
         "Databricks per-source config writes outside the allowlist (needs a CloudTrail trail)",
       );
 
-    // ================================================================
     // CloudWatch Dashboard — Structured Scan & Enrichment Pipeline
-    // ================================================================
     // Custom metrics come from the sources Lambdas via EMF-stdout (see
     // packages/sources/.../database/metrics.py), which the Lambda log pipeline
     // auto-extracts into `COA/Sources`. The enrichment ECS task
@@ -3921,9 +3732,8 @@ export class SourcesStack extends SCLStack {
       });
 
     // The model the enrichment task calls. Derived from the SAME resolved chat
-    // model ID the stack configures elsewhere (#94), so a configured model and
-    // these widgets cannot drift — previously this tracked the Python-side
-    // default independently and went dark on any non-default deploy.
+    // model ID the stack configures elsewhere, so the widgets cannot drift
+    // from the configured model.
     // Chat, not embed: enrichment never calls the embedding model.
     const enrichmentModelId = chatModelId;
 
@@ -4194,9 +4004,7 @@ export class SourcesStack extends SCLStack {
       }),
     );
 
-    // ================================================================
     // SSM Parameters
-    // ================================================================
     new ssm.StringParameter(this, "SsmSourcesApiFnArn", {
       parameterName: `${ssmPrefix}/sources/api-fn-arn`,
       stringValue: sourcesApiFn.functionArn,
@@ -4233,20 +4041,11 @@ export class SourcesStack extends SCLStack {
       description:
         "Sources document ingestion Step Functions state machine ARN",
     });
-    // The SECOND platform principal a Databricks source's credential-access role must
-    // trust. Two roles reach that customer role: the connector's execution role, on
-    // every request, published by the connector's own stack under
-    // `deployment/role-arn`; and THIS role, exactly once at registration, to
-    // `DescribeSecret` and prove the wiring works before a source is accepted. A trust
-    // policy naming only the connector role deploys fine and then refuses the create.
-    //
-    // ENV-LESS, matching the enrichment role below rather than the env-scoped connector
-    // subtree and the discovery role beneath it, so two environments in one account share
-    // the name and the last platform deploy wins. Pre-existing debt shared by every
-    // parameter this stack writes, and here it fails CLOSED both ways: a stale value
-    // publishes the wrong principal, so the create fails at submit, and the wrongly-trusted
-    // principal cannot use the trust anyway, since every `sts:AssumeRole` grant here is
-    // scoped to this deployment's `{prefix}-{env}-datasource-access-*`.
+    // The second platform principal a Databricks source's credential-access role must
+    // trust: the connector's execution role (every request, published by the connector's
+    // own stack under `deployment/role-arn`) and this role (once at registration, to
+    // `DescribeSecret`). The parameter name is env-less, like the enrichment role below, so
+    // two environments in one account share it and the last deploy wins.
     new ssm.StringParameter(this, "SsmSourcesApiRoleArn", {
       parameterName: `${ssmPrefix}/sources/api-role-arn`,
       stringValue: sourcesApiRole.roleArn,
@@ -4270,9 +4069,7 @@ export class SourcesStack extends SCLStack {
       description: "Sources database enrichment ECS task role ARN",
     });
 
-    // ================================================================
     // CfnOutputs
-    // ================================================================
     new cdk.CfnOutput(this, "SourcesTableName", {
       value: this.sourcesTable.tableName,
     });
@@ -4294,26 +4091,13 @@ export class SourcesStack extends SCLStack {
   }
 
   /**
-   * The one `sts:AssumeRole` grant shape every consumer of a customer-owned
-   * credential-access role holds — the discovery Lambda, the enrichment task and the
-   * sources API here, plus the Databricks connector from its own CDK app. Factored
-   * because registration and query have to agree on the bound.
+   * The `sts:AssumeRole` grant shape for a customer-owned credential-access role. No
+   * account restriction: the role may live in any account, bounded by the reserved name
+   * prefix (`ReservedRoleNamePrefix`) and the role's own trust policy. `Null:
+   * {"sts:ExternalId": "false"}` denies an assume that presents no ExternalId, which is
+   * derived server-side from the requesting namespace.
    *
-   * Two properties are load-bearing:
-   *
-   *   - **No account restriction.** The customer's credential-access role may live in
-   *     any account, including this deployment's own. What bounds COA instead is the
-   *     reserved NAME prefix — kept reserved by `ReservedRoleNamePrefix`, which fails
-   *     the synth if a COA-internal role is named under it — plus the target role's
-   *     own trust policy.
-   *   - **`Null: {"sts:ExternalId": "false"}`.** The role ARN is caller-supplied at
-   *     source-create, so the ExternalId — derived server-side from the requesting
-   *     namespace, never accepted from the request — is what binds an assume to the
-   *     namespace entitled to it. Denying an assume that presents none means a
-   *     regression fails closed instead of silently widening access.
-   *
-   * @param sid retained per call site so the deployed policies keep the Sids they
-   *   shipped with.
+   * @param sid kept per call site so deployed policies keep their Sids.
    */
   private assumeDatasourceAccessRoleStatement(
     sid: string,

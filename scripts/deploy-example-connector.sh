@@ -78,7 +78,7 @@ echo "  Stack:       ${STACK_NAME}"
 echo "  Region:      ${REGION}"
 echo ""
 
-# ── Resolve COA's two query roles ────────────────────────────────────────────
+# Resolve COA's two query roles.
 # Read, never guessed: both role names are CloudFormation-generated. Two roles because
 # two COA components reach a connector through Athena — serve runs the queries, and
 # discovery runs DESCRIBE, which is how the @pk / @fk tags are read at all. Grant only
@@ -124,7 +124,7 @@ echo ""
 "$REPO_ROOT/scripts/check-maven.sh" || exit 1
 echo ""
 
-# ── Build and deploy ─────────────────────────────────────────────────────────
+# Build and deploy.
 # connectors/ is a workspace of its own (see connectors/pnpm-workspace.yaml), so the
 # repository-root install does not reach it and every pnpm command runs from there.
 cd "$REPO_ROOT/connectors"

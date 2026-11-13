@@ -158,6 +158,7 @@ i:ClaimRecord a owl:Class ;
         claim_match = next(m for m in score.class_matches if m.golden_uri.endswith("/Claim"))
         # Claim itself has no parent → not grounded (which is correct)
         assert claim_match.grounded_to is None
+        assert score.grounded_classes == 0
 
 
 class TestScoreSerialization:

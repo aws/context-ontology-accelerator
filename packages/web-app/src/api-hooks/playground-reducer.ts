@@ -15,8 +15,6 @@ import { normalizeResponse } from "./normalize-response";
 import { STEP_LABELS, humanizeStepId } from "@components/Chat/step-labels";
 import { normalizeGraphContext } from "@utils/graph-context";
 
-// ── Actions ───────────────────────────────────────────────────────────
-
 export type PlaygroundAction =
   | { type: "SEND_QUERY"; id: string; requestId: string; query: string }
   | { type: "RETRY"; messageId: string; requestId: string }
@@ -28,15 +26,11 @@ export type PlaygroundAction =
   | { type: "RESTORE_HISTORY"; messages: HistoryMessage[] }
   | { type: "PREPEND_HISTORY"; messages: HistoryMessage[] };
 
-// ── State ─────────────────────────────────────────────────────────────
-
 export interface PlaygroundState {
   messages: ChatMessage[];
 }
 
 export const INITIAL_STATE: PlaygroundState = { messages: [] };
-
-// ── Reducer ───────────────────────────────────────────────────────────
 
 export function playgroundReducer(
   state: PlaygroundState,
@@ -147,7 +141,6 @@ export function playgroundReducer(
                 isLoading: false,
                 response: normalized,
                 content,
-                // Clear streaming state
                 stage: undefined,
                 streamingTokens: isGuardrailBlocked
                   ? undefined
@@ -197,8 +190,6 @@ export function playgroundReducer(
   }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────
-
 /** Convert HistoryMessage[] from session restore into ChatMessage[]. */
 function historyMessagesToChatMessages(
   messages: HistoryMessage[],
@@ -243,7 +234,7 @@ function historyMessagesToChatMessages(
   });
 }
 
-export function formatResponseContent(response: PlaygroundResponse): string {
+function formatResponseContent(response: PlaygroundResponse): string {
   const { result } = response;
   if (result.synthesizedAnswer) return result.synthesizedAnswer;
   if (result.resultRows && result.resultRows.length > 0) {

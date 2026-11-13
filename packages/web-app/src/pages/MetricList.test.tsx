@@ -10,10 +10,6 @@ import { LocaleProvider } from "../i18n/LocaleProvider";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { MetricList } from "./MetricList";
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
-
 let mockMetrics: Array<{
   name: string;
   label?: string;
@@ -69,8 +65,7 @@ vi.mock("../api-hooks/use-source-name-by-id", () => ({
   useSourceNameById: () => new Map<string, string>(),
 }));
 
-// LocaleProvider sits at the app root in production and supplies the
-// property filter's built-in strings the page no longer hand-writes.
+// LocaleProvider supplies the property filter's built-in strings.
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <LocaleProvider>
     <QueryClientProvider client={new QueryClient()}>
@@ -165,10 +160,6 @@ describe("MetricList export scope", () => {
   });
 
   it("exports only the filtered subset, not all metrics, when 'filtered' is chosen", async () => {
-    // Regression test: the filtered-export handler previously used
-    // `allMetrics.filter(m => items.some(...) || tokens.length > 0)` — the
-    // `||` made every metric match once any filter token existed, silently
-    // exporting everything instead of the filtered subset.
     mockMetrics = [makeMetric("total_orders"), makeMetric("unique_customers")];
     const user = userEvent.setup();
     render(<MetricList />, { wrapper });
@@ -205,24 +196,18 @@ describe("MetricList bulk-delete selection sync", () => {
     const user = userEvent.setup();
     const { rerender } = render(<MetricList />, { wrapper });
 
-    // Select metric_a.
     const rowA = screen.getByRole("row", { name: /metric_a/i });
     await user.click(within(rowA).getByRole("checkbox"));
     expect(
       screen.getByRole("button", { name: /delete 1 selected/i }),
     ).toBeInTheDocument();
 
-    // Simulate the bulk-delete completing: the query invalidation refetch
-    // returns data with metric_a removed (React Query would normally drive
-    // this via cache update — re-rendering with new mockMetrics + a fresh
-    // render approximates the same "allMetrics changed" transition).
+    // The bulk-delete refetch returns data without metric_a.
     mockMetrics = [makeMetric("metric_b")];
     rerender(<MetricList />);
 
-    // The button must reset to disabled "Delete", not linger at "1 selected".
-    // The exact "Delete" name can also match the bulk-delete modal's footer
-    // button (Cloudscape keeps modal content mounted even when closed), so
-    // pick the one that is NOT inside a dialog — that's the header action.
+    // Cloudscape keeps modal content mounted when closed, so pick the "Delete"
+    // button outside the dialog.
     expect(
       screen.queryByRole("button", { name: /delete 1 selected/i }),
     ).not.toBeInTheDocument();
@@ -244,8 +229,6 @@ describe("MetricList bulk-delete selection sync", () => {
       screen.getByRole("button", { name: /delete 1 selected/i }),
     ).toBeInTheDocument();
 
-    // Refetch returns the exact same set (e.g. a manual refresh) — the
-    // selection should NOT be cleared just because `allMetrics` re-rendered.
     mockMetrics = [makeMetric("metric_a"), makeMetric("metric_b")];
     rerender(<MetricList />);
 
@@ -255,16 +238,10 @@ describe("MetricList bulk-delete selection sync", () => {
   });
 
   it("deletes only the filtered subset, not all metrics, when 'filtered' is chosen", async () => {
-    // Regression test: the filtered-delete handler previously used the same
-    // `items.some(...) || tokens.length > 0` `||` bug as the export handler —
-    // once any filter token existed, every metric matched and got deleted
-    // instead of just the filtered subset.
     mockMetrics = [makeMetric("total_orders"), makeMetric("unique_customers")];
     const user = userEvent.setup();
     render(<MetricList />, { wrapper });
 
-    // Select a metric AND apply a filter so both the "selected" and
-    // "filtered" radio options are available in the modal.
     const rowA = screen.getByRole("row", { name: /total_orders/i });
     await user.click(within(rowA).getByRole("checkbox"));
 
@@ -310,9 +287,6 @@ describe("MetricList display label filtering", () => {
   }
 
   it("does not let free text match an unlabelled metric's missing label", async () => {
-    // Regression test: the default ":" read an unlabelled metric's label as
-    // the string "undefined", so "fin" matched every unlabelled metric and
-    // the filtered bulk delete took them too.
     mockMetrics = [makeMetric("finance_total"), makeMetric("monthly_revenue")];
     const user = userEvent.setup();
     render(<MetricList />, { wrapper });
@@ -431,9 +405,7 @@ describe("MetricList filtered scope covers the complete namespace", () => {
   }
 
   it("filtered export includes matches beyond the current client page (allPageItems, not items)", async () => {
-    // 25 matching metrics with pageSize 20 — matches on client page 2 must
-    // still be exported. The pre-#744 code derived names from `items`
-    // (CURRENT page only) and would export just the first 20.
+    // 25 matches with pageSize 20: names must come from allPageItems, not the current page.
     mockMetrics = Array.from({ length: 25 }, (_, i) =>
       makeMetric(`total_${String(i).padStart(2, "0")}`),
     );
@@ -476,12 +448,9 @@ describe("MetricList filtered scope covers the complete namespace", () => {
     );
     await user.click(within(dialog).getByRole("button", { name: /^export$/i }));
 
-    // Must NOT export yet — a server page is still unloaded.
     expect(mockExportMutate).not.toHaveBeenCalled();
-    // Drain must have started.
     expect(mockFetchNextPage).toHaveBeenCalled();
 
-    // Simulate the final page arriving with another matching metric.
     mockMetrics = [
       makeMetric("total_orders"),
       makeMetric("other_metric"),
@@ -504,7 +473,6 @@ describe("MetricList filtered scope covers the complete namespace", () => {
     const user = userEvent.setup();
     const { rerender } = render(<MetricList />, { wrapper });
 
-    // Select + filter so both radio options appear in the delete modal.
     const rowA = screen.getByRole("row", { name: /total_orders/i });
     await user.click(within(rowA).getByRole("checkbox"));
     const filterInput = screen.getByPlaceholderText(/find metrics/i);
@@ -562,8 +530,6 @@ describe("MetricList filtered scope covers the complete namespace", () => {
     );
     await user.click(within(dialog).getByRole("button", { name: /^export$/i }));
 
-    // The rejection must cancel the pending op and surface an error —
-    // NOT leave the button spinning forever.
     expect(
       await screen.findByText(/failed to load all metrics/i),
     ).toBeInTheDocument();
@@ -592,10 +558,8 @@ describe("MetricList filtered scope covers the complete namespace", () => {
     await user.click(within(dialog).getByRole("button", { name: /^export$/i }));
     expect(mockExportMutate).not.toHaveBeenCalled(); // draining
 
-    // User cancels while pages are still loading.
     await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
 
-    // Drain completes afterwards — the cancelled export must NOT fire.
     mockMetrics = [makeMetric("total_orders"), makeMetric("total_refunds")];
     mockHasNextPage = false;
     rerender(<MetricList />);

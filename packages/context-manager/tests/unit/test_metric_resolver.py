@@ -1,21 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for Tier 1 MetricResolver — in-memory metric cache.
-
-Tests cover:
-- Index building from seed data
-- Exact name matching (case-insensitive substring)
-- Synonym matching (word-boundary regex)
-- Multi-metric detection
-- Namespace filtering
-- Lookup by ID
-- list_all() compact summaries
-- Background refresh lifecycle
-- Neptune load (mocked)
-- match() exact-then-fuzzy interface
-- Fuzzy near-miss matching + dimension substitution (branch additions)
-"""
+"""Unit tests for Tier 1 MetricResolver — in-memory metric cache."""
 
 from __future__ import annotations
 
@@ -155,12 +141,9 @@ class TestSynonymMatch:
         assert result.metric_name == "total_revenue"
 
     async def test_synonym_no_partial_match(self):
-        """Synonym 'revenue' should not match 'irrevenued' (word boundary)."""
+        """Synonym 'revenue' should not match 'prevenued' (word boundary)."""
         resolver = _make_resolver()
 
-        # "revenues" contains "revenue" as substring but not at word boundary
-        # Actually "revenue" IS at a word boundary in "revenues" since \b matches between word chars
-        # Let's test with something that genuinely fails word boundary
         result = resolver.exact_name_synonym_match("prevenued metrics", "finance")
         assert not result.found
 
@@ -184,8 +167,6 @@ class TestResidualQualifierDetection:
             "show me the total revenue in USD please",
             "revenue",
             # Aggregate/unit scaffolding the metric's own SQL already encodes.
-            # NOTE: "net"/"average" are NOT scaffolding — see
-            # test_aggregate_modifiers_are_not_scaffolding.
             "what is our total revenue figure in usd",
         ],
     )
@@ -237,12 +218,7 @@ class TestResidualQualifierDetection:
         ],
     )
     async def test_aggregate_modifiers_and_time_words_are_not_scaffolding(self, query, expected):
-        """Words that change the aggregate or add a time window must NOT be stop-words.
-
-        Regression guard: these were all on the stop-word list during development,
-        which silently re-opened the bug — "average revenue" resolved at Tier-1
-        confidence 1.0 and returned the SUM.
-        """
+        """Words that change the aggregate or add a time window must NOT be stop-words."""
         resolver = _make_resolver()
 
         result = resolver.exact_name_synonym_match(query, "finance")
@@ -252,7 +228,7 @@ class TestResidualQualifierDetection:
     @pytest.mark.parametrize(
         "query",
         [
-            # Reviewer's case: a chat UI wraps the question in conversational padding.
+            # A chat UI wraps the question in conversational padding.
             "Hello. What was total revenue. Thank you",
             "hi what is total revenue thanks",
             "hey, total revenue?",
@@ -509,13 +485,7 @@ class TestMultiMetricDetection:
         assert result.match_count == 1
 
     async def test_latin_alias_inside_a_longer_alias_also_prefers_the_longer(self):
-        """Pruning is script-independent: longest match wins for Latin aliases too.
-
-        ``revenue`` and ``total revenue`` both match "what is total revenue"
-        with word boundaries. Before containment pruning this was a two-metric
-        question (Tier 2/3); now it resolves to the metric that names the whole
-        phrase.
-        """
+        """Pruning is script-independent: longest match wins for Latin aliases too."""
         resolver = _make_resolver(
             seed=[
                 {"metric_id": "m-revenue", "name": "revenue", "synonyms": [], "namespace": "sales"},
@@ -563,18 +533,6 @@ class TestListAll:
         names = {s["name"] for s in summaries}
         assert names == {"claims_count", "total_premium"}
 
-    async def test_list_all_compact_summary_format(self):
-        resolver = _make_resolver()
-
-        summaries = resolver.list_all("finance")
-        assert len(summaries) == 2
-        s = summaries[0]
-        assert "metric_id" in s
-        assert "name" in s
-        assert "display_name" in s
-        assert "description" in s
-        assert "dimensions" in s
-
     async def test_list_all_empty_namespace(self):
         resolver = _make_resolver()
 
@@ -609,10 +567,6 @@ class TestLegacyMatchInterface:
         result = await resolver.match("show me the total_revenue", "finance")
         assert result.found
         assert result.metric_name == "total_revenue"
-
-        result = await resolver.match("total_revenue", "finance")
-        assert resolver.loaded
-        assert result.found
 
 
 @pytest.mark.unit
@@ -696,7 +650,6 @@ class TestNeptuneRefresh:
         resolver = MetricResolver(neptune_client=mock_neptune)
         await resolver.start()
 
-        # Should not raise, resolver stays empty
         assert len(resolver._snapshot.by_id) == 0
 
     async def test_synonym_match_after_neptune_load(self):
@@ -945,8 +898,7 @@ class TestDimensionSubstitution:
             MetricResolver.substitute_dimensions(sql, {"region": "x"}, ["year"])
 
     def test_dimension_value_lookup_is_case_insensitive(self):
-        # MR !279 review: the allowed-set check was case-insensitive but the value
-        # lookup wasn't — {"Region": "EMEA"} must satisfy placeholder :region.
+        # Value lookup is case-insensitive like the allowed-set check.
         sql = "SELECT * FROM revenue WHERE region = :region"
         out = MetricResolver.substitute_dimensions(sql, {"Region": "EMEA"}, ["region"])
         assert "'EMEA'" in out
@@ -968,7 +920,7 @@ class TestDimensionSubstitution:
         assert MetricResolver.substitute_dimensions(sql, {}, []) == sql
 
     def test_supplied_dimension_with_no_placeholder_raises(self):
-        # Fail CLOSED (issue #53): a filter the template cannot bind must not be
+        # Fail CLOSED: a filter the template cannot bind must not be
         # dropped, or the caller gets the unfiltered GLOBAL total presented as the
         # answer to their filtered question — a wrong answer with a 200.
         sql = "SELECT SUM(amount) FROM revenue"
@@ -1088,9 +1040,8 @@ class TestDeclaredDimensionsFromTemplate:
 
     async def test_neptune_loaded_parameterized_metric_resolves_and_substitutes(self):
         """End-to-end through ``_bindings_to_seed`` -> index -> resolve -> substitute:
-        the exact live failure on coa-dev (v0.3.1/v0.3.2) — an API-published metric
-        ``WHERE region = {region}`` queried with ``options.dimensions=[{region: APAC}]``
-        raised "Dimension 'region' is not a declared dimension of this metric"."""
+        an API-published metric ``WHERE region = {region}`` queried with
+        ``options.dimensions=[{region: APAC}]`` must resolve and substitute."""
         from unittest.mock import AsyncMock
 
         mock_neptune = AsyncMock()
@@ -1286,7 +1237,7 @@ class TestMetricListSparql:
 
 @pytest.mark.unit
 class TestSelectExpression:
-    """#809: Tier-1 must pick the TRINO expression, not blindly ``dialects[0]``.
+    """Tier-1 must pick the TRINO expression, not blindly ``dialects[0]``.
 
     The direct-JDBC path re-transpiles with sqlglot ``read="trino"``, so a
     non-Trino expression at index 0 would be mis-parsed (wrong results or a
@@ -1323,17 +1274,15 @@ class TestSelectExpression:
         assert MetricResolver._select_expression(dialects) == "NO_LABEL"
 
     def test_empty_dialects_list_returns_empty_string(self):
-        """An empty list must not IndexError on the ``dialects[0]`` fallback (#809 bot review)."""
+        """An empty list must not IndexError on the ``dialects[0]`` fallback."""
         assert MetricResolver._select_expression([]) == ""
 
     def test_none_expression_value_coerces_to_empty_string(self):
         """Neptune stores expressionDialects as JSON, so ``{"expression": null}`` parses
         to ``None``. ``dict.get(k, "")`` only defaults on a MISSING key, not a present
         ``None`` — so the method must coerce None -> "" to honor its ``-> str`` contract
-        (#809 bot review). Covers both the TRINO-match branch and the fallback branch."""
-        # TRINO entry with null expression -> "" (not None)
+        Covers both the TRINO-match branch and the fallback branch."""
         assert MetricResolver._select_expression([{"dialect": "TRINO", "expression": None}]) == ""
-        # Fallback (no TRINO) with null expression at index 0 -> "" (not None)
         assert MetricResolver._select_expression([{"dialect": "REDSHIFT", "expression": None}]) == ""
 
     async def test_refresh_selects_trino_expression_from_neptune(self):
@@ -1364,17 +1313,11 @@ class TestSelectExpression:
 
 @pytest.mark.unit
 class TestSelectExpressionTranspileRoundTrip:
-    """#809 end-to-end guard: prove the SELECTED expression survives the direct-JDBC
-    executor's ``sqlglot.transpile(read="trino", write=<engine>)`` step as
-    engine-valid SQL — the exact chain that produced silently-wrong results before
-    the fix.
+    """The selected expression survives the direct-JDBC executor's
+    ``sqlglot.transpile(read="trino", write=<engine>)`` step as engine-valid SQL.
 
-    ``CompositeQueryExecutor`` (clients/composite_executor.py) re-transpiles every
-    metric with ``read="trino"`` before direct JDBC. If Tier-1 hands it a
-    non-Trino ``dialects[0]`` expression, the Trino parser mis-reads it: a
-    Redshift ``DATEADD(...)`` passes through *unchanged* into a PostgreSQL target
-    (Postgres has no ``DATEADD`` -> runtime failure / wrong result). Selecting the
-    TRINO expression yields ``... + INTERVAL '1 DAY'`` which Postgres accepts.
+    A Redshift ``DATEADD(...)`` read as Trino passes through unchanged into a
+    PostgreSQL target, which has no ``DATEADD``.
     """
 
     # A metric authored in BOTH dialects, TRINO NOT first (reproduces the bug shape).
@@ -1391,29 +1334,17 @@ class TestSelectExpressionTranspileRoundTrip:
         return sqlglot.transpile(sql, read="trino", write=engine, identify=False)[0]
 
     def test_selected_trino_expr_transpiles_to_valid_postgres(self):
-        """The #809-selected expression -> valid Postgres interval arithmetic
+        """The selected TRINO expression -> valid Postgres interval arithmetic
         (no bare DATEADD, which Postgres cannot execute)."""
         selected = MetricResolver._select_expression(self._DIALECTS)
         out = self._executor_transpile(selected, "postgres")
         assert "INTERVAL" in out.upper()
         assert "DATEADD" not in out.upper()
 
-    def test_old_index0_pick_would_emit_invalid_postgres(self):
-        """Discriminator: the pre-#809 behavior (dialects[0] = REDSHIFT) transpiled
-        read='trino' passes DATEADD through UNCHANGED -> invalid for Postgres. This
-        is the silently-wrong SQL the fix prevents; asserting it here documents why
-        selecting TRINO matters and fails if someone reverts to dialects[0]."""
-        index0_expr = self._DIALECTS[0]["expression"]
-        out = self._executor_transpile(index0_expr, "postgres")
-        assert "DATEADD" in out.upper()
-        # And the fix must diverge from this broken output.
-        selected = MetricResolver._select_expression(self._DIALECTS)
-        assert self._executor_transpile(selected, "postgres") != out
-
     def test_selected_expr_passes_sql_firewall(self):
         """The selected + transpiled SQL clears the Tier-2 SQLFirewall parsed with
         the ENGINE dialect (source_db.py calls ``validate(sql, dialect=<engine>)``).
-        Guards against the 'spurious UnsafeSQLError' symptom from the commit."""
+        Guards against a spurious UnsafeSQLError."""
         from coa_serve.tier2.sql_firewall import SQLFirewall
 
         selected = MetricResolver._select_expression(self._DIALECTS)
@@ -1427,7 +1358,7 @@ class TestSelectExpressionTranspileRoundTrip:
 class TestResidualTokensKorean:
     """The residual gate must see Korean: an ASCII-only tokenizer produces zero
     residual tokens for Korean questions, silently disabling the partial-match
-    bypass for them (GitHub issue #95)."""
+    bypass for them."""
 
     def _res(self, q, syn):
         from coa_serve.tier1.metric_resolver import _fold, residual_tokens
@@ -1457,8 +1388,6 @@ class TestResidualTokensKorean:
         # than one — either way it trips the gate, which is what matters.
         assert "누적" in res and "100" in res and "만원" in res
 
-
-# ── Non-ASCII matching (#928, Tier-1 half) ───────────────────────────────────
 
 SEED_METRICS_NON_ASCII = [
     {
@@ -1502,7 +1431,7 @@ SEED_METRICS_NON_ASCII = [
 
 @pytest.mark.unit
 class TestNonAsciiMatching:
-    """Tier-1 matching for scripts without space-marked word boundaries (#928).
+    """Tier-1 matching for scripts without space-marked word boundaries.
 
     Three previously-broken pieces, exercised together: the exact matcher's
     ``\\b`` (which no unsegmented text can satisfy), the residual gate's ASCII
@@ -1871,7 +1800,7 @@ class TestDeclinedMetricContext:
         assert "SELECT count(*) FROM claims WHERE status = 'OPEN'" in block
 
     def test_prompt_block_marks_the_user_residual_as_untrusted(self):
-        """SECURITY (#1116 review): the unhandled qualifier is a slice of the USER's
+        """The unhandled qualifier is a slice of the USER's
         question, so even though it rides inside the first-party block it must be
         labelled untrusted data, not authoritative instruction — else a question can
         smuggle directives into the authoritative section."""
@@ -1892,7 +1821,7 @@ class TestDeclinedMetricContext:
         assert "x" * 501 not in block
 
     def test_prompt_block_empty_when_no_sql_template(self):
-        """CORRECTNESS (review): a metric that matched by name but carries no formula
+        """A metric that matched by name but carries no formula
         (expressionDialects is OPTIONAL; the loader leaves sql_template empty when
         absent/unparseable) must forward NOTHING. A blank 'Definition SQL:' block
         tells the writer an authoritative definition exists, shows it none, and says

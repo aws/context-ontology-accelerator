@@ -37,20 +37,15 @@ describe("EvidencePanel", () => {
     fireEvent.click(screen.getByText("Graph evidence"));
 
     expect(screen.getByText("Graph context")).toBeInTheDocument();
-    expect(screen.getAllByText("Amazon", { exact: false })).not.toHaveLength(0);
-    expect(screen.getAllByText("Walmart", { exact: false })).not.toHaveLength(
-      0,
-    );
     expect(
       screen.getByText(/Amazon.*COMPETES_WITH.*Walmart/),
     ).toBeInTheDocument();
   });
 
   it("renders citations and relationships from a previous-runtime response", () => {
-    // The exact Tier-3 shape the service emitted before #984: citations named only
-    // by `sourceDoc` / `label`, and relationships nested under each entity with
-    // snake_case keys. The web app ships before the service, so it has to render
-    // this shape with nothing lost.
+    // The legacy Tier-3 shape: citations named only by `sourceDoc` / `label`, and
+    // relationships nested under each entity with snake_case keys. The web app
+    // ships before the service, so it has to render this shape with nothing lost.
     render(
       <EvidencePanel
         supportingContent={[
@@ -148,9 +143,6 @@ describe("EvidencePanel", () => {
     ).toBeInTheDocument();
   });
 
-  // A malformed `graphContext` used to reach the renderer intact: `"abc".length`
-  // read as truthy, the section called `.map` on a string, and the error boundary
-  // replaced the entire chat panel.
   it.each([
     ["a string", "abc"],
     ["an object", {}],

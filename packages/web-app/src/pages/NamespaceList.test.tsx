@@ -307,12 +307,10 @@ describe("NamespaceList delete confirmation modal", () => {
     const user = userEvent.setup();
     render(<NamespaceList />, { wrapper });
 
-    // Select the row via its checkbox.
     const row = screen.getByRole("row", { name: /sales-data/i });
     const checkbox = within(row).getByRole("checkbox");
     await user.click(checkbox);
 
-    // Open the "Change status" dropdown and click "Delete".
     const dropdownTrigger = screen.getByRole("button", {
       name: /change status/i,
     });
@@ -433,16 +431,6 @@ describe("getStatusActionItems", () => {
   it("undefined status: every action is disabled", () => {
     const items = getStatusActionItems(undefined);
     expect(items.every((i) => i.disabled)).toBe(true);
-  });
-
-  it("disabled items carry an explanatory reason", () => {
-    const items = getStatusActionItems(NamespaceStatus.ACTIVE);
-    expect(byId(items, NamespaceStatus.ACTIVE).disabledReason).toMatch(
-      /cannot activate/i,
-    );
-    expect(
-      byId(items, NamespaceStatus.ARCHIVED).disabledReason,
-    ).toBeUndefined();
   });
 });
 

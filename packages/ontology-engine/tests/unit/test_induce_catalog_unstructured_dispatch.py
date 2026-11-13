@@ -7,10 +7,6 @@
 the web app calls for BOTH strategies. When ``strategy ==
 'unstructured_lexical_graph'`` it delegates to the unstructured router,
 building an ``UnstructuredInductionRequest`` from the ``WorkbenchInductionRequest``.
-
-Regression: that hand-off previously DROPPED ``grounding_ontology_ids`` and
-``grounding_mode``, so a UI-selected foundational ontology never reached the
-unstructured pipeline (grounding silently no-op'd, foundational_grounded=0).
 These tests pin that the grounding params are forwarded.
 """
 
@@ -48,9 +44,7 @@ def _dispatch(body: WorkbenchInductionRequest):
         patch("coa_ontology.inducer.routers.induce_unstructured.start_unstructured_job") as mock_unstructured,
     ):
         mock_unstructured.return_value = SimpleNamespace(job_id="j", status="pending")
-        # graph_arn must satisfy UnstructuredInductionRequest's SSRF-guard
-        # pattern (12-digit account, valid graph id) added on main; a bare
-        # ``:0:graph/g-x`` now fails validation.
+        # graph_arn must pass the request's 12-digit-account graph-ARN pattern.
         req = _request_with_config({"neptune_endpoint": "arn:aws:neptune-graph:us-east-1:000000000000:graph/g-test123"})
         start_induction(body=body, request=req, namespace=_NS)
         mock_unstructured.assert_called_once()
@@ -85,8 +79,7 @@ class TestUnstructuredDispatchForwardsGrounding:
         assert unstructured_body.grounding_mode == "ENHANCED"
 
     def test_rerank_max_tokens_forwarded(self):
-        # The rerankMaxTokens knob must reach the unstructured request too, or
-        # the fail-loud fix on the document path can never be tuned (#59).
+        # The rerankMaxTokens knob must reach the unstructured request too.
         body = WorkbenchInductionRequest(
             datasource_ids=["ds-1"],
             ontology_uri_prefix=_PREFIX,
@@ -106,9 +99,8 @@ class TestUnstructuredDispatchForwardsGrounding:
         assert unstructured_body.rerank_max_tokens == 1000
 
 
-@pytest.mark.unit
 class TestWorkbenchRequestGroundingAliases:
-    """#9: the induction request must bind grounding fields from BOTH the
+    """The induction request must bind grounding fields from BOTH the
     snake_case names (existing callers) and the Smithy contract's camelCase wire
     names (generated clients), or a camelCase request silently defaults."""
 

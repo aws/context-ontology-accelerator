@@ -5,11 +5,8 @@
 
 The lexical recall builds a bounded metadata index per grounding pool. When the
 listing fails, or the pool exceeds a declared bound, the candidate set is
-incomplete. Both induction callers used to catch the resulting error in their
-fail-open handlers and continue without grounding, so a table or class whose
-exact-name class dense recall had already found came out novel (for example
-``customers`` became ``proposal:Customers`` with no link to the existing
-``business:Customers``).
+incomplete, so both induction callers must fail rather than continue without
+grounding.
 
 These tests drive the real ``GroundingService`` through the structured
 strategy (``TableToOntologyStrategy.induce`` with a real ``InductionPipeline``)
@@ -86,9 +83,6 @@ def _catalog(lister) -> MagicMock:
     return catalog
 
 
-# ── structured caller: TableToOntologyStrategy batch loop ───────────────────
-
-
 def _induce_structured(lister):
     catalog = _catalog(lister)
     embeddings = MagicMock()
@@ -127,9 +121,6 @@ def test_structured_control_grounds_customers_when_lookup_works():
 def test_structured_lookup_failure_fails_induction(lister, error, message):
     with pytest.raises(error, match=message):
         _induce_structured(lister)
-
-
-# ── unstructured caller: ground_classes per-class loop ─────────────────────
 
 
 def _ground_unstructured(lister):

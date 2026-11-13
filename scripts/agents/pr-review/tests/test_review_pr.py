@@ -157,9 +157,7 @@ class TestRenderComment:
 
 
 class TestMainGate:
-    def test_refuses_before_calling_the_model(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_refuses_before_calling_the_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An unprivileged actor must be refused before any spend or API read."""
         monkeypatch.setenv("GITHUB_REPOSITORY", "acme/widgets")
         monkeypatch.setenv("GITHUB_ACTOR", "outsider")
@@ -185,15 +183,15 @@ class TestDedup:
     def test_finds_previous_review_by_marker(self) -> None:
         mark = rp.marker("code", "abc123")
         payload = [{"body": f"## Code review\n{mark}", "html_url": "https://example.invalid/c/1"}]
-        assert rp.find_previous_review("acme/widgets", 1, mark, runner=_runner(payload)) is not None
+        assert (
+            rp.find_previous_review("acme/widgets", 1, mark, runner=_runner(payload)) == "https://example.invalid/c/1"
+        )
 
     def test_other_markers_do_not_match(self) -> None:
         payload = [{"body": rp.marker("docs", "abc123"), "html_url": "u"}]
         assert rp.find_previous_review("acme/widgets", 1, rp.marker("code", "abc123"), runner=_runner(payload)) is None
 
     def test_unreadable_comments_fail_open(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # Opposite trade-off from issue dedup: a duplicate comment on one PR is
-        # contained and visible, a silently skipped review is not.
         def boom(_args: list[str]) -> str:
             raise RuntimeError("500")
 
@@ -318,12 +316,8 @@ class TestPostReview:
         rp.post_review("acme/widgets", 1, "sha1", [f], "body", runner=runner)
         payload = json.loads(Path(captured[0][-1]).read_text())
         assert payload["event"] == "COMMENT", "must not approve or request changes"
-        assert payload["comments"][0] == {
-            "path": "a.py",
-            "line": 11,
-            "side": "RIGHT",
-            "body": payload["comments"][0]["body"],
-        }
+        comment = payload["comments"][0]
+        assert (comment["path"], comment["line"], comment["side"]) == ("a.py", 11, "RIGHT")
         assert "🟠 [HIGH]" in payload["comments"][0]["body"]
         assert payload["commit_id"] == "sha1"
 
@@ -340,12 +334,7 @@ class TestSummaryWithInline:
 
 
 class TestRedaction:
-    # Every fixture below is assembled from fragments rather than written as a
-    # literal. These strings exist to look exactly like real credentials, so a
-    # literal would be flagged by secret scanners (and the internal hostname
-    # would be rejected by the public mirror's own identifier scan) — tripping
-    # the very detectors this redaction complements. Concatenation keeps the
-    # coverage without the false positives.
+    # Built from fragments so secret scanners and the identifier scan do not flag them.
     _INTERNAL_HOST = "build." + "corp" + ".amazon" + ".com"
     _SLACK = "xoxb" + "-1234567890-abcdefghij"
     _GITHUB = "ghp" + "_0123456789abcdefghijklmnopqrstuvwx"

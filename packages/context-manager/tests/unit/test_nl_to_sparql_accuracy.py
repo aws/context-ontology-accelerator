@@ -1,13 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""NL-to-SPARQL accuracy enhancements.
-
-Covers the three MVP code sub-tasks:
-- :aiContext glossary injection (tbox_context)
-- SPARQL validation hardening — domain/range + GovernedMetric URI pattern
-- confidence calibration (the NL-to-SQL fallback trigger)
-"""
+"""NL-to-SPARQL glossary injection, validation hardening and confidence calibration."""
 
 from __future__ import annotations
 
@@ -23,9 +17,6 @@ from coa_serve.tier2.ontop.types import VectorHit
 
 def _hit(uri: str, score: float = 0.9) -> VectorHit:
     return VectorHit(type="ontology_class", score=score, entity_id="e1", uri=uri)
-
-
-# ── :aiContext glossary injection ───────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -105,9 +96,6 @@ class TestAiContextGlossary:
         assert "use net rate" in text
 
 
-# ── SPARQL validation hardening ──────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestGovernedMetricUriPattern:
     def test_recognizes_metric_urn(self):
@@ -162,7 +150,7 @@ class TestDomainRangeValidation:
         assert ("http://ex.org/o#Claim", "http://ex.org/o#policyNumber") in pairs
 
     async def test_prefixed_name_domain_mismatch_fails(self):
-        """End-to-end: a prefixed-name domain mismatch is now caught (was bypassed before)."""
+        """End-to-end: a prefixed-name domain mismatch is caught."""
         client = AsyncMock()
         client.ask.side_effect = [False, True]  # not-compatible, but declares a domain → mismatch
         client.query.return_value = [{"found": "0"}]
@@ -195,9 +183,6 @@ class TestDomainRangeValidation:
         v = SPARQLValidator(client, graph_uri_template="https://test.local/{namespace}")
         result = await v._validate_domain_range(self._typed_sparql(), "ns")
         assert result.valid is True
-
-
-# ── Confidence calibration (NL-to-SQL trigger) ────────────────────────────────
 
 
 @pytest.mark.unit

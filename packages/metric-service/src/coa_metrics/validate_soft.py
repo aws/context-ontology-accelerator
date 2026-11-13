@@ -3,7 +3,7 @@
 
 """Soft validation — shared by create and update handlers.
 
-Runs Checks 1-6 from the Metric Onboarding Service LLD §5.1.
+Runs the six validation checks (see ``validator.validate_metric``).
 SQL findings are returned for diagnostic parity with the explicit validate
 endpoint. Persistence handlers independently enforce syntax, read-only
 semantics, and executable statement shape before calling this best-effort

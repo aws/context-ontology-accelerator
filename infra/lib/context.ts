@@ -14,6 +14,7 @@ import {
   CTX_LAMBDA_RESERVED_CONCURRENCY,
   CTX_GUARDRAIL_TIER,
   CTX_GUARDRAIL_PROFILE,
+  CTX_PREFER_IPV4,
   DEFAULT_RESOURCE_PREFIX,
   DEFAULT_ENV,
   DEFAULT_PROJECT_TAG,
@@ -57,28 +58,13 @@ export function resolveContext(node: Node): ResolvedContext {
   const graphBaseUri =
     (node.tryGetContext(CTX_GRAPH_BASE_URI) as string) ??
     DEFAULT_GRAPH_BASE_URI;
-  // EventBridge source DOES track `prefix` (unlike the other brand tokens
-  // below). An event source is a ROUTING attribute on a transient message, not
-  // a persisted identifier: nothing is written into a data store keyed by it, so
-  // deriving it per-deployment orphans nothing. It has to be deployment-scoped
-  // because the bus it lands on (`default`) is ACCOUNT-GLOBAL and shared — two
-  // deployments in one account+region emitting the same source means each one's
-  // rules match the OTHER's events. That is not hypothetical: it provisioned
-  // duplicate per-namespace VKG services that only the originating deployment's
-  // teardown could ever delete, leaking ECS services and failing
-  // test_namespace_delete_deregisters_vkg. The explicit `event_source_prefix`
-  // context override is retained for the deliberate cross-deployment-interop
-  // case (one deployment consuming another's events).
+  // The default bus is account-global, so the event source tracks `prefix`
+  // to keep two deployments' rules from matching each other's events. Override
+  // with `event_source_prefix` for deliberate cross-deployment interop.
   const eventSourcePrefix =
     (node.tryGetContext(CTX_EVENT_SOURCE_PREFIX) as string) ?? prefix;
-  // The remaining data-plane identifiers are intentionally NOT derived from
-  // `prefix`. They are written into Neptune RDF and DataZone metadata, so they
-  // must stay stable across deployments and prefixes — a prefix change would
-  // re-mint every IRI and orphan the graph data already stored. See the BRAND
-  // block in libs/ts-shared/src/constants.ts. They are safe to keep static
-  // because each lives inside a container that is ALREADY prefix-isolated (its
-  // own Neptune cluster, its own DataZone domain), unlike the shared event bus.
-  // `prefix` governs physical resource names via prefixed()/ssmPrefix.
+  // Written into Neptune RDF and DataZone metadata, so these must not change
+  // with `prefix`; see BRAND in libs/ts-shared/src/constants.ts.
   const urnPrefix = DEFAULT_URN_PREFIX;
   const vocabPrefix = DEFAULT_VOCAB_PREFIX;
   const dzTypePrefix = DEFAULT_DZ_TYPE_PREFIX;
@@ -151,7 +137,7 @@ export function prefixedLambdaArn(scope: Construct, name: string): string {
  *
  * Single source of truth for the synth side. The runtime derives the same key
  * from `RESOURCE_TAG_PREFIX` (see `namespace_tag_key()` in
- * libs/common/constants.py) — the two must agree exactly or registration writes
+ * libs/common/src/coa_common/constants.py) — the two must agree exactly or registration writes
  * a tag the IAM conditions cannot match.
  */
 export function namespaceTagKey(node: Node): string {
@@ -168,9 +154,7 @@ export function namespaceTagKey(node: Node): string {
  * on reduced-quota accounts the reservation can be disabled without CDK
  * rejecting a literal `0` reservation.
  *
- * Validates that the value is a non-negative integer and throws at synth time
- * otherwise, matching the fail-fast behavior of the other numeric context
- * knobs (e.g. `dbScanEnrichmentTimeoutMinutes`).
+ * Throws at synth unless the value is a non-negative integer.
  */
 export function resolveLambdaReservedConcurrency(
   node: Node,
@@ -203,7 +187,7 @@ const GUARDRAIL_PROFILE_ID = /^[a-z]+(?:-[a-z]+)*\.guardrail\.v[0-9]+:[0-9]+$/;
  *
  * The default is the Classic tier, which is what an unset tier has always
  * produced. Classic content filters support English, French and Spanish only:
- * a Japanese prompt injection is not detected (#1255). The Standard tier
+ * a Japanese prompt injection is not detected. The Standard tier
  * supports more languages but requires cross-Region inference through a
  * system-defined guardrail profile, so the screened text can be processed in
  * any destination Region of that profile (for example `apac.guardrail.v1:0`
@@ -266,4 +250,43 @@ export function guardrailProfileResources(scope: Construct): string[] {
   if (!profileId) return [];
   const account = cdk.Stack.of(scope).account;
   return [`arn:aws:bedrock:*:${account}:guardrail-profile/${profileId}`];
+}
+
+/**
+ * Resolve the `prefer_ipv4` context value into the Docker build args for the
+ * Python images that run in the VPC subnets (`PREFER_IPV4` in each Dockerfile).
+ *
+ * On by default: harmless where IPv4 works, and in a dual-stack subnet without
+ * IPv6 egress to AWS it stops IPv6-first connects from stalling long enough to
+ * expire a request's SigV4 signature. Accepts a boolean (cdk.json) or the
+ * string "true"/"false" (the CLI `--context` bridge) and throws at synth time
+ * on anything else.
+ *
+ * Call it on every path, so an invalid value fails synth even when the stack
+ * uses a pre-built image. Pass `prebuiltImageContextKey` (the `*_image_uri`
+ * key) when it does: that image was built without these args and keeps the
+ * Dockerfile default, so `prefer_ipv4=false` cannot reach it, and synth warns
+ * instead of ignoring the value silently.
+ */
+export function resolvePreferIpv4BuildArgs(
+  scope: Construct,
+  prebuiltImageContextKey?: string,
+): Record<string, string> {
+  const raw: unknown = scope.node.tryGetContext(CTX_PREFER_IPV4);
+  const value = String(raw ?? true);
+  if (value !== "true" && value !== "false") {
+    throw new Error(
+      `${CTX_PREFER_IPV4} must be true or false, got: ${String(raw)}`,
+    );
+  }
+  if (prebuiltImageContextKey && value === "false") {
+    cdk.Annotations.of(scope).addWarningV2(
+      `coa:preferIpv4Ignored.${prebuiltImageContextKey}`,
+      `${CTX_PREFER_IPV4}=false has no effect on the pre-built image from ` +
+        `${prebuiltImageContextKey}: it keeps the Dockerfile default and ` +
+        "prefers IPv4. Build that image with --build-arg PREFER_IPV4=false " +
+        "to keep the IPv6-first order.",
+    );
+  }
+  return { PREFER_IPV4: value };
 }

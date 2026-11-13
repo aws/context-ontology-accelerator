@@ -1,81 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Task 9 — cross-cutting / missing unit-test coverage + design-property sweep.
-
-This module is the cross-cutting sweep for the ``lexical-baseline-retriever-fixes``
-bugfix spec. It does two things:
-
-1. **Records the design.md correctness-property → unit-test mapping**
-   (coverage tracking) in :data:`PROPERTY_TEST_MAPPING` below, and asserts the
-   referenced co-located test modules/classes actually exist so the mapping
-   cannot silently rot.
-2. **Fills the few genuine gaps at the seams between primitives** that are NOT
-   already covered by the co-located suites (tasks 1.a–8.a). It deliberately
-   does NOT duplicate those suites — each test here targets a seam/edge case
-   with no existing unit-level assertion.
-
-═══════════════════════════════════════════════════════════════════════════
- design.md Correctness Property  →  unit test(s)   (coverage tracking)
-═══════════════════════════════════════════════════════════════════════════
-
-Property 1 — NA backends produce a well-formed graph-store URI (BUG 1/7)
-    test_lexical_baseline.py::TestGraphStoreUri (NDB/NA/wss/host/prefix shapes)
-    test_lexical_baseline.py::TestBuildLexicalRetrieverStrategy
-        ::test_retriever_uses_na_graph_store_uri / ::test_retriever_uses_ndb_graph_store_uri
-    + seam gaps here: TestGraphStoreUriSeams (NA-detected-but-no-extractable-id
-      fallback; trailing-slash NDB host normalization; bare NA graph-id).
-    Validates: Requirements 2.1, 2.2, 2.3, 2.14
-
-Property 2 — strategy resolution honors precedence and rejects unknowns (BUG 8)
-    test_strategies.py::TestResolveStrategyPrecedence (request>deploy>default,
-        unknown-request→absent, unknown-deploy→warn+fallback)
-    test_models.py::TestRetrieverStrategyValidation (invalid request → 400/ValidationError)
-    test_strategy_wiring.py::TestRunTier3StrategyPrecedence
-    Validates: Requirements 2.15, 2.16, 2.17
-
-Property 3 — tenant scoping flows through the real code path (BUG 6)
-    test_lexical_baseline.py::TestGetEngineTenantAndCaching (tenant_id derivation,
-        per-(tenant,strategy) caching, override non-collision, distinct tenants)
-    Validates: Requirements 2.12, 2.13
-
-Property 4 — timeout is bounded and degrades gracefully (BUG 3)
-    test_lexical_baseline.py::TestBaselineLexicalRetrieverRetrieve
-        ::test_timeout_degrades_to_empty / ::test_concurrency_bounded_by_dedicated_executor
-    + seam gap here: TestResolveBoundaryDegradation (the Tier-3 resolve boundary
-      ``_resolve_via_lexical`` absorbs an unexpected raise out of ``retrieve`` —
-      the defensive try/except seam, distinct from the retriever-level timeout).
-    Validates: Requirements 2.8, 2.9
-
-Property 5 — tests exercise shipping code and real output (BUG 4, BUG 5)
-    test_lexical_baseline.py::TestMapResults (real nested Source/EntityContexts
-        shapes, defensive fallbacks, one-time warning)
-    NOTE: the populated-graph confirmation is the integration task (11); unit
-    level covers the mapping logic against the documented shape.
-    Validates: Requirements 2.10, 2.11, 2.18, 2.19
-
-Property 6 — the hand-rolled default path is unchanged (Preservation; 3.1, 3.7)
-    test_strategy_wiring.py::TestRunTier3HandRolledParity,
-        ::TestKnowledgeRetrieverHandRolledParity
-    test_lexical_baseline.py::TestBuildLexicalRetriever::test_returns_none_when_hand_rolled
-    Validates: Requirements 3.1, 3.7
-
-Property 7 — non-targeted invariants hold (Preservation; 3.2–3.5)
-    test_strategies.py::TestLazyImportInvariant + test_config.py
-        ::test_load_config_does_not_import_graphrag_toolkit (lazy graphrag import)
-    + seam gap here: TestVersionPinInvariant (3.3/3.4 — graphrag-lexical-graph==3.20.0
-      pin asserted; previously no unit test).
-    Validates: Requirements 3.2, 3.3, 3.4, 3.5
-
-Property 8 — new lexical default is documented, not silent (3.6, 3.8)
-    test_strategies.py::TestResolveStrategyPrecedence::test_default_is_chunk_based_semantic,
-        ::TestStrategyRegistry::test_default_spec_is_spec_for_default_strategy
-    test_config.py::TestLexicalRetrieverStrategyConfig::test_absent_var_yields_default
-    Validates: Requirements 2.4, 2.5, 2.6, 2.7, 3.6, 3.8
-═══════════════════════════════════════════════════════════════════════════
-
-_Requirements: 2.14, 2.15, 2.16, 2.17_
-"""
+"""Cross-cutting unit coverage for the lexical retriever seams."""
 
 from __future__ import annotations
 
@@ -88,11 +14,9 @@ from .lexical_helpers import (
     make_baseline_retriever,
     make_strategy_spec,
     make_synthesizer,
-    make_toolkit_node,
 )
 
-# Machine-checkable mirror of the prose mapping above: each design.md property
-# maps to the co-located module(s) (and optionally ``module::ClassName``) that
+# Each design property maps to the co-located module(s) (and optionally ``module::ClassName``) that
 # provide its unit-level coverage. The test below asserts every referent exists.
 PROPERTY_TEST_MAPPING: dict[str, list[str]] = {
     "Property 1": [
@@ -131,12 +55,9 @@ PROPERTY_TEST_MAPPING: dict[str, list[str]] = {
 }
 
 
-# ── Design-property sweep: mapping integrity ────────────────────────
-
-
 @pytest.mark.unit
 class TestDesignPropertyCoverageMapping:
-    """Assert each design.md Property has at least one existing unit-test
+    """Assert each design property has at least one existing unit-test
     referent, and that every referent (``module`` or ``module::Class``) actually
     resolves. This converts the coverage-tracking mapping into a live check so a
     renamed/removed test surfaces as a failure rather than silent rot."""
@@ -164,17 +85,14 @@ class TestDesignPropertyCoverageMapping:
         assert not missing, "Stale property→test mapping referents:\n" + "\n".join(missing)
 
 
-# ── Property 1 seam gaps — graph-store URI fallbacks ────────────────
-
-
 @pytest.mark.unit
 class TestGraphStoreUriSeams:
     """Edge cases at the URI-derivation seam not covered by TestGraphStoreUri.
 
     TestGraphStoreUri already covers the happy NDB/NA/wss/host/prefix shapes;
     these target the *fallback* branches in ``_graph_store_uri`` /
-    ``_is_neptune_analytics`` (the error-handling table's "NA endpoint not
-    recognized → NDB form" row and host-normalization edges).
+    ``_is_neptune_analytics`` (an unrecognized NA endpoint falls back to the NDB
+    form) and host-normalization edges.
     """
 
     def test_na_prefix_without_extractable_graph_id_falls_back_to_cleaned(self):
@@ -187,8 +105,7 @@ class TestGraphStoreUriSeams:
         assert uri == "neptune-graph://my-custom-graph-name"
 
     def test_unrecognized_endpoint_falls_back_to_ndb_form(self):
-        """An endpoint matching no NA signal degrades to the NDB URI form
-        (preserves prior behavior — error-handling table row)."""
+        """An endpoint matching no NA signal degrades to the NDB URI form."""
         from coa_serve.clients.factory import _graph_store_uri
 
         uri = _graph_store_uri("some-internal-host.example.com")
@@ -251,15 +168,12 @@ class TestGraphStoreUriSeams:
         assert _is_neptune_analytics(endpoint) is False
 
 
-# ── Property 4 seam gap — Tier-3 resolve-boundary degradation ───────
-
-
 @pytest.mark.unit
 class TestResolveBoundaryDegradation:
     """The defensive ``try/except`` seam in ``_resolve_via_lexical``.
 
     The retriever-level timeout/degradation is covered in test_lexical_baseline.
-    This covers the SECOND layer required by 2.9: even if the lexical retriever
+    This covers the second layer: even if the lexical retriever
     raises an *unhandled* exception (rather than returning an empty result), the
     Tier-3 resolve must still succeed with empties + an error trace step, never
     propagating the failure out of Tier 3.
@@ -317,12 +231,9 @@ class TestResolveBoundaryDegradation:
         assert "strategy=traversal" in lexical_steps[0]["detail"]
 
 
-# ── Property 7 seam gap — version-pin invariant (3.4) ───────────────
-
-
 @pytest.mark.unit
 class TestVersionPinInvariant:
-    """Requirement 3.3 / 3.4 / Property 7: ``graphrag-lexical-graph`` stays pinned
+    """``graphrag-lexical-graph`` stays pinned
     to ``==3.20.0`` (in sync with kg-build's requirements.txt, the root
     ``uv.lock``, and context-manager's own pin). No prior unit test asserted the
     pin; a silent bump would break reader/builder version parity."""
@@ -331,9 +242,6 @@ class TestVersionPinInvariant:
         from importlib.metadata import version
 
         assert version("graphrag-lexical-graph") == "3.20.0"
-
-
-# ── Cross-primitive seam: registry build_engine ↔ adapter cache ─────
 
 
 @pytest.mark.unit
@@ -393,22 +301,9 @@ class TestStrategyBuildEngineSeam:
         assert make_strategy_spec(RetrieverStrategy.TRAVERSAL).name is RetrieverStrategy.TRAVERSAL
 
 
-# ── Shared-helper integrity (consolidation guard) ───────────────────
-
-
 @pytest.mark.unit
 class TestSharedHelperIntegrity:
-    """Guard the consolidated helpers so the co-located suites can rely on them
-    as one source of truth (task 9 deliverable 1)."""
-
-    def test_toolkit_node_builder_shape(self):
-        node = make_toolkit_node(node_id="x1", text="t", score=0.7, metadata={"k": "v"})
-        assert node.node_id == "x1"
-        assert node.text == "t"
-        assert node.score == 0.7
-        assert node.metadata == {"k": "v"}
-        # Plain object: attribute access does NOT auto-create like a MagicMock.
-        assert not hasattr(node, "definitely_absent_attr")
+    """Guard the shared helpers the co-located suites rely on."""
 
     def test_endpoint_constants_match_derived_uris(self):
         """The NDB/NA endpoint fixtures agree with the factory's actual output,

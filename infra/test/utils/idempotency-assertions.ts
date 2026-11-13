@@ -1,10 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Shared assertions for the idempotency-table wiring (utils/idempotency.ts).
- * Not a test file itself — imported by the per-stack tests.
- */
+/** Assertions for the idempotency-table wiring (utils/idempotency.ts). */
 
 import { Template } from "aws-cdk-lib/assertions";
 import {

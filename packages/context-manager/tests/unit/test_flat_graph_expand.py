@@ -3,24 +3,9 @@
 
 """Ontology-graph expansion on the FLAT (non-agentic) NL→SQL path.
 
-The flat arm retrieves **once** — its 2-shot ``correct()`` re-generates on an
-execution error or an empty result, but never re-retrieves — so a table vector
-similarity did not rank is unreachable, and there is no tool call to recover it.
-This lever walks the induced FK graph one hop out from the retrieved classes and
-appends the reached tables' columns to the schema context.
-
-What these tests pin down is the difference between this and the FK expansion the
-generator already had, which measured nothing: that one adds table *names* from a
-sources-API adjacency that production never populates, and ``_build_raw_context``
-renders only tables that have a retrieved hit, so a name with no hit was dropped
-before it reached the prompt. So the assertions here are about the *prompt*: the
-walked table's columns are in the text handed to the model, the retrieved text is
-never displaced by the thinner walked one, and the whole thing is byte-identical
-to baseline when the flag is off.
-
-The walk itself is ``OntologyGraphTool.expand_from`` — the same FK adjacency the
-agentic arm's ``explore_graph`` tool walks (``test_graph_tools.py``), entered from
-the retrieved classes instead of from a table name an agent chose.
+The flat arm walks the induced FK graph one hop out from the retrieved classes and
+appends the reached tables' columns to the schema context. These tests check that the
+walked columns reach the prompt, retrieved text wins, and nothing changes when off.
 """
 
 from __future__ import annotations
@@ -132,9 +117,6 @@ def _expander(graph=None, template=TEMPLATE) -> OntologyGraphTool:
     return OntologyGraphTool(graph or _MockGraph(), namespace=NS, graph_uri_template=template)
 
 
-# ── expand_from ───────────────────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestExpandFrom:
@@ -180,9 +162,6 @@ class TestExpandFrom:
         assert await _expander(template="").expand_from([_iri("Shop_Orders")]) == []
 
 
-# ── the prompt block ─────────────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestGraphContextBlock:
     def test_drops_tables_the_retrieved_block_already_carries(self):
@@ -226,9 +205,6 @@ def test_hit_class_iri_reads_either_metadata_key():
     assert hit_class_iri(VectorHit(id="1", text="t", score=1.0, metadata={"uri": "u1"})) == "u1"
     assert hit_class_iri(VectorHit(id="1", text="t", score=1.0, metadata={"entity_uri": "u2"})) == "u2"
     assert hit_class_iri(VectorHit(id="1", text="t", score=1.0, metadata={})) == ""
-
-
-# ── generate() ────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -291,18 +267,14 @@ class TestGenerateWithExpansion:
         assert result.sql == "SELECT 1"  # the question is still answered
         assert "Table: orders" in prompt
         assert [s for s in result.trace_steps if s["step"] == "graph_expand_ontology"][0]["status"] == "error"
-        # A silent degradation on a default-on lever is indistinguishable from a
-        # namespace with no FK edges, so the failure has to name itself — and name
-        # the exception, since "neptune refused" and a bad seed IRI are different
-        # problems.
+        # The log names the exception so a refused query is distinguishable from no FK edges.
         entry = next(log for log in logs if log["event"] == "nl_to_sql_graph_expand_failed")
         assert "RuntimeError" in entry["error"] and "neptune refused" in entry["error"]
 
     async def test_the_context_log_counts_the_walked_table(self, mock_llm, mock_vector):
         # `context_tables` is documented as what the writer saw, and a walked table
         # has no retrieved hit behind it — so the hit-keyed filter drops it unless the
-        # walk's own additions are added back. Getting this wrong understates the
-        # prompt, which is the exact misreading the field was introduced to end.
+        # walk's own additions are added back.
         with structlog.testing.capture_logs() as logs:
             await self._generate(mock_llm, mock_vector, graph_expander=_expander())
 
@@ -327,9 +299,6 @@ class TestGenerateWithExpansion:
         assert "Table: customers" not in prompt
         step = [s for s in result.trace_steps if s["step"] == "graph_expand_ontology"][0]
         assert step["seeds"] == 0 and step["added"] == []
-
-
-# ── the flag and its wiring ──────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -367,9 +336,6 @@ class TestGraphExpandFlag:
             assert _graph_expand_enabled({}) is True
         with patch.dict(os.environ, {"SERVE_NL2SQL_GRAPH_EXPAND": "false"}):
             assert _graph_expand_enabled({"flatGraphExpand": "maybe"}) is False
-
-
-# ── the appended-table budget ─────────────────────────────────────────────────
 
 
 @pytest.mark.unit

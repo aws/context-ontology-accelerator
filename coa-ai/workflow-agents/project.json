@@ -1,0 +1,19 @@
+{
+  "name": "workflow-agents",
+  "namedInputs": { "default": ["python"] },
+  "targets": {
+    "lint": {
+      "command": "uv run ruff check coa-ai/workflow-agents && uv run ruff format --check coa-ai/workflow-agents && uv run mypy coa-ai/workflow-agents/src --ignore-missing-imports --cache-dir coa-ai/workflow-agents/.mypy_cache"
+    },
+    "test": {
+      "inputs": ["default", "^default", "smithyModels"],
+      "command": "COVERAGE_FILE=coa-ai/workflow-agents/.coverage uv run pytest coa-ai/workflow-agents/tests/unit -m unit -v --tb=short --cov=coa-ai/workflow-agents/src --cov-report=term-missing --cov-report=xml:coa-ai/workflow-agents/coverage.xml --cov-fail-under=80 --junitxml=coa-ai/workflow-agents/junit.xml"
+    },
+    "format": {
+      "command": "uv run ruff format coa-ai/workflow-agents"
+    },
+    "format:check": {
+      "command": "uv run ruff format --check coa-ai/workflow-agents"
+    }
+  }
+}

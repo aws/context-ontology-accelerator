@@ -6,7 +6,7 @@
 Some ontology text is not model output but a fixed template: foreign-key notes,
 deterministic fallback class descriptions, default proposal and topic-scheme
 titles. That text describes customer data, so it follows the namespace language
-(namespace-language LLD, section 2.2.6). V1 has reviewed ``en`` and ``ja``
+. V1 has reviewed ``en`` and ``ja``
 versions. Any other namespace language keeps the English text; the
 compatibility check then leaves it untagged because English text carries no
 evidence for that language.
@@ -24,7 +24,6 @@ from __future__ import annotations
 from coa_common.language_tags import DEFAULT_LANGUAGE, LanguageTagError, primary_language
 
 _TEMPLATES: dict[str, dict[str, str]] = {
-    # ── Proposal titles (proposal metadata, not RDF) ─────────────────────
     "structured_proposal_title": {
         "en": "Induced Structured Ontology",
         "ja": "構造化データから生成したオントロジー",

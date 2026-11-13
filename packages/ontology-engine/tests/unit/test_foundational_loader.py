@@ -3,31 +3,9 @@
 
 """Foundational ontology loader tests (async contract).
 
-The loader has historically been deceptively shallow: ``create_ontology
-+ fetch_ontology_from_source`` only registered the metadata + cached
-the raw bytes; nothing produced embeddings, so Match could never use
-the ontology for grounding. The June 2026 fix routes the fetched
-bytes through ``ingest_ontology`` so embeddings are created end-to-end.
-
-The July 2026 fix makes the load **asynchronous**: the endpoint returns
-202 + an ``IngestJob`` handle immediately and runs fetch + parse +
-embedding on a background thread, driving a DynamoDB-backed IngestJob
-(keyed by the ontology URI, same as ``ingest-from-s3``) that the shared
-``GET /ontologies/{id}/ingest-status/{job}`` poll endpoint reports on.
-Async because fetching + embedding a large ontology (FIBO, Schema.org)
-can exceed API Gateway's 29s integration timeout.
-
-These tests pin the post-fix contract:
-
-  * The POST endpoint returns 202 + a PENDING IngestJob keyed by the
-    ontology URI, and never blocks on fetch/ingest.
-  * The background worker drives the job RUNNING → COMPLETED, calling
-    ``ingest`` exactly once and recording the counts on the job result.
-  * Idempotent — a 409 from create_ontology (row already exists) doesn't
-    stop the load.
-  * A non-409 create error bubbles out synchronously (real failure).
-  * Fetch/parse failure drives the job FAILED without ingesting.
-  * An unknown curated key is a hard 404.
+The endpoint returns 202 + an ``IngestJob`` handle and runs fetch, parse and
+embedding on a background thread, because loading a large ontology can exceed
+API Gateway's 29s integration timeout.
 """
 
 from __future__ import annotations
@@ -72,12 +50,7 @@ class _FetchStub:
 
 @pytest.fixture
 def patched_loader():
-    """Patch the loader's collaborators so we can run it in isolation.
-
-    We replace the seams the worker uses (create/fetch/ingest/stores/open)
-    plus the DynamoDB IngestJob writes, and verify the worker sequences
-    them correctly and records job state — not re-test the collaborators.
-    """
+    """Patch create/fetch/ingest/stores/open and the DynamoDB IngestJob writes."""
     with (
         patch("coa_ontology.catalog.routers.foundational.create_ontology") as create,
         patch("coa_ontology.catalog.routers.foundational.fetch_ontology_from_source") as fetch,
@@ -127,19 +100,15 @@ def test_load_foundational_returns_202_job_and_never_blocks(patched_loader):
     with patch("coa_ontology.catalog.routers.foundational.Thread") as thread:
         resp = load_foundational_ontology("schema-org", namespace="ns-1")
 
-    # Registry row created on the request thread.
     patched_loader["create"].assert_called_once()
-    # A PENDING job keyed by the ontology URI was persisted.
     put_call = patched_loader["dynamo"].put_ingest_job.call_args
     assert put_call.args[1] == _BY_KEY["schema-org"].uri  # ontology_id == URI
     assert put_call.args[2] == IngestJobState.PENDING
-    # Worker started on a background thread (fetch/ingest did NOT run inline).
     thread.assert_called_once()
     thread.return_value.start.assert_called_once()
     patched_loader["fetch"].assert_not_called()
     patched_loader["ingest"].assert_not_called()
 
-    # 202 body carries a PENDING IngestJob handle keyed by the URI.
     assert resp.result.job_id
     assert resp.result.ontology_id == _BY_KEY["schema-org"].uri
     assert resp.result.status == IngestJobState.PENDING
@@ -159,7 +128,6 @@ def test_worker_drives_job_to_completed_with_counts(patched_loader):
     patched_loader["ingest"].assert_called_once()
 
     dynamo = patched_loader["dynamo"]
-    # RUNNING set first, COMPLETED set last with counts.
     states = [c.args[1] for c in dynamo.update_ingest_job.call_args_list]
     assert states[0] == IngestJobState.RUNNING
     assert states[-1] == IngestJobState.COMPLETED
@@ -181,7 +149,6 @@ def test_load_foundational_idempotent_when_registry_row_exists(patched_loader):
     with patch("coa_ontology.catalog.routers.foundational.Thread") as thread:
         resp = load_foundational_ontology("schema-org", namespace="ns-1")
 
-    # 409 swallowed; job still registered + worker started.
     patched_loader["dynamo"].put_ingest_job.assert_called_once()
     thread.return_value.start.assert_called_once()
     assert resp.result.status == IngestJobState.PENDING

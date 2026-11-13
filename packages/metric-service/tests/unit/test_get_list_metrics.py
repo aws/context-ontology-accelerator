@@ -16,9 +16,6 @@ from coa_metrics.neptune_client import MetricDefinition, MetricDialect
 pytestmark = pytest.mark.unit
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
 def _make_get_event(namespace: str = "test-ns", name: str = "revenue") -> dict:
     return {
         "httpMethod": "GET",
@@ -52,9 +49,6 @@ def _sample_metric(name: str = "revenue") -> MetricDefinition:
 
 
 _VIEWER_FLAGS = {"canViewSource": "true", "canViewOntology": "true"}
-
-
-# ── Get Metric tests ───────────────────────────────────────────────────
 
 
 class TestGetMetric:
@@ -94,9 +88,6 @@ class TestGetMetric:
         get_handler(_make_get_event(namespace="ns-alpha"), None)
 
         assert mock_neptune.return_value.get_metric.call_args[0][0] == "ns-alpha"
-
-
-# ── List Metrics tests ──────────────────────────────────────────────────
 
 
 class TestListMetrics:
@@ -218,9 +209,6 @@ class TestListMetrics:
 
         assert resp["statusCode"] == 200
         assert mock_neptune.return_value.list_metrics.call_args[1]["offset"] == 2147483647
-
-
-# ── Schema-blind callers (ADR: decompose-viewnamespace-schema-visibility) ──
 
 
 def _schema_metric() -> MetricDefinition:
