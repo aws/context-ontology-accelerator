@@ -58,7 +58,7 @@ from coa_ontology.catalog.graph_source_resolver import GraphSourceLookupError, r
 from coa_ontology.stores.base import GraphStore, VectorStore
 from coa_ontology.validation.schemas import Severity, ValidationFinding, ValidationTier
 
-# ── Security: XXE protection (CWE-611/CWE-502, Issue #572) ──────────────────
+# ── Security: XXE protection (CWE-611/CWE-502) ──────────────────
 # Patch Python's stdlib XML parsers (xml.sax, xml.etree, xml.dom, minidom) at
 # import time to reject external entity resolution and external DTDs. rdflib
 # delegates RDF/XML parsing to xml.sax, so this must run BEFORE any
@@ -135,7 +135,7 @@ SUPERSEDED_DEFINITION = _COA.supersededDefinition
 SUPERSEDED_ALT_LABEL = _COA.supersededAltLabel
 SUPERSEDED_GLOSSARY_TERM = _COA.supersededGlossaryTerm
 SUPERSEDED_TAG = _COA.supersededTag
-# Steward-reviewed glossary terms and tags (#1167) follow the same authored-wins
+# Steward-reviewed glossary terms and tags follow the same authored-wins
 # rule as descriptions and synonyms: a re-accept replaces them, so removing a
 # term during review actually removes it from the ontology.
 GLOSSARY_TERM = _COA.glossaryTerm
@@ -431,10 +431,6 @@ def _class_datasource_map_from_r2rml(r2rml_content: bytes | str | None) -> dict[
                 continue
             key = str(cls_uri)
             # Membership (key present) == mapped, independent of the ds-id, so a
-            # TriplesMap with no coa:datasourceId still marks its class mapped
-            # (empty-string value). For a class mapped by MULTIPLE TriplesMaps,
-            # keep the LAST NON-EMPTY ds-id, and never let an id-less TriplesMap
-            # blank out an id already found. (See this function's docstring.)
             if key not in mapping:
                 mapping[key] = ds_id  # first sighting (may be "")
             elif ds_id:
@@ -908,25 +904,6 @@ def ingest_ontology(
     title = md.title or _first_literal(g, ontology_id, RDFS.label) or _local_name(ontology_id)
     description = md.description or _first_literal(g, ontology_id, RDFS.comment)
 
-    # ── Tier-2 answerability signal ─────────────────────────────────────
-    # Parse the (optional) R2RML mapping into a class-URI → datasource-id map.
-    # A class present in this map is R2RML-mapped (the rr:class of some
-    # TriplesMap → SQL-backed → answerable by Ontop / NL->SQL). Two consumers
-    # derive from this single map:
-    #   * Neptune T-Box (store_class): emits an ``coa:isMapped`` boolean marker,
-    #     derived purely from map MEMBERSHIP (the ds-id string is not stored in
-    #     the graph). The serve T-Box context filters on it so unmapped
-    #     (unstructured / foundational) classes don't pollute the structured
-    #     prompt.
-    #   * AOSS embeddings (_accumulate_embeddings): writes the datasource-id
-    #     STRING into each class doc's ``data_source_id`` field; the serve
-    #     NL->SQL path filters on its presence.
-    # The R2RML is NOT loaded into the graph — only scanned here to derive this.
-    # NOTE: a class can be the rr:class of MULTIPLE TriplesMaps (mapped from
-    # several datasources). This map keeps only the LAST datasource-id seen for
-    # such a class. That is sufficient for the current use (membership = mapped;
-    # presence of any ds-id = answerable). Multi-source routing (federate instead
-    # of pinning one source) is a planned follow-up — widen to dict[str, set[str]].
     class_to_datasource: dict[str, str] = _class_datasource_map_from_r2rml(r2rml_content)
     # The graph twin: classes bound to a registered RDF_SPARQL source by name. Empty
     # for every ontology without the directive, so SQL and legacy imports are
@@ -983,7 +960,7 @@ def ingest_ontology(
     # re-defines (re-embedded in step 7); the earlier accept indexed the AI
     # description, and AOSS has no
     # client-supplied _id, so delete-then-add is the only way to REPLACE rather
-    # than accumulate (closes the #594/#824 duplication caveat for re-accept).
+    # than accumulate on re-accept.
     # Same scoping as 4b: exactly the incoming subjects; co-merged proposals'
     # embeddings are untouched. Skipped on a fresh ingest — nothing to retire.
     superseded_embedding_count = 0
@@ -1052,11 +1029,6 @@ def ingest_ontology(
     # transaction, so a batch that fails on chunk 2 of 3 (or a per-item loop that
     # throws partway) leaves earlier writes committed; without this the graph is
     # left with a partial class/property set. This mirrors the load_turtle
-    # rollback below. NOTE: this no-rollback-on-partial-projection gap is
-    # PRE-EXISTING — the previous per-class store_class loop had the same
-    # exposure; batching only changed the granularity of what's already
-    # committed at the point of failure, so this fix closes a latent gap rather
-    # than one introduced by batching.
     try:
         if hasattr(graph_store, "store_classes_batch"):
             graph_store.store_classes_batch(ontology_uri=ontology_id, classes=class_specs)
@@ -1304,15 +1276,6 @@ def ingest_ontology(
 
 # ── Embedding readiness ──────────────────────────────────────────────────
 
-# AOSS (OpenSearch Serverless) is eventually consistent on the vector index:
-# a freshly-written embedding is not immediately returned by a search. Any
-# flow that loads an ontology and then relies on its embeddings being
-# searchable (grounding recall against a freshly-loaded external ontology,
-# serve-time vector retrieval) must wait until every embedding it wrote is
-# queryable. ``STALL_TIMEOUT_S`` bounds how long we wait *without observing
-# progress* — it resets every time another embedding becomes searchable, so a
-# large ontology that's syncing slowly-but-steadily is never cut off; only a
-# genuinely stuck index trips it. Tunable via env for slower collections.
 EMBEDDING_SEARCHABLE_STALL_TIMEOUT_S = float(os.getenv("INGEST_EMBEDDING_READY_TIMEOUT_S", "120"))
 EMBEDDING_SEARCHABLE_POLL_S = float(os.getenv("INGEST_EMBEDDING_READY_POLL_S", "3"))
 
@@ -1353,7 +1316,7 @@ def wait_for_embeddings_searchable(
     IMPORTANT — a ``False`` return means LOSS, not benign lag. This wait runs
     only AFTER :func:`_accumulate_embeddings` has confirmed the vector store
     acknowledged every write (``bulk_with_retry`` raises on any doc that fails
-    to land — see #173). So the docs are known-acknowledged before we start
+    to land). So the docs are known-acknowledged before we start
     polling; if after ``stall_timeout_s`` of no forward progress some URIs are
     STILL not searchable, that is an index that will not converge (a dropped
     write that slipped past acknowledgement, or an index-health problem), NOT a
@@ -1627,8 +1590,6 @@ def _catalog_classes(
 
 
 def _first_literal(g: Graph, subject: str, predicate) -> str | None:
-    from rdflib import URIRef
-
     for o in g.objects(URIRef(subject), predicate):
         s = str(o).strip()
         if s:
@@ -1701,7 +1662,7 @@ def _accumulate_embeddings(
     ``physical_names`` is ``(class URI -> table, property URI -> column)`` from the
     R2RML (:func:`_physical_names_from_r2rml`). NL->SQL executes the names written
     after ``Table:`` and in ``Columns:``, so those come from the R2RML; the OWL
-    label is added as ``Business name`` only where it differs (#1287). Without it,
+    label is added as ``Business name`` only where it differs. Without it,
     or for an entry the R2RML does not resolve, the label is used as before.
 
     Each column comment is cut to ``_MAX_COLUMN_COMMENT_EMBED_CHARS`` characters in
@@ -1751,7 +1712,7 @@ def _accumulate_embeddings(
     table_of, column_of = physical_names or ({}, {})
 
     def _table_name(cls_uri) -> str:
-        """The executable table name: R2RML's, else the OWL label (pre-#1287 behaviour)."""
+        """The executable table name: R2RML's, else the OWL label."""
         return table_of.get(str(cls_uri)) or _label_of(cls_uri)
 
     def _column_name(prop_uri) -> str:
@@ -1801,7 +1762,7 @@ def _accumulate_embeddings(
 
         ``embed_text`` is EMBEDDED for retrieval: names, description, synonyms,
         relationships and columns with their comments, plus the table's glossary
-        terms. It deliberately stays close to its pre-#1167 shape: enrichment fills
+        terms. It deliberately omits per-column hints: enrichment fills
         synonyms, glossary terms and tags for nearly every column, and the vector
         input is cut at 8000 characters, so per-column hints would push a wide
         table's last columns out of the vector.
@@ -1858,7 +1819,7 @@ def _accumulate_embeddings(
             if glossary_terms:
                 parts.append(f"Glossary terms: {', '.join(glossary_terms)}")
             if rich:
-                # The rest of what the Ontop context carries (#1167), so both
+                # The rest of what the Ontop context carries, so both
                 # serve paths answer from the same approved metadata.
                 if tags:
                     parts.append(f"Tags: {', '.join(tags)}")
@@ -1882,7 +1843,7 @@ def _accumulate_embeddings(
             # rich=True → generation context: adds type, steward terms and allowed
             # values so the LLM writes correct casts and WHERE literals, and keeps
             # the comment up to _MAX_COLUMN_COMMENT_CHARS (a bridge-written one whole).
-            # A column whose OWL label differs from its physical name (#1287) carries
+            # A column whose OWL label differs from its physical name carries
             # the label as "business name"; the name before ":" is what SQL executes.
             return ", ".join(
                 (f"{column}:{dtype}" if rich else column)
@@ -1953,8 +1914,8 @@ def _accumulate_embeddings(
             item |= _backend_fields(entity_type, uri, graph_map)
             items.append(item)
         # store_embeddings_batch returns the docs the store confirms it wrote.
-        # With bulk_with_retry now raising PartialIndexError on any doc that
-        # fails to land (see #173), a partial write reaches the except-block
+        # bulk_with_retry raises PartialIndexError on any doc that fails to
+        # land, so a partial write reaches the except-block
         # below rather than being reported as success. We derive count and
         # entity_uris from the STORE'S RETURN VALUE, not len(items): the two
         # must be structurally coupled so "count" can never again be the
@@ -2003,19 +1964,6 @@ def _accumulate_embeddings(
     except Exception as e:
         log.exception("embedding accumulation failed for %s", ontology_id)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-
-
-def _wipe(graph_store: GraphStore, vector_store: VectorStore, namespace: str, ontology_id: str) -> None:
-    """Remove an ontology's presence across the three stores prior to replace."""
-    try:
-        vector_store.delete_embeddings_for_ontology(ontology_id, namespace=namespace)
-    except Exception:  # pragma: no cover — best effort
-        log.exception("wipe: delete_embeddings_for_ontology failed for %s", ontology_id)
-    try:
-        graph_store.delete_ontology(ontology_id)
-    except Exception:
-        log.exception("wipe: graph_store.delete_ontology failed for %s", ontology_id)
-    dynamo_store.delete_ontology_registry(namespace, ontology_id)
 
 
 def _derive_graph_uri_for_response(graph_store: GraphStore, ontology_id: str, namespace: str, load_result: Any) -> str:

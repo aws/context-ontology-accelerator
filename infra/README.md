@@ -11,14 +11,16 @@ infra/
 │   ├── constants.ts        # Shared constants and context key names
 │   ├── context.ts          # CDK context helpers (prefix, env)
 │   ├── paths.ts            # Portable monorepo path resolution
+│   ├── solution.ts         # Stack wiring for the solution
 │   ├── types.ts            # Shared TypeScript types
 │   ├── constructs/         # Reusable CDK constructs
+│   ├── aspects/            # CDK aspects
 │   ├── lambdas/            # Inline Lambda handlers (admin user, etc.)
 │   ├── utils/
 │   │   └── api-utils.ts    # OpenAPI spec enrichment (integrations, auth)
 │   └── stacks/
 │       ├── foundation/     # Network, auth, storage, authnz
-│       └── services/       # API, namespace, unstructured ingestion
+│       └── services/       # API, namespace, sources, ontology, serve, metric, VKG, MCP, data layer
 └── test/                   # Jest CDK tests
 ```
 
@@ -211,19 +213,12 @@ these:
 5. **Force-delete the DataZone domain** via
    `datazone delete-domain --skip-deletion-check`, resolving the domain
    ID from the `/smus/domain-id` SSM parameter, then wait for it to fully
-   delete. CFN already calls `DeleteProject` with `skipDeletionCheck=true`
-   internally (confirmed via CloudTrail), but that cascade can't clear a
-   shared asset type (e.g. `CoaRelationalTable`, owned by the system
-   project) while OTHER projects' assets still reference that type — and
-   every namespace has its own project holding its scanned-table assets
-   of that type, so this isn't an edge case. That stalls the system
-   project's delete ("failed to stabilize due to internal failure"),
-   which stalls `DefaultProjectProfile`'s, which stalls the domain's
-   ("Domain cannot be deleted because there are existing projects under
-   this domain") — confirmed against a real stuck stack. DataZone's own
-   `delete-domain --skip-deletion-check` is a true force-delete at the
-   domain level with no such cross-project carve-out. The domain and its
-   `FormType`, `Project`, `PolicyGrant`, `ProjectProfile`, `UserProfile`,
+   delete. CFN's `DeleteProject` cannot clear a shared asset type (e.g.
+   `CoaRelationalTable`, owned by the system project) while other projects'
+   assets still reference it, which stalls the system project's delete and
+   then the domain's. DataZone's own `delete-domain --skip-deletion-check`
+   force-deletes at the domain level without that restriction. The domain
+   and its `FormType`, `Project`, `PolicyGrant`, `ProjectProfile`, `UserProfile`,
    `ProjectMembership`, and `Owner` child resources are
    `RemovalPolicy.RETAIN` in `namespace-stack.ts` so CFN never attempts
    (and fails) to delete any of them itself — this step is what actually
@@ -268,12 +263,9 @@ these:
    `GetBucketTagging`/`NoSuchTagSet` (the custom resource's tag check
    racing bucket-policy propagation) and "bucket not empty" (the same
    race leaving objects undeleted) — and prints the exact remediation
-   command for the specific bucket, rather than requiring a wiki lookup.
-   These are a known, still-open CDK library limitation (the bucket
-   policy granting the cleanup Lambda access already has a correct,
-   explicit `DependsOn` ahead of the custom resource — this isn't a
-   missing grant in this repo's code) — the script detects and guides
-   through them, it doesn't prevent them.
+   command for the specific bucket. These are a known upstream CDK
+   limitation: the script detects them and prints the fix, it doesn't
+   prevent them.
 8. **Finish the network stack.** Wait for the connector stacks, delete any
    federated Glue connection created while step 7 ran, and wait up to 30
    minutes for Glue to release the deleted connections' ENIs (about 19 minutes
@@ -359,8 +351,8 @@ Stacks are deployed in dependency order (managed by `addDependency()` in `bin/ap
 | `coa-dev-authnz`     | DynamoDB tables (roles, resource mappings), seed roles                                                                                                                             | Table ARNs                                                  | —                                  | 3 min        |
 | `coa-dev-namespace`  | DataZone domain, project, asset types, **per-namespace Athena workgroups** (created/deleted with namespace lifecycle)                                                              | Domain ID                                                   | network, authnz                    | 5 min        |
 | `coa-dev-api`        | API Gateway, Lambda authorizer, **cache-invalidation Lambda** (DynamoDB Streams → authorizer role-cache version bump, DLQ `coa-dev-cache-invalidation-dlq`), Lambda handlers                | API URL, REST API ID                                        | network, auth                      | 3 min        |
-| `coa-dev-structured` | Structured ingestion Lambda, DynamoDB tables, **per-datasource Glue Connections + Athena federated catalogs** (created during scan)                                                | Table ARNs                                                  | network, namespace                 | 3 min        |
-| `coa-dev-serve`      | AgentCore Runtime, private ALB, DNS resolver Lambda, target group                                                                                                                  | `AlbDnsName`, `AgentRuntimeArn`, `AgentRuntimeEndpointName` | network, auth, storage, structured | 10 min       |
+| `coa-dev-sources`    | Sources API and scan pipeline Lambdas, DynamoDB tables, **per-datasource Glue Connections + Athena federated catalogs** (created during scan)                                                | Table ARNs                                                  | network, namespace                 | 3 min        |
+| `coa-dev-serve`      | AgentCore Runtime, private ALB, DNS resolver Lambda, target group                                                                                                                  | `AlbDnsName`, `AgentRuntimeArn`, `AgentRuntimeEndpointName` | network, auth, storage, sources    | 10 min       |
 | `coa-dev-web`        | CloudFront distribution, S3 bucket, VPC Origin (`/ws`)                                                                                                                             | Distribution URL                                            | auth, api, serve                   | 5 min        |
 | `coa-dev-vkg`        | VKG ECS Fargate service                                                                                                                                                            | —                                                           | network                            | 5 min        |
 
@@ -488,8 +480,7 @@ propagates to all dashboards/alarms with no per-stack change. Until then,
 operators must watch the dashboards directly.
 
 **Not covered:** Bedrock AgentCore Runtime *internal* health (MCP server, serve
-context-manager) — `cdk-monitoring-constructs` has no native AgentCore support;
-tracked as a follow-up.
+context-manager) — `cdk-monitoring-constructs` has no native AgentCore support.
 
 ## Athena Federation Architecture
 
@@ -512,7 +503,7 @@ The **Connector Security Group** (`{prefix}connector-sg`) is attached to every G
 - **Purpose**: lets Glue Connections initiate JDBC sessions to source databases (port-agnostic at the SG level since database engines vary).
 - **Customer requirement**: source-database security groups (RDS, Redshift, etc.) must allow inbound traffic from this SG on the database port. The SG ID is exported via `/{prefix}/network/connector-sg-id` for cross-account / cross-VPC reference.
 
-> **Single-AZ caveat:** Glue Connections take exactly one `SubnetId`, so each connection lives in a single AZ. The structured stack currently picks the first `PRIVATE_WITH_EGRESS` subnet, meaning all federated queries flow through one AZ. An AZ outage will impact federated queries until the connection is recreated against another subnet. Multi-AZ resilience is tracked as future work; customers needing HA today should provision a second connection in another subnet and switch the catalog when needed.
+> **Single-AZ caveat:** Glue Connections take exactly one `SubnetId`, so each connection lives in a single AZ. The sources stack currently picks the first `PRIVATE_WITH_EGRESS` subnet, meaning all federated queries flow through one AZ. An AZ outage will impact federated queries until the connection is recreated against another subnet. Multi-AZ resilience is not implemented; customers needing HA today should provision a second connection in another subnet and switch the catalog when needed.
 
 ### Per-namespace workgroups (Namespace Service)
 
@@ -523,7 +514,7 @@ Each namespace gets its own Athena workgroup, named `{prefix}{namespaceId}`:
 - **Tagging**: `{tag-prefix}:namespace=<namespaceId>`, `{tag-prefix}:managed=true` for cost allocation and ownership tracking.
 - **Failure handling**: if the workgroup cannot be confirmed to exist (e.g., the SSM parameter for the results bucket is missing or Athena returns an unexpected error), the `athenaWorkgroupName` field is **not** stored on the namespace record. We never persist a name for a workgroup we did not create.
 
-### Per-data-source resources (Structured Stack)
+### Per-data-source resources (Sources Stack)
 
 For every JDBC data source on first scan:
 
@@ -534,7 +525,7 @@ For every JDBC data source on first scan:
 
 For JDBC sources, the platform creates a **managed AWS Glue Data Catalog federated connector**: a Glue Connection with `AthenaProperties.MANAGED_CONNECTION=true` (AWS runs the connector — no Lambda, no CloudFormation stack), registered with Lake Formation (`register-resource --with-federation`), then a Glue federated catalog (`create-catalog` with a `FederatedCatalog` block). The source is then queryable under Athena's default `AwsDataCatalog` as `AwsDataCatalog.<catalog>.<schema>.<table>`, governed by Lake Formation.
 
-Per-environment shared resources (Structured Stack): a single Glue Data Catalog / Lake Formation role (`{prefix}federated-catalog-role`, trusted by Glue + Lake Formation) set as each connection's `ROLE_ARN`. No connector Lambda or SAR application is deployed.
+Per-environment shared resources (Sources Stack): a single Glue Data Catalog / Lake Formation role (`{prefix}federated-catalog-role`, trusted by Glue + Lake Formation) set as each connection's `ROLE_ARN`. No connector Lambda or SAR application is deployed.
 
 Provisioning runs in a **dedicated `{prefix}sources-federation-provisioner` Lambda**, invoked as its own JDBC-only step in the scan pipeline (after discovery, before enrichment). It is intentionally separate from the discovery connector so the broad Lake Formation privilege stays isolated to a single-purpose role. The step is **fatal**: if provisioning fails, the pipeline's Catch marks the scan `FAILED` and the source `SCAN_FAILED`, since a source that isn't queryable is not a successful scan.
 
@@ -576,14 +567,14 @@ These notes apply to operators upgrading an existing deployment to a release tha
 
 - **Storage stack** provisions both new S3 buckets (`{prefix}athena-results-{account}` and `{prefix}athena-spill-{account}`) and their SSM parameters on the next `cdk deploy`.
 - **Network stack** creates the `{prefix}connector-sg` security group and exports its ID under `/{prefix}/network/connector-sg-id` on the next `cdk deploy`.
-- **Structured stack** picks up the connector SG and subnet wiring; no manual action needed.
+- **Sources stack** picks up the connector SG and subnet wiring; no manual action needed.
 
 No downtime is expected for these stack updates — all resources are additive.
 
 ### What does NOT change retroactively
 
 - **Existing namespaces will NOT receive Athena workgroups.** The `_create_athena_workgroup` step runs only inside `CreateNamespace`. Namespaces created before the upgrade will have no `athenaWorkgroupName` and Athena queries against their federated catalogs are not yet supported. To enable federation on a legacy namespace, recreate it under a new name (or run a backfill workgroup-creation script — not provided).
-- **Existing JDBC data sources will NOT have Glue Connections / Athena catalogs until the next successful scan.** Federation provisioning is invoked from the discovery handler (`_provision_athena_federation`) and runs at most once per source (idempotent — it skips if `glueConnectionName` is already populated). Triggering a scan on each source after the upgrade is sufficient; no DDB rewrite is required.
+- **Existing JDBC data sources will NOT have Glue Connections / Athena catalogs until the next successful scan.** Federation provisioning runs in the scan pipeline's provisioner step, at most once per source (idempotent — it skips if `glueConnectionName` is already populated). Triggering a scan on each source after the upgrade is sufficient; no DDB rewrite is required.
 - **S3/Iceberg-backed Glue data sources are intentionally skipped.** Athena queries them natively via `AwsDataCatalog`, so no Glue Connection / federated catalog is created and `glueConnectionName` / `athenaDataCatalogName` remain null on those sources.
 
 ### Required customer action

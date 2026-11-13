@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Determinism guard for the parallelized second-pass column-match loop (D.6).
+"""Determinism guard for the parallelized second-pass column-match loop.
 
 The column loop in ``match_concepts`` is parallelized with a bounded
 ThreadPoolExecutor (width via ``INDUCER_COLUMN_MATCH_WORKERS``). Correctness

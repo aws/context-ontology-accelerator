@@ -58,8 +58,6 @@ import { InfoPopover } from "@components/InfoPopover";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
-// --- Constants ---
-
 const PAGE_SIZE = 25;
 
 const REVIEW_STATUS_TYPE: Record<string, "success" | "warning" | "error"> = {
@@ -67,8 +65,6 @@ const REVIEW_STATUS_TYPE: Record<string, "success" | "warning" | "error"> = {
   [ReviewStatus.PENDING_REVIEW]: "warning",
   [ReviewStatus.REJECTED]: "error",
 };
-
-// --- Helpers ---
 
 function getColumnStatus(col: ColumnMetadata): string {
   return col.businessMetadata?.reviewStatus ?? ReviewStatus.PENDING_REVIEW;
@@ -86,8 +82,6 @@ function statusCell(col: ColumnMetadata, t: AppTranslate) {
     </StatusIndicator>
   );
 }
-
-// --- Confidence / source display (shared) ---
 
 /** Render an AI-inference confidence score as a colour-coded percentage.
  * Deterministic keys carry no score (confidence 0) and render as "—" — the
@@ -123,12 +117,7 @@ const NON_AI_DESCRIPTION_SOURCES = new Set([
   "STEWARD_SPECIFIED",
 ]);
 
-/** Render the description's provenance, plus an inline hint icon when tags/
- * synonyms/glossary terms may be AI-generated even though this description
- * came from a non-AI source. `enrichmentSource` on `businessMetadata` only
- * ever describes the *description* field — tags, synonyms, and glossary
- * terms can be AI-generated independently, so the hint sits directly next
- * to the description-source badge that would otherwise misrepresent them. */
+/** Render the description's provenance, plus the AI-enriched hint when it applies. */
 function descriptionSourceBadge(
   meta:
     | {
@@ -154,16 +143,10 @@ function descriptionSourceBadge(
   );
 }
 
-/** True when `businessMetadata` has non-empty tags/synonyms/glossary terms
- * that may be AI-generated even though the description's source is
- * non-AI (source catalog, 3rd-party catalog, or steward). The backend
- * stores provenance once per metadata block (see `table_enricher.py`), so
- * this can't be asserted with certainty — it's a hint, not a guarantee.
- *
- * Returns false when `metadataEnrichmentEnabled` is false — the scan
- * pipeline skips the enrichment step entirely for such sources (see
- * `metadataEnrichmentEnabled` on `DatabaseSourceDetail`), so there's no AI
- * involvement to warn about regardless of `enrichmentSource`. */
+/** True when tags/synonyms/glossary terms may be AI-generated although the
+ * description's source is non-AI: `enrichmentSource` describes only the
+ * description. A hint, not a guarantee. False when enrichment is disabled,
+ * because the scan then skips the enrichment step. */
 function hasPossiblyAiEnrichedFields(
   meta:
     | {
@@ -183,14 +166,7 @@ function hasPossiblyAiEnrichedFields(
   );
 }
 
-/** Info icon (not a Badge) clarifying that tags/synonyms/glossary terms may
- * be AI-generated even when the description's source is the source catalog,
- * a 3rd-party catalog, or a steward. Rendered inline next to
- * the "Description source" badge (via `descriptionSourceBadge`) since it
- * flags that *that field's* provenance is inconsistent with the provenance
- * of the other metadata fields in the same block. Deliberately visually
- * distinct from the tag/synonym/glossary Badges, so it doesn't read as just
- * another generated tag. */
+/** Info icon (not a Badge, so it doesn't read as another tag) for possibly AI-generated fields. */
 function AiEnrichedHint() {
   const { t } = useAppI18n();
   return (
@@ -211,14 +187,9 @@ function AiEnrichedHint() {
   );
 }
 
-/** One-line inference note with the full text on demand.
- *
- * A column can carry several inferred relationships and each is a yes/no call;
- * the note must be readable at a glance (0.3.3 feedback). The backend already
- * shortens it to a clause; this keeps the row to one line regardless and puts
- * the full text one click away rather than inline. */
 const REVIEW_NOTE_INLINE_CHARS = 90;
 
+/** One-line inference note with the full text in a popover. */
 function ReviewNote({ note }: { note: string }) {
   const short =
     note.length > REVIEW_NOTE_INLINE_CHARS
@@ -243,11 +214,7 @@ function ReviewNote({ note }: { note: string }) {
   );
 }
 
-// --- Re-scan diff (old vs new) ---
-
-/** Badge text + colour for a re-scan column change status. Added is additive
- * (green), removed is destructive (red), a modified column is a neutral change
- * (blue). Defaults to "Changed" for any unexpected status. */
+/** Badge text + colour for a re-scan column change status. */
 function rescanColumnBadge(
   status: string,
   t: AppTranslate,
@@ -291,9 +258,7 @@ function rescanFieldChangeList(fields: RescanFieldChange[]) {
   );
 }
 
-/** One column's re-scan change for the summary Alert: the column name + an
- * Added/Removed/Changed badge, and — for a modified column — its changed fields
- * listed (indented) as old → new. */
+/** One column's re-scan change for the summary Alert. */
 function rescanColumnChangeRow(change: RescanColumnChange, t: AppTranslate) {
   const { text, color } = rescanColumnBadge(change.status ?? "modified", t);
   const fields = change.fields ?? [];
@@ -312,18 +277,12 @@ function rescanColumnChangeRow(change: RescanColumnChange, t: AppTranslate) {
   );
 }
 
-/** "Changes since last approved scan" summary, shown only while the source is in
- * RESCAN_REVIEW (when `rescanDiff` is present on the table). Two groups for an
- * at-a-glance read: table-level field changes and per-column changes, each as
- * old → new. The same per-column detail is also reachable inline on each column
- * row in the Columns table below (via the info icon next to its badge). */
+/** "Changes since last approved scan" summary, shown while `rescanDiff` is present. */
 function RescanChangesPanel({ diff }: { diff: RescanTableDiff }) {
   const { t } = useAppI18n();
   const tableFields = diff.tableFields ?? [];
   const columns = diff.columns ?? [];
-  // Foldable so a table with many changed columns doesn't produce a huge panel
-  // on larger graphs. Collapsed still shows the counts, so the steward sees the
-  // magnitude at a glance; expand for the old → new detail.
+  // Foldable; collapsed still shows the counts.
   const tableCount = t(
     tableFields.length === 1
       ? "{count} table-level change"
@@ -378,9 +337,7 @@ function RescanChangesPanel({ diff }: { diff: RescanTableDiff }) {
   );
 }
 
-/** Shown while the source is in RESCAN_REVIEW for a table the re-scan discovered
- * for the first time (`added`): it has no old-vs-new diff — the whole table is
- * new — so we say so instead of showing an empty changes panel. */
+/** Shown in RESCAN_REVIEW for a table the re-scan discovered (`added`). */
 function NewTablePanel() {
   const { t } = useAppI18n();
   return (
@@ -392,9 +349,7 @@ function NewTablePanel() {
   );
 }
 
-/** Shown while the source is in RESCAN_REVIEW for a table the re-scan found
- * gone from the source (`pendingDeletion`): it is dropped and will be deleted
- * when the re-scan is approved, unless the steward keeps it. */
+/** Shown in RESCAN_REVIEW for a table the re-scan found gone (`pendingDeletion`). */
 function DroppedTablePanel() {
   const { t } = useAppI18n();
   return (
@@ -406,11 +361,8 @@ function DroppedTablePanel() {
   );
 }
 
-/** Per-column re-scan indicator for a column row: an Added/Removed/Changed
- * badge. For a modified column, an info icon next to the badge opens a popover
- * listing each changed field as old → new — the icon is the discoverable
- * trigger (matching the `InfoPopover` pattern used across the app), since a
- * plain badge gives no signal that it is interactive. */
+/** Per-column re-scan badge. A modified column gets an info icon as the popover
+ * trigger, since a plain badge gives no signal that it is interactive. */
 function rescanColumnChangeCell(change: RescanColumnChange, t: AppTranslate) {
   const { text, color } = rescanColumnBadge(change.status ?? "modified", t);
   const fields = change.fields ?? [];
@@ -431,8 +383,6 @@ function rescanColumnChangeCell(change: RescanColumnChange, t: AppTranslate) {
   return badge;
 }
 
-// --- Component ---
-
 export const TableDetail: React.FC = () => {
   const { t } = useAppI18n();
   const navigate = useNavigate();
@@ -446,10 +396,7 @@ export const TableDetail: React.FC = () => {
     dataSourceId ?? "",
     tableId ?? "",
   );
-  // Fetched only to gate the AI-enriched hint icon: when
-  // metadataEnrichmentEnabled is false, the scan pipeline never ran the
-  // enrichment step, so tags/synonyms/glossary terms can't be AI-generated
-  // even if the description's source looks non-AI.
+  // Fetched only to gate the AI-enriched hint icon.
   const { data: sourceData } = useGetSource(
     namespaceId ?? "",
     dataSourceId ?? "",
@@ -576,7 +523,6 @@ export const TableDetail: React.FC = () => {
     );
   };
 
-  // Filter columns by review status
   const filteredColumns = useMemo(() => {
     const cols = data?.columns ?? [];
     if (statusFilter === "all") return cols;
@@ -622,7 +568,7 @@ export const TableDetail: React.FC = () => {
       {
         id: "review",
         header: t("Review"),
-        // Inferred relationships (#1088) carry a review state; authoritative keys
+        // Inferred relationships carry a review state; authoritative keys
         // (deterministic/steward) do not and render "—". Cross-source relationships
         // also show a chip and their inference provenance so a steward can judge.
         cell: (fk) => {
@@ -659,7 +605,6 @@ export const TableDetail: React.FC = () => {
     return map;
   }, [data?.rescanDiff?.columns]);
 
-  // Column definitions matching coa-ui style
   const columnDefs = useMemo<TableProps.ColumnDefinition<ColumnMetadata>[]>(
     () => [
       {
@@ -767,11 +712,8 @@ export const TableDetail: React.FC = () => {
           const rescanChange = col.name
             ? rescanColumnChanges.get(col.name)
             : undefined;
-          // A re-scan-dropped column is surfaced below as the actionable
-          // "Pending deletion" badge (with a Keep button). Showing the diff's
-          // red "Removed" badge too is a duplicate of the same fact — and reads
-          // as already-gone when it is only pending — so suppress it in that one
-          // case. Added/modified columns still show their diff badge.
+          // A dropped column already shows "Pending deletion"; a "Removed"
+          // badge would duplicate it.
           const showRescanChange =
             rescanChange &&
             !(rescanChange.status === "removed" && col.pendingDeletion);
@@ -854,8 +796,6 @@ export const TableDetail: React.FC = () => {
     (c) => getColumnStatus(c) === ReviewStatus.PENDING_REVIEW,
   ).length;
 
-  // --- Actions ---
-
   function notify(type: "success" | "error", content: string) {
     setFlash((prev) => [...prev, { id: String(Date.now()), type, content }]);
   }
@@ -865,13 +805,8 @@ export const TableDetail: React.FC = () => {
     const snapshot = [...selected];
     const total = snapshot.length;
     setBulkLoading(true);
-    // Review SEQUENTIALLY, not concurrently. Each per-column review is a full
-    // read-modify-write of the entire table asset on the backend (load asset →
-    // flip one column → write a new revision). Firing them in parallel makes
-    // those writes race off the same baseline revision and clobber each other,
-    // so only the last writer's column survives and the rest are silently lost
-    // (even though every call returns 200). runSequential awaits each call so
-    // the next one reads the revision the previous one just wrote.
+    // Review sequentially: each review rewrites the whole table asset on the
+    // backend, so parallel calls race off the same revision and lose writes.
     let failed: ColumnMetadata[] = [];
     try {
       ({ failed } = await runSequential(snapshot, (col) =>
@@ -999,7 +934,7 @@ export const TableDetail: React.FC = () => {
     });
   }
 
-  // Approve/reject one inferred relationship (#1088). Re-sends the full FK list
+  // Approve/reject one inferred relationship. Re-sends the full FK list
   // (so unrelated keys are preserved) with only the target's reviewStatus
   // changed; the backend keeps its source/targetDatasourceId/provenance.
   function reviewRelationship(target: ForeignKeyOutput, decision: string) {
@@ -1072,7 +1007,6 @@ export const TableDetail: React.FC = () => {
         />
       )}
 
-      {/* Table-level metadata header */}
       <Header
         variant="h1"
         actions={
@@ -1121,7 +1055,6 @@ export const TableDetail: React.FC = () => {
       {data.added && !data.rescanDiff && <NewTablePanel />}
       {data.pendingDeletion && <DroppedTablePanel />}
 
-      {/* Table metadata summary */}
       <Container
         header={
           <Header
@@ -1195,7 +1128,6 @@ export const TableDetail: React.FC = () => {
         />
       </Container>
 
-      {/* Keys & relationships */}
       <Container
         header={
           <Header
@@ -1258,7 +1190,6 @@ export const TableDetail: React.FC = () => {
         </SpaceBetween>
       </Container>
 
-      {/* Pending review alert */}
       {pendingCount > 0 && (
         <Alert
           type="info"
@@ -1275,7 +1206,6 @@ export const TableDetail: React.FC = () => {
         </Alert>
       )}
 
-      {/* Columns table with selection, filtering, pagination, edit */}
       <Table<ColumnMetadata>
         {...collectionProps}
         items={items}
@@ -1356,7 +1286,6 @@ export const TableDetail: React.FC = () => {
         }}
       />
 
-      {/* Edit modal */}
       {editing && (
         <EditColumnModal
           column={editing}
@@ -1366,7 +1295,6 @@ export const TableDetail: React.FC = () => {
         />
       )}
 
-      {/* Table edit modal */}
       {editingTable && (
         <EditTableModal
           businessMetadata={data.businessMetadata}
@@ -1377,7 +1305,6 @@ export const TableDetail: React.FC = () => {
         />
       )}
 
-      {/* Keys edit modal */}
       {editingKeys && (
         <EditKeysModal
           tableName={data.name ?? ""}
@@ -1393,8 +1320,6 @@ export const TableDetail: React.FC = () => {
     </SpaceBetween>
   );
 };
-
-// --- Shared helpers ---
 
 function toTokens(
   values: string[],
@@ -1439,15 +1364,8 @@ function useTokenField(initial: string[]) {
   };
 }
 
-/** Synonyms field shared by the table and column editors.
- *
- * The list is pre-filled with whatever is stored, which for an enriched source
- * is the AI-generated guesses (steward-curation supersede: `enrichmentSource` only describes the
- * description, so we cannot tell an AI synonym from an authored one per item).
- * A steward who only adds terms would otherwise re-submit the AI ones too and
- * the ontology would keep them as live `skos:altLabel`s. "Clear all" lets them
- * start from an empty, authored list; PATCH replaces the whole list, and the
- * next re-induction + accept supersedes the previous generation in the graph. */
+/** Synonyms field shared by the table and column editors. Pre-filled synonyms
+ * may be AI-generated; Save replaces the whole list. */
 function SynonymsField({
   field,
   placeholder,
@@ -1455,10 +1373,7 @@ function SynonymsField({
   field: ReturnType<typeof useTokenField>;
   placeholder: string;
 }) {
-  // `Clear all` unmounts itself when it clears the list (the button is
-  // conditional on `items.length > 0`). Without moving focus, keyboard users
-  // lose their place. After clear() runs, transfer focus to the synonyms
-  // input — the natural next thing to interact with, and it stays mounted.
+  // Move focus to the input: `Clear all` unmounts itself when it clears the list.
   const { t } = useAppI18n();
   const inputRef = useRef<InputProps.Ref>(null);
   const handleClear = () => {
@@ -1503,8 +1418,6 @@ function SynonymsField({
     </FormField>
   );
 }
-
-// --- Edit Table Modal ---
 
 function EditTableModal({
   businessMetadata,
@@ -1618,8 +1531,6 @@ function EditTableModal({
   );
 }
 
-// --- Edit Column Modal ---
-
 function EditColumnModal({
   column,
   onDismiss,
@@ -1724,8 +1635,6 @@ function EditColumnModal({
     </Modal>
   );
 }
-
-// --- Edit Keys Modal ---
 
 function EditKeysModal({
   tableName,

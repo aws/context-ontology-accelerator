@@ -16,8 +16,7 @@ named graph in the namespace, so a vertex from an induced ontology
 can include edges that reach into foundational ontologies registered
 in the same namespace.
 
-Labels follow the namespace's immutable language (namespace-language LLD
-§2.2.5): each resource is named with the label ranked first by
+Labels follow the namespace's immutable language: each resource is named with the label ranked first by
 :func:`~coa_ontology.catalog.namespace_language.label_preference_for`, and a
 vertex's ``labels`` list is ordered best first. A language never hides a
 resource.
@@ -234,7 +233,7 @@ def get_ontology_overview(
     the response carries the un-paged totals (``total_classes`` etc.) so a
     client shows the true count while rendering one page. This bounds the
     response: a wide ontology (thousands of classes/properties) would otherwise
-    exceed the API Gateway / Lambda response limit and 502 the call (#143).
+    exceed the API Gateway / Lambda response limit and 502 the call.
 
     Set ``sample=true`` for a bounded taxonomy seed (a few largest-subtree
     root classes + a capped set of their descendants, no properties) instead

@@ -34,14 +34,13 @@ from coa_ontology.inducer.services.unicode_normalization import (
 
 log = logging.getLogger(__name__)
 
-# R2RML namespace
 
 RR = Namespace("http://www.w3.org/ns/r2rml#")
 
 # SCL vocabulary for datasource provenance annotations on TriplesMaps
 SCL = Namespace(VOCAB_URI)
 
-# Steward-reviewed business metadata carried onto ontology terms (#1167). Both
+# Steward-reviewed business metadata carried onto ontology terms. Both
 # are plain literals: the catalog stores glossary terms and tags as free-text
 # strings, not as IRIs of glossary concepts, so an object predicate such as
 # skos:related would assert a link to a concept that does not exist.
@@ -638,7 +637,7 @@ def resolve_fk_target_identity(
     the shape asserts a class-typed reference against a column the mapping emits
     as a literal, or the join and the range name different tables.
 
-    With ``target_datasource_id`` (an approved cross-source relationship, #1140),
+    With ``target_datasource_id`` (an approved cross-source relationship),
     resolution stays inside that datasource. The sources pipeline may prefix the
     id with ``DS#`` while ``CatalogTable.datasourceId`` is bare, so both sides go
     through :func:`bare_datasource_id`.
@@ -648,8 +647,7 @@ def resolve_fk_target_identity(
       warning. Nothing identifies the parent, and the probes below would look in
       the referrer's own datasource, which the hint rules out. The name is then in
       :func:`ambiguous_target_names`, so every artifact degrades to a literal.
-    * None in the run -> the unhinted probes below, unchanged from before the hint
-      existed (#1150's tests pin this). All four artifacts take this branch
+    * None in the run -> the unhinted probes below. All four artifacts take this branch
       together, so they still agree; a warning names the table it fell back to.
 
     Probe order without a usable hint, most specific first:
@@ -1039,7 +1037,7 @@ AUTHORITATIVE_FK_SOURCES: frozenset[str] = frozenset(
 
 
 def fk_edge_allowed(source: str | None, review_status: str | None) -> bool:
-    """Whether a foreign key may become a relationship in ANY induced artifact (#1088).
+    """Whether a foreign key may become a relationship in ANY induced artifact.
 
     "Use only approved relationships downstream." Shared by the ontology
     (``owl:ObjectProperty``), the mapping (``rr:parentTriplesMap`` join), and the
@@ -1050,7 +1048,7 @@ def fk_edge_allowed(source: str | None, review_status: str | None) -> bool:
       * authoritative source (deterministic / catalog / steward) -> allowed;
       * ``review_status`` empty/None -> allowed. FKs stored before the review
         field existed, and every catalog source that does not populate it, carry
-        no status; allowing them preserves pre-#1088 behaviour so existing
+        no status; allowing them preserves the behaviour from before the review field existed so existing
         ontologies do not lose edges on re-induction;
       * ``APPROVED`` -> allowed;
       * ``PENDING_REVIEW`` / ``REJECTED`` -> NOT allowed — the column degrades to
@@ -1185,7 +1183,7 @@ def _annotate_triples_map(g: Graph, tmap: URIRef, table: CatalogTable) -> None:
     to R2RML processors) but are parsed by the VKG translation layer to route
     queries to the correct data source at execution time.
 
-    NO CATALOG ANNOTATION, DELIBERATELY. The cross-source-join work (#965) needs a
+    NO CATALOG ANNOTATION, DELIBERATELY. The cross-source-join work needs a
     catalog qualifier per table, and it is tempting to bake one in here. It is not
     baked in, for three reasons:
 
@@ -1272,8 +1270,6 @@ class InductionStrategy(ABC):
         drop tables.
         """
         ...
-
-    # ── R2RML generation ─────────────────────────────────────────────
 
     def build_r2rml(
         self,
@@ -1627,9 +1623,6 @@ class InductionStrategy(ABC):
                         g.add((jc, RR.child, Literal(sql_ident(child_col))))
                         g.add((jc, RR.parent, Literal(sql_ident(parent_col))))
 
-                    # No bookkeeping needed: composite_fk_anchors already assigned
-                    # each constraint to exactly one column, so no other column can
-                    # re-emit this relationship.
                     continue
 
                 if col.name in malformed_composite_columns:
@@ -1649,12 +1642,10 @@ class InductionStrategy(ABC):
                     g.add((om, RR.datatype, xsd_for_column(col.dataType, col.name)))
                     continue
 
-                # Simple (single-column) FKs — EVERY gate-passing one (#1088 follow-up),
+                # Simple (single-column) FKs — EVERY gate-passing one,
                 # through the same selection the ontology uses (simple_fk_constraints),
                 # so the set of joins here equals the set of owl:ObjectProperty edges
-                # there. This is also where the review gate reaches the mapping: a
-                # PENDING/REJECTED inferred FK used to become a live Ontop join while
-                # the ontology withheld its edge.
+                # there.
                 # (parent TriplesMap, parent column, target ds, join R2RML-supported)
                 resolved: list[tuple[URIRef, str, str | None, bool]] = []
                 for tc in simple_fk_constraints(table, col.name):
@@ -1675,7 +1666,6 @@ class InductionStrategy(ABC):
                 # artifacts do not apply the R2RML column guard).
                 joins = [r for r in resolved if r[3]]
                 if joins:
-                    # Per-FK qualifiers computed once; identical rule in ontology + SHACL.
                     entries: list[tuple[str, str | None, str | None]] = [
                         (str(pt).rsplit("TriplesMap_", 1)[-1], fk_parent_col, tds)
                         for pt, fk_parent_col, tds, _ in resolved

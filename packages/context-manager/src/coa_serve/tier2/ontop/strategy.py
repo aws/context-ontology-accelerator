@@ -83,14 +83,7 @@ class OntopStrategy:
         vector_client: VectorClient | None = None,
         oss_ontology_index: str = "",
     ):
-        """Wire the SPARQL translator, VKG translator, and vector retrieval index.
-
-        Args:
-            nl_to_sparql: Natural-language-to-SPARQL translator.
-            vkg_translator: SPARQL-to-SQL VKG translator + executor.
-            vector_client: Optional client for ontology-class vector hits.
-            oss_ontology_index: OpenSearch ontology index for class retrieval.
-        """
+        """Wire the SPARQL translator, VKG translator, and vector retrieval index."""
         self._nl_to_sparql = nl_to_sparql
         self._vkg_translator = vkg_translator
         self._vector_client = vector_client
@@ -98,11 +91,6 @@ class OntopStrategy:
 
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
         """Translate the query to SPARQL, resolve it through the VKG, and execute.
-
-        Args:
-            query: The natural-language query to answer.
-            namespace: Namespace the query targets.
-            context: Shared strategy context (embedding, profile, options, trace).
 
         Returns:
             A StrategyResult on success, or None when the strategy should be
@@ -163,7 +151,6 @@ class OntopStrategy:
         if tier2_result is None:
             return None
 
-        # Record trace steps from VKG (pass detail as dict, not str repr — E4)
         self._replay_vkg_steps(tier2_result, trace)
 
         # Authorization deny is terminal
@@ -174,13 +161,11 @@ class OntopStrategy:
         if tier2_result.query_result and not tier2_result.error:
             # The VKG translate response names the ontology version it executed
             # against (owl:versionInfo). "unknown" is the service's own
-            # missing-value sentinel, not a version — normalize it away (#986).
+            # missing-value sentinel, not a version — normalize it away.
             vkg_version = tier2_result.vkg_result.ontology_version if tier2_result.vkg_result else ""
             return StrategyResult(
-                # Report the statement that RAN, not Ontop's raw translate output.
-                # After the cross-source fix they differ whenever the query spans sources: the executed
-                # form is catalog-qualified, the raw form has bare names that resolve
-                # nowhere. Fall back to the raw SQL only if execution never set it.
+                # Report the statement that RAN (catalog-qualified), not Ontop's raw
+                # translate output; fall back to the raw SQL only if execution never set it.
                 sql=tier2_result.executed_sql or (tier2_result.vkg_result.sql if tier2_result.vkg_result else ""),
                 rows=tier2_result.query_result.rows,
                 columns=tier2_result.query_result.columns,
@@ -203,7 +188,7 @@ class OntopStrategy:
         Used on success, error, and retry paths so the translator's own steps —
         including the authoritative t2.vkg.compile (SPARQL→SQL) step that records
         whether translation succeeded or failed — are always surfaced. Detail is
-        passed through as a dict (not str repr) for the UI formatters (E4).
+        passed through as a dict (not str repr) for the UI formatters.
         """
         for ts in tier2_result.trace_steps:
             trace.record(
@@ -316,7 +301,6 @@ class OntopStrategy:
             model_id=model_id,
             tbox_context=tbox_context,
         )
-        # Replay sub-steps from retry translation into outer trace (E3)
         if retry_result.trace_steps:
             annotated = [
                 {**s, "toolUsed": s.get("toolUsed") or _TIER2_TOOL_USED.get(str(s.get("step", "")))}
@@ -364,16 +348,8 @@ class OntopStrategy:
             index_name = ontology_vector_index_name(self._oss_ontology_index, namespace)
 
             # Restrict the CLASS retrieval to R2RML-mapped classes, matching the
-            # gate NL→SQL applies (nl_to_sql/sql_generator.py). Unmapped classes —
-            # document-induced or from a loaded foundational ontology — have no
-            # table behind them, so authoring SPARQL against them produces a query
-            # VKG cannot compile: nothing comes back, in exactly the mixed
-            # DATABASE + DOCUMENTS namespace the ``is_mapped`` design exists to
-            # protect (see external-docs "Mapped classes and Tier-2
-            # answerability"). Without the gate a document-heavy query filled the
-            # top-k with unmapped classes; the provenance skip evaluator only
-            # bails when ALL top-k hits are unmapped, so the partial mix fell
-            # through untouched.
+            # gate NL→SQL applies: unmapped classes have no table behind them, so
+            # SPARQL authored against them produces a query VKG cannot compile.
             # SQL backend gate: graph (RDF_SPARQL) classes are answered by the SPARQL strategy.
             class_hits = await self._vector_client.search(
                 embedding,

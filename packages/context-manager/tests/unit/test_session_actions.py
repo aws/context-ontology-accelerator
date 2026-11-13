@@ -36,14 +36,9 @@ async def _invoke_collect(payload, context=None):
 
 @pytest.fixture(autouse=True)
 def _bypass_namespace_admission():
-    """Bypass the F-2 Cedar namespace-admission gate for these invoke() tests.
+    """Patch the Cedar namespace-admission gate to ALLOW for these invoke() tests.
 
-    These exercise session persistence / streaming with bare-mock orchestrators
-    and predate the gate (F-2, CWE-862); patch it to a no-op ALLOW so they stay
-    focused on persistence. Session CRUD actions return before the gate anyway;
-    this only affects the query/streaming path. The gate itself is covered in
-    test_main.TestNamespaceAdmissionGate and test_authz_invariants. Returning
-    (None, None) keeps the query path resolving its own profile as before.
+    The gate itself is tested in test_main.TestNamespaceAdmissionGate.
     """
     with patch("coa_serve.main._authorize_namespace_access", new_callable=AsyncMock, return_value=(None, None)):
         yield
@@ -74,9 +69,6 @@ def config():
         memory_id="test-memory",
         session_metadata_table="test-session-metadata",
     )
-
-
-# ── getRecentSession ──────────────────────────────────────────────────────
 
 
 @agentcore_required
@@ -155,9 +147,6 @@ class TestGetRecentSession:
 
         assert result["error"] == "ValidationError"
         assert result["statusCode"] == 400
-
-
-# ── getSessionHistory ─────────────────────────────────────────────────────
 
 
 @agentcore_required
@@ -273,9 +262,6 @@ class TestGetSessionHistory:
         assert result["statusCode"] == 400
 
 
-# ── createSession ─────────────────────────────────────────────────────────
-
-
 @agentcore_required
 @pytest.mark.asyncio
 class TestCreateSession:
@@ -327,9 +313,6 @@ class TestCreateSession:
 
         assert result["error"] == "ValidationError"
         assert result["statusCode"] == 400
-
-
-# ── listSessions ──────────────────────────────────────────────────────────
 
 
 @agentcore_required
@@ -404,9 +387,6 @@ class TestListSessions:
         assert result["statusCode"] == 400
 
 
-# ── deleteSession ─────────────────────────────────────────────────────────
-
-
 @agentcore_required
 @pytest.mark.asyncio
 class TestDeleteSession:
@@ -475,9 +455,6 @@ class TestDeleteSession:
         assert result["statusCode"] == 400
 
 
-# ── Streaming SSE session persistence ─────────────────────────────────────
-
-
 @agentcore_required
 @pytest.mark.asyncio
 class TestStreamingSessionPersistence:
@@ -500,7 +477,6 @@ class TestStreamingSessionPersistence:
 
         mock_init.return_value = None
 
-        # Orchestrator
         async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=50)
@@ -517,7 +493,6 @@ class TestStreamingSessionPersistence:
         mock_orch.resolve = mock_resolve
         main_mod._orchestrator = mock_orch
 
-        # Session metadata
         mock_metadata = MagicMock()
         mock_record = MagicMock()
         mock_record.session_id = "auto-sess-1"
@@ -525,7 +500,6 @@ class TestStreamingSessionPersistence:
         mock_metadata.update_activity = AsyncMock()
         main_mod._session_metadata = mock_metadata
 
-        # Session manager
         mock_session_mgr = MagicMock()
         mock_session_mgr.create_or_resume = AsyncMock(return_value=("auto-sess-1", None))
         mock_session_mgr.append_turn = AsyncMock()
@@ -543,7 +517,6 @@ class TestStreamingSessionPersistence:
         assert len(done_events) == 1
         assert done_events[0].get("sessionId") == "auto-sess-1"
 
-        # Session was created and turn was persisted
         mock_metadata.create.assert_called_once()
         mock_session_mgr.append_turn.assert_called_once()
         mock_metadata.update_activity.assert_called_once()
@@ -596,14 +569,11 @@ class TestStreamingSessionPersistence:
             context=ctx,
         )
 
-        # May be list (with step events) or could include done
         all_events = results if isinstance(results, list) else [results]
         done_events = [e for e in all_events if isinstance(e, dict) and e.get("type") == "done"]
         assert len(done_events) == 1
 
-        # Ownership was validated
         mock_metadata.validate_ownership.assert_called_once_with("user-sub-xyz", "existing-sess")
-        # Session resumed with conversation history
         mock_session_mgr.create_or_resume.assert_called_once()
         call_kwargs = mock_session_mgr.create_or_resume.call_args[1]
         assert call_kwargs["session_id"] == "existing-sess"
@@ -650,7 +620,6 @@ class TestStreamingSessionPersistence:
             context=ctx,
         )
 
-        # Should still get a done event despite persistence failure
         all_events = results if isinstance(results, list) else [results]
         done_events = [e for e in all_events if isinstance(e, dict) and e.get("type") == "done"]
         assert len(done_events) == 1

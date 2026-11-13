@@ -339,17 +339,10 @@ export class NamespaceStack extends SCLStack {
         "SMUS domain for namespace isolation and metadata management",
     });
     domain.node.addDependency(executionRole);
-    // CFN's native DeleteDomain has no force/cascade option (unlike
-    // DeleteProject, which CFN always calls with skipDeletionCheck=true
-    // under the hood — confirmed via CloudTrail), so it fails outright
-    // once any project exists under the domain: "Domain cannot be
-    // deleted because there are existing projects under this domain".
-    // Namespace-created projects (one per namespace, holding that
-    // namespace's scanned-table assets) always exist while any namespace
-    // does, so this is not an edge case — RETAIN means CFN never
-    // attempts this delete itself; destroy.sh calls DataZone's own
-    // delete-domain --skip-deletion-check directly instead, which does
-    // support a full cascading force-delete at the domain level.
+    // CFN's DeleteDomain has no force option and fails while any project
+    // exists under the domain, and each namespace owns one. RETAIN keeps CFN
+    // from attempting it; destroy.sh calls DataZone delete-domain
+    // --skip-deletion-check instead.
     domain.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     this.domainId = domain.attrId;
@@ -411,7 +404,7 @@ export class NamespaceStack extends SCLStack {
     );
     dzProjectAccessUserProfile.node.addDependency(dzProjectAccessRole);
     dzProjectAccessUserProfile.node.addDependency(domain);
-    // #660 — same DataZone delete-order class of problem as FormType
+    // Same DataZone delete-order class of problem as FormType
     // below (see its comment for detail): the native CfnUserProfile L1
     // has no hook to satisfy DataZone's own deletion preconditions, so
     // RETAIN avoids CFN attempting (and failing) to delete it directly.
@@ -552,7 +545,7 @@ export class NamespaceStack extends SCLStack {
     });
     formType.node.addDependency(systemProject);
     formType.node.addDependency(createFormTypeGrant);
-    // #660 — DataZone requires a FormType to be DISABLED before
+    // DataZone requires a FormType to be DISABLED before
     // DeleteFormType succeeds; the native CfnFormType resource has no
     // such delete hook, so cdk destroy fails with "should be disabled to
     // Delete" and leaves the stack in DELETE_FAILED. RETAIN (see
@@ -721,7 +714,7 @@ export class NamespaceStack extends SCLStack {
     // Precondition checks for delete: read-only queries to detect active
     // operations that could race with the deletion pipeline's cleanup.
     // - SOURCES_TABLE ByNamespace GSI: sources actively scanning/enriching.
-    // - METRIC_IMPORT_JOBS_TABLE: IN_PROGRESS import jobs (#215 — completed/
+    // - METRIC_IMPORT_JOBS_TABLE: IN_PROGRESS import jobs (completed/
     //   failed jobs no longer block deletion).
     // Ontology induction jobs are checked via an HTTP call to the
     // ontology-engine (see delete_handler._check_active_induction_jobs) —
@@ -790,7 +783,7 @@ export class NamespaceStack extends SCLStack {
     // Read-time VKG health resolution (GetNamespace -> resolve_vkg_health)
     // calls ecs:DescribeServices, then ecs:ListTasks + ecs:DescribeTasks to
     // read the container's functional-probe healthStatus (a running task is not
-    // necessarily able to translate — #170). All scoped to the VKG cluster via
+    // necessarily able to translate). All scoped to the VKG cluster via
     // the ecs:cluster condition, mirroring the deletion pipeline grant.
     if (props.vkgClusterArn) {
       namespaceApiFn.addToRolePolicy(
@@ -856,9 +849,6 @@ export class NamespaceStack extends SCLStack {
         ontologyBucketName: props.ontologyBucketName,
         ontologyEngineEndpoint: props.ontologyEngineEndpoint,
         // For dropping the namespace's GraphRAG doc-KG indexes on teardown.
-        // Read from SSM (the storage stack writes both) — see bin/app.ts for
-        // the explicit addDependency this read requires, since CDK cannot infer
-        // ordering from valueForStringParameter.
         opensearchEndpoint,
         opensearchCollectionName,
         resourcePrefix: this.prefixed(""),

@@ -25,9 +25,7 @@ describe("runSequential", () => {
 
     const { succeeded, failed } = await runSequential([1, 2, 3, 4], run);
 
-    // Never more than one operation running at once.
     expect(maxConcurrent).toBe(1);
-    // Operations started in input order.
     expect(startOrder).toEqual([1, 2, 3, 4]);
     expect(succeeded).toEqual([1, 2, 3, 4]);
     expect(failed).toEqual([]);
@@ -40,22 +38,9 @@ describe("runSequential", () => {
 
     const { succeeded, failed } = await runSequential([1, 2, 3, 4, 5], run);
 
-    // Every item is attempted even though some reject.
     expect(run).toHaveBeenCalledTimes(5);
     expect(succeeded).toEqual([1, 3, 5]);
     expect(failed).toEqual([2, 4]);
-  });
-
-  it("preserves the order in which calls are made", async () => {
-    const calls: string[] = [];
-    const run = (item: string) => {
-      calls.push(item);
-      return Promise.resolve();
-    };
-
-    await runSequential(["a", "b", "c"], run);
-
-    expect(calls).toEqual(["a", "b", "c"]);
   });
 
   it("handles an empty list without invoking the operation", async () => {

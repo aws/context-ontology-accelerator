@@ -213,12 +213,7 @@ export function OntologyPage() {
   const [selectedFoundationalKeys, setSelectedFoundationalKeys] = useState<
     string[]
   >([]);
-  // Already-loaded foundational ontologies for the namespace — fetched
-  // alongside the curated catalog so the grounding Multiselect only offers
-  // ontologies that are actually queryable. A foundational counts as loaded
-  // when there is a registry row whose URI matches the catalog entry's URI
-  // AND embedding_count > 0 (registry row alone isn't enough; the Match step
-  // needs embeddings).
+  // Every loaded ontology; the grounding Multiselect disables the non-ready ones.
   const [loadedOntologyRecords, setLoadedOntologyRecords] = useState<
     OntologyRecord[]
   >([]);
@@ -227,10 +222,7 @@ export function OntologyPage() {
   const apiClient = useApiClient();
 
   useEffect(() => {
-    // Load available DATABASE sources via the unified sources endpoint.
-    // SourcesStack endpoint /sources is the post-!169 source-of-truth that
-    // covers both Glue and JDBC datasources; the legacy /data-sources endpoint
-    // (StructuredStack) only sees JDBC sources.
+    // /sources covers both Glue and JDBC sources.
     let cancelled = false;
     setDatasourceError(null);
     apiClient
@@ -263,21 +255,12 @@ export function OntologyPage() {
                 .join(" · "),
             })),
         );
-        // A source's induction is STALE when the source was re-scanned and
-        // re-approved AFTER its newest induction. We look at the newest
-        // induction of ANY status (accepted OR pending):
-        //   induction time = newest created_at of an "induction" proposal
-        //     (status accepted or pending) whose metadata.datasource_ids
-        //     includes the source.
-        //   re-scan time   = newest scan-history REVIEW row with isRescan.
-        // If the newest induction postdates the re-scan the source is current —
-        // this is how a fresh re-induction, even one still pending review,
-        // clears the banner. If the re-scan postdates it the source is stale,
-        // and we route it by that newest induction's status: an accepted
-        // induction is an out-of-date ontology; a pending one is a proposal
-        // built on the older source. Best-effort — one proposals fetch plus one
-        // scan-history fetch per approved source (no per-source re-scan marker
-        // exists); failures are ignored.
+        // A source's induction is STALE when its newest re-scan review row
+        // (isRescan) postdates its newest accepted-or-pending induction proposal.
+        // A stale source is routed by that induction's status: accepted means an
+        // out-of-date ontology, pending means a proposal built on the older source.
+        // Best-effort: one proposals fetch plus one scan-history fetch per approved
+        // source; failures are ignored.
         const approvedDbSources = (data.items || []).filter(
           (s) => s.status === "APPROVED",
         );
@@ -394,20 +377,10 @@ export function OntologyPage() {
       .then(([catalogResp, allLoaded]) => {
         if (cancelled) return;
         setFoundationalCatalog(catalogResp.items ?? []);
-        // Show ALL loaded ontologies — including ones that have not finished
-        // embedding (embedding_count == 0/null) or failed to ingest. Hiding
-        // them here made a still-embedding or failed-ingest ontology silently
-        // vanish from Start Induction with no signal (issue #540). Readiness
-        // (and thus selectability) is decided per row in the multiselect
-        // options below via ontologyIngestState().
+        // Show all loaded ontologies, including un-embedded and failed ones;
+        // pre-select the ready induced ones so new runs converge with prior ones.
         const loaded = allLoaded ?? [];
         setLoadedOntologyRecords(loaded);
-        // Pre-check the namespace's accepted induced ontologies by default so
-        // new runs converge with prior ones (incremental induction). Only
-        // READY induced ontologies are pre-selected — an un-embedded one is
-        // shown disabled and cannot be grounded against. The user can deselect
-        // them — the backend grounds against exactly the selected pool, with
-        // no server-side auto-include.
         setSelectedFoundationalKeys(
           loaded
             .filter(
@@ -462,12 +435,7 @@ export function OntologyPage() {
       cancelled = true;
     };
   }, [namespaceId, apiClient, t]);
-  // Poll induction job status. Cleanup ensures interval is cancelled on
-  // unmount or when pollingJobId changes (e.g. user starts a second induction).
-  // On completion the page navigates to the freshly-created proposal so
-  // the user lands on actionable content instead of having to scan the
-  // proposals tab. On failure the stages strip surfaces the error and
-  // the user stays on the page to retry.
+  // Poll the induction job; on completion open the new proposal.
   useEffect(() => {
     if (!pollingJobId || !namespaceId) return;
     const interval = setInterval(async () => {
@@ -477,16 +445,8 @@ export function OntologyPage() {
         if (j.status === "completed") {
           setPollingJobId(null);
           setInducting(false);
-          // Decide what to do (duplicate notice / navigate / refresh) via a pure
-          // helper. Duplicate detection keys on the FULL combined table set
-          // across every selected datasource, so it only fires for an exact
-          // structural match already accepted — a superset selection (e.g.
-          // adding a second datasource) has a different fingerprint and proceeds
-          // as a normal new induction.
           const action = resolveCompletedInductionAction(j, pollingJobId);
           if (action.kind === "duplicate") {
-            // Do NOT auto-navigate — surface a notice with a link to the
-            // pre-existing proposal and let the user decide.
             setDuplicateProposalId(action.proposalId);
             setActiveTab("proposals");
           } else if (action.kind === "navigate") {
@@ -546,15 +506,6 @@ export function OntologyPage() {
     setShowInductionModal(false);
     try {
       const dsIds = selectedDatasources.map((o) => o.value!);
-      // Grounding applies to BOTH strategies: the structured
-      // (table_to_ontology) path grounds tables and the unstructured
-      // (lexical graph) path grounds its induced classes against the same
-      // loaded foundational ontologies.
-      // Combine curated catalog selection (key) + custom-uploaded ontologies
-      // (ontology id). The backend resolves both via the same lookup —
-      // curated keys map to canonical ontology IDs in the catalog, and
-      // custom uploads went into the same ontologies table.
-      const groundingIds = [...selectedFoundationalKeys];
       // The bridge works on the namespace's accepted induced ontology (the
       // prefix below, the one table inductions from this page write); it reads
       // no source selection and no grounding.
@@ -573,7 +524,9 @@ export function OntologyPage() {
             confidence_threshold: confidenceThreshold,
             grounding_mode: groundingMode,
             grounding_ontology_ids:
-              groundingIds.length > 0 ? groundingIds : undefined,
+              selectedFoundationalKeys.length > 0
+                ? selectedFoundationalKeys
+                : undefined,
           });
       setActiveTab("proposals");
       setPollingJobId(job.job_id);
@@ -952,18 +905,7 @@ export function OntologyPage() {
                           .filter((v): v is string => Boolean(v)),
                       )
                     }
-                    // All loaded ontologies are SHOWN — induced, foundational, and
-                    // uploaded. Ready ones (finished embedding) are SELECTABLE; the
-                    // backend grounds against EXACTLY the selected pool (no
-                    // server-side auto-include), and ready induced ontologies are
-                    // pre-checked by default (see the load effect) so new runs
-                    // converge with prior ones. Ontologies that have not finished
-                    // embedding or failed to ingest are shown DISABLED with a
-                    // per-row status label so they are not silently hidden from
-                    // Start Induction (issue #540). Readiness is derived from
-                    // ontologyIngestState() — the single source of truth also used
-                    // by the Ontologies-list StatusIndicator — so the two views can
-                    // never disagree about whether a row is ready.
+                    // Readiness comes from ontologyIngestState so this view matches the list.
                     options={loadedOntologyRecords.map((rec) => {
                       const ingestState = ontologyIngestState(rec);
                       const isReady = ingestState === "ready";
@@ -1101,11 +1043,6 @@ export function OntologyPage() {
   );
 }
 
-/** Friendly display metadata for each ontology_type the registry can
- *  return. Induced ontologies come from accepted induction proposals;
- *  foundational ones are curated public ontologies loaded/uploaded into
- *  the namespace; user_created/user_uploaded are custom uploads. Anything
- *  unmapped falls back to its raw type string with a neutral badge. */
 /**
  * Ingest lifecycle of a registered (loaded) reference ontology, derived from
  * its ``parse_status`` (async parse/embed worker) with a legacy fallback for
@@ -1142,14 +1079,9 @@ const PROPOSAL_STATUS_MESSAGES: Record<string, AppMessage> = {
   cancelled: "cancelled",
 };
 
-/** Derive the ingest state of a registered ontology row.
- *
- *  A row that already has embeddings is DONE regardless of parse_status: the
- *  foundational-load path can leave parse_status stuck at "pending" even after
- *  embeddings land (backend append-path bug), so trusting "pending" over a
- *  positive embedding_count would show "Ingesting" forever AND never let the
- *  poll terminate. So: positive embeddings → ready first; then parse_status;
- *  then default to ingesting for a freshly-registered row with nothing yet. */
+/** Derive the ingest state of a registered ontology row: parse_error, then
+ *  positive embeddings, then parse_status ok, else ingesting. Embeddings outrank
+ *  parse_status because the foundational-load path can leave it stuck at "pending". */
 export function ontologyIngestState(row: OntologyRecord): OntologyIngestState {
   if (row.parseStatus === "parse_error") return "failed";
   if ((row.embeddingCount ?? 0) > 0) return "ready";
@@ -1158,10 +1090,8 @@ export function ontologyIngestState(row: OntologyRecord): OntologyIngestState {
 }
 
 /** StatusIndicator type + label for a proposal's status, as shown in the
- * Proposals list. ``inducing`` is the trigger-time in-progress stub (issue
- * I-3f1f50cc); ``failed`` is a worker-failed induction; ``embeddings_sync`` is
- * the accept-phase embedding backfill. Exported so it can be unit-tested
- * directly (the full Tabs->table render is flaky under jsdom's fake timers). */
+ * Proposals list. ``inducing`` is the trigger-time in-progress stub; ``failed`` is
+ * a worker-failed induction; ``embeddings_sync`` is the accept-phase embedding backfill. */
 export function proposalStatusDisplay(status: string): {
   type: "success" | "error" | "in-progress" | "pending";
   label: string;
@@ -1206,21 +1136,14 @@ export function proposalStatusText(status: string, t: AppTranslate): string {
 
 /** What the UI should do when an induction job reaches ``completed``.
  *
- *  - ``duplicate`` — the run was short-circuited by structural-fingerprint
- *    duplicate detection: NO new proposal was created, and ``proposalId`` is the
- *    pre-existing accepted proposal. The UI shows a notice + link (no redirect).
- *  - ``navigate`` — a normal run; ``proposalId`` is the freshly-created proposal
- *    to open. Prefer the report's ``induced_ontology_id`` (authoritative) and
- *    fall back to the polled job id (proposal_id == job_id on the normal path;
- *    resilient when induced_ontology_id isn't hydrated on the DDB-fallback poll).
- *  - ``refresh`` — nothing to navigate to (no id at all); just refresh the list.
+ *  - ``duplicate``: an exact structural match already exists; ``proposalId`` is that
+ *    accepted proposal, shown as a notice with a link, not a redirect.
+ *  - ``navigate``: open the new proposal, ``induced_ontology_id`` or else the job id
+ *    (proposal_id == job_id on the normal path).
+ *  - ``refresh``: no id to open; refresh the list.
  *
- *  A bridge job (``bridge_report`` set) names its proposal in
- *  ``bridge_report.proposal_id``; without one the run found nothing to change
- *  and there is no proposal row, so the job id must not be used.
- *
- *  Exported as a pure function so the duplicate-vs-navigate decision is unit
- *  tested directly (the 4s poll loop + Cloudscape Tabs render is flaky in jsdom).
+ *  A bridge job names its proposal in ``bridge_report.proposal_id``; without one there
+ *  is no proposal row, so the job id must not be used.
  */
 export function resolveCompletedInductionAction(
   job: {
@@ -1242,9 +1165,7 @@ export function resolveCompletedInductionAction(
       : { kind: "refresh" };
   }
   const proposalId =
-    (job.report?.["induced_ontology_id"] as string | undefined) ??
-    polledJobId ??
-    null;
+    (job.report?.["induced_ontology_id"] as string | undefined) ?? polledJobId;
   if (proposalId) {
     return { kind: "navigate", proposalId };
   }
@@ -1299,10 +1220,7 @@ function OntologiesTab({
   // After a successful upload, ingestion (parse + embed) runs asynchronously;
   // this notice tells the user counts will populate once it finishes.
   const [ingestNotice, setIngestNotice] = useState<string | null>(null);
-  // Set (not a single string) so concurrent Loads on different reference
-  // ontologies each keep their own spinner — a scalar was overwritten by the
-  // latest click, so starting a second load hid the first's spinner even
-  // though its background load + poll was still running.
+  // A Set so concurrent loads keep separate spinners.
   const [loadingUris, setLoadingUris] = useState<Set<string>>(new Set());
   const [catalogByUri, setCatalogByUri] = useState<
     Map<string, FoundationalOntology>
@@ -1453,7 +1371,6 @@ function OntologiesTab({
     setUploadError(null);
     try {
       const fmt = inferOntologyFormat(uploadFiles[0].name);
-      const uploadedTitle = uploadTitle;
       await uploadOntologyFile(
         apiClient,
         namespace,
@@ -1470,7 +1387,7 @@ function OntologiesTab({
       setIngestNotice(
         t(
           '"{name}" uploaded. Parsing and embedding run in the background — class and embedding counts will appear here once ingestion completes. Refresh in a moment to check progress.',
-          { name: uploadedTitle },
+          { name: uploadTitle },
         ),
       );
     } catch (e) {
@@ -1607,8 +1524,7 @@ function OntologiesTab({
             header: t("Type"),
             sortingField: "ontologyType",
             cell: (e) => {
-              const isAvailable = e._available;
-              if (isAvailable) {
+              if (e._available) {
                 return <Badge color="green">{t("Foundational")}</Badge>;
               }
               const { color } = ontologyTypeDisplay(e.ontologyType);
@@ -1656,15 +1572,8 @@ function OntologiesTab({
                       if (!namespace) return;
                       setLoadingUris((s) => new Set(s).add(e.uri ?? ""));
                       try {
-                        // POST returns 202 after synchronously creating an
-                        // `ingesting` registry row (the ECS task fetches + embeds
-                        // in the background). We only await the POST round-trip,
-                        // then refresh so that row appears — the table's own
-                        // ingest-state poll (`hasPendingIngest` effect) drives it
-                        // to ready/failed. No separate button-side poll: it would
-                        // duplicate that poll and, being client-local, wouldn't
-                        // survive a refresh anyway (the row's "Ingesting" status
-                        // does).
+                        // The POST returns 202 with an `ingesting` row; the
+                        // hasPendingIngest poll drives it to its final state.
                         await loadFoundationalOntology(
                           apiClient,
                           namespace,
@@ -1699,23 +1608,11 @@ function OntologiesTab({
               const statusIndicator = (
                 <StatusIndicator type={type}>{t(label)}</StatusIndicator>
               );
-              // Every LOADED reference ontology is deletable here — both
-              // user-uploaded content and loaded foundational ontologies (the
-              // backend teardown is type-agnostic, and a foundational can be
-              // re-loaded from the catalog afterwards). Only the not-yet-loaded
-              // catalog placeholders (``_available``, handled above) have no
-              // registry row to delete and stay Load-only. The confirm modal is
-              // type-aware (see closeDeleteModal / the modal body) so deleting a
-              // re-loadable foundational reads differently from permanent
-              // user/induced data.
+              // Every loaded reference ontology is deletable; the not-yet-loaded
+              // catalog placeholders (``_available``) have no registry row.
               const isDeleting = e.status === "deleting";
-              // Mirror the backend guard: a NON-induced ontology can't be deleted
-              // while induced ontologies exist (they're grounded against it, so it
-              // would leave them dangling — the API returns 409). Disable Delete
-              // proactively + explain why, instead of letting the user click into
-              // a guaranteed error. Induced ontologies aren't listed here at all
-              // (this table is non-induced only) — they delete from their detail
-              // page, reached via Explorer → Ontologies.
+              // Mirror the backend guard: a non-induced ontology can't be deleted
+              // while induced ontologies are grounded against it (the API returns 409).
               const blockedByInduced =
                 ontologyTypeGroup(e.ontologyType) !== "induced" &&
                 inducedOntologies.length > 0;
@@ -1758,21 +1655,17 @@ function OntologiesTab({
         ]}
         empty={
           <Box textAlign="center">
-            {typeFilter === "induced"
+            {typeFilter === "foundational"
               ? t(
-                  "No induced ontologies yet. Run an induction and accept its proposal to see one here.",
+                  "No foundational ontologies loaded yet. Load one from the catalog below.",
                 )
-              : typeFilter === "foundational"
+              : typeFilter === "uploaded"
                 ? t(
-                    "No foundational ontologies loaded yet. Load one from the catalog below.",
+                    "No uploaded ontologies yet. Use Upload your own ontology above.",
                   )
-                : typeFilter === "uploaded"
-                  ? t(
-                      "No uploaded ontologies yet. Use Upload your own ontology above.",
-                    )
-                  : t(
-                      "No reference ontologies yet. Load one from the catalog, or upload your own.",
-                    )}
+                : t(
+                    "No reference ontologies yet. Load one from the catalog, or upload your own.",
+                  )}
           </Box>
         }
         header={
@@ -1938,11 +1831,7 @@ function ProposalsTab({
       .finally(() => setLoading(false));
   }, [apiClient, namespace, refreshKey]);
 
-  // Poll while any proposal is still being induced so the in-progress stub row
-  // (written at induction trigger time, status "inducing") flips to the real
-  // proposal ("pending") — or to "failed" — on its own, without a manual
-  // Refresh. Same pattern as the OntologiesTab ingest poll. Tears down once no
-  // row is inducing.
+  // Poll while a proposal is "inducing" so the stub row flips to pending or failed.
   const hasInducing = items.some((p) => p.status === "inducing");
   useEffect(() => {
     if (!namespace || !hasInducing) return;
@@ -1964,10 +1853,7 @@ function ProposalsTab({
           id: "id",
           header: t("Proposal ID"),
           sortingField: "proposal_id",
-          // Show the full UUID — it's the proposal's only unique identifier
-          // (proposal_id == the induction job_id, minted as uuid4). A proposal
-          // spans many tables, so no single label can identify it; truncating
-          // the id risked ambiguous prefixes between runs.
+          // The full id is the proposal's only unique label.
           cell: (e) => (
             <Link
               href={`/namespaces/${namespace}/ontology/proposals/${e.proposal_id}`}
@@ -2012,11 +1898,8 @@ function ProposalsTab({
         {
           id: "scope",
           header: t("Scope"),
-          // A per-run size that means something for both source types:
-          // tables processed for structured runs, classes induced for
-          // unstructured. A single label can't disambiguate co-named runs
-          // (they often share a generic default); Scope always can.
-          // Blank ("—") only for in-flight rows that have no metadata yet.
+          // Tables processed (structured) or classes induced (unstructured);
+          // "—" for in-flight rows with no metadata yet.
           sortingComparator: (a, b) =>
             proposalScopeSortKey(a.metadata, a.source_type) -
             proposalScopeSortKey(b.metadata, b.source_type),

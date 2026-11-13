@@ -28,8 +28,6 @@ import { sourceStatusType, sourceStatusLabel } from "@utils/source-status";
 import { useAppI18n } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
 
-// ── Type labels ──────────────────────────────────────────────────────────────
-
 const SOURCE_TYPE_LABELS: Record<string, AppMessage> = {
   DATABASE: "Database",
   DOCUMENTS: "Documents",
@@ -84,8 +82,6 @@ function localizedSourceStatus(
   return message ? t(message) : label;
 }
 
-// ── Type filter options ───────────────────────────────────────────────────────
-
 // Priority order for summary dashboard
 const SUMMARY_STATUS_PRIORITY = [
   "PENDING_REVIEW",
@@ -96,8 +92,6 @@ const SUMMARY_STATUS_PRIORITY = [
   "ENRICHING",
   "COMPLETED",
 ];
-
-// ── Preferences ───────────────────────────────────────────────────────────────
 
 const PAGE_SIZE_OPTIONS: Array<
   CollectionPreferencesProps.PageSizeOption & { label: AppMessage }
@@ -130,8 +124,6 @@ const DEFAULT_PREFERENCES: CollectionPreferencesProps.Preferences = {
   stripedRows: true,
 };
 
-// ── Sorting ───────────────────────────────────────────────────────────────────
-
 type SortingColumn = { sortingField: string };
 
 function sortItems(
@@ -155,8 +147,6 @@ function sortItems(
     return isDescending ? -cmp : cmp;
   });
 }
-
-// ── Component ─────────────────────────────────────────────────────────────────
 
 export const SourceList: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
@@ -213,7 +203,6 @@ export const SourceList: React.FC = () => {
       }));
   }, [allItems, t]);
 
-  // Dynamic status filter options based on what's actually in the data
   const statusFilterOptions = useMemo<SelectProps.Option[]>(() => {
     const seen = new Set<string>();
     for (const item of allItems) {
@@ -234,7 +223,6 @@ export const SourceList: React.FC = () => {
     return opts;
   }, [allItems, t]);
 
-  // Client-side filtering
   const filteredItems = useMemo(
     () =>
       allItems

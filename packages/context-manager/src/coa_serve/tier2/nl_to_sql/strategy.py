@@ -123,20 +123,12 @@ def writer_options(options: dict) -> WriterOptions:
 def _governed_metric_block(declined: DeclinedMetricContext | None, resolved_source_id: str) -> str:
     """The governed-metric block to forward to the SQL writer, or ``""`` when it must not be.
 
-    Two suppressions, both the same principle — never ship a block we can't stand behind:
-
-    - **No formula.** ``prompt_block`` already returns ``""`` for a template-less
-      metric, so a metric that matched by name but carries no SQL forwards nothing.
-    - **Source contradiction.** The metric's formula is authored against
-      ``declined.data_source_id``; Tier 2 resolves its own execution source
-      independently (request pin, else k-NN retrieval). When the two are both known
-      and DIFFER, "preserve this formula" is actively harmful — the resolved
-      source's schema may not contain the formula's tables (wrong-source SQL, or a
-      burned correction shot), and the formula's Trino dialect may not match the
-      resolved source's. Dropping the block is better than instructing the writer
-      to preserve a formula it cannot satisfy. When the resolved source is unknown
-      (unpinned, before retrieval) we cannot prove a contradiction, so we forward
-      best-effort — the downstream firewall + executor still enforce scope.
+    Nothing is forwarded for a template-less metric (``prompt_block`` is empty).
+    The block is also dropped when the metric's source
+    (``declined.data_source_id``) and the resolved execution source are both known
+    and differ: the resolved source's schema may not contain the formula's tables.
+    When the resolved source is unknown the block is forwarded best-effort; the
+    firewall and executor still enforce scope.
     """
     if declined is None:
         return ""
@@ -172,12 +164,8 @@ _SQL_STRING_LITERAL = re.compile(r"'((?:[^']|'')*)'")
 # Shortest literal we treat as a "user value". A 1-char filter is too likely to
 # be an incidental substring of the question to protect from correction.
 _MIN_USER_LITERAL_LEN = 2
-# Default per-statement execution timeout (seconds) — the NON-REST fallback used
-# only when no request deadline is threaded (the long streaming/AgentCore path,
-# RESOLVE_TIMEOUT_S ~170s, or an unwired caller). Preserves the historical fixed
-# budget for that path. On the REST path a deadline IS threaded, so
-# _exec_timeout_seconds() clamps below this to min(35, remaining - margin) — on a
-# 29s REST budget that is always < 29s; this 35 never applies there.
+# Default per-statement execution timeout (seconds), used only when no request
+# deadline is threaded; with a deadline, _exec_timeout_seconds() clamps below it.
 _DEFAULT_EXEC_TIMEOUT_S = 35
 # Floor for a deadline-derived execution timeout. Below this a query has no
 # realistic chance of completing, so we do not shrink the executor timeout past
@@ -194,15 +182,8 @@ _CORRECTION_MARGIN_S = 2.0
 _TRUTHY = ("1", "true", "on", "yes")
 _FALSY = ("0", "false", "off", "no")
 
-# Expansion is ON unless something turns it off. It shipped off in !999 and was
-# flipped once the third repeat of each cell landed: execution accuracy is up in
-# 6 of 6 Spider 2.0 arm x seed contrasts (+2.2 to +7.4pp; 810 paired questions,
-# 67 win / 35 loss, exact p=0.002; question-clustered bootstrap CI +1.1 to +7.0pp,
-# excluding zero), and retrieval full-hit is up in 8 of 9 repeats across all three
-# cells (+6 to +20.8pp). BIRD's execution accuracy is a three-repeat wash
-# (+0.2pp, p=0.78) at +11.9pp full-hit, so the flip is a gain where it helps and
-# neutral where it does not — which is what makes ON the better default rather
-# than merely the better average.
+# Expansion is on unless something turns it off: it raised execution accuracy on
+# the measured Spider 2.0 benchmarks and was neutral on BIRD.
 _GRAPH_EXPAND_DEFAULT = True
 
 
@@ -226,19 +207,12 @@ def _graph_expand_enabled(options: dict | None = None) -> bool:
     """True when ontology-graph expansion of the retrieved tables is on.
 
     When on (and a graph client is wired), the tables one FK hop from the retrieved
-    classes are appended to the schema context with their columns — this path's only
-    route to a table vector retrieval did not rank, since it has one shot and no
-    tools. Where the agentic arm's ``explore_graph`` is a tool the model may or may
-    not call, this fires on every generation, so the measured effect is the graph's,
-    not the model's tool adherence.
+    classes are appended to the schema context with their columns.
 
     Three layers, most specific first: per-request ``options.flatGraphExpand``, then
     deployment-wide ``SERVE_NL2SQL_GRAPH_EXPAND``, then ``_GRAPH_EXPAND_DEFAULT``
-    (on). Both explicit layers can say OFF as well as ON — the per-request form is
-    what lets expansion-on and expansion-off run PAIRED against ONE image, and now
-    that the default is on, an A/B's control arm must pass
-    ``flatGraphExpand: false`` rather than omit the option, or it measures the
-    treatment twice.
+    (on). Both explicit layers can say OFF as well as ON, so a control arm must pass
+    ``flatGraphExpand: false`` rather than omit the option.
     """
     if options is not None:
         per_request = _tri_state(options.get("flatGraphExpand", ""))
@@ -373,15 +347,13 @@ def _user_supplied_literal_in_sql(sql: str, query: str) -> bool:
     straight from the user's question. If so, an empty result is the correct
     "no such entity" answer and the self-correction shot must NOT be allowed to
     loosen/re-case/substitute that value — doing so fabricates rows for a
-    different, real entity (the reported bug). If no user-supplied literal is
-    involved, an empty result may be a genuinely wrong query (bad JOIN,
-    over-restrictive derived filter) that still warrants correction.
+    different, real entity. If no user-supplied literal is involved, an empty
+    result may be a genuinely wrong query (bad JOIN, over-restrictive derived
+    filter) that still warrants correction.
 
-    Scope: single-quoted STRING literals only — the reported failure is
-    proper-noun / categorical entity values. Numeric literals are intentionally
-    not protected (they are far more likely to be incidental and rarely cause a
-    fabricated-entity substitution). Match is case-insensitive substring, since
-    the model may re-case a value (e.g. user "acme" → SQL 'ACME').
+    Scope: single-quoted STRING literals only (proper-noun / categorical entity
+    values); numeric literals are not protected. Match is case-insensitive
+    substring, since the model may re-case a value (e.g. user "acme" → SQL 'ACME').
     """
     if not sql or not query:
         return False
@@ -442,7 +414,7 @@ class NLtoSQLStrategy:
             query_executor: Executor that runs authorized SQL; None disables execution.
             oss_ontology_index: OpenSearch ontology index used for class retrieval.
             max_shots: Maximum generation+execution attempts (1 = no self-correction).
-                Defaults to the NL_TO_SQL_MAX_SHOTS env var or 2.
+                Defaults to the SERVE_NL2SQL_MAX_SHOTS env var or 2.
             graph_client: SPARQL client backing the ontology-graph expansion, which
                 is on by default (``SERVE_NL2SQL_GRAPH_EXPAND`` /
                 ``options.flatGraphExpand`` turn it off). None disables the walk
@@ -465,7 +437,7 @@ class NLtoSQLStrategy:
         self._max_shots = max_shots if max_shots is not None else _resolve_max_shots()
 
     def _exec_timeout_seconds(self, context: StrategyContext) -> int:
-        """Per-statement execution timeout, derived from the request deadline (A4/A6).
+        """Per-statement execution timeout, derived from the request deadline.
 
         With a deadline threaded, cap the executor at the time actually left in the
         request budget (leaving the correction margin) so a single statement cannot
@@ -500,8 +472,7 @@ class NLtoSQLStrategy:
     def _fits_deadline(self, context: StrategyContext, estimated_shot_cost_s: float) -> bool:
         """True when another shot (a correction or the vote) fits the remaining request budget.
 
-        No deadline threaded → always True (pre-A0 behaviour: the shot runs
-        unconditionally, as it always did on the long-budget path). With a
+        No deadline threaded → always True (the shot runs unconditionally). With a
         deadline, the next shot is approved only when the time left (minus a margin
         for post-shot assembly/serialization) covers its estimated cost — estimated
         as what the shot just completed took.
@@ -615,15 +586,9 @@ class NLtoSQLStrategy:
         t_ms = int((time.perf_counter() - t_start) * 1000)
 
         if nl_to_sql_result.error or not nl_to_sql_result.sql:
-            # Consolidate all sub-steps into a single t2.sql.generate step (E10).
-            # A retrieval-backend failure (e.g. the vector proxy/index being
-            # unavailable) means this strategy could not even start — that's a
-            # graceful SKIP with fallthrough to the next strategy (VKG/Ontop),
-            # not an error. Reserve "error" for a genuine generation failure so
-            # the trace doesn't show a red step on every query when only the
-            # optional NL→SQL retrieval path is degraded. A namespace with no
-            # SQL-backed class (``no_tables_retrieved``) is a steady state, not a
-            # failure, so it is a skip too.
+            # A retrieval-backend failure or a namespace with no SQL-backed class
+            # (``no_tables_retrieved``) is a SKIP with fallthrough to the next
+            # strategy; "error" is reserved for a genuine generation failure.
             err = nl_to_sql_result.error or "empty_sql"
             skipped = isinstance(err, str) and (err.startswith("retrieve_failed") or err == "no_tables_retrieved")
             trace.record(
@@ -636,7 +601,6 @@ class NLtoSQLStrategy:
             logger.warning("nl_to_sql_failed", error=nl_to_sql_result.error, duration_ms=t_ms)
             return None
 
-        # Consolidate sub-steps into single t2.sql.generate/success step (E10)
         confidence = nl_to_sql_result.confidence
         # List the tables the generated SQL reads, not the retrieval context:
         # retrieval and the FK walk put tables in front of the SQL writer that the
@@ -662,11 +626,6 @@ class NLtoSQLStrategy:
             trace.record(StepId.T2_SQL_EXECUTE, "skipped", 0, detail="no query_executor configured")
             return None
 
-        # ── Two-shot loop: generate → firewall → execute; regenerate ONCE on an
-        # execution ERROR, or on a zero-row result whose filter value did NOT come
-        # from the user's question. A zero-row result that filters on a
-        # user-supplied literal is a legitimate "no such entity" answer and is
-        # returned as-is — see the empty-result handling below and the docstring. ─
         sql = nl_to_sql_result.sql
         confidence = nl_to_sql_result.confidence
         data_source_id = nl_to_sql_result.data_source_id or options.get("dataSourceId", "")
@@ -765,17 +724,9 @@ class NLtoSQLStrategy:
             # fast path is unaffected.
             prepared = await self._prepare_sql(fw_result.authorized_sql, nl_to_sql_result, namespace)
             if prepared.error:
-                # A reference that cannot be attributed to ONE physical table — the
-                # same bare name in two sources/schemas. Refuse the query with a
-                # client-visible ambiguity error instead of returning None: a bare
-                # None is masked downstream as an incidental miss (NoResult), which
-                # hides a mis-route behind a generic "no data". Raising a terminal
-                # ServeError surfaces the explicit reason ("...is ambiguous...") to
-                # the caller and tells them how to proceed (qualify the reference or
-                # pass a source). Not retried (a correction shot hits the same
-                # ambiguity) and not executed (it could read a different source's
-                # table than the one authorized) — the same fail-closed treatment as
-                # unsafe SQL, but reported rather than silently skipped.
+                # A reference that cannot be attributed to ONE physical table: refuse
+                # with a client-visible ambiguity error (None would read as a miss).
+                # Never retried or executed.
                 trace.record(StepId.T2_SQL_EXECUTE, "error", 0, detail=prepared.error)
                 logger.warning("nl_to_sql_ambiguous_reference", namespace=namespace, error=prepared.error)
                 raise AmbiguousReferenceError(prepared.error)
@@ -809,16 +760,8 @@ class NLtoSQLStrategy:
                 # different ones than the first), grant-filtered like the generate step.
                 tables = tables_visible_to(SQLFirewall.referenced_tables(fw_result.authorized_sql), profile)
 
-                # Decide whether a ZERO-row result is a legitimate, deterministic
-                # answer or a signal worth one corrective regeneration. A
-                # non-empty result is always final. For zero rows the question is
-                # WHERE the filter value came from: if a WHERE literal was taken
-                # straight from the user's question, an empty result is the CORRECT
-                # "no such entity" answer — coaxing the model to loosen/re-case it
-                # only fabricates rows for a DIFFERENT, real value. If NO
-                # user-supplied literal is involved, an empty result may instead be
-                # a genuinely wrong query (bad JOIN / over-restrictive derived
-                # filter), which still gets the one correction shot.
+                # Zero rows filtering on a user-supplied literal is a final answer
+                # (see _user_supplied_literal_in_sql); a non-empty result is final.
                 user_value_filter = exec_result.row_count == 0 and _user_supplied_literal_in_sql(
                     fw_result.authorized_sql, query
                 )
@@ -908,32 +851,12 @@ class NLtoSQLStrategy:
     ) -> tuple[str, float] | None:
         """Regenerate the SQL from ``last_error`` when the deadline fits; None means stop."""
         trace = context.trace
-        # A shot remains (reached on an execution ERROR, or a zero-row result
-        # with no user-supplied filter value): ask the LLM to correct the SQL
-        # from the feedback in ``last_error`` — model-driven, no rule
-        # catalogue — reusing the already-retrieved schema context.
-        #
-        # A4 — deadline-aware correction: before spending another full
-        # generate→firewall→execute cycle, check it can FIT the remaining
-        # request budget. The correction shot is a latency-doubling accuracy
-        # feature; over a short transport (REST, ~29s) the second shot pushes
-        # total latency past the ceiling and the caller 504s AFTER serve has
-        # already computed a usable first-shot answer. Rather than start work
-        # that cannot return, skip the correction and return the best result in
-        # hand. Estimated cost of the next shot = what THIS shot just took
-        # (generate was already paid once; a correction is generate+execute of
-        # comparable magnitude). No deadline threaded → estimate is None →
-        # never skip (pre-A0 behaviour preserved, e.g. the 170s AgentCore path
-        # where the second shot always fits).
+        # A shot remains: ask the LLM to correct the SQL from ``last_error``,
+        # reusing the already-retrieved schema context. Skip the correction when
+        # its estimated cost (what this shot took) plus a margin exceeds the
+        # remaining request budget; with no deadline threaded, never skip.
         if not self._fits_deadline(context, shot_cost_s):
-            # Record ONLY the decision — not a latency. Per the trace model,
-            # step latency is the true elapsed time of a step that ran; this
-            # step represents a correction that did NOT run, so its duration is
-            # genuinely 0. The shot that DID run already recorded its own
-            # latency on its t2.sql.generate/t2.sql.execute steps — we do not
-            # restate a duration here. The deadline is an independent dimension
-            # surfaced at request level (see main.py), so the detail carries
-            # only the boolean reason for the skip, never seconds.
+            # Record only the decision: the correction did not run, so duration is 0.
             trace.record(
                 StepId.T2_SQL_GENERATE,
                 "skipped",
@@ -961,12 +884,6 @@ class NLtoSQLStrategy:
                 nl_result.ddl_context,
                 # The statement handed to the executor (post-qualification), which
                 # is what the engine reported its line/column positions against.
-                # The pre-qualification text differs from it on a cross-source
-                # query (catalog/schema rewrite, single-line sqlglot rendering), so
-                # the error coordinates pointed into a statement the model never
-                # saw. The executor may still cap LIMIT or transpile, so this is the
-                # closest text the strategy has to what ran (a vote's candidate
-                # included: it passes the statement its execution already ran).
                 failed_sql=failed_sql,
                 execution_error=last_error,
                 evidence=evidence,
@@ -1205,11 +1122,7 @@ class NLtoSQLStrategy:
         marker and ``prepare_execution_sql`` refuses the query rather than run it
         against a guessed schema.
         """
-        # Cheap short-circuit that skips three sqlglot parses (routing extraction,
-        # restore, qualify) on the common single-source path. Preparation is a
-        # no-op UNLESS the hits span two real sources or mark a name ambiguous —
-        # ``table_sources_need_preparation`` distinguishes those from the single
-        # unambiguous source that needs nothing done.
+        # Skip three sqlglot parses on the single-source path.
         if not table_sources_need_preparation(nl_result.table_sources):
             return PreparedSQL(sql=sql)
         routing = sql_table_routing(sql, nl_result.table_sources, nl_result.table_candidates)

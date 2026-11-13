@@ -35,12 +35,6 @@ export const AGENTCORE_RESTRICTED_AZ_IDS: Record<string, readonly string[]> = {
  * (missing creds, API error, fewer than ``count`` supported AZs). This
  * is intentional: silently falling back to default AZs in a restricted
  * region reintroduces the exact bug this module prevents.
- *
- * @param region   Deploy region (from ``CDK_DEFAULT_REGION``).
- * @param count    Minimum AZ names required (AgentCore needs ≥2 for HA).
- * @param client   Optional injected EC2 client (for tests).
- * @returns        Supported AZ names (sorted, sliced to ``count``), or
- *                 ``undefined`` if the region has no restrictions.
  */
 export async function resolveAgentCoreAzNames(
   region: string,

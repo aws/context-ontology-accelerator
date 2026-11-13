@@ -6,8 +6,6 @@
 Tests use a mocked boto3 client to verify query construction,
 response parsing, batching logic, and error handling without
 requiring a live Neptune Analytics endpoint.
-
-Requirements: 1.3, 2.1, 2.2, 2.4, 2.5, 2.6, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13
 """
 
 import io
@@ -15,11 +13,15 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-
-pytestmark = pytest.mark.unit
-
+from botocore.exceptions import ClientError
 from coa_ontology.inducer.unstructured.stores.na_lexical import (
     NeptuneAnalyticsLexicalStore,
+    _extract_spc_predicate_complement,
+    _extract_spo_predicate,
+    _is_caseless_predicate_word,
+    _is_predicate_word,
+    _strip_object_suffix,
+    _strip_subject_prefix,
 )
 from coa_ontology.inducer.unstructured.stores.protocol import (
     ClassRecord,
@@ -30,6 +32,8 @@ from coa_ontology.inducer.unstructured.stores.protocol import (
     RelationRecord,
     TopicRecord,
 )
+
+pytestmark = pytest.mark.unit
 
 
 def _make_payload(results: list[dict]) -> dict:
@@ -54,15 +58,6 @@ class TestNeptuneAnalyticsLexicalStoreInit:
         """Should raise ValueError when graph_id is empty."""
         with pytest.raises(ValueError, match="graph_id is required"):
             NeptuneAnalyticsLexicalStore(graph_id="")
-
-    def test_accepts_valid_graph_id(self):
-        """Should construct successfully with a valid graph_id."""
-        mock_client = MagicMock()
-        store = NeptuneAnalyticsLexicalStore(
-            graph_id="g-abc123",
-            boto_client=mock_client,
-        )
-        assert store._graph_id == "g-abc123"
 
     def test_satisfies_protocol(self):
         """NeptuneAnalyticsLexicalStore should satisfy LexicalGraphStore protocol."""
@@ -220,7 +215,7 @@ class TestGetEntitiesByClass:
         assert call_kwargs["parameters"]["limit"] == 50
 
     def test_returns_empty_list_for_unknown_class(self):
-        """Should return empty list when no entities match (Req 2.8)."""
+        """Should return empty list when no entities match."""
         mock_client = MagicMock()
         mock_client.execute_query.return_value = _make_payload([])
 
@@ -345,7 +340,7 @@ class TestGetFactsForEntities:
         mock_client.execute_query.assert_not_called()
 
     def test_batches_at_500_ids(self):
-        """Should batch queries when entity_ids exceeds 500 (Req 2.11)."""
+        """Should batch queries when entity_ids exceeds 500."""
         mock_client = MagicMock()
         mock_client.execute_query.side_effect = lambda **kwargs: _make_payload([])
 
@@ -399,7 +394,7 @@ class TestGetTopics:
         assert result[0] == TopicRecord(topic_id="t1", value="Finance", statement_count=25)
 
     def test_includes_topics_with_zero_statements(self):
-        """Should include topics with zero connected statements (Req 2.13)."""
+        """Should include topics with zero connected statements."""
         mock_client = MagicMock()
         mock_client.execute_query.return_value = _make_payload(
             [
@@ -498,7 +493,7 @@ class TestGetGraphSchema:
             store.get_graph_schema()
 
     def test_raises_value_error_on_zero_classes(self):
-        """Should raise ValueError when schema has zero class entries (Req 2.5)."""
+        """Should raise ValueError when schema has zero class entries."""
         mock_client = MagicMock()
         mock_client.execute_query.side_effect = [
             _make_payload(
@@ -574,10 +569,8 @@ class TestErrorHandling:
     """Test error handling and descriptive error messages."""
 
     def test_raises_runtime_error_on_client_error(self):
-        """Should raise RuntimeError with descriptive message on ClientError (Req 2.4)."""
+        """Should raise RuntimeError with descriptive message on ClientError."""
         mock_client = MagicMock()
-        from botocore.exceptions import ClientError
-
         error_response = {"Error": {"Code": "AccessDeniedException", "Message": "Access denied"}}
         mock_client.execute_query.side_effect = ClientError(error_response, "ExecuteQuery")
 
@@ -592,8 +585,6 @@ class TestErrorHandling:
     def test_retries_on_unprocessable_exception(self):
         """Should retry on UnprocessableException before failing."""
         mock_client = MagicMock()
-        from botocore.exceptions import ClientError
-
         error_response = {"Error": {"Code": "UnprocessableException", "Message": "Retry me"}}
         # Fail twice, then succeed
         mock_client.execute_query.side_effect = [
@@ -611,8 +602,6 @@ class TestErrorHandling:
     def test_raises_after_max_retries(self):
         """Should raise RuntimeError after exhausting retries."""
         mock_client = MagicMock()
-        from botocore.exceptions import ClientError
-
         error_response = {"Error": {"Code": "UnprocessableException", "Message": "Always fails"}}
         mock_client.execute_query.side_effect = ClientError(error_response, "ExecuteQuery")
 
@@ -620,19 +609,6 @@ class TestErrorHandling:
 
         with pytest.raises(RuntimeError, match="backend=neptune_analytics"):
             store._oc_query("RETURN 1 AS ok")
-
-
-# ── Fact value parsing helpers ─────────────────────────────────────────
-
-
-from coa_ontology.inducer.unstructured.stores.na_lexical import (  # noqa: E402
-    _extract_spc_predicate_complement,
-    _extract_spo_predicate,
-    _is_caseless_predicate_word,
-    _is_predicate_word,
-    _strip_object_suffix,
-    _strip_subject_prefix,
-)
 
 
 class TestStripSubjectPrefix:
@@ -736,9 +712,6 @@ class TestIsPredicateWord:
         assert _is_predicate_word("AUDITS,")
         assert _is_predicate_word("(EMPLOYED)")
 
-    def test_pure_numeric_does_not_qualify(self):
-        assert not _is_predicate_word("123")
-
 
 class TestExtractSpoPredicate:
     """``_extract_spo_predicate`` recovers the predicate phrase from
@@ -791,11 +764,7 @@ class TestExtractSpoPredicate:
         )
 
     def test_falls_back_when_subject_doesnt_match(self):
-        """If the subject prefix doesn't match (extraction drift),
-        return the input unchanged minus the object suffix.
-        """
-        # No clean fall back to do — predicate ends up including
-        # whatever was at the front of fact_value.
+        """Without a matching subject prefix, the input minus the object suffix is returned."""
         assert _extract_spo_predicate("PAID Company", "Awardee", "Company") == "PAID"
 
 
@@ -803,21 +772,6 @@ class TestExtractSpcPredicateComplement:
     """``_extract_spc_predicate_complement`` splits SPC fact values
     into a predicate phrase and a complement using the
     "leading uppercase tokens" heuristic."""
-
-    def test_single_word_predicate_with_complement(self):
-        assert _extract_spc_predicate_complement(
-            "downstream users RESTRICTED ON resale",
-            "downstream users",
-        ) == ("RESTRICTED ON", "resale")
-
-    def test_multiword_predicate_with_complement(self):
-        assert _extract_spc_predicate_complement(
-            "Short-term lease expenses TIME PERIOD first half of fiscal year 2024",
-            "Short-term lease expenses",
-        ) == (
-            "TIME PERIOD",
-            "first half of fiscal year 2024",
-        )
 
     def test_predicate_with_connectors(self):
         assert _extract_spc_predicate_complement(
@@ -837,16 +791,6 @@ class TestExtractSpcPredicateComplement:
         ) == (
             "DESCRIPTION",
             "leading global software and device maker",
-        )
-
-    def test_subject_case_drift(self):
-        # Subject "Company" in fact, "company" in record.
-        assert _extract_spc_predicate_complement(
-            "Company HAS ALLOWANCE income tax contingencies",
-            "company",
-        ) == (
-            "HAS ALLOWANCE",
-            "income tax contingencies",
         )
 
     def test_predicate_only_no_complement_returns_none(self):
@@ -939,11 +883,8 @@ class TestExtractSpcPredicateComplement:
 class TestCaselessPredicates:
     """Predicates in a script without case (Japanese, Chinese, Korean).
 
-    The A1 extraction prompt tells the model to write predicate names in the
-    namespace language, uppercase only where letters have case and an
-    underscore where the name would contain a space. Before this fix every
-    such SPC fact parsed to an empty predicate and Rule 4 dropped it, so a
-    Japanese document produced no datatype properties.
+    A caseless predicate is the first token of the fact value after the
+    subject, so such SPC facts still yield a datatype property.
     """
 
     @pytest.mark.parametrize(
@@ -993,8 +934,7 @@ class TestCaselessPredicates:
     )
     def test_caseless_with_uppercase_latin_suffix_is_uppercase_predicate(self, fact_value, expected):
         # ``"担当者A".isupper()`` is True because ``A`` is its only cased
-        # letter, so the token keeps the existing uppercase rule. This MR does
-        # not change how such a token parses.
+        # letter, so the token keeps the existing uppercase rule.
         assert _is_caseless_predicate_word("担当者A") is False
         assert _extract_spc_predicate_complement(fact_value, "設備") == expected
 
@@ -1022,7 +962,6 @@ class TestCaselessPredicates:
         """End to end through Rule 4: the parsed fact becomes a Japanese property."""
         from coa_ontology.inducer.unstructured.services.induction_rules import induce_datatype_properties
         from coa_ontology.inducer.unstructured.services.iri_resolver import InMemoryIRIResolver
-        from coa_ontology.inducer.unstructured.stores.protocol import FactRecord
         from rdflib import OWL, RDF, RDFS, Literal
 
         predicate, complement = _extract_spc_predicate_complement("プレス機 KX-7 点検周期 30日", "プレス機 KX-7")

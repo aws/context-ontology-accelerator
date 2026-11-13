@@ -8,7 +8,7 @@
  *
  * The OIDC `sub` claim is NOT guaranteed to satisfy this: Cognito issues UUIDs
  * (36 chars, always safe), but other IdPs — e.g. enterprise SSO — issue short
- * human-readable usernames (e.g. "noahpaig", 8 chars), which fail the AgentCore
+ * human-readable usernames (e.g. "jdoe1234", 8 chars), which fail the AgentCore
  * constraint outright.
  */
 const MIN_RUNTIME_SESSION_ID_LENGTH = 33;

@@ -13,7 +13,7 @@ tables qualified, source confirmed JDBC-capable via the has_jdbc_endpoint gate)
 to direct JDBC (SourceDBQueryExecutor) and everything else — cross-source,
 Glue-native, ambiguous, or with JDBC disabled — to Athena federation.
 
-Data-source RESOLUTION (Kun's 40cd2b8): ``_resolve_data_source`` /
+Data-source RESOLUTION: ``_resolve_data_source`` /
 ``_infer_data_source`` resolve a ``data_source_id`` (explicit caller id -> VKG
 ``datasourceRouting`` -> table-prefix heuristic) that is passed into
 ``executor.execute(...)``; the composite/Athena use it for routing and
@@ -79,12 +79,8 @@ class Tier2Result:
     trace_steps: list[TraceStep] = field(default_factory=list)
     error: str | None = None
     #: The statement actually handed to the executor — i.e. ``vkg_result.sql`` after
-    #: the firewall's rewrite AND cross-source qualification. Distinct from
-    #: ``vkg_result.sql``, which is Ontop's raw translate output. Reporting the raw
-    #: form as ``queryUsed`` is actively misleading after the cross-source fix: a cross-source
-    #: statement's bare table names cannot resolve under any single
-    #: ``QueryExecutionContext``, so the SQL shown to an operator is one that
-    #: provably does not run. ``None`` when the pipeline never reached execution.
+    #: the firewall's rewrite AND cross-source qualification, as opposed to Ontop's
+    #: raw translate output. ``None`` when the pipeline never reached execution.
     executed_sql: str | None = None
 
 
@@ -111,12 +107,7 @@ class VKGTranslator:
             query_executor: Executor that runs the authorized SQL.
             sources_registry: Optional registry used ONLY to look up the Athena
                 catalog name of each datasource when a query spans more than one
-                (see :mod:`..table_qualifier`). With no registry wired, a
-                cross-source query keeps its previous behaviour. Typed as the
-                narrow :class:`~..table_qualifier.SourceLookup` Protocol rather
-                than left bare, so a wiring mistake in ``dependencies.py`` fails
-                type-check instead of surfacing as a runtime AttributeError on
-                the first cross-source query.
+                (see :mod:`..table_qualifier`).
         """
         self._vkg_endpoint = vkg_endpoint
         self._firewall = firewall
@@ -160,16 +151,7 @@ class VKGTranslator:
     ) -> Tier2Result:
         """Run the full Tier 2 pipeline: translate -> firewall -> execute.
 
-        Args:
-            sparql: Valid SPARQL query to translate.
-            namespace: Ontology namespace (validated for safe interpolation).
-            data_source_id: Target data source (may be empty for cross-source).
-            profile: Caller's authorization profile for firewall evaluation.
-            max_rows: Maximum result rows.
-            timeout_seconds: Query execution timeout.
-
-        Returns:
-            Tier2Result with query results or error information.
+        ``data_source_id`` may be empty for a cross-source query.
         """
         from ...query_utils import validate_namespace
 
@@ -320,10 +302,7 @@ class VKGTranslator:
                 timeout_seconds=timeout_seconds,
             )
             # Capture the executing engine BEFORE projection: _project_to_sparql may
-            # return a fresh QueryResult that does not carry it forward. Surfaced on
-            # the execute step (athena | redshift | jdbc) so the Redshift-dispatch
-            # guard is observable from the trace on the ontop path too — the
-            # nl_to_sql path already records it.
+            # return a fresh QueryResult that does not carry it forward.
             executed_engine = getattr(query_result, "engine", "") or "unknown"
             # Project raw SQL result to SPARQL solution (if projection metadata available)
             if vkg_result.projection:
@@ -393,11 +372,9 @@ class VKGTranslator:
         source record from DDB (athenaDataCatalogName, discoveredSchemas)
         for catalog/schema resolution.
 
-        A MULTI-source query still returns "" here, but that no longer means
-        "pick an arbitrary source": ``resolve()`` qualifies such SQL to
-        ``catalog.schema.table`` first, after which the executor's catalog
-        resolution is irrelevant (qualified names override the Athena
-        ``QueryExecutionContext``). "" is now "no single source applies".
+        "" means no single source applies: ``resolve()`` qualifies multi-source
+        SQL to ``catalog.schema.table`` first, and qualified names override the
+        Athena ``QueryExecutionContext``.
         """
         if vkg_result.datasource_routing:
             ds_ids = distinct_datasources(vkg_result.datasource_routing)
@@ -436,14 +413,6 @@ class VKGTranslator:
         correct-looking header over an all-NULL column, which is a worse
         failure than showing the SQL aliases. Alias lookup falls back to a
         case-insensitive match because some drivers normalise column labels.
-
-        Args:
-            qr: Raw QueryResult from SQL execution (keyed by SQL aliases).
-            proj: Projection metadata from Ontop (SPARQL vars -> SQL aliases).
-
-        Returns:
-            QueryResult with columns renamed to SPARQL variables and projected,
-            or ``qr`` unchanged when the projection cannot be applied.
         """
         columns = list(proj.select_vars)
         by_lower = {c.lower(): c for c in qr.columns}

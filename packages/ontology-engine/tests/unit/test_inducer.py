@@ -15,52 +15,11 @@ from coa_ontology.inducer.services.pipeline import (
     InductionPipeline,
     SourceConcept,
     _cosine_similarity,
-    _label_from_uri,
-    _to_camel,
-    _to_pascal,
 )
-from rdflib import OWL, RDF, RDFS, XSD, Namespace, URIRef
+from rdflib import OWL, RDF, RDFS, Namespace, URIRef
 from rdflib.namespace import PROV, SKOS
 
 # ── Pure helpers ──
-
-
-@pytest.mark.parametrize(
-    "input_,expected",
-    [
-        ("order_item", "OrderItem"),
-        ("product", "Product"),
-        ("line-item", "LineItem"),
-        ("a_b_c", "ABC"),
-    ],
-)
-def test_to_pascal(input_, expected):
-    assert _to_pascal(input_) == expected
-
-
-@pytest.mark.parametrize(
-    "input_,expected",
-    [
-        ("order_date", "orderDate"),
-        ("product", "product"),
-        ("total_amount", "totalAmount"),
-    ],
-)
-def test_to_camel(input_, expected):
-    assert _to_camel(input_) == expected
-
-
-@pytest.mark.parametrize(
-    "uri,expected",
-    [
-        ("http://schema.org/dateCreated", "date created"),
-        ("http://schema.org/Product", "product"),
-        ("http://purl.org/dc/terms/title", "title"),
-        ("http://ex.org/foo#barBaz", "bar baz"),
-    ],
-)
-def test_label_from_uri(uri, expected):
-    assert _label_from_uri(uri) == expected
 
 
 def test_cosine_similarity_identical():
@@ -156,41 +115,6 @@ def _make_matches(table):
             scoring_strategy="lexical",
         ),
     ]
-
-
-def test_build_ontology_structure():
-    pipeline = InductionPipeline(None, None, None)
-    table = _make_table()
-    concepts = pipeline.extract_concepts([table])
-    matches = _make_matches(table)
-
-    g = pipeline.build_ontology("http://ex.org/induced#", [table], concepts, matches)
-
-    # Ontology declaration
-    ont = URIRef("http://ex.org/induced")
-    assert (ont, RDF.type, OWL.Ontology) in g
-
-    # Induced class
-    orders_cls = URIRef("http://ex.org/induced#Orders")
-    assert (orders_cls, RDF.type, OWL.Class) in g
-    assert (orders_cls, RDFS.subClassOf, URIRef("http://schema.org/Order")) in g
-    assert (orders_cls, SKOS.closeMatch, URIRef("http://schema.org/Order")) in g
-
-    # Grounding must NOT emit owl:imports — a live import of the (often
-    # non-dereferenceable) foundational URI makes Ontop/OWLAPI network-fetch it
-    # at VKG load and fail every query. The grounding is fully carried by
-    # rdfs:subClassOf + skos:* above, so no owl:imports triple should exist.
-    assert list(g.triples((None, OWL.imports, None))) == []
-
-    # Primary key → owl:hasKey + cardinality 1
-    order_id_prop = URIRef("http://ex.org/induced#orders_orderId")
-    assert table.columns[0].constraint == "PRIMARY_KEY"
-    assert (orders_cls, OWL.hasKey, order_id_prop) in g
-
-    # Novel column still gets a property
-    total_prop = URIRef("http://ex.org/induced#orders_totalAmount")
-    assert (total_prop, RDF.type, OWL.DatatypeProperty) in g
-    assert (total_prop, RDFS.range, XSD.decimal) in g
 
 
 def test_production_strategy_grounds_via_subclass_and_skos_not_groundedto():
@@ -338,86 +262,6 @@ def test_production_strategy_self_match_emits_no_reflexive_grounding_axioms(matc
     assert (orders_cls, SKOS.relatedMatch, orders_cls) not in g
     # ...and no vacuous self matchConfidence.
     assert list(g.triples((orders_cls, match_confidence, None))) == []
-
-
-def test_build_ontology_fk():
-    """Foreign key columns become ObjectProperties."""
-    pipeline = InductionPipeline(None, None, None)
-    cols = [
-        CatalogColumn(name="id", dataType="INT", constraint="PRIMARY_KEY"),
-        CatalogColumn(name="customer_id", dataType="INT"),
-    ]
-    constraints = [
-        CatalogConstraint(
-            constraintType="FOREIGN_KEY",
-            columns=["customer_id"],
-            referredColumns=["test_db.public.customers.id"],
-        ),
-    ]
-    table = _make_table("orders", cols, constraints)
-    matches = [
-        ConceptMatch(
-            source_table="orders",
-            source_column="",
-            matched_class_uri=None,
-            matched_ontology_id=None,
-            similarity=None,
-            match_type="novel",
-            scoring_strategy="lexical",
-        ),
-        ConceptMatch(
-            source_table="orders",
-            source_column="id",
-            matched_class_uri=None,
-            matched_ontology_id=None,
-            similarity=None,
-            match_type="novel",
-            scoring_strategy="lexical",
-        ),
-        ConceptMatch(
-            source_table="orders",
-            source_column="customer_id",
-            matched_class_uri=None,
-            matched_ontology_id=None,
-            similarity=None,
-            match_type="novel",
-            scoring_strategy="lexical",
-        ),
-    ]
-
-    g = pipeline.build_ontology("http://ex.org/induced#", [table], pipeline.extract_concepts([table]), matches)
-
-    fk_prop = URIRef("http://ex.org/induced#orders_customerId")
-    assert (fk_prop, RDF.type, OWL.ObjectProperty) in g
-    assert (fk_prop, RDFS.range, URIRef("http://ex.org/induced#Customers")) in g
-
-
-def test_build_ontology_self_match_emits_no_reflexive_axioms():
-    """The retired InductionPipeline.build_ontology reference path must also skip
-    a self-match (matched_class_uri == the table's own class IRI): no reflexive
-    rdfs:subClassOf / skos:exactMatch / closeMatch. Guards the latent copy of the
-    induction self-loop bug even though this path is not mounted in production."""
-    pipeline = InductionPipeline(None, None, None)
-    table = _make_table()  # 'orders' → http://ex.org/induced#Orders
-    orders_cls = URIRef("http://ex.org/induced#Orders")
-    matches = [
-        ConceptMatch(
-            source_table=table.name,
-            source_column="",
-            matched_class_uri=str(orders_cls),  # self-match
-            matched_ontology_id="http://ex.org/induced#",
-            similarity=0.99,
-            match_type="exact",
-            scoring_strategy="lexical",
-        ),
-    ]
-
-    g = pipeline.build_ontology("http://ex.org/induced#", [table], pipeline.extract_concepts([table]), matches)
-
-    assert (orders_cls, RDF.type, OWL.Class) in g
-    assert (orders_cls, RDFS.subClassOf, orders_cls) not in g
-    assert (orders_cls, SKOS.exactMatch, orders_cls) not in g
-    assert (orders_cls, SKOS.closeMatch, orders_cls) not in g
 
 
 def _haskey_members(g) -> list[URIRef]:

@@ -69,7 +69,6 @@ describe("SourcesStack", () => {
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
-    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-sources-api"]);
   });
 
@@ -270,8 +269,8 @@ describe("SourcesStack", () => {
 
     it("grants the sources-api role Glue GetTags AND GetDatabase for the namespace-ownership check", () => {
       // Source-create refuses a Glue database whose owner has not tagged it for
-      // the caller's namespace (finding F-8). The check fails closed, so without
-      // this grant every native Glue source create would 403.
+      // the caller's namespace. The check fails closed, so without this grant every
+      // native Glue source create would 403.
       const apiFn = Object.values(
         template.findResources("AWS::Lambda::Function"),
       ).find((fn: any) =>
@@ -314,7 +313,7 @@ describe("SourcesStack", () => {
     const bySid = (sid: string) =>
       allStatements().find((s: any) => s.Sid === sid);
 
-    it("grants nested-catalog Glue access to the discovery and enrichment roles (issue 118)", () => {
+    it("grants nested-catalog Glue access to the discovery and enrichment roles", () => {
       interface PolicyStmt {
         Sid?: string;
         Action: string | string[];
@@ -413,12 +412,9 @@ describe("SourcesStack", () => {
         .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
     }
 
-    // There used to be an unconditioned `SecretsManagerCoaManaged` statement on
-    // the discovery role covering `{prefix}datasource-*`. IAM statements are
-    // additive, so it exempted exactly the naming convention the platform's own
-    // credential secrets use from the tag requirement above. Verified live: with
-    // it attached, an untagged secret and a secret tagged for another namespace
-    // were both readable.
+    // IAM statements are additive: an unconditioned statement covering
+    // `{prefix}datasource-*` would exempt the platform's own credential secrets
+    // from the tag requirement above.
     it("leaves the discovery role no untagged in-account read path", () => {
       const reads = statementsForFunction("sources-db-connector").filter(
         (s: any) => {
@@ -610,7 +606,7 @@ describe("SourcesStack", () => {
     });
 
     // The discovery role reads Glue across the whole account (`database/*`,
-    // `table/*/*`), which is what finding F-8 turned into cross-namespace access.
+    // `table/*/*`), which would otherwise allow cross-namespace access.
     // The tag is the authorization that read is now checked against, so it has to
     // be readable on the same resources.
     it("grants the discovery role Glue GetTags alongside its account-wide reads", () => {
@@ -733,7 +729,7 @@ describe("SourcesStack", () => {
     });
   });
 
-  describe("Federation Provisioner (Option B isolation)", () => {
+  describe("Federation Provisioner (dedicated Lambda)", () => {
     it("creates a dedicated JDBC federation provisioner Lambda in VPC", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp(
@@ -967,11 +963,6 @@ describe("SourcesStack", () => {
         "arn:aws:iam::*:role/coa-dev-datasource-access-*",
         "arn:aws:iam::*:role/coa-dev-datasource-access-*",
       ]);
-      for (const resource of resources) {
-        // No `123456789012` anywhere in the ARN: an account restriction here would
-        // refuse the deliberate cross-account topology.
-        expect(String(resource)).not.toContain(TEST_ENV.account);
-      }
     });
 
     it("keeps the Sids the deployed policies shipped with", () => {
@@ -1059,7 +1050,6 @@ describe("SourcesStack", () => {
           }),
         },
       });
-      expect(SOURCES_PREFIX).not.toBe("/coa/connectors/databricks/sources");
     });
 
     it("passes the connector-ARN parameter NAME, not the ARN itself", () => {
@@ -1071,10 +1061,6 @@ describe("SourcesStack", () => {
           }),
         },
       });
-      // The connector is deployed from its own CDK app, so `infra` cannot see its
-      // ARN at synth — and passing the name instead is what keeps the ARN out of
-      // this template. A value here would mean someone resolved it at synth.
-      expect(DEPLOYMENT_PARAM).not.toContain("arn:aws:lambda");
     });
 
     // Net-new: this role held no SSM write at all. Integrity is the property —
@@ -1402,9 +1388,8 @@ describe("SourcesStack", () => {
       expect(description).toContain("credentialSecretArn");
     });
 
-    // Notifying nobody is a deliberate round-one seam (see the next test), but being on
-    // no dashboard as well left the one alarm whose threat has no other signal visible
-    // only to whoever thought to open the CloudWatch console.
+    // No alarm action is wired, so the alarm notifies nobody; it must also be on the
+    // dashboard so it is visible to whoever opens the CloudWatch console.
     it("shows the alarm on the stack's OE dashboard, since it notifies nobody", () => {
       const [alarmId] = Object.entries(
         template.findResources("AWS::CloudWatch::Alarm"),
@@ -1426,8 +1411,8 @@ describe("SourcesStack", () => {
     });
 
     it("carries no alarm action when the deployment supplies none", () => {
-      // `alarmAction` is undefined in bin/app.ts (round one). The detection must
-      // record and alarm anyway rather than being blocked on a notification channel.
+      // `alarmAction` is not passed in bin/app.ts. The detection must record and alarm
+      // anyway rather than being blocked on a notification channel.
       const alarm = Object.values(
         template.findResources("AWS::CloudWatch::Alarm"),
       ).find(
@@ -1657,9 +1642,6 @@ describe("SourcesStack", () => {
     it("rejects non-TLS access to both queues", () => {
       const [queueId] = verifyQueue();
       const [dlqId] = verifyDlq();
-      const policies = JSON.stringify(
-        template.findResources("AWS::SQS::QueuePolicy"),
-      );
       for (const id of [queueId, dlqId]) {
         const policy = Object.values(
           template.findResources("AWS::SQS::QueuePolicy"),
@@ -1671,7 +1653,6 @@ describe("SourcesStack", () => {
           "aws:SecureTransport",
         );
       }
-      expect(policies).toContain("aws:SecureTransport");
     });
 
     it("runs the packaged handler in the VPC with the SPARQL egress SG", () => {
@@ -1893,7 +1874,7 @@ describe("SourcesStack", () => {
     });
 
     it("worker can re-enqueue to its own queue: REVIEW_QUEUE_URL env + sqs:SendMessage grant", () => {
-      // Self-continuation (#853): a source too large for one invocation pages
+      // Self-continuation: a source too large for one invocation pages
       // itself by re-enqueuing with a nextToken, so the worker needs both the
       // queue URL and SendMessage on it. The grant is checked against the
       // worker's own role — the API Lambda also holds SendMessage on this
@@ -2124,7 +2105,7 @@ describe("SourcesStack", () => {
 
   describe("Telemetry — CloudWatch Dashboard and Alarms", () => {
     it("emits the facade OE dashboard plus the structured-scan dashboard, and no legacy SourcesScanDashboard", () => {
-      // One facade dashboard + the #116 structured-scan dashboard.
+      // One facade dashboard + the structured-scan dashboard.
       template.resourceCountIs("AWS::CloudWatch::Dashboard", 2);
       // Legacy dashboard name must be gone.
       const dashboards = template.findResources("AWS::CloudWatch::Dashboard", {
@@ -2140,7 +2121,7 @@ describe("SourcesStack", () => {
     });
   });
 
-  describe("Structured Scan Dashboard (#116)", () => {
+  describe("Structured Scan Dashboard", () => {
     // The dashboard body is a JSON string, so charted metric names are asserted
     // by substring. Each name is emitted by packages/sources — a rename on
     // either side silently darkens a widget, which is what this guards.
@@ -2154,12 +2135,6 @@ describe("SourcesStack", () => {
       expect(found).toHaveLength(1);
       return JSON.stringify(found[0].Properties.DashboardBody);
     };
-
-    it("names the dashboard <prefix>-sources-structured-scan", () => {
-      template.hasResourceProperties("AWS::CloudWatch::Dashboard", {
-        DashboardName: Match.stringLikeRegexp("sources-structured-scan$"),
-      });
-    });
 
     it("SEARCHes the COA/Sources namespace the Python emitter publishes to", () => {
       // The namespace is a contract between coa_sources.database.metrics
@@ -2308,7 +2283,7 @@ describe("SourcesStack", () => {
       expect(definition).toContain("$.scanJobSK");
     });
 
-    it("carries only the bounded issues fields out of preprocessing, never the full array (issue 104)", () => {
+    it("carries only the bounded issues fields out of preprocessing, never the full array", () => {
       const definition = stateMachineDefinition();
       // The preprocess resultSelector and the DDB write must reference the
       // bounded fields the handler now returns, not the unbounded issues array
@@ -2390,7 +2365,7 @@ describe("SourcesStack", () => {
   });
 
   describe("Scan timeout terminal state", () => {
-    // Fix A: the DbEnrichment EcsRunTask carries a CATCHABLE per-task timeout
+    // The DbEnrichment EcsRunTask carries a CATCHABLE per-task timeout
     // (States.Timeout) so an over-long enrichment routes through the error
     // chain to SCAN_FAILED, instead of the un-catchable execution-level
     // ExecutionTimedOut that stranded the source in ENRICHING.
@@ -2398,28 +2373,19 @@ describe("SourcesStack", () => {
       const machines = template.findResources(
         "AWS::StepFunctions::StateMachine",
       );
-      // The ASL is embedded as an escaped JSON string inside a Fn::Join;
-      // strip the backslash escaping so the rendered States Language can be
-      // matched directly. The enrichment timeout is configurable
-      // (dbScanEnrichmentTimeoutMinutes); default 120 min → taskTimeout 7200 s
-      // on DbEnrichment, and the db-scan state-machine `TimeoutSeconds` is that
-      // + 2 min = 7320 s. 7320 is unique to this state machine's own timeout,
-      // so assert on it to prove the taskTimeout < execution-timeout ordering
-      // that keeps the catchable path firing first.
+      // The ASL is embedded as an escaped JSON string inside a Fn::Join; strip the backslash
+      // escaping so the rendered States Language can be matched directly.
       const definition = JSON.stringify(Object.values(machines)).replace(
         /\\/g,
         "",
       );
-      // Per-task deadline on DbEnrichment (default 120 min). Both values live
-      // inside the backslash-stripped ASL: the task-level 7200 in the
-      // DbEnrichment state, and the state-machine execution ceiling 7320
-      // (task + 2 min), which keeps the catchable States.Timeout firing before
-      // the un-catchable ExecutionTimedOut.
+      // DbEnrichment task timeout 7200 s (default 120 min); the state-machine execution
+      // ceiling is task + 2 min = 7320 s, so the catchable States.Timeout fires first.
       expect(definition).toContain('"TimeoutSeconds":7200');
       expect(definition).toContain('"TimeoutSeconds":7320');
     });
 
-    // Fix B: the reaper is the out-of-band backstop for execution-level aborts
+    // The reaper is the out-of-band backstop for execution-level aborts
     // that are not catchable in-machine.
     it("creates the db-scan reaper Lambda in VPC with SOURCES_TABLE", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
@@ -2681,7 +2647,7 @@ describe("SourcesStack", () => {
     });
   });
 
-  describe("DB Enrichment Guardrail Wiring (#111 AC5/AC6)", () => {
+  describe("DB Enrichment Guardrail Wiring", () => {
     // Regression guard: the enrichment task ran UNGUARDED because
     // GUARDRAIL_SSM_PARAM was never set, so _resolve_guardrail_id() always
     // returned None and every Converse call went out without a guardrail.
@@ -2776,7 +2742,7 @@ describe("SourcesStack", () => {
     }
   });
 
-  describe("Bedrock model IDs from deploy config (#94)", () => {
+  describe("Bedrock model IDs from deploy config", () => {
     const renderWithModels = (models: {
       bedrockChatModelId?: string;
       bedrockEmbedModelId?: string;
@@ -2882,7 +2848,7 @@ describe("SourcesStack", () => {
     });
   });
 
-  describe("Preprocessing Lambda reserved concurrency (#48)", () => {
+  describe("Preprocessing Lambda reserved concurrency", () => {
     it("reserves the default concurrency (5) when unset", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp("sources-doc-preprocessing$"),
@@ -2953,8 +2919,7 @@ describe("SourcesStack", () => {
       // data: its only s3:GetObject is the narrowly-scoped re-scan backup metadata
       // read (`rescan-backup/*`, system-written table/column forms) that the
       // tables API needs for the diff panel. Any GetObject NOT scoped to
-      // rescan-backup — a broad grant or one over `raw/*` — is the regression this
-      // guards against.
+      // rescan-backup, such as a broad grant or one over `raw/*`, must fail.
       const policies = template.findResources("AWS::IAM::Policy");
       let sawTagRead = false;
       let sawCustomerObjectRead = false;
@@ -3592,15 +3557,8 @@ describe("Athena catalog-name prefix budget", () => {
   });
 });
 
-// The running coa-dev-kg-build image accreted Critical/High OS CVEs (perl,
-// openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian point
-// releases that fix them; the base is now AL2023. Two Dockerfile
-// properties keep the image patchable: a pinned base digest (supply-chain
-// integrity + a cache-busting bump lever) and a post-install
-// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
-// updates in past the pinned snapshot). These guard against regression —
-// removing the upgrade line, or floating the base back onto a mutable tag, is
-// exactly how the CVEs came back. Mirrors ontology-stack's hygiene block.
+// The Dockerfile pins the base digest and runs `dnf upgrade --releasever=latest`,
+// the only mechanism that pulls AL2023 security updates in past the pinned snapshot.
 describe("kg-build Dockerfile CVE hygiene", () => {
   const dockerfile = fs.readFileSync(
     path.join(

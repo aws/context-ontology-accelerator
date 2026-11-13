@@ -2,11 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * ColumnDenylistEditor — structured editor for a per-table column denylist.
- *
- * Replaces the free-form `table: col1, col2` textarea with a Cloudscape
- * `AttributeEditor`: one row per table, where the table name is a plain text
- * field and the denied columns are edited with {@link TokenInput} chips.
+ * Structured editor for a per-table column denylist.
  *
  * The editor operates on an array of {@link ColumnDenylistRow} so that empty
  * or in-progress rows are preserved while editing. Convert to/from the wire

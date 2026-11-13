@@ -3,8 +3,8 @@
 
 """Lexical-KG retrieval via graphrag-toolkit. No ontology consulted.
 
-Adapter that instantiates a graphrag-toolkit LexicalGraphQueryEngine
-configured for traversal-based search and exposes a method shaped like
+Adapter that builds a graphrag-toolkit LexicalGraphQueryEngine for the
+selected strategy and exposes a method shaped like
 the rest of tier3/. Does NOT subclass any toolkit class.
 
 The published ontology graph (urn:coa:{namespace}:published) is not
@@ -48,19 +48,15 @@ from .strategies import (
     score_preservation_installed,
 )
 
-# ---------------------------------------------------------------------------
 # WORKAROUND: graphrag-toolkit v3.18.3 hardcodes a retired Bedrock model
 # (us.anthropic.claude-3-7-sonnet-20250219-v1:0) as the default for both
-# extraction and response LLMs. Additionally, GraphRAGConfig.response_llm
-# setter does not propagate to keyword_vss_provider (GitHub issue filed).
-#
-# Patching the module-level constants is the only reliable workaround.
+# extraction and response LLMs, and the GraphRAGConfig.response_llm setter does
+# not propagate to keyword_vss_provider, so patch the module-level constants.
 # TODO: Remove once graphrag-toolkit publishes a fix with active model defaults.
 #
 # Model resolution: GRAPHRAG_LLM_MODEL (explicit override), then BEDROCK_MODEL_ID
 # (serve-stack always sets it from bedrockLlmModelId, which synth validates for
 # the deploy region), then the US default. ``or`` so an empty value falls through.
-# ---------------------------------------------------------------------------
 _ACTIVE_MODEL = (
     os.environ.get("GRAPHRAG_LLM_MODEL") or os.environ.get("BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
 )
@@ -77,7 +73,7 @@ logger = structlog.get_logger(__name__)
 _LEXICAL_MAX_WORKERS = int(os.environ.get("LEXICAL_MAX_WORKERS", "4"))
 
 # Default values used when the toolkit node metadata does not carry the
-# expected fields. Kept as module constants so mapping fallbacks are explicit.
+# expected fields.
 _DEFAULT_ENTITY_TYPE = "lexical_entity"
 
 # Vector indexes serve OPENS for retrieval. MUST mirror kg-build's EMBEDDING_INDEXES
@@ -86,13 +82,8 @@ _DEFAULT_ENTITY_TYPE = "lexical_entity"
 # CREATE one, and on AOSS NEXTGEN that create is rejected with
 # ``illegal_argument_exception: Field parameter 'engine' is not supported`` (the
 # incompatibility kg-build monkey-patches, which serve does not). The exception is
-# logged and swallowed, leaving a broken index handle behind.
-#
-# Naming ``statement`` here (the toolkit default, alongside ``chunk``) did exactly
-# that on a chunk,topic graph, and the resulting failure surfaced as TopicBeamSearch
-# returning 1 node with confidence 0.0 and "No relevant context" — a symptom that
-# points nowhere near the real cause. ``topic`` must still be named explicitly or
-# TopicBeamSearch gets a DummyVectorIndex.
+# logged and swallowed, leaving a broken index handle behind. ``topic`` must still
+# be named explicitly or TopicBeamSearch gets a DummyVectorIndex.
 #
 # Env-overridable so a graph built with a different EMBEDDING_INDEXES set can be
 # read without a deploy; keep the two in lockstep.
@@ -100,24 +91,16 @@ _READ_EMBEDDING_INDEXES = [
     name.strip() for name in os.environ.get("READ_EMBEDDING_INDEXES", "chunk,topic").split(",") if name.strip()
 ]
 
-# ---------------------------------------------------------------------------
-# Tenant override seam (eval-only).
+# Tenant override seam (eval-only). In production the retriever derives
+# ``tenant_id = to_graphrag_tenant_id(namespace)``; ``tenant_id_override=None``
+# (the default) keeps that.
 #
-# Production multi-tenancy contract (design Property 3 / BUG 6): the retriever
-# derives ``tenant_id = to_graphrag_tenant_id(namespace)`` and passes it to the
-# toolkit factory. ``tenant_id_override=None`` (the default) preserves exactly
-# that behavior.
-#
-# ``DEFAULT_TENANT_OVERRIDE`` is a sentinel — distinct from ``None`` — that
-# means "ignore the namespace and read under the graphrag-toolkit *default*
-# tenant" (``tenant_id=None`` → the factory's ``to_tenant_id(None)`` →
-# ``DEFAULT_TENANT_ID`` → bare ``__Chunk__`` labels / bare ``chunk`` index).
-# Its value is intentionally NOT a valid graphrag TenantId (which is 1–25
+# ``DEFAULT_TENANT_OVERRIDE`` is a sentinel — distinct from ``None`` — meaning
+# "read under the graphrag-toolkit *default* tenant" (bare ``__Chunk__`` labels /
+# bare ``chunk`` index). Its value is NOT a valid graphrag TenantId (1–25
 # lowercase alphanumerics/periods), so it can never collide with a real
-# namespace-derived tenant. The seam is general (an explicit literal tenant
-# string is also accepted), but the only in-tree use is the eval/integ harness
-# reading the toolkit-built default-tenant SEC-10Q graph (task 12); it is NOT
-# wired into ``build_lexical_retriever`` or the request path.
+# namespace-derived tenant. Only the eval/integ harness uses it; it is NOT wired
+# into ``build_lexical_retriever`` or the request path.
 DEFAULT_TENANT_OVERRIDE = "__graphrag_default_tenant__"
 
 # One-time guard so an unexpected toolkit metadata shape logs a single warning
@@ -126,12 +109,7 @@ _shape_mismatch_warned = False
 
 
 def _warn_shape_mismatch_once(**details) -> None:
-    """Emit a single ``logger.warning`` for an unexpected toolkit node shape.
-
-    The first call logs; subsequent calls are no-ops for the lifetime of the
-    process. This keeps a genuine shape regression visible without flooding
-    logs when every node in every request shares the same unexpected shape.
-    """
+    """Emit a single ``logger.warning`` for an unexpected toolkit node shape."""
     global _shape_mismatch_warned
     if not _shape_mismatch_warned:
         _shape_mismatch_warned = True
@@ -441,24 +419,13 @@ class BaselineLexicalRetriever:
         self._post_processors = post_processors
         self._timeout_s = timeout_s
         # Eval-only tenant override seam (see DEFAULT_TENANT_OVERRIDE).
-        #   None                     -> derive tenant from namespace (production default).
-        #   DEFAULT_TENANT_OVERRIDE  -> read under the toolkit default tenant (tenant_id=None).
-        #   any other string         -> read under that literal tenant.
-        # NOT wired into build_lexical_retriever / the request path; constructed
-        # directly only by the eval/integ harness (task 12).
         self._tenant_id_override = tenant_id_override
-        # Cache of query engines keyed by (effective_tenant, strategy.name) so a
-        # per-request strategy override does not collide with the cache, and so an
-        # override engine never collides with a namespace-derived engine. The
-        # effective tenant is the override (or ``None`` for the toolkit default
-        # tenant) when one is set, otherwise the namespace-derived tenant_id.
+        # Engines keyed by (effective_tenant, strategy.name), so neither a
+        # per-request strategy nor a tenant override collides with another engine.
         self._engines: dict[tuple[str | None, str], object] = {}
         # Strategy names whose engine could NOT be patched for score preservation.
-        # Membership is a property of the installed toolkit build and the strategy,
-        # not of a tenant, so recording it per strategy name is sufficient. Every
-        # retrieval on such a strategy returns 0.0 relevance for every chunk, which
-        # is indistinguishable from genuinely irrelevant results — so the retrieval
-        # step is marked degraded rather than reported as a clean success.
+        # Their zero scores are indistinguishable from irrelevance, so retrieval on
+        # them is marked degraded.
         self._unranked_strategies: set[str] = set()
 
         # Dedicated bounded executor for synchronous toolkit retrieval. Owning a
@@ -493,29 +460,15 @@ class BaselineLexicalRetriever:
         )
 
     def _get_engine(self, namespace: str, strategy: StrategySpec):
-        """Get or create a query engine, cached per (effective_tenant, strategy.name).
-
-        By default (``tenant_id_override is None``) the effective tenant is
-        ``to_graphrag_tenant_id(namespace)`` — the production multi-tenancy
-        contract (design Property 3 / BUG 6), unchanged. When the eval-only
-        override is set, the namespace derivation is bypassed:
-
-          * ``DEFAULT_TENANT_OVERRIDE`` → ``tenant_id=None`` so the toolkit
-            factory reads under its default tenant (bare ``__Chunk__`` labels /
-            bare ``chunk`` index).
-          * any other override string → that literal tenant is read.
-        """
+        """Get or create a query engine, cached per (effective_tenant, strategy.name)."""
         from coa_common.constants import to_graphrag_tenant_id
 
         override_used = self._tenant_id_override is not None
         if not override_used:
-            # Production default: derive the tenant from the namespace.
             tenant_id: str | None = to_graphrag_tenant_id(namespace)
         elif self._tenant_id_override == DEFAULT_TENANT_OVERRIDE:
-            # Toolkit default tenant: pass tenant_id=None to the factory.
             tenant_id = None
         else:
-            # Explicit literal tenant to read.
             tenant_id = self._tenant_id_override
 
         key = (tenant_id, strategy.name)
@@ -534,20 +487,12 @@ class BaselineLexicalRetriever:
         # Opt-in LLM cost accounting reads GraphRAG's keyword-LLM usage below its cache.
         patch_llm_usage_accounting()
         # A question in one script must not lose the statements written in another
-        # because a few same-script statements share a word with it (#1263).
+        # because a few same-script statements share a word with it.
         patch_cross_script_statement_prune()
 
         graph_store = GraphStoreFactory.for_graph_store(self._graph_store_uri)
-        # Open the topic index too, not just the toolkit default ['chunk','statement'].
-        # TopicBeamSearch (TopicGraphRAG) seeds from ``get_index('topic')``; without
-        # ``topic`` in index_names the factory hands back a DummyVectorIndex and the
-        # retriever dies with "'DummyVectorIndex' object has no attribute
-        # 'embed_model'" — observed live on a namespace whose topic index exists with
-        # 5,681 vectors. This is the READ-side counterpart of the kg-build change that
-        # started WRITING the topic index (EMBEDDING_INDEXES); the write side alone is
-        # useless if serve never opens the index. Naming an extra index is NOT harmless
-        # though — see _READ_EMBEDDING_INDEXES: a name the graph lacks triggers a create
-        # that AOSS NEXTGEN rejects. Keep this list mirroring kg-build's.
+        # Open the topic index too, or TopicBeamSearch gets a DummyVectorIndex; see
+        # _READ_EMBEDDING_INDEXES.
         vector_store = VectorStoreFactory.for_vector_store(self._vector_store_uri, index_names=_READ_EMBEDDING_INDEXES)
 
         if self._retrievers is not None or self._post_processors is not None:
@@ -586,20 +531,13 @@ class BaselineLexicalRetriever:
     # client hardcodes ``total_max_attempts=1`` (no retry) and does NOT let us
     # override ``retries`` via config (``create_config`` passes it as an explicit
     # Config kwarg, so an override raises "multiple values for keyword 'retries'").
-    # Neptune reaps idle/stale pooled connections even when near-idle, so a reused
-    # connection can drop mid-request and surface as a GraphQueryError. Two distinct
-    # transient signatures are observed on the deployed serve runtime, both from a
-    # dropped pooled connection on an idempotent read (safe to retry):
+    # A reaped pooled connection on an idempotent read surfaces as a GraphQueryError
+    # with one of two messages (matched by substring, since the toolkit wraps every
+    # backend failure in GraphQueryError):
     #   * "Connection was closed before we received a valid response" (ConnectionClosedError)
     #   * "SSL: UNEXPECTED_EOF_WHILE_READING" (the TLS socket closed mid-read)
-    # ``chunk_based_semantic`` is the most exposed strategy because it fans out the
-    # most concurrent Neptune queries (cosine seeds x threaded per-chunk statement
-    # expansion + beam), so a single dropped connection there previously zeroed the
-    # whole retriever. We match on the message substring rather than the exception
-    # type because the toolkit wraps every backend failure in a generic
-    # GraphQueryError. ``unexpected_eof_while_reading`` is matched specifically (not
-    # the generic "ssl validation failed") so a genuine, persistent cert
-    # misconfiguration is NOT silently retried.
+    # The generic "ssl validation failed" is NOT matched, so a persistent cert
+    # misconfiguration is not silently retried.
     _RETRIABLE_QUERY_ERROR_MARKERS = (
         "connection was closed",
         "connectionclosederror",
@@ -776,18 +714,9 @@ class BaselineLexicalRetriever:
     def _map_results_with_diagnostics(nodes: list) -> tuple[list[ChunkResult], list[GraphEntity], int]:
         """Map graphrag-toolkit ``NodeWithScore`` results to Tier 3 data model.
 
-        Defensive against the real toolkit metadata shapes (see
-        ``bedrock_context_format.py`` / ``traversal_based_base_retriever.py``):
-        ``source_doc`` is read from the nested ``Source`` (``metadata["source"]
-        ["sourceId"]`` or ``metadata["result"]["source"]["sourceId"]``) and
-        entities from the toolkit ``EntityContexts`` structure under
-        ``metadata["entity_contexts"]``. All access uses ``.get``/``isinstance``
-        with empty fallbacks, and a single ``logger.warning`` is emitted on a
-        shape mismatch (a node that has metadata but yields neither a
-        ``source_doc`` nor any entities) instead of crashing. Source-less text
-        attached to real graph entities is retained in their
-        ``supportingStatements`` property; all other anonymous/malformed text is
-        dropped and counted for retrieval tracing.
+        Logs a single warning on an unexpected shape instead of crashing. Source-less
+        text attached to real graph entities is kept in their ``supportingStatements``
+        property; all other anonymous text is dropped and counted for tracing.
         """
         chunks: list[ChunkResult] = []
         chunks_seen: set[tuple[str, str]] = set()

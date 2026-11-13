@@ -13,7 +13,6 @@ import {
 } from "aws-cdk-lib/aws-cloudwatch";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ecs from "aws-cdk-lib/aws-ecs";
-import * as elbv2 from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as stepfunctions from "aws-cdk-lib/aws-stepfunctions";
@@ -24,19 +23,18 @@ import {
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
 import { Construct } from "constructs";
 
-/** Config for a per-stack OE monitoring facade. */
+/** Config for a per-stack monitoring facade. */
 export interface SclMonitoringProps {
   /** Alarm name prefix, typically the stack's this.prefixed("..."). */
   readonly alarmNamePrefix: string;
   /**
-   * Optional alarm action strategy. Defaults to undefined: alarms are
-   * action-ready (actionsEnabled) but route nowhere until a strategy is
-   * plugged in at the app.ts seam. This is intentional for round one.
+   * Optional alarm action strategy. Defaults to undefined: alarms are action-ready
+   * (actionsEnabled) but route nowhere until a strategy is passed.
    */
   readonly alarmAction?: IAlarmActionStrategy;
 }
 
-// ── OE alarm-threshold conventions (one source of truth) ────────────────
+// ── Alarm-threshold conventions (one source of truth) ────────────────
 const LAMBDA_MAX_FAULTS = 1;
 const LAMBDA_MAX_THROTTLES = 1;
 const API_P99_LATENCY = Duration.seconds(5);
@@ -47,7 +45,6 @@ const TABLE_MAX_THROTTLED = 1;
 const TABLE_MAX_SYSTEM_ERRORS = 1;
 const ECS_MAX_CPU_PERCENT = 90;
 const ECS_MAX_MEM_PERCENT = 90;
-const ALB_MAX_5XX = 1;
 
 /**
  * Builder-style wrapper around a cdk-monitoring-constructs MonitoringFacade.
@@ -103,13 +100,8 @@ export class SclMonitoring extends Construct {
   monitorApi(api: apigateway.IRestApi): this {
     this.facade.monitorApiGateway({
       api,
-      // Pin the alarm-friendly name. Left unset, cdk-monitoring-constructs
-      // derives it from the RestApi name, which is an unresolved CDK token, so
-      // the alarm construct IDs came out as
-      // `...scldevapiscldevapiTokenTOKEN2572FaultCountWarning`. The token
-      // *counter* shifts whenever anything earlier in the app allocates a
-      // different number of tokens, which silently replaced these two alarms on
-      // unrelated changes. A literal makes the logical IDs deterministic.
+      // Pin the alarm-friendly name. The derived name is an unresolved CDK token whose
+      // counter shifts with unrelated changes, which silently replaced these alarms.
       // Only one API is monitored (api-stack.ts), so a fixed name cannot collide.
       alarmFriendlyName: "RestApi",
       addLatencyP99Alarm: {
@@ -225,43 +217,6 @@ export class SclMonitoring extends Construct {
                   comparisonOperator: ComparisonOperator.GREATER_THAN_THRESHOLD,
                   treatMissingDataOverride: TreatMissingData.NOT_BREACHING,
                   evaluationPeriods: 3,
-                },
-              },
-            },
-          ],
-        },
-      ],
-    });
-    return this;
-  }
-
-  /**
-   * Serve ALB health via always-emitted ELB metrics (5XX + unhealthy hosts).
-   * AgentCore Runtime *internal* health behind the ALB is out of round one.
-   */
-  monitorAlb(
-    loadBalancer: elbv2.IApplicationLoadBalancer,
-    friendlyName: string,
-  ): this {
-    this.facade.monitorCustom({
-      alarmFriendlyName: `${friendlyName}-alb`,
-      metricGroups: [
-        {
-          title: `${friendlyName} ALB 5XX`,
-          metrics: [
-            {
-              metric: loadBalancer.metrics.httpCodeElb(
-                elbv2.HttpCodeElb.ELB_5XX_COUNT,
-                { statistic: Stats.SUM, period: Duration.minutes(5) },
-              ),
-              alarmFriendlyName: `${friendlyName}-alb-5xx`,
-              addAlarm: {
-                Warning: {
-                  threshold: ALB_MAX_5XX,
-                  comparisonOperator: ComparisonOperator.GREATER_THAN_THRESHOLD,
-                  treatMissingDataOverride: TreatMissingData.NOT_BREACHING,
-                  evaluationPeriods: 1,
-                  datapointsToAlarm: 1,
                 },
               },
             },
