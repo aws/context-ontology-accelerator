@@ -5,7 +5,7 @@
 
 The graph routers name each vertex, search hit, overview entry and schema class
 with one label chosen from the namespace's immutable language
-(namespace-language LLD §2.2.5), the same ranking the serve readers use
+, the same ranking the serve readers use
 (:mod:`coa_common.label_language`). The language is read from the namespace item
 on the server, once per request; no request parameter can change it.
 

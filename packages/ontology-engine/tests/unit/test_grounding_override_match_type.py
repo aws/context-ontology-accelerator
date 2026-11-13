@@ -4,15 +4,8 @@
 """Grounding-override match_type must be derived from the chosen candidate's
 score, not hardcoded.
 
-Regression for the observed bug: overriding a match and then reverting to the
-original grounding left the tier stuck at ``high_confidence``. Concretely —
-``publication → Publication`` starts as an *exact* (0.95) match; the user
-overrides it to ``Product`` and then back to ``Publication``; it must return to
-``exact``, not stay ``high_confidence``. The old code hardcoded
-``m.match_type = "high_confidence"`` on every override (proposals.py), which was
-both lossy (destroyed the original tier) and wrong (asserted a tier unrelated to
-the candidate's score). Each match keeps its candidates with scores, so the tier
-is recoverable.
+Overriding a match derives its tier from the chosen candidate's score, so
+reverting to the original grounding restores ``exact``.
 """
 
 from __future__ import annotations
@@ -127,10 +120,6 @@ def _patch_store_and_pipeline(monkeypatch):
     return proposals, captured
 
 
-def _proposal_with_stale_semantics():
-    return _proposal_item()
-
-
 def _match_after_override(proposals, captured, item, override_uri):
     proposals._apply_grounding_overrides("p-ground", {"publication": override_uri}, item, namespace="ns")
     return next(m for m in captured["matches"] if m["source_table"] == "publication")
@@ -138,7 +127,7 @@ def _match_after_override(proposals, captured, item, override_uri):
 
 def test_override_to_weaker_candidate_demotes_tier(monkeypatch):
     proposals, captured = _patch_store_and_pipeline(monkeypatch)
-    pub = _match_after_override(proposals, captured, _proposal_with_stale_semantics(), _PRODUCT)
+    pub = _match_after_override(proposals, captured, _proposal_item(), _PRODUCT)
     # Product's 0.72 is embedding-only, so it uses the STANDARD ladder and is
     # ambiguous rather than being promoted by the rerank ladder. The old
     # Publication relationship/rationale must not follow the new target.
@@ -149,10 +138,9 @@ def test_override_to_weaker_candidate_demotes_tier(monkeypatch):
 
 
 def test_revert_to_original_exact_restores_exact(monkeypatch):
-    """The bug: this used to stay 'high_confidence'. Reverting to Publication
-    (fused 0.95) must restore 'exact'."""
+    """Reverting to Publication (fused 0.95) must restore 'exact'."""
     proposals, captured = _patch_store_and_pipeline(monkeypatch)
-    pub = _match_after_override(proposals, captured, _proposal_with_stale_semantics(), _PUBLICATION)
+    pub = _match_after_override(proposals, captured, _proposal_item(), _PUBLICATION)
     assert pub["match_type"] == "exact"
     assert pub["similarity"] == 0.95
     assert pub["relationship"] is None
@@ -166,7 +154,7 @@ def test_override_to_unknown_uri_is_rejected(monkeypatch):
         _match_after_override(
             proposals,
             captured,
-            _proposal_with_stale_semantics(),
+            _proposal_item(),
             "https://parallax.aws/commercial/ontology/NotACandidate",
         )
     assert "matches" not in captured
@@ -174,7 +162,7 @@ def test_override_to_unknown_uri_is_rejected(monkeypatch):
 
 def test_clear_override_sets_novel(monkeypatch):
     proposals, captured = _patch_store_and_pipeline(monkeypatch)
-    pub = _match_after_override(proposals, captured, _proposal_with_stale_semantics(), None)
+    pub = _match_after_override(proposals, captured, _proposal_item(), None)
     assert pub["match_type"] == "novel"
     assert pub["matched_class_uri"] is None
     assert pub["matched_ontology_id"] is None

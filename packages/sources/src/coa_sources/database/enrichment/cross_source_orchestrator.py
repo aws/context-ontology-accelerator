@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Namespace-scoped orchestration for cross-source relationship detection (#1088).
+"""Namespace-scoped orchestration for cross-source relationship detection.
 
 The detection algorithm (``cross_source_relationship_inferrer``) is pure. This
 module is what actually RUNS it in a namespace: it enumerates the namespace's
@@ -210,14 +210,7 @@ def run_for_namespace(
     Reads via the DataZone metadata store and writes back via the enrichment
     write path (same asset-revision mechanism Pass 1 uses).
 
-    Serialised per namespace by a conditional-write lock so two sources finishing
-    enrichment at the same time cannot run the pass concurrently and write the
-    same child tables (a lost-update race on the shared asset). A pass that does
-    not win the lock skips — the holder already covers the current settled state.
-    The pass only ever reads/writes sources in ``_ENRICHED_STATUSES``, so it never
-    touches a source that is still mid-enrichment; the only contention it must
-    guard is pass-vs-pass, which this lock removes. The lock is stale-TTL'd so a
-    crashed holder cannot wedge detection permanently.
+    Serialised per namespace by the ``_LOCK_SK`` lock; a pass that does not win it skips.
     """
     lock_dao = dao or DynamoDBDAO(sources_table, region=region)
     if not _acquire_namespace_lock(lock_dao, namespace_id):

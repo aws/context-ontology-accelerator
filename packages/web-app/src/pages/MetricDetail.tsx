@@ -49,7 +49,6 @@ export const MetricDetail: React.FC = () => {
     { text: metricName ?? "" },
   ]);
 
-  // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");
 
   const [deleteModalVisible, setDeleteModalVisible] = useState(false);
@@ -104,7 +103,6 @@ export const MetricDetail: React.FC = () => {
 
   return (
     <SpaceBetween size="l">
-      {/* Overview */}
       <Container
         header={
           <Header
@@ -169,7 +167,6 @@ export const MetricDetail: React.FC = () => {
         </ColumnLayout>
       </Container>
 
-      {/* Source */}
       <Container header={<Header variant="h2">{t("Source")}</Header>}>
         <SpaceBetween size="m">
           {definitionWithheld && withheldNotice}
@@ -195,7 +192,6 @@ export const MetricDetail: React.FC = () => {
         </SpaceBetween>
       </Container>
 
-      {/* Expressions */}
       <Container header={<Header variant="h2">{t("Expressions")}</Header>}>
         {definitionWithheld ? (
           withheldNotice
@@ -229,7 +225,6 @@ export const MetricDetail: React.FC = () => {
         )}
       </Container>
 
-      {/* AI Context */}
       {metric.aiContext && (
         <Container header={<Header variant="h2">{t("AI Context")}</Header>}>
           <SpaceBetween size="m">
@@ -267,7 +262,6 @@ export const MetricDetail: React.FC = () => {
         </Container>
       )}
 
-      {/* Ontology Links */}
       <Container header={<Header variant="h2">{t("Ontology Links")}</Header>}>
         {metric.ontologyConcepts && metric.ontologyConcepts.length > 0 ? (
           <SpaceBetween direction="horizontal" size="xs">
@@ -284,7 +278,6 @@ export const MetricDetail: React.FC = () => {
         )}
       </Container>
 
-      {/* Delete Modal */}
       <Modal
         visible={deleteModalVisible}
         onDismiss={() => {

@@ -26,11 +26,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
     """
 
     def __init__(self, namespace: str | None = None):
-        """Bind the store to a namespace threaded through every call.
-
-        Args:
-            namespace: Namespace to scope all vertices, edges, and queries to.
-        """
+        """Bind the store to a namespace threaded through every call."""
         self._namespace = namespace
 
     # Ontology CRUD ----------------------------------------------------
@@ -55,20 +51,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         license_tier=None,
         limit=None,
     ):
-        """List ontologies in the bound namespace, optionally filtered.
-
-        Args:
-            ontology_type: Restrict to a single ontology type when provided.
-            uri: Restrict to a specific ontology URI when provided.
-            source_registry: Restrict to ontologies from a source registry.
-            domain_tags: Domain tag filter; only the first is used (NA accepts
-                a single tag), a list or scalar is accepted.
-            license_tier: Restrict to a license tier when provided.
-            limit: Maximum number of ontologies to return (defaults to 50).
-
-        Returns:
-            List of matching ontology dicts.
-        """
+        """List ontologies in the bound namespace, optionally filtered."""
         # na_store.list_ontologies accepts a single domain_tag; pick the first
         # if a list is passed. (The Neptune-DB graph store accepts a list too,
         # which is why the Protocol uses the plural form.)
@@ -105,24 +88,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         query_backend=None,
         data_source_id=None,
     ):
-        """Persist a class into the ontology's graph in the bound namespace.
-
-        Args:
-            ontology_uri: URI of the owning ontology.
-            class_uri: URI of the class to store.
-            labels: Human-readable labels for the class.
-            comments: Definitions/comments for the class.
-            super_classes: Parent class URIs (``rdfs:subClassOf`` targets).
-            is_mapped: Tier-2 R2RML-answerability marker; accepted for protocol
-                parity but not persisted on this backend (see the note below).
-            query_backend: Graph-backend marker; accepted for protocol parity and,
-                like ``is_mapped``, not persisted on this backend yet.
-            data_source_id: Graph source binding; accepted for protocol parity and
-                not persisted on this backend yet.
-
-        Returns:
-            The stored class as a dict.
-        """
+        """Persist a class into the ontology's graph in the bound namespace."""
         # NOTE: ``is_mapped`` (the Tier-2 R2RML-answerability marker) is accepted
         # to keep the GraphStore protocol consistent with the NDB backend, but is
         # intentionally NOT persisted here yet. NA uses a property-graph model
@@ -157,19 +123,7 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         domains=None,
         ranges=None,
     ):
-        """Persist a property into the ontology's graph in the bound namespace.
-
-        Args:
-            ontology_uri: URI of the owning ontology.
-            prop_uri: URI of the property to store.
-            label: Human-readable label for the property.
-            comment: Definition/comment for the property.
-            domains: Domain class URIs for the property.
-            ranges: Range URIs (class IRIs for object properties, datatypes otherwise).
-
-        Returns:
-            The stored property as a dict.
-        """
+        """Persist a property into the ontology's graph in the bound namespace."""
         return na_store.store_property(
             ontology_uri,
             prop_uri,
@@ -294,13 +248,6 @@ class NeptuneAnalyticsGraphStore(GraphStore):
         class_prefix: str | None = None,
     ) -> dict:
         """Raise — Neptune Analytics has no bulk namespace schema query.
-
-        Args:
-            namespace: Namespace whose schema was requested.
-            max_results: Unused; kept for protocol parity.
-            include_properties: Unused; kept for protocol parity.
-            label_preference: Unused; kept for protocol parity.
-            class_prefix: Unused; kept for protocol parity.
 
         Raises:
             NotImplementedError: Always, on this backend.

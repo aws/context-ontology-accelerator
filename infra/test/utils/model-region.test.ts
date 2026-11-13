@@ -74,7 +74,7 @@ describe("regionGeographies", () => {
 });
 
 describe("modelIdRegionConflict", () => {
-  // The #1020 report: every default is a us. profile, deployed to Tokyo.
+  // Every default is a us. profile, deployed to Tokyo.
   it.each([
     DEFAULT_BEDROCK_LLM_MODEL_ID,
     DEFAULT_BEDROCK_MODEL_ID,
@@ -87,7 +87,7 @@ describe("modelIdRegionConflict", () => {
   });
 
   it.each([
-    // The verified Tokyo workaround from #1020, plus the docs' example config.
+    // The verified Tokyo workaround plus the docs' example config.
     ["global.anthropic.claude-sonnet-5", "ap-northeast-1"],
     ["global.cohere.embed-v4:0", "ap-northeast-1"],
     ["jp.anthropic.claude-haiku-4-5-20251001-v1:0", "ap-northeast-1"],
@@ -266,7 +266,7 @@ describe("assertModelIdsInvocableFromRegion", () => {
     expect(message).toContain("the bare in-region model id");
   });
 
-  it("passes the verified Tokyo configuration from #1020", () => {
+  it("passes the verified Tokyo configuration", () => {
     expect(() =>
       assertModelIdsInvocableFromRegion(
         resolveConfiguredModelIds({

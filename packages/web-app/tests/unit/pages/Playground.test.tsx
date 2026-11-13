@@ -26,21 +26,6 @@ vi.mock("../../../src/components/NamespaceProvider", () => ({
   }),
 }));
 
-vi.mock("../../../src/api-hooks", () => ({
-  usePlaygroundChatSSE: () => ({
-    state: { messages: [] },
-    sessionId: null,
-    isRestoring: false,
-    isStreaming: false,
-    sendQuery: vi.fn(),
-    newChat: vi.fn(),
-    retryQuery: vi.fn(),
-    hasMoreHistory: false,
-    isLoadingOlderHistory: false,
-    requestOlderHistory: vi.fn(),
-  }),
-}));
-
 vi.mock("../../../src/api-hooks/use-playground-chat-sse", () => ({
   usePlaygroundChatSSE: () => ({
     state: { messages: [] },
@@ -71,7 +56,6 @@ vi.mock("../../../src/components/ToolsPanelProvider", () => ({
     unregisterDrawer: vi.fn(),
     openDrawer: vi.fn(),
     closeDrawer: vi.fn(),
-    toggleDrawer: vi.fn(),
   }),
 }));
 
@@ -88,9 +72,7 @@ function renderPlayground() {
 describe("Playground", () => {
   it("renders the playground header", () => {
     renderPlayground();
-    expect(
-      screen.getByText("Playground"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Playground")).toBeInTheDocument();
   });
 
   it("renders the chat container with empty state", () => {

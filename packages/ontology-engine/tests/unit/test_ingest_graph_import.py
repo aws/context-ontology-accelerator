@@ -109,9 +109,6 @@ def _specs(graph_store) -> dict:
     }
 
 
-# ── Resolver ────────────────────────────────────────────────────────────
-
-
 class TestResolveGraphSources:
     @pytest.fixture(autouse=True)
     def _env(self, monkeypatch):
@@ -206,9 +203,6 @@ class TestResolveGraphSources:
         with patch(f"{_RESOLVER}.boto3.resource") as resource:
             assert resolve_graph_sources([], "ns-test") == {}
         resource.assert_not_called()
-
-
-# ── Ingest ──────────────────────────────────────────────────────────────
 
 
 @pytest.mark.usefixtures("graph_sources_on")
@@ -331,13 +325,7 @@ ex:C a owl:Class ; coa_import:dataSourceName "gone" .
 
     def test_class_mapped_by_r2rml_and_a_graph_source_is_rejected(self):
         ttl = _PREFIXES + 'ex:Order a owl:Class ; coa_import:dataSourceName "my-neptune" .\n'
-        r2rml = """
-@prefix rr: <http://www.w3.org/ns/r2rml#> .
-@prefix coa: <http://coa.amazon.com/vocab/coa#> .
-<urn:tm:order> a rr:TriplesMap ; coa:datasourceId "ds-sql" ;
-    rr:subjectMap [ rr:class <http://example.org/o#Order> ] .
-"""
-        (finding,) = self._rejected(ttl, r2rml=r2rml).findings
+        (finding,) = self._rejected(ttl, r2rml=_ORDER_R2RML).findings
         assert finding.code == "graph_source_conflicts_r2rml"
         assert finding.subject == _ORDER
 

@@ -10,9 +10,7 @@ import { useAppI18n } from "../../i18n/LocaleProvider";
 /**
  * The warning shown inside every ontology delete-confirm modal.
  *
- * Single home for both halves of the copy. The header used to come from
- * `deleteOntologyCopy` while each page hand-wrote its own body, so the two
- * descriptions of the same destructive action could drift apart.
+ * Single home for the delete-warning header and body.
  */
 export function OntologyDeleteWarning({
   ontologyType,

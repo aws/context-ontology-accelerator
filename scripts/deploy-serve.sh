@@ -100,9 +100,7 @@ echo ""
 echo "--- Deploying CDK stack ---"
 
 CONTEXT=(--context "env=${ENV}" --context "context_manager_image_uri=${IMAGE_FULL}")
-# Same SCL_* settings as deploy.sh, so the serve stack synthesizes the way it was
-# created. Set the variables you used for `make deploy-dev`: CDK context is not
-# persisted, and any one left unset goes back to its default.
+# Same SCL_* settings as deploy.sh, so the serve stack synthesizes the way it was created.
 # shellcheck source=lib/cdk-context.sh source-path=SCRIPTDIR
 source "${REPO_ROOT}/scripts/lib/cdk-context.sh"
 # serve-stack reads the peering CIDRs too (cross-VPC JDBC egress on its security
@@ -124,20 +122,8 @@ pnpm --filter coa-infra exec cdk deploy "${PREFIX}-${ENV}-serve" \
   ${APPROVAL}
 
 # ── Post-deploy check ────────────────────────────────────────────────────────
-#
-# This deliberately does NOT invoke the runtime. The runtime is created with
-# `RuntimeAuthorizerConfiguration.usingJWT(...)` (serve-stack.ts), so it accepts
-# only a bearer ID token from the configured IdP — a SigV4
-# `aws bedrock-agentcore invoke-agent-runtime` is rejected no matter how long the
-# runtime has been warm. The previous version of this block appeared to invoke the
-# runtime but read a CFN output that does not exist (`AgentRuntimeEndpointName`,
-# while the stack exports AgentRuntimeArn / Id / Name), so the qualifier was always
-# empty and every failure was redirected to /dev/null — it "passed" while verifying
-# nothing.
-#
-# Rather than fake an invocation, assert what can actually be checked without a
-# user token: the runtime exists and reached a READY state. An end-to-end query
-# needs an ID token and belongs in the integ suite (`make test-integ`), not here.
+# The runtime uses a JWT authorizer (serve-stack.ts), so a SigV4 invoke is rejected.
+# Assert only that the runtime exists and is READY; end-to-end queries live in `make test-integ`.
 
 echo ""
 echo "--- Post-deploy check ---"
@@ -182,20 +168,15 @@ echo ""
 echo "=== Serve Layer Deployment Complete ==="
 echo "  Stack:    ${PREFIX}-${ENV}-serve"
 echo "  Image:    ${IMAGE_FULL}"
-if [ -n "${RUNTIME_ARN}" ] && [ "${RUNTIME_ARN}" != "None" ]; then
-  echo "  Runtime:  ${RUNTIME_ARN}"
-  echo ""
-  # The runtime authorizes with JWT (serve-stack.ts), so it needs a bearer ID
-  # token from the configured IdP — a SigV4 `aws bedrock-agentcore
-  # invoke-agent-runtime` is rejected. The previous version of this block
-  # printed exactly that command, which cannot work.
-  echo "Invoke with a bearer ID token from the app's IdP:"
-  echo "  curl -X POST \\"
-  echo "    'https://bedrock-agentcore.${REGION}.amazonaws.com/runtimes/${RUNTIME_ID}/invocations?qualifier=DEFAULT' \\"
-  echo "    -H \"Authorization: Bearer \${ID_TOKEN}\" \\"
-  echo "    -H 'Content-Type: application/json' \\"
-  echo "    -d '{\"query\":\"...\",\"namespace\":\"...\"}'"
-  echo ""
-  echo "Or run the integ suite, which provisions a token for you:"
-  echo "  make test-integ"
-fi
+echo "  Runtime:  ${RUNTIME_ARN}"
+echo ""
+# JWT authorizer: a bearer ID token is required.
+echo "Invoke with a bearer ID token from the app's IdP:"
+echo "  curl -X POST \\"
+echo "    'https://bedrock-agentcore.${REGION}.amazonaws.com/runtimes/${RUNTIME_ID}/invocations?qualifier=DEFAULT' \\"
+echo "    -H \"Authorization: Bearer \${ID_TOKEN}\" \\"
+echo "    -H 'Content-Type: application/json' \\"
+echo "    -d '{\"query\":\"...\",\"namespace\":\"...\"}'"
+echo ""
+echo "Or run the integ suite, which provisions a token for you:"
+echo "  make test-integ"

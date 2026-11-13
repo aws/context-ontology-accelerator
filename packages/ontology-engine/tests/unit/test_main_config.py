@@ -3,12 +3,8 @@
 
 """Unit tests for main.py's app.state.config defaults.
 
-Specifically regression-protects the URLs that are used for internal HTTP
-self-calls (e.g. the validation routine fetches ontology turtle via the
-public /ontologies/ endpoint). Pre-consolidation defaults pointed at
-Docker-Compose hostnames (`http://ontology-catalog:8000`,
-`http://embedding-generator:8000`) which produced DNS failures on every
-demo run post-MR-!39.
+The URLs used for internal HTTP self-calls (e.g. the validation routine
+fetching ontology turtle via /ontologies/) must default to localhost so they resolve.
 """
 
 import importlib
@@ -91,7 +87,7 @@ class TestConfigOverrides:
 
 
 class TestGroundingLlmModelId:
-    """GH #236: grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID), a
+    """Grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID), a
     cheap reranker, and is overridable with GROUNDING_LLM_MODEL_ID for a
     region-valid id. An empty variable falls through to the Haiku default."""
 

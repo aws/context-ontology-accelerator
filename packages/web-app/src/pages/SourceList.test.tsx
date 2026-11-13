@@ -8,10 +8,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { SourceList } from "./SourceList";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 const NS_ID = "550e8400-e29b-41d4-a716-446655440000";
 
 function makeSource(overrides: Record<string, unknown> = {}) {
@@ -45,17 +41,9 @@ vi.mock("@api-hooks", () => ({
   useListSources: () => mockUseListSources,
 }));
 
-vi.mock("@coa/control-plane-client", () => ({
-  SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
-}));
-
 vi.mock("@utils/helpers", () => ({
   formatTimestamp: (ts: unknown) => (ts ? "2026-05-01" : "—"),
 }));
-
-// ---------------------------------------------------------------------------
-// Wrapper
-// ---------------------------------------------------------------------------
 
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <QueryClientProvider client={new QueryClient()}>
@@ -67,16 +55,10 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
   </QueryClientProvider>
 );
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe("SourceList", () => {
   beforeEach(() => {
     mockUseListSources = { ...defaultMock };
   });
-
-  // ── Loading / empty states ────────────────────────────────────────────────
 
   it("renders the Sources header", () => {
     render(<SourceList />, { wrapper });
@@ -104,8 +86,6 @@ describe("SourceList", () => {
     expect(screen.getByText("Failed to load sources")).toBeInTheDocument();
   });
 
-  // ── Summary dashboard ─────────────────────────────────────────────────────
-
   it("renders summary tiles only for statuses that have items", () => {
     mockUseListSources = {
       ...defaultMock,
@@ -119,10 +99,8 @@ describe("SourceList", () => {
       },
     };
     render(<SourceList />, { wrapper });
-    // Labels use sourceStatusLabel() — lowercase "r" in "Pending review"
     expect(screen.getAllByText("Approved").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Pending review").length).toBeGreaterThan(0);
-    // SCANNING has no items — should not appear in summary
     expect(screen.queryByText("Scanning")).not.toBeInTheDocument();
   });
 
@@ -149,7 +127,6 @@ describe("SourceList", () => {
     };
     render(<SourceList />, { wrapper });
 
-    // Summary counts appear as link text in the KeyValuePairs tiles
     const countLinks = screen.getAllByText(/^\d+$/);
     const values = countLinks.map((el) => Number(el.textContent));
     expect(values).toContain(2); // APPROVED
@@ -189,8 +166,6 @@ describe("SourceList", () => {
     expect(screen.getAllByText("Scan failed").length).toBeGreaterThan(0);
   });
 
-  // ── Table rendering ───────────────────────────────────────────────────────
-
   it("renders source rows with correct columns", () => {
     mockUseListSources = {
       ...defaultMock,
@@ -210,7 +185,6 @@ describe("SourceList", () => {
     render(<SourceList />, { wrapper });
 
     expect(screen.getByText("my-glue-db")).toBeInTheDocument();
-    // Status uses sourceStatusLabel() — "Approved" not "APPROVED"
     expect(screen.getAllByText("Approved").length).toBeGreaterThan(0);
     expect(screen.getByText("Database · Glue")).toBeInTheDocument();
   });
@@ -303,8 +277,6 @@ describe("SourceList", () => {
     expect(screen.getByText("(2)")).toBeInTheDocument();
   });
 
-  // ── Filtering ─────────────────────────────────────────────────────────────
-
   it("filters items by name text", () => {
     mockUseListSources = {
       ...defaultMock,
@@ -319,7 +291,6 @@ describe("SourceList", () => {
     };
     render(<SourceList />, { wrapper });
 
-    // Placeholder is "Find sources" in the actual component
     const textFilter = screen.getByPlaceholderText("Find sources");
     fireEvent.change(textFilter, { target: { value: "postgres" } });
 
@@ -356,8 +327,6 @@ describe("SourceList", () => {
     expect(screen.queryByText("doc-source")).not.toBeInTheDocument();
   });
 
-  // ── Sorting ───────────────────────────────────────────────────────────────
-
   it("sorts by createdAt descending by default (newest first)", () => {
     mockUseListSources = {
       ...defaultMock,
@@ -380,26 +349,18 @@ describe("SourceList", () => {
     };
     render(<SourceList />, { wrapper });
 
-    // Both names should be visible; verify "newer" appears before "older" in the DOM
     const newerEl = screen.getByText("newer");
     const olderEl = screen.getByText("older");
-    expect(newerEl).toBeInTheDocument();
-    expect(olderEl).toBeInTheDocument();
-    // "newer" should come before "older" in document order
     expect(
       newerEl.compareDocumentPosition(olderEl) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
-  // ── Preferences ───────────────────────────────────────────────────────────
-
   it("renders the preferences gear icon", () => {
     render(<SourceList />, { wrapper });
     expect(screen.getByTitle("Preferences")).toBeInTheDocument();
   });
-
-  // ── Pagination ────────────────────────────────────────────────────────────
 
   it("paginates items — default page size is 20", () => {
     const items = Array.from({ length: 25 }, (_, i) =>

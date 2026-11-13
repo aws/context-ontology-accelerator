@@ -73,32 +73,21 @@ export const ApiClientProvider: React.FC<PropsWithChildren> = ({
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         const rawFallback = `API ${method} ${path} failed (${res.status}): ${text}`;
-        // Left undefined until the body supplies them, so the 403 branch below
-        // can tell "the server said nothing" from "the server said this". With
-        // both pre-seeded to a fallback its `||` defaults were unreachable, and
-        // a 403 with an empty body rendered the bare `API GET … failed (403):`
-        // string at the user instead of the authorization sentence.
+        // Undefined until the body supplies them, so the 403 default below
+        // applies when the server said nothing.
         let code: string | undefined;
         let message: string | undefined;
 
         try {
           const parsed = JSON.parse(text);
           code = parsed.code ?? code;
-          // Smithy-modeled errors carry `message`; a FastAPI `HTTPException`
-          // uses `detail` instead, and most ontology-engine 4xx responses are
-          // the latter. Reading only `message` left those falling through to
-          // the raw fallback, so a caller that surfaced `error.message` showed
-          // the user `API POST … failed (409): {"detail":"…"}` with the real
-          // sentence buried in JSON. A non-string `detail` (some routes send an
-          // object) keeps the fallback rather than rendering "[object Object]".
+          // Smithy-modeled errors carry `message`; FastAPI uses `detail`. A
+          // non-string `detail` keeps the fallback.
           const detail =
             typeof parsed.detail === "string" ? parsed.detail : undefined;
           message = parsed.message ?? detail;
-          // Some endpoints return a structured `errors` array with the
-          // specific reasons (e.g. OSI import parse errors). Fold the string
-          // entries into the message so the UI surfaces actionable detail
-          // instead of just the generic top-level message. Non-string entries
-          // are ignored so we never render "[object Object]".
+          // Fold string entries of a structured `errors` array (e.g. OSI
+          // import parse errors) into the message.
           if (Array.isArray(parsed.errors)) {
             const details = parsed.errors.filter(
               (e: unknown): e is string => typeof e === "string",

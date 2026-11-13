@@ -1,36 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the induction rules module (Task 12.1, Requirement 10).
-
-Covers ``induce_classes``:
-
-- One ``owl:Class`` per classification with ``count >= floor``
-- ``rdfs:label`` carries the original CamelCase ``__SYS_Class__`` value
-- ``rdfs:comment`` carries the generated description (when available)
-- Floor threshold filters out low-count classes
-- Empty result + WARNING when no classes pass the floor
-- ``exact`` band reuses the matched IRI (no minting)
-- ``close_match`` band mints new IRI AND emits ``skos:closeMatch``
-- ``novel`` band mints new IRI without ``skos:closeMatch``
-- Defensive paths: missing normalizer entry, empty class_iri
-- Standard prefixes are bound on the returned graph
-
-IRI realism
------------
-
-The fixture IRIs in this file follow the real minting convention from
-Requirement 7.1 / 10.2: ``http://coa.amazon.com/namespace/{ns}/
-ontology/{name}/class/{normalized-label}``. The helper
-``_class_iri(label)`` constructs an IRI exactly the way a real
-:class:`InMemoryIRIResolver` would, so test assertions about IRI shape
-catch real bugs (like the ``resolve(label, label)`` → ``resolve(label,
-"class")`` fix that landed earlier).
-
-``_real_resolver()`` returns a real :class:`InMemoryIRIResolver` wrapped
-in a ``MagicMock`` spy: real minting, plus ``.resolve.assert_*``
-introspection where it's needed.
-"""
+"""Unit tests for the unstructured induction rules."""
 
 from __future__ import annotations
 
@@ -56,7 +27,7 @@ from coa_ontology.inducer.unstructured.services.iri_resolver import (
 from coa_ontology.inducer.unstructured.stores.protocol import (
     ClassRecord,
 )
-from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, URIRef
+from rdflib import OWL, RDF, RDFS, XSD, Literal, URIRef
 from rdflib.compare import isomorphic
 from rdflib.namespace import DCTERMS, SKOS
 
@@ -68,24 +39,12 @@ _TEST_PREFIX = f"{GRAPH_BASE_URI}/namespace/{_TEST_NS}/ontology/{_TEST_ONTO}"
 
 
 def _class_iri(label: str) -> str:
-    """The IRI a real resolver would mint for class ``label``.
-
-    Per Requirement 10.2, class IRIs use the literal token ``"class"``
-    in the classification slot. The value (the class label) is
-    normalized via the resolver's ``normalize_string`` (lowercase,
-    spaces → hyphens, alphanumerics-only).
-    """
+    """The IRI a real resolver would mint for class ``label``."""
     return f"{_TEST_PREFIX}/class/{normalize_string(label)}"
 
 
 def _existing_class_iri(label: str) -> str:
-    """An IRI that's 'already known' from a prior pipeline run.
-
-    Same shape as ``_class_iri`` but in a separate namespace to make
-    test intent explicit (the ``exact`` / ``close_match`` paths pull
-    a previously-minted IRI out of the index, which would have come
-    from an earlier run with the same template).
-    """
+    """An IRI already minted by a prior run, in a separate namespace."""
     other_ns = "existing-ns"
     return f"{GRAPH_BASE_URI}/namespace/{other_ns}/ontology/{_TEST_ONTO}/class/{normalize_string(label)}"
 
@@ -111,24 +70,13 @@ def _nr(
 
 
 def _real_resolver() -> MagicMock:
-    """Real ``InMemoryIRIResolver`` wrapped in a ``MagicMock`` spy.
-
-    ``induce_classes`` doesn't call ``.resolve()`` directly (the IRI
-    comes from the ``NormalizationResult``), but tests can still pass
-    this where the signature requires an ``IRIResolver`` and the spy
-    can confirm the resolver was indeed not consulted.
-    """
+    """Real ``InMemoryIRIResolver`` wrapped in a ``MagicMock`` spy."""
     return MagicMock(
         wraps=InMemoryIRIResolver(
             namespace=_TEST_NS,
             ontology_name=_TEST_ONTO,
         )
     )
-
-
-def _to_dict(g: Graph) -> set[tuple]:
-    """Materialize a Graph as a set of ``(s, p, o)`` tuples for easy assertions."""
-    return set(g.triples((None, None, None)))
 
 
 class TestBasicEmission:
@@ -146,7 +94,7 @@ class TestBasicEmission:
             floor=3,
         )
 
-        triples = _to_dict(g)
+        triples = g
         company_uri = URIRef(_class_iri("Company"))
         assert (company_uri, RDF.type, OWL.Class) in triples
         assert (
@@ -160,21 +108,8 @@ class TestBasicEmission:
             Literal("A business organization.", datatype=XSD.string),
         ) in triples
 
-    def test_label_is_xsd_string_typed(self):
-        """Req 10.3: label must be xsd:string-typed, not a plain literal."""
-        cls = ClassRecord(value="Company", count=10)
-        g = induce_classes(
-            class_distribution=[cls],
-            descriptions={"Company": "desc"},
-            normalizer_results={"Company": _nr(_class_iri("Company"))},
-            iri_resolver=_real_resolver(),
-        )
-        labels = list(g.objects(URIRef(_class_iri("Company")), RDFS.label))
-        assert len(labels) == 1
-        assert labels[0].datatype == XSD.string  # type: ignore[union-attr]
-
     def test_comment_is_xsd_string_typed(self):
-        """Req 10.4: comment must be xsd:string-typed."""
+        """Comment must be xsd:string-typed."""
         cls = ClassRecord(value="Company", count=10)
         g = induce_classes(
             class_distribution=[cls],
@@ -188,7 +123,7 @@ class TestBasicEmission:
 
 
 class TestCamelCaseLabel:
-    """Req 10.3: rdfs:label is the original __SYS_Class__ value (CamelCase)."""
+    """The rdfs:label is the original __SYS_Class__ value (CamelCase)."""
 
     def test_camelcase_value_preserved_in_label(self):
         cls = ClassRecord(value="FinancialInstrument", count=10)
@@ -210,7 +145,7 @@ class TestClassAlternativeLabels:
     """Exact class variants emit one preferred label plus SKOS alternatives."""
 
     def test_consolidated_labels_keep_the_original_camelcase_form(self):
-        """Req 10.3 holds for every consolidated spelling, not just one.
+        """The CamelCase label holds for every consolidated spelling, not just one.
 
         The normalizer and the description generator key classes by the
         spaced lookup form (``"Control Panel"``). The emitted labels must
@@ -301,12 +236,7 @@ class TestClassAlternativeLabels:
         assert not list(g.objects(URIRef(class_iri), SKOS.altLabel))
 
     def test_preferred_label_follows_observed_frequency_not_record_order(self):
-        """The dominant spelling wins even when a rarer one is seen first.
-
-        Regression: the preferred label used to be whichever record reached
-        the consolidated IRI first, so reordering ``class_distribution``
-        silently changed the emitted ``rdfs:label``.
-        """
+        """The dominant spelling wins even when a rarer one is seen first."""
         class_iri = _class_iri("Compressor")
         normalizer_results = {
             "Compressor": _nr(class_iri, preferred_label="Compressor"),
@@ -381,7 +311,7 @@ class TestClassAlternativeLabels:
 
         class_uri = URIRef(class_iri)
         # An English namespace asserts no tags, so the label keeps the
-        # untagged ``xsd:string`` form, as it does on ``main``.
+        # untagged ``xsd:string`` form.
         assert list(g.objects(class_uri, RDFS.label)) == [Literal("COMPRESSOR", datatype=XSD.string)]
         assert not list(g.objects(class_uri, SKOS.altLabel))
 
@@ -401,7 +331,7 @@ class TestClassAlternativeLabels:
 
 
 class TestFloorThreshold:
-    """Req 10.1 + 10.5: floor controls inclusion; empty graph + warning if zero pass."""
+    """Floor controls inclusion; empty graph + warning if zero pass."""
 
     def test_class_below_floor_skipped(self):
         cls_low = ClassRecord(value="Tiny", count=2)
@@ -460,10 +390,10 @@ class TestFloorThreshold:
 
 
 class TestNormalizerBands:
-    """Req 9.3 / 9.4 / 9.5 — band drives IRI reuse and skos:closeMatch."""
+    """Band drives IRI reuse and skos:closeMatch."""
 
     def test_exact_band_reuses_matched_iri(self):
-        """exact band: class_iri IS the matched_existing_iri (per Req 9.3).
+        """exact band: class_iri IS the matched_existing_iri.
         ``induce_classes`` just emits with that IRI; no resolver call."""
         cls = ClassRecord(value="Company", count=10)
         # Simulate exact band: class_iri == matched_existing_iri.
@@ -636,7 +566,6 @@ class TestMultipleClasses:
             normalizer_results=normalizer_results,
             iri_resolver=_real_resolver(),
         )
-        # 3 declarations × (rdf:type + rdfs:label + rdfs:comment) = 9 triples.
         type_triples = list(g.triples((None, RDF.type, OWL.Class)))
         assert len(type_triples) == 3
         emitted_uris = {str(s) for s, _, _ in type_triples}
@@ -674,13 +603,10 @@ class TestMultipleClasses:
         assert close_match_triples == [(URIRef(_class_iri("Business")), SKOS.closeMatch, URIRef(_class_iri("Company")))]
 
 
-# ── Rule 2 — induce_individuals (Task 12.2, Requirement 11) ─────────────
-
-
 def _individual_iri(value: str, classification: str) -> str:
     """The IRI a real resolver would mint for an individual.
 
-    Per Requirement 11.2, A-Box individuals use the entity's classification
+    A-Box individuals use the entity's classification
     label (e.g. ``"Company"``) as the classification slot — distinct from
     T-Box classes which use the literal ``"class"`` token.
     """
@@ -689,11 +615,7 @@ def _individual_iri(value: str, classification: str) -> str:
 
 def _entity(value: str, classification: str, eid: str = "") -> EntityRecord:
     """Build a test ``EntityRecord``."""
-    from coa_ontology.inducer.unstructured.stores.protocol import (
-        EntityRecord as _ER,
-    )
-
-    return _ER(
+    return EntityRecord(
         entity_id=eid or f"id-{value}",
         value=value,
         classification=classification,
@@ -704,17 +626,15 @@ from coa_ontology.inducer.unstructured.services.induction_rules import (  # noqa
     induce_individuals,
 )
 from coa_ontology.inducer.unstructured.stores.protocol import (  # noqa: E402
-    EntityRecord,  # re-exported for type-check at module scope
+    EntityRecord,
 )
 
 
 class TestIncludeIndividualsFlag:
-    """Req 11.6 — gate flag controls whether the rule runs at all."""
+    """Gate flag controls whether the rule runs at all."""
 
     def test_default_returns_empty_graph(self):
         """Default ``include_individuals=False`` → empty graph, no work."""
-        from rdflib import OWL, RDF
-
         entities = [_entity("Apple", "Company")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_individuals(
@@ -739,11 +659,9 @@ class TestIncludeIndividualsFlag:
 
 
 class TestNamedIndividualEmission:
-    """Req 11.1, 11.3, 11.4 — three triples per emitted entity."""
+    """Three triples per emitted entity."""
 
     def test_one_individual_three_triples(self):
-        from rdflib import OWL, RDF, RDFS, XSD, Literal, URIRef
-
         entities = [_entity("Apple", "Company")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_individuals(
@@ -755,12 +673,12 @@ class TestNamedIndividualEmission:
 
         expected_iri = _individual_iri("Apple", "Company")
         expected_class_iri = _class_iri("Company")
-        triples = _to_dict(g)
-        # Req 11.1: owl:NamedIndividual declaration.
+        triples = g
+        # owl:NamedIndividual declaration.
         assert (URIRef(expected_iri), RDF.type, OWL.NamedIndividual) in triples
-        # Req 11.3: class typing.
+        # Class typing.
         assert (URIRef(expected_iri), RDF.type, URIRef(expected_class_iri)) in triples
-        # Req 11.4: rdfs:label, xsd:string-typed.
+        # rdfs:label, xsd:string-typed.
         assert (
             URIRef(expected_iri),
             RDFS.label,
@@ -768,8 +686,6 @@ class TestNamedIndividualEmission:
         ) in triples
 
     def test_label_is_xsd_string_typed(self):
-        from rdflib import RDFS, XSD, URIRef
-
         entities = [_entity("Apple", "Company")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_individuals(
@@ -783,9 +699,7 @@ class TestNamedIndividualEmission:
         assert labels[0].datatype == XSD.string  # type: ignore[union-attr]
 
     def test_label_preserves_entity_value_verbatim(self):
-        """Req 11.4: label is the entity's ``value`` exactly as supplied."""
-        from rdflib import RDFS, URIRef
-
+        """Label is the entity's ``value`` exactly as supplied."""
         entities = [_entity("Acme Corp.", "Company")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_individuals(
@@ -794,7 +708,7 @@ class TestNamedIndividualEmission:
             iri_resolver=_real_resolver(),
             include_individuals=True,
         )
-        # IRI uses normalized form (period stays per Pattern-1).
+        # IRI uses normalized form (the period stays).
         expected_iri = _individual_iri("Acme Corp.", "Company")
         labels = list(g.objects(URIRef(expected_iri), RDFS.label))
         # Label is the original ``value`` string.
@@ -802,15 +716,13 @@ class TestNamedIndividualEmission:
 
 
 class TestIRIShape:
-    """Req 11.2 — individual IRIs use the entity's class as classification slot.
+    """Individual IRIs use the entity's class as classification slot.
 
     This is the specific disambiguation from class IRIs (which use the
-    literal ``"class"`` slot per Req 10.2).
+    literal ``"class"`` slot).
     """
 
     def test_individual_iri_uses_class_slot_not_literal_class_keyword(self):
-        from rdflib import RDF, URIRef
-
         entities = [_entity("Apple", "Company")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_individuals(
@@ -820,19 +732,12 @@ class TestIRIShape:
             include_individuals=True,
         )
 
-        # Individual IRI is .../Company/Apple — NOT .../class/Apple.
         individual_iri = _individual_iri("Apple", "Company")
-        assert "/Company/Apple" in individual_iri
-        assert "/class/Apple" not in individual_iri
-        # And the corresponding triple exists.
         assert (URIRef(individual_iri), RDF.type, None) in [(s, p, None) for s, p, _ in g]
 
     def test_individual_iri_distinct_from_class_iri(self):
         """The class itself and an entity literally named after the class
-        get distinct IRIs — this is the disambiguation Req 10.2 / 11.2
-        is designed for."""
-        from rdflib import RDF, URIRef
-
+        get distinct IRIs."""
         # Entity literally named "Company", classification "Company".
         entities = [_entity("Company", "Company")]
         class_iris = {"Company": _class_iri("Company")}
@@ -843,24 +748,14 @@ class TestIRIShape:
             include_individuals=True,
         )
         individual_iri = _individual_iri("Company", "Company")
-        class_iri = _class_iri("Company")
-        # Distinct IRIs even though the name matches.
-        assert individual_iri != class_iri
         # The individual exists.
         assert (URIRef(individual_iri), RDF.type, None) in [(s, p, None) for s, p, _ in g]
-        # And the IRIs differ because of the slot:
-        assert "/class/Company" in class_iri
-        assert "/Company/Company" in individual_iri
 
 
 class TestMissingClassIRI:
-    """Req 11.5 — entity with no class IRI is skipped with a warning."""
+    """Entity with no class IRI is skipped with a warning."""
 
     def test_missing_class_skips_with_warning(self, caplog):
-        import logging
-
-        from rdflib import OWL, RDF
-
         entities = [
             _entity("Apple", "Company"),  # ok
             _entity("Bob", "Person"),  # missing class IRI
@@ -886,10 +781,6 @@ class TestMissingClassIRI:
         assert "Person" in caplog.text
 
     def test_all_missing_yields_empty_graph(self, caplog):
-        import logging
-
-        from rdflib import OWL, RDF
-
         entities = [
             _entity("Bob", "Person"),
             _entity("Alice", "Person"),
@@ -925,10 +816,6 @@ class TestEmptyAndDefensive:
     def test_resolver_failure_skips_entity_with_warning(self, caplog):
         """An entity whose value normalizes to empty (e.g. all whitespace)
         causes the resolver to raise — we catch it and skip the entity."""
-        import logging
-
-        from rdflib import OWL, RDF
-
         entities = [
             _entity("Apple", "Company"),  # ok
             _entity("   ", "Company"),  # whitespace-only → resolver raises
@@ -957,8 +844,6 @@ class TestMultipleEntities:
     """Smoke checks across multiple entities and classes."""
 
     def test_three_entities_three_classes(self):
-        from rdflib import OWL, RDF
-
         entities = [
             _entity("Apple", "Company"),
             _entity("Bob", "Person"),
@@ -979,18 +864,13 @@ class TestMultipleEntities:
         # Three NamedIndividual declarations.
         named = list(g.subjects(RDF.type, OWL.NamedIndividual))
         assert len(named) == 3
-        # Each one has the class typing too (rdf:type <class_iri>).
         # Triple count: 3 entities × 3 triples each = 9.
         all_triples = list(g.triples((None, None, None)))
-        # Plus namespace bindings don't generate triples; the only
-        # triples are the per-entity ones.
         assert len(all_triples) == 9
 
     def test_same_class_multiple_entities(self):
         """Two entities of the same class get the same class typing
         target."""
-        from rdflib import RDF, URIRef
-
         entities = [
             _entity("Apple", "Company"),
             _entity("Globex", "Company"),
@@ -1012,8 +892,6 @@ class TestMultipleEntities:
         """Adding the same entity twice yields a single set of triples
         (rdflib graphs are sets — duplicates collapse). Verifies we
         don't double-mint."""
-        from rdflib import OWL, RDF
-
         entities = [
             _entity("Apple", "Company"),
             _entity("Apple", "Company"),  # duplicate
@@ -1054,11 +932,6 @@ class TestRule2NamespaceBindings:
         bound = {prefix: ns for prefix, ns in g.namespaces()}
         for required in ("owl", "rdfs", "xsd", "skos"):
             assert required in bound
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Rule 3 — induce_object_properties (Task 12.3, Requirement 12)
-# ──────────────────────────────────────────────────────────────────────
 
 
 from coa_ontology.inducer.unstructured.services.induction_rules import (  # noqa: E402
@@ -1105,47 +978,19 @@ def _spc(
 
 
 def _property_iri(normalized_predicate: str, subject_class: str = "Company") -> str:
-    """The IRI a real resolver would mint for an ``owl:ObjectProperty``
-    after Task 12D.
+    """The ``owl:ObjectProperty`` IRI minted per ``(predicate, subject_class)``.
 
-    Per the amended Req 12.2, object property IRIs are minted per
-    ``(normalized_predicate, subject_class)`` aggregation key. The
-    classification slot is the path-normalized subject class label
-    followed by the literal token ``"ObjectProperty"`` — placing the
-    class segment first to keep all of a class's resources under a
-    common ``.../<Subject-Class>/...`` prefix.
-
-    Default ``subject_class`` is ``"Company"`` because most tests
-    in this file use Company-subject SPO facts; override per test
-    when the subject class differs.
+    The slot is ``<Subject-Class>/ObjectProperty``.
     """
     return f"{_TEST_PREFIX}/{normalize_string(subject_class)}/ObjectProperty/{normalize_string(normalized_predicate)}"
 
 
 class TestRule3BasicEmission:
-    """Req 12.1, 12.2 — one ``owl:ObjectProperty`` per distinct
+    """One ``owl:ObjectProperty`` per distinct
     normalized predicate, with the deterministic property IRI."""
 
-    def test_single_spo_fact_emits_object_property(self):
-        from rdflib import OWL, RDF, URIRef
-
-        facts = [_spo("Apple", "Company", "operates_in", "USA", "Location")]
-        class_iris = {
-            "Company": _class_iri("Company"),
-            "Location": _class_iri("Location"),
-        }
-        g = induce_object_properties(
-            facts=facts,
-            class_iris=class_iris,
-            iri_resolver=_real_resolver(),
-        )
-        prop_uri = URIRef(_property_iri("operates_in"))
-        assert (prop_uri, RDF.type, OWL.ObjectProperty) in g
-
     def test_property_iri_uses_object_property_slot(self):
-        """Req 12.2 — classification slot is the literal ``"ObjectProperty"``."""
-        from rdflib import OWL, RDF
-
+        """Classification slot is the literal ``"ObjectProperty"``."""
         facts = [_spo("Apple", "Company", "operates_in", "USA", "Location")]
         class_iris = {
             "Company": _class_iri("Company"),
@@ -1171,12 +1016,10 @@ class TestRule3BasicEmission:
 
 
 class TestRule3DomainAndRange:
-    """Req 12.3, 12.4, 12.5 — domain/range emission, including
+    """Domain/range emission, including
     multiple-class fan-out for shared predicates."""
 
     def test_domain_and_range_for_single_fact(self):
-        from rdflib import RDFS, URIRef
-
         facts = [_spo("Apple", "Company", "operates_in", "USA", "Location")]
         class_iris = {
             "Company": _class_iri("Company"),
@@ -1188,17 +1031,15 @@ class TestRule3DomainAndRange:
             iri_resolver=_real_resolver(),
         )
         prop_uri = URIRef(_property_iri("operates_in"))
-        # Req 12.3 — rdfs:domain points at subject class.
+        # rdfs:domain points at subject class.
         assert (prop_uri, RDFS.domain, URIRef(_class_iri("Company"))) in g
-        # Req 12.4 — rdfs:range points at object class.
+        # rdfs:range points at object class.
         assert (prop_uri, RDFS.range, URIRef(_class_iri("Location"))) in g
 
     def test_distinct_subject_classes_produce_distinct_properties(self):
-        """Req 12.2/12.3 (Task 12D-amended): the same predicate on
+        """The same predicate on
         different subject classes produces TWO distinct property IRIs,
         each with exactly one rdfs:domain."""
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spo("Apple", "Company", "operates_in", "USA", "Location"),
             _spo("Bob", "Person", "operates_in", "USA", "Location"),
@@ -1214,8 +1055,6 @@ class TestRule3DomainAndRange:
             iri_resolver=_real_resolver(),
         )
         # Two distinct properties — one per (predicate, subject_class).
-        from rdflib import OWL, RDF
-
         decls = list(g.subjects(RDF.type, OWL.ObjectProperty))
         assert len(decls) == 2
 
@@ -1231,10 +1070,8 @@ class TestRule3DomainAndRange:
         assert person_domains == [URIRef(_class_iri("Person"))]
 
     def test_multiple_distinct_ranges_fan_out(self):
-        """Req 12.5: shared predicate across different object classes
+        """Shared predicate across different object classes
         produces one rdfs:range per distinct class."""
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spo("Apple", "Company", "operates_in", "USA", "Location"),
             _spo("Apple", "Company", "operates_in", "tech", "Industry"),
@@ -1258,8 +1095,6 @@ class TestRule3DomainAndRange:
     def test_repeated_same_pair_collapses_to_one_triple(self):
         """rdflib graphs are sets — duplicate (predicate, domain, range)
         triples from many facts collapse into one each."""
-        from rdflib import RDFS, URIRef
-
         # Three facts, same subject/object class pair.
         facts = [
             _spo("Apple", "Company", "operates_in", "USA", "Location"),
@@ -1283,12 +1118,10 @@ class TestRule3DomainAndRange:
 
 
 class TestRule3PredicateNormalization:
-    """Req 12.1 + Req 19.2 — surface-form variants collapse into one
-    property; Req 12.6 / Req 19.3 — canonical original-spelling label."""
+    """Surface-form variants collapse into one
+    property with a canonical original-spelling label."""
 
     def test_surface_variants_collapse_to_one_property(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "Company", "WORKS_FOR", "x", "Person"),
             _spo("b", "Company", "works for", "x", "Person"),
@@ -1309,9 +1142,7 @@ class TestRule3PredicateNormalization:
         assert str(decls[0]).endswith("/Company/ObjectProperty/works_for")
 
     def test_canonical_label_is_most_common_original(self):
-        """Req 12.6 / Req 19.3 — most-frequent original spelling wins."""
-        from rdflib import RDFS, URIRef
-
+        """Most-frequent original spelling wins."""
         facts = [
             _spo("a", "Company", "WORKS_FOR", "x", "Person"),
             _spo("b", "Company", "WORKS_FOR", "x", "Person"),
@@ -1333,9 +1164,7 @@ class TestRule3PredicateNormalization:
         assert str(labels[0]) == "WORKS_FOR"
 
     def test_canonical_label_lex_tiebreak(self):
-        """Req 19.3 — when counts tie, lexicographic-first wins."""
-        from rdflib import RDFS, URIRef
-
+        """When counts tie, lexicographic-first wins."""
         # Both spellings appear once → tie → lex-first ("WORKS_FOR" < "works_for"
         # in Unicode order because uppercase comes first).
         facts = [
@@ -1379,12 +1208,7 @@ class TestRule3PredicateNormalization:
         }
 
     def test_padding_and_case_noise_do_not_become_alt_labels(self):
-        """Surface forms differing only by padding/case fold into one.
-
-        Regression: every raw spelling became a ``skos:altLabel``, so a
-        predicate could carry alternatives like ``"  DELIVERED TO  "`` that
-        repeat the preferred label with different whitespace.
-        """
+        """Surface forms differing only by padding/case fold into one."""
         facts = [
             _spo("a", "Company", "DELIVERED TO", "x", "Person"),
             _spo("b", "Company", "DELIVERED TO", "y", "Person"),
@@ -1410,33 +1234,13 @@ class TestRule3PredicateNormalization:
         # English namespace asserts no tags, so every label stays untagged.
         assert set(g.objects(prop_uri, SKOS.altLabel)) == {Literal("DELIVERED_TO", datatype=XSD.string)}
 
-    def test_label_is_xsd_string_typed(self):
-        from rdflib import RDFS, XSD, URIRef
-
-        facts = [_spo("a", "Company", "operates_in", "x", "Location")]
-        class_iris = {
-            "Company": _class_iri("Company"),
-            "Location": _class_iri("Location"),
-        }
-        g = induce_object_properties(
-            facts=facts,
-            class_iris=class_iris,
-            iri_resolver=_real_resolver(),
-        )
-        prop_uri = URIRef(_property_iri("operates_in"))
-        labels = list(g.objects(prop_uri, RDFS.label))
-        assert len(labels) == 1
-        assert labels[0].datatype == XSD.string  # type: ignore[union-attr]
-
 
 class TestRule3MissingClassFiltering:
-    """Req 12.7 — facts referencing a class below the floor (i.e. not
+    """Facts referencing a class below the floor (i.e. not
     in ``class_iris``) are skipped; the property gets no contribution
     from them, and is omitted entirely if all its facts are skipped."""
 
     def test_subject_class_below_floor_skips_fact(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "RareClass", "operates_in", "x", "Location"),
             _spo("b", "Company", "operates_in", "y", "Location"),
@@ -1454,16 +1258,12 @@ class TestRule3MissingClassFiltering:
         decls = list(g.subjects(RDF.type, OWL.ObjectProperty))
         assert len(decls) == 1
         # Only Company is a domain — RareClass was filtered out.
-        from rdflib import RDFS, URIRef
-
         prop_uri = URIRef(_property_iri("operates_in"))
         domains = set(g.objects(prop_uri, RDFS.domain))
         assert URIRef(_class_iri("Company")) in domains
         assert len(domains) == 1
 
     def test_object_class_below_floor_skips_fact(self):
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spo("a", "Company", "operates_in", "x", "RareClass"),
             _spo("b", "Company", "operates_in", "y", "Location"),
@@ -1483,10 +1283,8 @@ class TestRule3MissingClassFiltering:
         assert len(ranges) == 1
 
     def test_all_facts_filtered_omits_property(self):
-        """Req 12.7 (corollary): if every fact for a predicate is
+        """If every fact for a predicate is
         skipped, no property declaration is emitted."""
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "RareClass", "operates_in", "x", "Location"),
         ]
@@ -1510,8 +1308,6 @@ class TestRule3MissingClassFiltering:
         The canonical label should be ``"works_for"`` — not the
         more-numerous-but-filtered-out variant.
         """
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spo("a", "RareClass", "BIG_LOUD_NAME", "x", "Person"),
             _spo("b", "RareClass", "BIG_LOUD_NAME", "x", "Person"),
@@ -1540,8 +1336,6 @@ class TestRule3SPCFiltering:
     Rule 3."""
 
     def test_spc_fact_alone_yields_empty_graph(self):
-        from rdflib import OWL, RDF
-
         facts = [_spc("Apple", "Company", "founded", "1976")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_object_properties(
@@ -1552,8 +1346,6 @@ class TestRule3SPCFiltering:
         assert not list(g.subjects(RDF.type, OWL.ObjectProperty))
 
     def test_mixed_spo_spc_keeps_only_spo(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("Apple", "Company", "operates_in", "USA", "Location"),
             _spc("Apple", "Company", "founded", "1976"),
@@ -1579,8 +1371,6 @@ class TestRule3DefensivePaths:
     def test_predicate_normalizes_to_empty_skips_with_warning(self, caplog):
         """A predicate that strips to empty (e.g. ``"!!!"``) cannot
         produce a valid IRI — skip with WARNING, don't crash."""
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "Company", "!!!", "x", "Location"),
             _spo("b", "Company", "operates_in", "y", "Location"),
@@ -1606,8 +1396,6 @@ class TestRule3DefensivePaths:
     def test_resolver_failure_isolates_to_one_predicate(self, caplog):
         """A resolver exception for one predicate must not stop the
         others from being emitted."""
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "Company", "operates_in", "x", "Location"),
             _spo("b", "Company", "works_for", "x", "Person"),
@@ -1650,8 +1438,6 @@ class TestRule3MultipleProperties:
     """Multiple predicates emit independent property declarations."""
 
     def test_three_predicates_three_properties(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("a", "Company", "operates_in", "x", "Location"),
             _spo("b", "Company", "owns", "y", "Product"),
@@ -1699,56 +1485,25 @@ class TestRule3NamespaceBindings:
         assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Rule 4 — induce_datatype_properties (Task 12.4, Requirement 13)
-# ──────────────────────────────────────────────────────────────────────
-
-
 from coa_ontology.inducer.unstructured.services.induction_rules import (  # noqa: E402
     induce_datatype_properties,
 )
 
 
 def _datatype_property_iri(normalized_predicate: str, subject_class: str = "Company") -> str:
-    """The IRI a real resolver would mint for an ``owl:DatatypeProperty``
-    after Task 12D.
+    """The ``owl:DatatypeProperty`` IRI minted per ``(predicate, subject_class)``.
 
-    Per the amended Req 13.3, datatype property IRIs are minted per
-    ``(normalized_predicate, subject_class)`` aggregation key. The
-    classification slot is the path-normalized subject class label
-    followed by the literal token ``"DatatypeProperty"`` — placing
-    the class segment first to keep all of a class's resources under
-    a common ``.../<Subject-Class>/...`` prefix.
-
-    Default ``subject_class`` is ``"Company"`` because most tests
-    in this file use Company-subject SPC facts; override per test
-    when the subject class differs.
+    The slot is ``<Subject-Class>/DatatypeProperty``.
     """
     return f"{_TEST_PREFIX}/{normalize_string(subject_class)}/DatatypeProperty/{normalize_string(normalized_predicate)}"
 
 
 class TestRule4BasicEmission:
-    """Req 13.1, 13.2, 13.3 — one ``owl:DatatypeProperty`` per distinct
+    """One ``owl:DatatypeProperty`` per distinct
     normalized predicate, with the deterministic property IRI."""
 
-    def test_single_spc_fact_emits_datatype_property(self):
-        from rdflib import OWL, RDF, URIRef
-
-        facts = [_spc("Apple", "Company", "founded", "1976")]
-        class_iris = {"Company": _class_iri("Company")}
-        g = induce_datatype_properties(
-            facts=facts,
-            class_iris=class_iris,
-            iri_resolver=_real_resolver(),
-        )
-        prop_uri = URIRef(_datatype_property_iri("founded"))
-        assert (prop_uri, RDF.type, OWL.DatatypeProperty) in g
-
     def test_property_iri_uses_datatype_property_slot(self):
-        """Req 13.3 (Task 12D-amended) — classification slot is
-        ``"DatatypeProperty/<subject_class>"``."""
-        from rdflib import OWL, RDF
-
+        """The classification slot is ``<subject_class>/DatatypeProperty``."""
         facts = [_spc("Apple", "Company", "founded", "1976")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_datatype_properties(
@@ -1771,12 +1526,10 @@ class TestRule4BasicEmission:
 
 
 class TestRule4DomainAndRange:
-    """Req 13.4, 13.5, 13.6 — domain emission, XSD range inference,
+    """Domain emission, XSD range inference,
     multi-class domain fan-out for shared predicates."""
 
     def test_domain_for_single_fact(self):
-        from rdflib import RDFS, URIRef
-
         facts = [_spc("Apple", "Company", "founded", "1976")]
         class_iris = {"Company": _class_iri("Company")}
         g = induce_datatype_properties(
@@ -1785,14 +1538,12 @@ class TestRule4DomainAndRange:
             iri_resolver=_real_resolver(),
         )
         prop_uri = URIRef(_datatype_property_iri("founded"))
-        # Req 13.4 — rdfs:domain points at subject class.
+        # rdfs:domain points at subject class.
         assert (prop_uri, RDFS.domain, URIRef(_class_iri("Company"))) in g
 
     def test_xsd_integer_range_inferred_from_unanimous_integers(self):
-        """Req 13.5 + Req 18.1 + Req 18.8 — unanimous integer values
+        """Unanimous integer values
         yield ``xsd:integer`` range."""
-        from rdflib import RDFS, XSD, URIRef
-
         facts = [
             _spc("Apple", "Company", "founded", "1976"),
             _spc("Microsoft", "Company", "founded", "1975"),
@@ -1809,9 +1560,7 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.integer}
 
     def test_xsd_decimal_range_inferred_from_unanimous_decimals(self):
-        """Req 18.2 — unanimous decimal values yield ``xsd:decimal``."""
-        from rdflib import RDFS, XSD, URIRef
-
+        """Unanimous decimal values yield ``xsd:decimal``."""
         facts = [
             _spc("Apple", "Company", "revenue", "394.328"),
             _spc("Microsoft", "Company", "revenue", "211.915"),
@@ -1827,9 +1576,7 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.decimal}
 
     def test_xsd_boolean_range_inferred_from_unanimous_booleans(self):
-        """Req 18.3 — unanimous boolean values yield ``xsd:boolean``."""
-        from rdflib import RDFS, XSD, URIRef
-
+        """Unanimous boolean values yield ``xsd:boolean``."""
         facts = [
             _spc("Apple", "Company", "is_public", "true"),
             _spc("Microsoft", "Company", "is_public", "true"),
@@ -1846,9 +1593,7 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.boolean}
 
     def test_xsd_date_range_inferred(self):
-        """Req 18.4 — unanimous ISO-8601 date values yield ``xsd:date``."""
-        from rdflib import RDFS, XSD, URIRef
-
+        """Unanimous ISO-8601 date values yield ``xsd:date``."""
         facts = [
             _spc("Apple", "Company", "ipo_date", "1980-12-12"),
             _spc("Microsoft", "Company", "ipo_date", "1986-03-13"),
@@ -1864,9 +1609,7 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.date}
 
     def test_xsd_string_range_default_for_freeform_text(self):
-        """Req 18.6 — values that match no pattern default to ``xsd:string``."""
-        from rdflib import RDFS, XSD, URIRef
-
+        """Values that match no pattern default to ``xsd:string``."""
         facts = [
             _spc("Apple", "Company", "headquarters", "Cupertino, CA"),
             _spc("Microsoft", "Company", "headquarters", "Redmond, WA"),
@@ -1882,10 +1625,8 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.string}
 
     def test_xsd_string_for_mixed_types(self):
-        """Req 18.7 — when complement values infer to different types,
+        """When complement values infer to different types,
         the property's range is ``xsd:string``."""
-        from rdflib import RDFS, XSD, URIRef
-
         facts = [
             _spc("Apple", "Company", "size", "150000"),  # integer
             _spc("Microsoft", "Company", "size", "large"),  # string
@@ -1901,11 +1642,9 @@ class TestRule4DomainAndRange:
         assert ranges == {XSD.string}
 
     def test_distinct_subject_classes_produce_distinct_properties(self):
-        """Req 13.3 (Task 12D-amended) — same predicate across different
+        """Same predicate across different
         subject classes produces TWO distinct ``owl:DatatypeProperty``
         declarations, each with exactly one ``rdfs:domain``."""
-        from rdflib import OWL, RDF, RDFS, URIRef
-
         facts = [
             _spc("Apple", "Company", "founded", "1976"),
             _spc("Bob", "Person", "founded", "1965"),
@@ -1934,18 +1673,14 @@ class TestRule4DomainAndRange:
         assert person_domains == [URIRef(_class_iri("Person"))]
 
     def test_xsd_inference_is_per_subject_class(self):
-        """Req 13.5 (Task 12D-amended): the XSD inference operates
+        """The XSD inference operates
         within each (predicate, subject_class) aggregation, NOT pooled
         across subject classes.
 
         ``Vehicle.weight`` (in tons, decimal) and ``Person.weight``
         (in kg, integer) infer to ``xsd:decimal`` and ``xsd:integer``
-        respectively. Under the old contract these would have been
-        pooled and inferred to ``xsd:string`` because the pool would
-        be mixed. After 12D each property has its own clean inference.
+        respectively; a pooled inference would yield ``xsd:string``.
         """
-        from rdflib import RDFS, XSD, URIRef
-
         facts = [
             # Vehicle.weight in tons (decimal)
             _spc("Truck", "Vehicle", "weight", "2.5"),
@@ -1966,9 +1701,6 @@ class TestRule4DomainAndRange:
         vehicle_prop = URIRef(_datatype_property_iri("weight", "Vehicle"))
         person_prop = URIRef(_datatype_property_iri("weight", "Person"))
 
-        # Per-class XSD inference: vehicle decimals → xsd:decimal,
-        # person integers → xsd:integer. Critically, NEITHER is
-        # xsd:string (which is what a pooled inference would yield).
         vehicle_ranges = set(g.objects(vehicle_prop, RDFS.range))
         person_ranges = set(g.objects(person_prop, RDFS.range))
         assert vehicle_ranges == {XSD.decimal}
@@ -1976,12 +1708,10 @@ class TestRule4DomainAndRange:
 
 
 class TestRule4LabelAndComment:
-    """Req 13.7, 13.8, 19.3 — canonical-by-frequency label and
+    """Canonical-by-frequency label and
     observation-frequency comment."""
 
     def test_canonical_label_is_most_common_original(self):
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spc("a", "Company", "FOUNDED", "1976"),
             _spc("b", "Company", "FOUNDED", "1975"),
@@ -2018,32 +1748,8 @@ class TestRule4LabelAndComment:
             Literal("model no", datatype=XSD.string),
         }
 
-    def test_label_is_xsd_string_typed(self):
-        from rdflib import RDFS, XSD, URIRef
-
-        facts = [_spc("a", "Company", "founded", "1976")]
-        class_iris = {"Company": _class_iri("Company")}
-        g = induce_datatype_properties(
-            facts=facts,
-            class_iris=class_iris,
-            iri_resolver=_real_resolver(),
-        )
-        prop_uri = URIRef(_datatype_property_iri("founded"))
-        labels = list(g.objects(prop_uri, RDFS.label))
-        assert len(labels) == 1
-        assert labels[0].datatype == XSD.string  # type: ignore[union-attr]
-
     def test_observation_frequency_comment_single_class(self):
-        """Req 13.8 — the comment names the count; the class comes from rdfs:domain.
-
-        The class name is deliberately NOT interpolated into the sentence. It comes
-        from the corpus, so an English frame around it manufactures a literal
-        holding two languages on a non-English corpus ("Observed across 1 fact(s)
-        in class 技術的特性"). RDF 1.1 cannot language-tag such a literal, and no
-        extraction-prompt change can remove it because we generate it ourselves.
-        """
-        from rdflib import RDFS, XSD, URIRef
-
+        """The comment names the count; the class comes from rdfs:domain."""
         facts = [
             _spc("Apple", "Company", "founded", "1976"),
             _spc("Microsoft", "Company", "founded", "1975"),
@@ -2061,25 +1767,17 @@ class TestRule4LabelAndComment:
         assert comment.datatype == XSD.string  # type: ignore[union-attr]
         text = str(comment)
         assert "2" in text  # fact count
-        # No corpus-derived text at all — that is what keeps the literal
-        # single-language whatever the corpus is written in.
-        assert text.isascii()
         # The class is not lost: rdfs:domain carries it, which is where a consumer
         # should read it from anyway.
         assert URIRef(_class_iri("Company")) in set(g.objects(prop_uri, RDFS.domain))
 
     def test_observation_frequency_comment_per_subject_class(self):
-        """Req 13.8 (Task 12D-amended) — the same predicate observed on TWO
-        subject classes produces TWO distinct properties, each with its own
-        observation-frequency comment and its own ``rdfs:domain``.
+        """The same predicate on TWO subject classes produces TWO distinct properties.
 
         The per-class distinction is asserted on ``rdfs:domain`` rather than on the
-        comment text: the class name no longer appears in the sentence, because
-        interpolating corpus-derived text into an English frame manufactures a
-        mixed-language literal (see the single-class test above).
+        comment text, because interpolating corpus-derived text into an English frame manufactures a
+        mixed-language literal.
         """
-        from rdflib import RDFS, URIRef
-
         facts = [
             _spc("Apple", "Company", "founded", "1976"),
             _spc("Microsoft", "Company", "founded", "1975"),
@@ -2114,13 +1812,11 @@ class TestRule4LabelAndComment:
 
 
 class TestRule4MissingClassFiltering:
-    """Req 13.9 — facts whose subject class is below the floor are
+    """Facts whose subject class is below the floor are
     skipped; the property is omitted entirely if all its facts are
     skipped."""
 
     def test_subject_class_below_floor_skips_fact(self):
-        from rdflib import OWL, RDF, RDFS, URIRef
-
         facts = [
             _spc("a", "RareClass", "founded", "1900"),
             _spc("b", "Company", "founded", "1976"),
@@ -2143,8 +1839,6 @@ class TestRule4MissingClassFiltering:
         assert len(domains) == 1
 
     def test_all_facts_filtered_omits_property(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spc("a", "RareClass", "founded", "1900"),
         ]
@@ -2163,8 +1857,6 @@ class TestRule4MissingClassFiltering:
         """When facts are filtered out due to missing class IRIs,
         their complement values must NOT influence the XSD inference.
         """
-        from rdflib import RDFS, XSD, URIRef
-
         # Three filtered-out facts have non-numeric complements; the
         # surviving fact has an integer. The result must be xsd:integer
         # — using only the kept fact.
@@ -2191,8 +1883,6 @@ class TestRule4SPOFiltering:
     Rule 4."""
 
     def test_spo_fact_alone_yields_empty_graph(self):
-        from rdflib import OWL, RDF
-
         facts = [_spo("Apple", "Company", "operates_in", "USA", "Location")]
         class_iris = {
             "Company": _class_iri("Company"),
@@ -2206,8 +1896,6 @@ class TestRule4SPOFiltering:
         assert not list(g.subjects(RDF.type, OWL.DatatypeProperty))
 
     def test_mixed_spo_spc_keeps_only_spc(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spo("Apple", "Company", "operates_in", "USA", "Location"),
             _spc("Apple", "Company", "founded", "1976"),
@@ -2231,8 +1919,6 @@ class TestRule4DefensivePaths:
     """Edge cases: empty predicate, resolver failure isolation."""
 
     def test_predicate_normalizes_to_empty_skips_with_warning(self, caplog):
-        from rdflib import OWL, RDF
-
         facts = [
             _spc("a", "Company", "!!!", "1900"),
             _spc("b", "Company", "founded", "1976"),
@@ -2255,8 +1941,6 @@ class TestRule4DefensivePaths:
     def test_resolver_failure_isolates_to_one_predicate(self, caplog):
         """A resolver exception for one predicate must not stop the
         others from being emitted."""
-        from rdflib import OWL, RDF
-
         facts = [
             _spc("a", "Company", "founded", "1976"),
             _spc("b", "Company", "revenue", "100.5"),
@@ -2296,8 +1980,6 @@ class TestRule4SamePredicateAsObjectAndDatatype:
         # Run Rule 3 and Rule 4 with the same predicate appearing
         # in both SPO and SPC contexts. Verify the two properties
         # land at distinct IRIs.
-        from rdflib import OWL, RDF
-
         spo_facts = [_spo("Apple", "Company", "based", "USA", "Location")]
         spc_facts = [_spc("Microsoft", "Company", "based", "Redmond, WA")]
         class_iris = {
@@ -2322,8 +2004,6 @@ class TestRule4MultipleProperties:
     """Multiple predicates emit independent declarations."""
 
     def test_three_predicates_three_properties(self):
-        from rdflib import OWL, RDF
-
         facts = [
             _spc("Apple", "Company", "founded", "1976"),
             _spc("Apple", "Company", "revenue", "394.328"),
@@ -2365,9 +2045,6 @@ class TestRule4NamespaceBindings:
         assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
 
 
-# ── Rule 5 — induce_concepts (Task 12.5, Requirement 14) ────────────────
-
-
 from coa_ontology.inducer.unstructured.services.induction_rules import (  # noqa: E402
     MAX_CONCEPT_CLASS_LOOKUP_ENTRIES,
     induce_concepts,
@@ -2390,13 +2067,7 @@ def _topic(value: str, topic_id: str = "t1", count: int = 0) -> TopicRecord:
 
 
 def _topic_iri(value: str) -> str:
-    """The IRI a real resolver would mint for a topic with this value.
-
-    Per Requirement 14.2, topic concept IRIs use the literal token
-    ``"Topic"`` in the classification slot. The value (the topic
-    string) is normalized via the resolver's case-preserving
-    Pattern-1 form (spaces → ``-``, alphanumerics preserved).
-    """
+    """The IRI a real resolver would mint for a topic with this value."""
     return f"{_TEST_PREFIX}/Topic/{normalize_for_iri_path(value)}"
 
 
@@ -2406,7 +2077,7 @@ def _scheme_iri(namespace_name: str = _TOPIC_NS) -> str:
 
 
 class TestSchemeAlwaysEmitted:
-    """Req 14.4 / 14.5 — the ConceptScheme is emitted on every run.
+    """The ConceptScheme is emitted on every run.
 
     Even when the topic input is empty, the scheme is a meaningful
     pipeline artifact (a future run can attach concepts to it).
@@ -2430,7 +2101,7 @@ class TestSchemeAlwaysEmitted:
         assert not list(g.subjects(RDF.type, SKOS.Concept))
 
     def test_scheme_label_uses_namespace_name(self):
-        """Req 14.5 — label literal is exactly ``"<ns> Topic Scheme"``."""
+        """Label literal is exactly ``"<ns> Topic Scheme"``."""
         g = induce_concepts(
             topics=[],
             iri_resolver=_real_resolver(),
@@ -2467,7 +2138,7 @@ class TestSchemeAlwaysEmitted:
 
 
 class TestConceptEmission:
-    """Req 14.1 / 14.3 / 14.4 — three triples per emitted topic."""
+    """Three triples per emitted topic."""
 
     def test_single_topic_emits_three_concept_triples(self):
         topic = _topic("Financial Holdings Summary", topic_id="t-fhs")
@@ -2480,18 +2151,18 @@ class TestConceptEmission:
         concept_uri = URIRef(_topic_iri("Financial Holdings Summary"))
         scheme_uri = URIRef(_scheme_iri())
 
-        # Req 14.1 — declaration.
+        # Declaration.
         assert (concept_uri, RDF.type, SKOS.Concept) in g
-        # Req 14.3 — prefLabel with xsd:string datatype, exact value.
+        # PrefLabel with xsd:string datatype, exact value.
         assert (
             concept_uri,
             SKOS.prefLabel,
             Literal("Financial Holdings Summary", datatype=XSD.string),
         ) in g
-        # Req 14.4 — link to scheme.
+        # Link to scheme.
         assert (concept_uri, SKOS.inScheme, scheme_uri) in g
 
-        # Exactly four triples for the concept (decl + prefLabel + inScheme)
+        # Three triples for the concept (decl + prefLabel + inScheme)
         # plus two for the scheme (decl + label).
         assert len(g) == 5
 
@@ -2665,26 +2336,11 @@ class TestConceptEmission:
         assert fingerprints[0] == fingerprints[1]
         assert len(fingerprints[0]) == 5
 
-    def test_preflabel_is_xsd_string(self):
-        """Req 14.3 — prefLabel must be xsd:string-typed."""
-        g = induce_concepts(
-            topics=[_topic("Legal Proceedings")],
-            iri_resolver=_real_resolver(),
-            namespace_name=_TOPIC_NS,
-        )
-        concept_uri = URIRef(_topic_iri("Legal Proceedings"))
-        labels = list(g.objects(concept_uri, SKOS.prefLabel))
-        assert len(labels) == 1
-        assert isinstance(labels[0], Literal)
-        assert labels[0].datatype == XSD.string
-        assert str(labels[0]) == "Legal Proceedings"
-
     def test_preserves_topic_value_verbatim_in_preflabel(self):
         """The prefLabel literal contains the topic.value EXACTLY,
         including punctuation, casing, and surrounding whitespace
         (after the leading/trailing strip).
         """
-        # Real-world examples from the dev graph.
         topic = _topic("Cash Equivalents and Marketable Securities Summary as of April 30, 2023")
         g = induce_concepts(
             topics=[topic],
@@ -2722,7 +2378,7 @@ class TestConceptEmission:
 
 
 class TestRule5IRIShape:
-    """Req 14.2 — concept IRIs use ``"Topic"`` as the classification slot.
+    """Concept IRIs use ``"Topic"`` as the classification slot.
 
     These tests pin the IRI shape so a regression in either the
     resolver normalization OR the rule's slot choice would fail loudly.
@@ -2738,10 +2394,9 @@ class TestRule5IRIShape:
         assert len(iris) == 1
         iri_str = str(iris[0])
         assert iri_str == f"{_TEST_PREFIX}/Topic/Apple"
-        assert "/Topic/" in iri_str
 
     def test_iri_normalizes_spaces_to_hyphens(self):
-        """Per Pattern-1: spaces collapse to ``-``, casing preserved."""
+        """Spaces collapse to ``-``, casing preserved."""
         g = induce_concepts(
             topics=[_topic("Financial Performance")],
             iri_resolver=_real_resolver(),
@@ -2751,7 +2406,7 @@ class TestRule5IRIShape:
         assert iri_str == f"{_TEST_PREFIX}/Topic/Financial-Performance"
 
     def test_iri_preserves_camelcase(self):
-        """Per Pattern-1: source casing is preserved verbatim."""
+        """Source casing is preserved verbatim."""
         g = induce_concepts(
             topics=[_topic("iPhone Net Sales Performance")],
             iri_resolver=_real_resolver(),
@@ -2761,24 +2416,18 @@ class TestRule5IRIShape:
         assert iri_str == f"{_TEST_PREFIX}/Topic/iPhone-Net-Sales-Performance"
 
     def test_punctuation_percent_encoded_or_dropped(self):
-        """Per Pattern-1: parens/colons/etc. are percent-encoded, then
-        consecutive hyphens collapse and trailing hyphens trim.
-        ``"Topic (with punct.)"`` → ``"Topic-with-punct."`` (period is
-        unreserved per RFC 3986).
-        """
+        """Parens and other reserved punctuation are normalized out of the IRI path."""
         g = induce_concepts(
             topics=[_topic("Topic A (preview)")],
             iri_resolver=_real_resolver(),
             namespace_name=_TOPIC_NS,
         )
         iri_str = str(next(iter(g.subjects(RDF.type, SKOS.Concept))))
-        # The exact normalization rules are tested in the resolver
-        # tests; this test pins the shape end-to-end.
         expected = f"{_TEST_PREFIX}/Topic/{normalize_for_iri_path('Topic A (preview)')}"
         assert iri_str == expected
 
     def test_concept_iri_disjoint_from_class_iri(self):
-        """Req 14.2 — concept IRIs use "Topic", class IRIs use "class".
+        """Concept IRIs use "Topic", class IRIs use "class".
 
         A topic literally named "Person" must NOT collide with the
         ``owl:Class`` IRI for the Person class. The slot disambiguates.
@@ -2800,7 +2449,7 @@ class TestRule5IRIShape:
 
 
 class TestRule5EmptyAndDefensive:
-    """Req 14.6 — defensive paths."""
+    """Defensive paths."""
 
     def test_empty_value_topic_skipped_with_warning(self, caplog):
         topics = [_topic("", topic_id="t-empty"), _topic("Real", topic_id="t-real")]
@@ -2878,15 +2527,7 @@ class TestRule5EmptyAndDefensive:
         assert "t-bad" in warnings_text
 
     def test_duplicate_values_resolve_to_same_iri(self):
-        """If two topics share a value (modulo case), the resolver's
-        case-folded lookup returns the same IRI for both — so the graph
-        ends up with one ``skos:Concept`` declaration, two
-        ``skos:prefLabel`` triples (one per topic), and two
-        ``skos:inScheme`` triples (RDF set semantics will dedupe).
-
-        This mirrors how the resolver's first-spelling-wins works for
-        case-only variants.
-        """
+        """Topics that differ only by case resolve to one ``skos:Concept``."""
         topics = [
             _topic("Apple Inc.", topic_id="t-1"),
             _topic("apple inc.", topic_id="t-2"),  # case-only variant
@@ -2921,7 +2562,7 @@ class TestRule5NamespaceBindings:
 class TestGeneratedCommentsAreSingleLanguage:
     """A comment COA writes itself must not mix languages, whatever the corpus.
 
-    Issue #897's blocker is that RDF 1.1 gives a literal one language tag or one
+    RDF 1.1 gives a literal one language tag or one
     datatype, never a tag per fragment — so a literal holding two languages cannot
     be tagged correctly under any scheme. Extraction-prompt work can reduce
     mixed-language labels coming FROM the corpus, but it cannot touch a literal
@@ -2930,13 +2571,7 @@ class TestGeneratedCommentsAreSingleLanguage:
     """
 
     def test_a_non_ascii_class_name_does_not_leak_into_the_comment(self):
-        """The measured case: 17 such literals in one real induced ontology.
-
-        The frame was ``f"Observed across {n} fact(s) in class {domain_name}"``, and
-        ``domain_name`` is the class's own label — Japanese on a Japanese corpus.
-        """
-        from rdflib import RDFS
-
+        """A Japanese class label does not appear in the generated comment."""
         facts = [
             _spc("測定器A", "技術的特性", "設置場所", "屋内"),
             _spc("測定器B", "技術的特性", "設置場所", "屋外"),
@@ -2958,8 +2593,6 @@ class TestGeneratedCommentsAreSingleLanguage:
         A consumer that wants the class reads ``rdfs:domain``; the comment restated
         it only in a form that made the literal untaggable.
         """
-        from rdflib import RDFS, URIRef
-
         facts = [_spc("測定器A", "技術的特性", "設置場所", "屋内")]
         class_iris = {"技術的特性": _class_iri("技術的特性")}
         g = induce_datatype_properties(

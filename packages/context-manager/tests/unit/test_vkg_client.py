@@ -50,7 +50,6 @@ class TestVKGClientInit:
 @pytest.mark.unit
 class TestVKGClientTranslate:
     async def test_successful_translation(self):
-        """Test successful SPARQL -> SQL translation."""
         client = VKGClient(base_url="http://vkg.local:8080")
 
         mock_http = AsyncMock()
@@ -75,7 +74,6 @@ class TestVKGClientTranslate:
 
     @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
     async def test_503_retry(self):
-        """Test retry on 503 (VKG mid-reload)."""
         client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
 
         mock_http = AsyncMock()
@@ -89,7 +87,6 @@ class TestVKGClientTranslate:
 
     @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
     async def test_non_200_raises(self):
-        """Test non-200 non-retryable response raises VKGTranslationError."""
         client = VKGClient(base_url="http://vkg.local:8080", max_retries=1)
 
         mock_http = AsyncMock()
@@ -100,7 +97,6 @@ class TestVKGClientTranslate:
             await client.translate("INVALID", namespace="demo")
 
     async def test_missing_sql_field_raises(self):
-        """Test response missing 'sql' field raises."""
         client = VKGClient(base_url="http://vkg.local:8080")
 
         mock_http = AsyncMock()
@@ -111,7 +107,6 @@ class TestVKGClientTranslate:
             await client.translate("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
 
     async def test_default_dialect_when_missing(self):
-        """Test defaults to postgresql dialect when not in response."""
         client = VKGClient(base_url="http://vkg.local:8080")
 
         mock_http = AsyncMock()
@@ -156,7 +151,6 @@ class TestVKGClientTranslate:
 
     @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
     async def test_connect_error_raises(self):
-        """Test ConnectError raises VKGTranslationError."""
         client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
 
         mock_http = AsyncMock()
@@ -168,7 +162,6 @@ class TestVKGClientTranslate:
 
     @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
     async def test_connect_timeout_raises(self):
-        """Test ConnectTimeout raises VKGTranslationError."""
         client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
 
         mock_http = AsyncMock()
@@ -180,7 +173,6 @@ class TestVKGClientTranslate:
 
     @patch("retryhttp.retry", lambda **kwargs: lambda f: f)
     async def test_remote_protocol_error_raises(self):
-        """Test RemoteProtocolError raises VKGTranslationError."""
         client = VKGClient(base_url="http://vkg.local:8080", max_retries=3)
 
         mock_http = AsyncMock()

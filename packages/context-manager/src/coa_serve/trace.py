@@ -35,14 +35,7 @@ def client_error_detail(exc: BaseException, **extra: object) -> dict[str, object
 
 
 class TraceCollector:
-    """Collects TraceStep entries as the pipeline progresses.
-
-    Args:
-        on_record: Optional async callback invoked for each recorded step.
-            Used by the SSE emitter to emit progressive ``step`` events.
-            Callbacks are scheduled as tasks and can be awaited via ``flush()``
-            to guarantee delivery before emitting subsequent events (e.g. done).
-    """
+    """Collects TraceStep entries as the pipeline progresses."""
 
     def __init__(self, on_record: OnRecordCallback | None = None) -> None:
         """Initialize an empty collector and start the wall-clock timer.
@@ -94,7 +87,7 @@ class TraceCollector:
         self._fire_callback(ts)
 
     def add_dicts(self, steps: Sequence[dict]) -> None:
-        """Ingest trace steps from downstream modules that return dicts or tuples of dicts."""
+        """Ingest trace steps returned as dicts by downstream modules."""
         for s in steps:
             step = s.get("step", "unknown")
             status = s.get("status", "unknown")
@@ -137,12 +130,9 @@ class TraceCollector:
         events to the SSE stream before the 403 error event and lets any
         authenticated caller enumerate restricted table names.
 
-        Best-effort: a task already past ``create_task`` scheduling and
-        actually executing may still complete. Under a single-threaded
-        event loop, tasks scheduled via ``loop.create_task`` do not run
-        until the current coroutine yields, so the common case (record
-        step → raise AccessDeniedError → discard) cancels before delivery.
-        (See the trace-flush-on-denial hardening in ``main.py::_run_resolve``.)
+        Best-effort: a task already executing may still complete, but tasks
+        scheduled via ``loop.create_task`` do not run until the current
+        coroutine yields, so record → raise → discard cancels before delivery.
         """
         for task in self._pending_tasks:
             if not task.done():

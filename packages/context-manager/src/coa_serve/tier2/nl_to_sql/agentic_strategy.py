@@ -3,34 +3,17 @@
 
 """Agentic NL-to-SQL strategy — the Tier-2 adapter for the NL→SQL agent.
 
-This is the production (AgentCore-runtime) counterpart of the local deep-reasoning
-harness. Where :class:`NLtoSQLStrategy` does a fixed retrieve → generate →
-(correct) pipeline, this strategy delegates to :class:`SqlAgent`, which
-*iteratively* discovers the right tables (inspecting candidate schemas, following
-FKs) before writing SQL, then executes and self-corrects. On the multi-source
-Spider 2.0 regime that iterative schema inspection is the main lever over
-single-shot retrieval (it was the doc's "agentic" column, ~50% vs single-shot ~26%).
-
-The strategy itself holds no prompt, no tools and no agent loop. It is the seam
-between the ``StructuredQueryStrategy`` protocol and the reusable pieces:
-
-  * :class:`~coa_serve.tier2.tools.TableCatalog` — ``search_tables`` / ``get_table_schema``
-  * :class:`~coa_serve.tier2.tools.SqlAuthoringTool` — ``generate_sql``
-  * :class:`~coa_serve.tier2.tools.OntologyGraphTool` — ``explore_graph`` (opt-in:
-    ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL`` deployment-wide,
-    ``options.deepReasoningGraphTraversal``
-    per request, withheld by ``options.excludeTools = ["explore_graph"]``)
-  * :class:`~coa_serve.sql_execution.SqlExecutionService` — firewall + executor
-  * :class:`~coa_serve.agents.SqlAgent` — the prompt + the bounded tool-use loop
-
-so it constructs those from the request context, runs the agent, and maps the
-outcome onto trace records and a :class:`StrategyResult`. The same tools back any
-other consumer (an MCP tool, an HTTP route) without going through this strategy.
+Where :class:`NLtoSQLStrategy` does a fixed retrieve → generate → (correct)
+pipeline, this strategy delegates to :class:`SqlAgent`, which iteratively
+discovers the right tables (inspecting candidate schemas, following FKs) before
+writing SQL, then executes and self-corrects. The strategy holds no prompt, tools
+or agent loop: it builds the tools from the request context, runs the agent, and
+maps the outcome onto trace records and a :class:`StrategyResult`.
 
 Worst-case latency and token spend are bounded by a per-request cap on statement
 executions, a stop just before the request deadline, and the per-statement
-execution timeout, not by a turn count (see :mod:`coa_serve.agents.sql_agent`).
-It is an OPT-IN strategy: it runs only when the request pins ``options.strategy = "deep-reasoning"`` (see
+execution timeout (see :mod:`coa_serve.agents.sql_agent`). It runs only when the
+request pins ``options.strategy = "deep-reasoning"`` (see
 ``StructuredQueryTier._strategies_for``), never as an implicit fallback.
 """
 
@@ -69,22 +52,9 @@ _TRUTHY = ("1", "true", "on", "yes")
 def _reported_confidence(outcome_confidence: float) -> float:
     """Confidence for a statement the agent verified by executing it.
 
-    The score is the SQL writer's own self-rating for that statement — the same
-    signal, on the same scale, that the single-shot NL→SQL strategy reports, so
-    the two paths stay comparable and this one reports a measurement rather than
-    a constant.
-
-    Floored at :data:`EMPTY_RESULT_CONFIDENCE_FLOOR` because this path has one
-    thing single-shot does not: the statement RAN. A verified result must not be
-    discarded as a low-confidence empty (``is_low_confidence_empty``) or dropped
-    by the orchestrator's confidence gate on the strength of a self-rating the
-    execution already checked.
-
-    Args:
-        outcome_confidence: The writer's self-reported confidence, 0.0 if unknown.
-
-    Returns:
-        The confidence to report on the StrategyResult.
+    The score is the SQL writer's own self-rating, floored at
+    :data:`EMPTY_RESULT_CONFIDENCE_FLOOR` because the statement ran, so a verified
+    result is not discarded as a low-confidence empty.
     """
     return max(outcome_confidence, EMPTY_RESULT_CONFIDENCE_FLOOR)
 
@@ -102,19 +72,11 @@ def _graph_traversal_enabled(options: dict | None = None) -> bool:
        ``options.agenticGraphTraversal`` is the accepted pre-rename spelling.
     3. ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL`` sets the deployment default (off);
        ``SERVE_AGENTIC_GRAPH_TRAVERSAL`` is still read.
-
-    Without a per-request enable, comparing "deep reasoning" against "deep reasoning
-    + traversal" needs two deployments, so every measured difference is confounded
-    with whatever else changed between the two images. Off (by any route) the
-    agent gets the same four tools and the same prompt as before, so that arm is
-    unchanged.
     """
     if "explore_graph" in ((options or {}).get("excludeTools") or ()):
         return False
     if options and any(
         str(options.get(key, "")).strip().lower() in _TRUTHY
-        # Pre-rename spelling accepted so a benchmark script pinned to it keeps
-        # enabling the tool rather than silently measuring the no-traversal arm.
         for key in ("deepReasoningGraphTraversal", "agenticGraphTraversal")
     ):
         return True
@@ -143,7 +105,7 @@ class AgenticStrategy:
 
         ``graph_client`` is optional: it backs the opt-in ``explore_graph`` tool
         (flag ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL``). With it unset or the flag off, no
-        graph tool is built and the agent runs exactly as it did before.
+        graph tool is built.
         """
         self._sql_generator = sql_generator
         self._firewall = firewall
@@ -156,16 +118,12 @@ class AgenticStrategy:
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
         """Run the bounded tool-use agent; return a StrategyResult or None on miss.
 
-        Scope: this opt-in ``deep-reasoning`` path is SINGLE-SOURCE. It executes
-        through ``SqlExecutionService`` and does NOT run
-        ``table_qualifier.prepare_execution_sql``, so it does not rewrite bare table
-        names to ``catalog.schema.table``. A genuinely cross-source query on this
-        path therefore reproduces the cross-source failure (bare names -> Athena TABLE_NOT_FOUND). It is
-        never the default or a fallback (StructuredQueryTier engages it only when a
-        request pins ``options.strategy="deep-reasoning"``), and the qualifier-backed
-        ``ontop`` and ``nl_to_sql`` strategies cover cross-source. Threading
-        qualification through the agentic tool loop + SqlExecutionService is a
-        separate change; until then, treat deep-reasoning as single-source-only.
+        Scope: this path is SINGLE-SOURCE. It executes through
+        ``SqlExecutionService`` and does NOT run
+        ``table_qualifier.prepare_execution_sql``, so bare table names are not
+        rewritten to ``catalog.schema.table`` and a cross-source query fails
+        (Athena TABLE_NOT_FOUND). The ``ontop`` and ``nl_to_sql`` strategies cover
+        cross-source.
         """
         if not self._query_executor:
             context.trace.record(StepId.T2_SQL_EXECUTE, "skipped", 0, detail="no query_executor configured")

@@ -31,23 +31,12 @@ export interface LakeFormationAdminProps {
  * writes the full settings back (`PutDataLakeSettings`) — preserving existing
  * admins and other settings. Removes the role on stack deletion (best-effort).
  *
- * NOTE: `PutDataLakeSettings` is authorized by the IAM permission granted below,
- * NOT by the caller's own membership in `DataLakeAdmins`. This works unattended on
- * any account, greenfield or with admins already present, and needs no
- * out-of-band bootstrap. An earlier version of this comment claimed the caller
- * had to be a data-lake admin itself; that was verified false by direct test (a
- * non-admin role with only the two `*DataLakeSettings` permissions modified the
- * admin list on an account with four existing admins). An `AccessDeniedException`
- * here means the IAM action is denied — look for an SCP or permission boundary.
+ * `PutDataLakeSettings` is authorized by the IAM permission granted below, not
+ * by the caller's own membership in `DataLakeAdmins`, so no out-of-band
+ * bootstrap is needed. An `AccessDeniedException` means the IAM action is
+ * denied: look for an SCP or permission boundary.
  */
 export class LakeFormationAdmin extends Construct {
-  /**
-   * Execution role of the onEvent Lambda — the principal that calls
-   * `PutDataLakeSettings`. It needs the IAM action (granted below), not
-   * data-lake admin membership.
-   */
-  public readonly adminLambdaRole: iam.IRole;
-
   constructor(scope: Construct, id: string, props: LakeFormationAdminProps) {
     super(scope, id);
 
@@ -59,7 +48,6 @@ export class LakeFormationAdmin extends Construct {
         path.join(__dirname, "../lambdas/lakeformation-admin"),
       ),
     });
-    this.adminLambdaRole = onEvent.role!;
 
     // LF settings APIs do not support resource-level scoping.
     onEvent.addToRolePolicy(
@@ -91,9 +79,7 @@ export class LakeFormationAdmin extends Construct {
       serviceToken: provider.serviceToken,
       properties: {
         RoleArnSsmParameterName: props.roleArnSsmParameterName,
-        // Value-carrying property so repointing the parameter triggers an
-        // Update — see LakeFormationAdminProps.roleArn. The handler reads the
-        // authoritative ARN from SSM; this is only a change detector.
+        // Change detector; see props.roleArn.
         RoleArn: props.roleArn,
       },
     });

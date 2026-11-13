@@ -112,7 +112,6 @@ def format_grouped_turtle(raw_turtle: str) -> str:
             ns_str = ns_str + "#"
         g.bind("", Namespace(ns_str), override=True, replace=True)
 
-    # Categorize subjects.
     onto_subjects = sorted(g.subjects(RDF.type, OWL.Ontology), key=str)
     class_subjects = sorted(g.subjects(RDF.type, OWL.Class), key=str)
     obj_prop_subjects = sorted(g.subjects(RDF.type, OWL.ObjectProperty), key=str)

@@ -11,7 +11,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Add the Lambda source to path so we can import it
 _LAMBDA_DIR = str(Path(__file__).parents[2] / "lambda" / "aoss-search-proxy")
 sys.path.insert(0, _LAMBDA_DIR)
 

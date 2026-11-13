@@ -20,7 +20,6 @@ from coa_sources.database.metrics import emit_metric
 
 logger = logging.getLogger(__name__)
 
-# TODO hardcoding for now, if there is a better way we can change it
 # Claude Haiku 4.5 pricing (us-east-1, per token)
 _BEDROCK_INPUT_COST_PER_TOKEN = 1.00 / 1_000_000  # $1.00 per 1M input tokens
 _BEDROCK_OUTPUT_COST_PER_TOKEN = 5.00 / 1_000_000  # $5.00 per 1M output tokens
@@ -31,20 +30,10 @@ _GUARDRAIL_CODES = {"AccessDeniedException", "ModelErrorException"}
 
 
 class EnrichmentContext:
-    """Accumulates data gathered during the enrichment process.
-
-    Constructed from the DynamoDB source item; derives metric dimensions
-    (engine) and accumulates token usage during processing.
-    """
+    """Metric dimensions (namespace and engine) derived from a source DDB item."""
 
     def __init__(self, source_item: dict, namespace_id: str) -> None:
-        """Build the context from a source DDB item.
-
-        Args:
-            source_item: The source's DynamoDB record; the engine dimension is
-                derived from its configuration.
-            namespace_id: Namespace the source belongs to, used as a dimension.
-        """
+        """Build the context from a source DDB item."""
         self.namespace_id = namespace_id
         self.engine = _resolve_engine(source_item)
 
@@ -75,12 +64,7 @@ class BedrockTokenUsageCounter:
         self.output_tokens = 0
 
     def record_call(self, input_tokens: int, output_tokens: int) -> None:
-        """Add one Bedrock call's token counts to the running totals.
-
-        Args:
-            input_tokens: Input (prompt) tokens consumed by the call.
-            output_tokens: Output (completion) tokens produced by the call.
-        """
+        """Add one Bedrock call's token counts to the running totals."""
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
 
@@ -96,12 +80,7 @@ class EnrichmentMetricEmitter:
     """Emits enrichment metrics using data from an EnrichmentContext."""
 
     def __init__(self, context: EnrichmentContext) -> None:
-        """Bind the emitter to a context and start a fresh token counter.
-
-        Args:
-            context: Enrichment context supplying the Engine/NamespaceId
-                dimensions attached to every emitted metric.
-        """
+        """Bind the emitter to a context and start a fresh token counter."""
         self._ctx = context
         self._token_counter = BedrockTokenUsageCounter()
 

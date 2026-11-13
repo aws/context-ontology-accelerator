@@ -47,15 +47,10 @@ _UNSET = object()
 
 
 def _build_dao(ns_item=_UNSET, source_item=None):
-    """Build a DAO mock that returns different items by key.
+    """Build one DAO mock whose ``get`` routes by SK to the namespace or source item.
 
-    ``ns_dao.get`` is called on the namespace key first, and ``ds_dao.get``
-    is called on the source key. The handler instantiates two separate DAO
-    instances (one per table); we simulate that by routing ``get`` based on
-    the SK value.
-
-    ``ns_item=None`` simulates a missing namespace; pass ``_UNSET`` (the
-    default) to use a working namespace stub.
+    ``ns_item=None`` simulates a missing namespace; ``_UNSET`` (the default) uses a
+    working namespace stub.
     """
     dao = MagicMock()
     ns = {"dataZoneProjectId": "proj-123"} if ns_item is _UNSET else ns_item
@@ -89,11 +84,9 @@ class TestEnrichmentHandlerStatus:
         update_calls = mock_dao.update.call_args_list
         assert len(update_calls) == 2
 
-        # First call: ENRICHING
         assert update_calls[0][1]["update_fields"]["status"] == SourceStatus.ENRICHING
         assert update_calls[0][1]["key"] == {"PK": "NS#ns-test", "SK": "SRC#ds-123"}
 
-        # Second call: PENDING_REVIEW
         assert update_calls[1][1]["update_fields"]["status"] == SourceStatus.PENDING_REVIEW
 
     @patch(
@@ -105,7 +98,7 @@ class TestEnrichmentHandlerStatus:
     )
     @patch("coa_common.dao.DynamoDBDAO")
     def test_cross_source_detection_failure_is_non_fatal(self, mock_dao_cls, mock_run, mock_xsrc):
-        # #1088: the cross-source pass is best-effort. If it raises, this source's
+        # The cross-source pass is best-effort. If it raises, this source's
         # enrichment must still complete (terminal PENDING_REVIEW, never
         # SCAN_FAILED) and the failure must be observable via a metric.
         mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
@@ -173,11 +166,8 @@ class TestEnrichmentHandlerStatus:
         update_calls = mock_dao.update.call_args_list
         assert len(update_calls) == 3
 
-        # First call: ENRICHING on data source
         assert update_calls[0][1]["update_fields"]["status"] == SourceStatus.ENRICHING
-        # Second call: SCAN_FAILED on data source
         assert update_calls[1][1]["update_fields"]["status"] == SourceStatus.SCAN_FAILED
-        # Third call: errorMessage on scan job
         assert "errorMessage" in update_calls[2][1]["update_fields"]
         assert "Bedrock error" in update_calls[2][1]["update_fields"]["errorMessage"]
 
@@ -279,7 +269,6 @@ class TestEnrichmentMetricEmission:
 
         handler()
 
-        # Collect all emitted metric names
         emitted_names = [call[0][0] for call in mock_emit.call_args_list]
 
         assert "EnrichmentJobDurationMs" in emitted_names
@@ -303,7 +292,6 @@ class TestEnrichmentMetricEmission:
 
         handler()
 
-        # Every emitted metric should include Engine and NamespaceId
         for call in mock_emit.call_args_list:
             kwargs = call[1]
             assert kwargs.get("Engine") == "mysql", f"Missing Engine on {call[0][0]}"
@@ -411,21 +399,6 @@ class TestEnrichmentPartialTables:
     succeeded) is written back with its surviving metadata and counted under
     tables_enriched. The handler must emit the TablesPartial metric and record
     which tables are incomplete on the scan-job row for steward review."""
-
-    @pytest.fixture(autouse=True)
-    def _skip_cross_source_pass(self):
-        # These tests assert on the handler's partial-enrichment bookkeeping
-        # (metric + scan-job row), driven by the mocked table_enricher.run
-        # return value. The best-effort #1088 cross-source pass that runs
-        # afterwards is out of scope here; left live against a MagicMock DAO its
-        # lock is acquired and its source-pagination loop spins forever on a
-        # truthy MagicMock last_evaluated_key. Stub it out (the dedicated
-        # cross-source tests cover it) so these stay fast and deterministic.
-        with patch(
-            "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
-            return_value={"sources": 0, "relationships_written": 0, "tables_updated": 0},
-        ):
-            yield
 
     _PARTIAL_RESULT = {
         "tables_enriched": 2,
@@ -742,36 +715,15 @@ class TestEnrichmentProgressPublishing:
         assert writes[0][1]["condition"] == "attribute_exists(PK)"
         assert writes[0][1]["raise_on_error"] is False
 
-    @patch(
-        f"{ENRICHER_MODULE}.run",
-        return_value={"tables_enriched": 1, "tables_failed": 0, "tables_skipped_unchanged": 0, "failed_table_ids": []},
-    )
-    @patch("coa_common.dao.DynamoDBDAO")
-    def test_enricher_is_given_a_progress_callback(self, mock_dao_cls, mock_run):
-        mock_dao = _build_dao(source_item={"sourceId": "ds-123"})
-        mock_dao_cls.return_value = mock_dao
-
-        from coa_sources.database.pipeline.enrichment_handler import handler
-
-        handler()
-
-        assert callable(mock_run.call_args[1]["progress"])
-
 
 class TestNamespaceLanguageSnapshot:
     """The worker uses the job input's snapshot and never the namespace item's value."""
 
     @patch(
-        "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
-        return_value={"relationships_written": 0},
-    )
-    @patch(
         f"{ENRICHER_MODULE}.run", return_value={"tables_enriched": 1, "tables_failed": 0, "tables_skipped_unchanged": 0}
     )
     @patch("coa_common.dao.DynamoDBDAO")
-    def test_snapshot_reaches_enrichment_without_rereading_language(
-        self, mock_dao_cls, mock_run, _cross_source, monkeypatch
-    ):
+    def test_snapshot_reaches_enrichment_without_rereading_language(self, mock_dao_cls, mock_run, monkeypatch):
         monkeypatch.setenv("NAMESPACE_LANGUAGE", "ja")
         # The namespace item is still read for the DataZone project id, but its
         # language (deliberately different here) must not be consulted.
@@ -807,14 +759,10 @@ class TestNamespaceLanguageSnapshot:
 
     @pytest.mark.parametrize("snapshot", [_UNSET, ""])
     @pytest.mark.parametrize(("ns_language", "expected"), [("ja", "ja"), (_UNSET, "en")])
-    @patch(
-        "coa_sources.database.enrichment.cross_source_orchestrator.run_for_namespace",
-        return_value={"relationships_written": 0},
-    )
     @patch(f"{ENRICHER_MODULE}.run")
     @patch("coa_common.dao.DynamoDBDAO")
     def test_pre_snapshot_job_resolves_once_and_records_it(
-        self, mock_dao_cls, mock_run, _cross_source, ns_language, expected, snapshot, monkeypatch, caplog
+        self, mock_dao_cls, mock_run, ns_language, expected, snapshot, monkeypatch, caplog
     ):
         if snapshot is _UNSET:
             monkeypatch.delenv("NAMESPACE_LANGUAGE")

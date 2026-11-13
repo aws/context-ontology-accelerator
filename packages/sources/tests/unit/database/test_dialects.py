@@ -113,8 +113,6 @@ class TestRedshiftDialect:
             captured.append(sql)
             if "pg_catalog.pg_namespace" in sql:
                 return [("public",), ("analytics",), ("pg_catalog",)]
-            if "information_schema.schemata" in sql:
-                return []  # Redshift returns nothing here
             return []
 
         schemas = RedshiftDialect().list_schemas(_Conn(responder))
@@ -137,7 +135,7 @@ class TestRedshiftDialect:
 
     def test_fetch_columns_recovers_late_binding_view(self):
         """A late-binding view returns nothing from information_schema.columns and
-        must be recovered via pg_get_late_binding_view_cols(), marked nullable (#134)."""
+        must be recovered via pg_get_late_binding_view_cols(), marked nullable."""
 
         def responder(sql, p):
             if "information_schema.columns" in sql:
@@ -229,11 +227,8 @@ class TestInformationSchemaDialect:
         assert fk == {"orders": [("customer_id", "customers", "id")]}
 
     def test_fetch_constraints_composite_fk_paired_by_position(self):
-        # A composite (2-column) FK must pair columns BY POSITION — (a,b)->(x,y),
-        # NOT the N×N cartesian product the old constraint_column_usage join
-        # produced. The position-matched query joins kcu (FK side) to the
-        # referenced unique constraint on position_in_unique_constraint, so the
-        # DB returns exactly the correctly-paired rows.
+        # A composite (2-column) FK pairs columns by position: (a,b)->(x,y), via
+        # position_in_unique_constraint.
         conn = _Conn(
             lambda sql, p: (
                 [("order_items", "order_id"), ("order_items", "line_no")]
@@ -253,8 +248,6 @@ class TestInformationSchemaDialect:
                 ("line_no", "shipments", "line_no"),
             ]
         }
-        # Must use referential_constraints with a positional join, NOT the
-        # cartesian constraint_column_usage join that mis-paired composite FKs.
         fk_sql = next(s for s, _ in conn.cursor_obj.calls if "referential_constraints" in s.lower())
         assert "position_in_unique_constraint" in fk_sql.lower()
         assert "constraint_column_usage" not in fk_sql.lower()
@@ -324,7 +317,7 @@ class TestSnowflakeDialect:
 
     def test_fetch_constraints_uses_show_commands_not_key_column_usage(self):
         # Snowflake's INFORMATION_SCHEMA has no KEY_COLUMN_USAGE, so the inherited
-        # ANSI query raises and constraint discovery silently yields empty (#191).
+        # ANSI query raises and constraint discovery silently yields empty.
         # Constraints must come from SHOW PRIMARY KEYS / SHOW IMPORTED KEYS, read
         # by column name. Uses a composite PK (CATALOG_RETURNS has a 2-column PK).
         def responder(sql, p):
@@ -362,7 +355,7 @@ class TestSnowflakeDialect:
 
         assert pk == {"CATALOG_RETURNS": ["CR_ITEM_SK", "CR_ORDER_NUMBER"]}
         assert fk == {"CATALOG_RETURNS": [("CR_CALL_CENTER_SK", "CALL_CENTER", "CC_CALL_CENTER_SK")]}
-        # Must use SHOW commands, never the non-existent ANSI view (#191).
+        # Must use SHOW commands, never the non-existent ANSI view.
         assert any("show primary keys" in s.lower() for s, _ in conn.cursor_obj.calls)
         assert any("show imported keys" in s.lower() for s, _ in conn.cursor_obj.calls)
         assert all("key_column_usage" not in s.lower() for s, _ in conn.cursor_obj.calls)
@@ -691,27 +684,27 @@ class TestOracleDialect:
 class TestConnectLazyImports:
     """connect() must lazily import the right driver and pass sane args."""
 
-    def _run_connect(self, dialect, module_name, attr_path):
+    def _run_connect(self, dialect, module_name):
         mod = MagicMock()
         with patch.dict(sys.modules, {module_name: mod}):
             dialect.connect(host="h.example.com", port=1, database="db", user="u", password="p", options={})
         return mod
 
     def test_postgres_uses_pg8000_with_tls(self):
-        mod = self._run_connect(PostgresDialect(), "pg8000", "connect")
+        mod = self._run_connect(PostgresDialect(), "pg8000")
         assert mod.connect.call_args.kwargs["ssl_context"] is True
         assert mod.connect.call_args.kwargs["database"] == "db"
 
     def test_mysql_uses_pymysql_with_ssl_context(self):
-        mod = self._run_connect(MySqlDialect(), "pymysql", "connect")
+        mod = self._run_connect(MySqlDialect(), "pymysql")
         assert "ssl" in mod.connect.call_args.kwargs
 
     def test_sqlserver_uses_pytds_server_kwarg(self):
-        mod = self._run_connect(SqlServerDialect(), "pytds", "connect")
+        mod = self._run_connect(SqlServerDialect(), "pytds")
         assert mod.connect.call_args.kwargs["server"] == "h.example.com"
 
     def test_oracle_uses_oracledb_dsn(self):
-        mod = self._run_connect(OracleDialect(), "oracledb", "connect")
+        mod = self._run_connect(OracleDialect(), "oracledb")
         assert mod.connect.call_args.kwargs["dsn"] == "h.example.com:1/db"
 
     def test_snowflake_derives_account_and_passes_warehouse(self):
@@ -768,7 +761,7 @@ class TestFetchDistinctValues:
         return responder
 
     def test_low_cardinality_repeated_column_returns_values(self):
-        # 2 distinct values over 133 rows → enum-like → keep
+        # 2 distinct values over 37 rows → enum-like → keep
         conn = _Conn(self._responder(total=37, distinct=2, values=[("RETURNED",), ("RETURN_REQUESTED",)]))
         out = self._dialect().fetch_distinct_values(conn, "coa_demo", "orders", ["return_state"], max_distinct=50)
         assert out == {"return_state": ["RETURNED", "RETURN_REQUESTED"]}
@@ -909,7 +902,7 @@ class TestEnumValueShapeFilter:
 @pytest.mark.unit
 class TestRunRollsBackOnError:
     """_run() must roll back on a failed statement so a poisoned Postgres/Redshift
-    transaction cannot make the next query fail with a misleading 25P02 (issue #129)."""
+    transaction cannot make the next query fail with a misleading 25P02."""
 
     class _AbortableCursor:
         def __init__(self, conn):

@@ -29,13 +29,8 @@ export interface TraceData {
   metadata: Record<string, unknown>;
   confidence?: { score: number; rationale: string };
   userQuery: string;
-  /**
-   * Resolved execution mode ("standard" / "deep-reasoning"). Threaded so the
-   * full-trace "Tier outcome" badge can follow the same mode-wins rule as the
-   * Rationale panel: a Deep Reasoning answer resolves at tier 3 but must not
-   * read "Tier 3 — knowledge" (#1166). Absent on responses that omit it, in
-   * which case the badge falls back to the tier label.
-   */
+  /** Resolved execution mode; it wins over tier for the "Tier outcome" badge.
+   *  When absent the badge falls back to the tier label. */
   executionMode?: ExecutionMode;
 }
 
@@ -56,12 +51,6 @@ function isLocationState(value: unknown): value is LocationState {
   return "message" in value || Object.keys(value).length === 0;
 }
 
-function toRecord(
-  value: Record<string, unknown> | undefined | null,
-): Record<string, unknown> {
-  return value ?? {};
-}
-
 function resolveFromRouterState(
   state: LocationState,
   requestIdParam: string | undefined,
@@ -77,7 +66,7 @@ function resolveFromRouterState(
     sparqlGenerated: result.sparqlGenerated,
     requestId: requestIdParam ?? message.requestId ?? "unknown",
     guardrailBlocked: result.guardrailBlocked ?? false,
-    metadata: toRecord(result.metadata),
+    metadata: result.metadata ?? {},
     confidence: result.confidence,
     userQuery: query ?? "—",
     executionMode: result.executionMode,
@@ -90,10 +79,8 @@ function resolveFromHistory(
   requestId: string,
 ): TraceData {
   const meta = msg.metadata ?? {};
-  // The typed history metadata doesn't expose executionMode, but the backend
-  // stamps the resolved mode into the free-form inner metadata as `mode`
-  // (orchestrator sets result.metadata["mode"] = "deep-reasoning"). Read it and
-  // coerce to ExecutionMode so the badge can apply the same mode-wins rule.
+  // History metadata has no executionMode; the backend stamps the mode into the
+  // inner metadata as `mode`.
   const rawMode = meta.metadata?.mode;
   const executionMode: ExecutionMode | undefined =
     rawMode === "deep-reasoning" || rawMode === "standard"
@@ -107,7 +94,7 @@ function resolveFromHistory(
     sparqlGenerated: meta.sparqlGenerated,
     requestId,
     guardrailBlocked: meta.guardrailBlocked ?? false,
-    metadata: toRecord(meta.metadata),
+    metadata: meta.metadata ?? {},
     confidence: meta.confidence,
     userQuery: userQuery !== "—" ? userQuery : (meta.query ?? "—"),
     executionMode,

@@ -61,10 +61,6 @@ def instrumented(client_name: str):
     return decorator
 
 
-# ── Graph Client (Neptune DB, Neptune Analytics) ─────────────────────────
-
-
-# Enables isinstance() checks against this protocol at runtime.
 @runtime_checkable
 class GraphClient(Protocol):
     """Read-only graph query interface for SPARQL operations.
@@ -86,9 +82,6 @@ class GraphClient(Protocol):
     async def health_check(self) -> dict[str, Any]:
         """Probe graph backend reachability; returns a status dict, never raises."""
         ...
-
-
-# ── Vector Client (OpenSearch Serverless, Neptune Analytics) ─────────────
 
 
 @dataclass
@@ -142,24 +135,9 @@ class VectorClient(Protocol):
         """k-NN search scoped by index, optionally filtered by entity_type / mapped-only / ontology / backend."""
         ...
 
-    async def hybrid_search(
-        self,
-        query_text: str,
-        query_vector: list[float],
-        *,
-        namespace: str = "",
-        top_k: int = 5,
-        index: str | None = None,
-    ) -> list[VectorHit]:
-        """Combined BM25 keyword + k-NN vector search."""
-        ...
-
     async def health_check(self) -> dict[str, Any]:
         """Probe vector backend reachability; returns a status dict, never raises."""
         ...
-
-
-# ── LLM Client (Bedrock) ─────────────────────────────────────────────────
 
 
 class GuardrailOutcome(StrEnum):
@@ -240,7 +218,7 @@ class ContentFilteredError(ValueError):
     Deliberately NOT a :class:`GuardrailBlockedError`: this is native model-side
     filtering, not a Bedrock Guardrail policy action, and conflating them would make
     the two indistinguishable in traces and on dashboards. Subclasses ``ValueError``
-    because that is what this condition raised before it was typed.
+    for backward-compatible ``except`` clauses.
     """
 
     def __init__(self, message: str, *, stop_reason: str = "content_filtered") -> None:
@@ -275,7 +253,7 @@ class LLMClient(Protocol):
         """Call Bedrock Converse API. Returns ConverseResult with text and guardrail status.
 
         ``guard_content`` is the user-supplied text to tag for guardrail
-        evaluation (M-5 prompt-injection scoping); when set, only that segment is
+        evaluation (prompt-injection scoping); when set, only that segment is
         guard-evaluated, leaving retrieved context/instructions untouched.
 
         ``top_p`` is an optional nucleus-sampling cutoff; determinism-sensitive
@@ -316,9 +294,6 @@ class LLMClient(Protocol):
     async def health_check(self) -> dict[str, Any]:
         """Probe LLM backend reachability; returns a status dict, never raises."""
         ...
-
-
-# ── Query Executor (asyncpg, Athena) ─────────────────────────────────────
 
 
 @dataclass
@@ -365,9 +340,6 @@ class QueryExecutor(Protocol):
     async def health_check(self) -> dict[str, Any]:
         """Probe query executor reachability; returns a status dict, never raises."""
         ...
-
-
-# ── Client Set ────────────────────────────────────────────────────────────
 
 
 @dataclass

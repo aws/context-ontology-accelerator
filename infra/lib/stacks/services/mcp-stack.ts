@@ -31,16 +31,11 @@ export interface McpStackProps extends cdk.StackProps {
 }
 
 /**
- * MCP Server: Thin protocol adapter on AgentCore Runtime.
+ * MCP Server: thin protocol adapter on AgentCore Runtime.
  *
- * Architecture (post-refactor):
  * - Discovery tools (list_metrics, describe_schema) invoke backend Lambdas directly
  * - Execution tools (query, translate, rag, graph) forward to Context Manager
  *   via AgentCore invocations API (HTTP POST with JWT forwarding)
- * - MCP server does NOT run the orchestrator in-process
- * - Minimal IAM: Lambda invoke (discovery), InvokeAgentRuntime (execution),
- *   DynamoDB read (roles/RRM), SSM
- *
  */
 export class McpStack extends SCLStack {
   public readonly agentRuntimeArn: string;
@@ -72,11 +67,8 @@ export class McpStack extends SCLStack {
       this,
       `${ssmPrefix}/mcp-client-id`,
     );
-    // The JWT claim name carrying group membership — "cognito:groups" for
-    // Cognito, or the customer's configured claim (oidcSettings.groupClaim,
-    // default "groups") for direct OIDC. Read from SSM instead of hardcoding
-    // DEFAULT_GROUP_CLAIM ("cognito:groups"): that constant is wrong on the
-    // OIDC path and silently breaks all group-based role resolution.
+    // JWT group claim name: read from SSM because "cognito:groups" is wrong on
+    // the direct-OIDC path.
     const groupClaimName = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/authentication-group-token-name`,
@@ -189,12 +181,8 @@ export class McpStack extends SCLStack {
         // The default, stated so the template shows it. "false" is a local-dev
         // switch that the server refuses to start with under SCL_MCP_MODE.
         SCL_AUTH_ENABLED: "true",
-        // Independent JWT signature verification in claims.py, as
-        // defense-in-depth behind the AgentCore RuntimeAuthorizerConfiguration
-        // above. Same issuer/audience trust anchor, IdP-agnostic (Cognito,
-        // Okta, EntraID, ...) via coa_common.auth.build_token_authorizer.
-        // MCP callers authenticate as the MCP/CLI client, so JWT_CLIENT_ID
-        // uses mcpClientId (not the web app's clientId).
+        // Independent JWT verification (defense in depth behind the AgentCore
+        // authorizer); callers are the MCP/CLI client, so use mcpClientId.
         JWT_ISSUER_URL: issuerUrl,
         JWT_CLIENT_ID: mcpClientId,
       },

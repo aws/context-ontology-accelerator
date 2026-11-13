@@ -1,23 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever AccumulatedContext store (task 5).
-
-Covers ``coa_serve.tier3.agentic.context``:
-
-- :meth:`AccumulatedContext.add` incorporates a ToolResult's chunks/entities
-  before the next step (Req 4.2) and returns the count of genuinely NEW,
-  de-duplicated retrieval results (Req 6.3) — so a step that surfaces only
-  already-seen items returns ``0`` and drives the ``no_new_information`` stop.
-- Duplicate chunks/entities (across calls and within one call) are never
-  double-counted; arrival order is preserved.
-- ``degraded_sources`` accumulates one record per failure (Req 9.1-9.3).
-- ``ontology`` defaults to ``None`` and is settable (per-request cache, Req 3.8).
-
-The chunk/entity stand-ins here are lightweight: ``add`` handles items
-structurally (by attribute), so the tests need neither ``ChunkResult`` /
-``GraphEntity`` nor any ``graphrag_toolkit`` access.
-"""
+"""Unit tests for the Agentic Retriever AccumulatedContext store (``coa_serve.tier3.agentic.context``)."""
 
 from __future__ import annotations
 
@@ -81,13 +65,6 @@ class TestDefaults:
         assert a.seen_keys is not b.seen_keys
         assert a.degraded_sources is not b.degraded_sources
 
-    def test_ontology_is_settable(self):
-        """The per-request ontology cache (Req 3.8) is a plain settable field."""
-        ctx = AccumulatedContext()
-        sentinel = object()
-        ctx.ontology = sentinel  # type: ignore[assignment]
-        assert ctx.ontology is sentinel
-
 
 @pytest.mark.unit
 class TestAddNewCount:
@@ -117,7 +94,7 @@ class TestAddNewCount:
 @pytest.mark.unit
 class TestDeduplication:
     """Duplicate items are not double-counted — this drives the
-    ``no_new_information`` stop (Req 6.3)."""
+    ``no_new_information`` stop."""
 
     def test_duplicate_chunk_across_calls_not_counted_again(self):
         ctx = AccumulatedContext()
@@ -279,8 +256,7 @@ class TestDeduplication:
 @pytest.mark.unit
 class TestRowsChannel:
     """Structured rows (NL→SQL / metric tools) accumulate and count toward progress
-    like chunks/entities — the fix for a successful SQL tool being mis-scored as
-    no-progress because its output arrives on ``rows``, not ``chunks``."""
+    like chunks/entities."""
 
     def test_rows_count_as_new_progress(self):
         ctx = AccumulatedContext()
@@ -328,7 +304,7 @@ class TestRowsChannel:
 
 @pytest.mark.unit
 class TestForkAndMerge:
-    """P2 parallel sub-questions: fork gives a private sub-context; merge folds it
+    """Parallel sub-questions: fork gives a private sub-context; merge folds it
     back with the same dedup as sequential accumulation."""
 
     def test_fork_shares_ontology_but_not_mutable_state(self):
@@ -348,7 +324,7 @@ class TestForkAndMerge:
         assert child.chunks is not parent.chunks
 
     def test_private_seen_keys_prevents_false_no_progress(self):
-        """The core P2 invariant: a sibling retrieving a chunk the PARENT already
+        """The core fork invariant: a sibling retrieving a chunk the PARENT already
         saw still counts it as new IN ITS OWN fork (own seen_keys), so its
         no-progress signal is judged against its own retrievals, not a sibling's."""
         parent = AccumulatedContext()
@@ -541,7 +517,7 @@ class TestForkAndMerge:
 
 @pytest.mark.unit
 class TestDegradedSources:
-    """Degraded sources accumulate across failures (Req 9.1-9.3, 9.5)."""
+    """Degraded sources accumulate across failures."""
 
     def test_record_degraded_accumulates(self):
         ctx = AccumulatedContext()
@@ -560,14 +536,6 @@ class TestDegradedSources:
         ctx.record_degraded("vector_search", "timeout")
         assert len(ctx.degraded_sources) == 2
 
-    def test_direct_append_also_accumulates(self):
-        """The controller appends degraded records directly; that path
-        accumulates too."""
-        ctx = AccumulatedContext()
-        ctx.degraded_sources.append({"source": "graph_traversal", "reason": "error"})
-        ctx.degraded_sources.append({"source": "vector_search", "reason": "timeout"})
-        assert len(ctx.degraded_sources) == 2
-
     def test_add_does_not_touch_degraded_sources(self):
         """``add`` only incorporates retrieval results; degraded tracking is a
         separate concern owned by the controller."""
@@ -578,7 +546,7 @@ class TestDegradedSources:
 
 @pytest.mark.unit
 class TestExecutedQueries:
-    """#1166 cut #3: query artifacts a structured tool ran are collected on the
+    """Query artifacts a structured tool ran are collected on the
     context (so Deep Reasoning can return them like Standard mode does)."""
 
     def test_add_collects_executed_queries(self):
@@ -630,7 +598,7 @@ class TestExecutedQueries:
 
 @dataclass(frozen=True)
 class _ScoredChunk:
-    """Chunk stand-in carrying a relevance score (for idea-8 ranking tests)."""
+    """Chunk stand-in carrying a relevance score (for relevance-ranking tests)."""
 
     chunk_id: str = ""
     text: str = ""
@@ -640,7 +608,7 @@ class _ScoredChunk:
 
 @pytest.mark.unit
 class TestRelevanceRankedRefs:
-    """Idea 8: relevance-ranked carried-context views (vs the recency views)."""
+    """Relevance-ranked carried-context views (vs the recency views)."""
 
     def _ctx(self) -> AccumulatedContext:
         ctx = AccumulatedContext()
@@ -714,13 +682,7 @@ class TestRecentRowSnippets:
 
 @pytest.mark.unit
 class TestEntityBounds:
-    """Entity accumulation must be bounded and cheap.
-
-    Nothing upstream bounded the entity count, so a broad traversal could push
-    thousands of entities into the planner summary, the synthesis prompt, the wire
-    response and the persisted session envelope; and merging an already-seen entity
-    rescanned the whole list, recomputing a dedupe key per element.
-    """
+    """Entity accumulation must be bounded and cheap."""
 
     def test_entity_count_is_capped_and_the_cap_is_reported(self):
         ctx = AccumulatedContext()

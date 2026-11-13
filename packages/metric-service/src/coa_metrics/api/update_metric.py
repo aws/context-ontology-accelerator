@@ -93,7 +93,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if name_error:
         return api_response(400, {"message": name_error})
 
-    # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
     except (json.JSONDecodeError, TypeError):
@@ -113,12 +112,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if label_error:
         return api_response(400, {"message": label_error})
 
-    # Check metric exists
     existing = _get_neptune().get_metric(namespace, name)
     if existing is None:
         return api_response(404, {"message": "Metric not found in namespace"})
 
-    # Build updated metric definition (includes SqlDialect validation)
     try:
         metric = _build_updated_metric(request, name, caller, existing)
     except ValueError as exc:
@@ -143,12 +140,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if source_error:
         return api_response(400, {"message": source_error})
 
-    # Validation findings — block only on the SQL syntax + shape checks
-    # (BLOCKING_CHECKS), matching create and the serve firewall (#617/#1050).
-    # Block by check name, not severity, so an ERROR-severity metadata check
-    # (e.g. table_reference on provable absence) does not 400 here — it has its
-    # own dedicated gate (check_source_table_exists) (Kun's review, !1133).
-    # _validate_soft surfaces the check name under the "field" key.
+    # Only the SQL syntax and shape checks block (BLOCKING_CHECKS); table_reference
+    # has its own gate (check_source_table_exists). _validate_soft surfaces the
+    # check name under the "field" key.
     findings = _validate_soft(request, namespace, data_source_lookup=data_source_lookup)
     blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
     if blocking:
@@ -163,20 +157,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("ontology_concept_resolution_failed", error=str(exc))
 
-    # Atomic update in Neptune (delete + insert)
     try:
         _get_neptune().update_metric(namespace, name, metric)
     except Exception as exc:
         logger.exception("neptune_update_failed", error=str(exc))
         return api_response(500, {"message": "Internal server error"})
 
-    # Re-embed in OpenSearch (best-effort)
     try:
         _get_opensearch().embed_metric(namespace, metric)
     except Exception as exc:
         logger.warning("opensearch_embed_failed", error=str(exc), name=name)
 
-    # Emit EventBridge event (best-effort)
     try:
         bus_name = os.environ.get("EVENTBRIDGE_BUS_NAME", "default")
         _get_eventbridge().put_events(

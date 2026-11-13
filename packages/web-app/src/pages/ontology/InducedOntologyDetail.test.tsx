@@ -1,7 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React from "react";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -184,8 +183,6 @@ describe("InducedOntologyDetailPage", () => {
     expect(screen.getByText("Missing ontology")).toBeInTheDocument();
   });
 
-  // ── "Grounded against" rollup ──
-
   it("rolls up grounded-to targets to the owning ontology with a class count", () => {
     const { container } = renderAt(search);
     expect(container.textContent).toContain("Grounded against");
@@ -212,11 +209,6 @@ describe("InducedOntologyDetailPage", () => {
     // And no per-ontology rollup row is emitted.
     expect(container.textContent).not.toContain("Customer Ontology");
   });
-
-  // ── Delete affordance (regression guard) ──
-  // The refactor that split Explorer from Induction removed the only induced
-  // delete trigger and nothing failed, because the sole coverage was a
-  // copy-string unit test. These assert the affordance itself.
 
   it("exposes a Delete ontology action", () => {
     const { container } = renderAt(search);

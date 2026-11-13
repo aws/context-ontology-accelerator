@@ -177,7 +177,7 @@ class TestGetOntologyOverview:
         assert prop["range"] is None
 
     def test_annotation_property_excluded_from_both_buckets(self):
-        # #33: an ingested annotation property (e.g. the grounding
+        # An ingested annotation property (e.g. the grounding
         # `matchConfidence` marker) carries BOTH owl:AnnotationProperty and a
         # generic rdf:Property stamp, with no rdfs:range. It must NOT be
         # classified as an object property (relationship) — it belongs in

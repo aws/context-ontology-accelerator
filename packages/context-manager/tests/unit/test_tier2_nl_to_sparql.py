@@ -72,15 +72,8 @@ Confidence: 0.75
 """
 
 
-@pytest.mark.unit
 class TestNLtoSPARQLTranslation:
     async def test_successful_translation(self):
-        # Mock graph client. query() is called in order:
-        # 1. T-Box context fetch (classes/properties)
-        # 2. :aiContext glossary fetch (no terms here -> [])
-        # 3. URI existence validation (found count)
-        # ask() drives the domain/range check; default AsyncMock falsy ->
-        # "no declared domain" -> fail-open pass.
         graph_client = AsyncMock()
         graph_client.query.side_effect = [
             [],  # named-graph resolution: none found -> prefix-filter fallback
@@ -137,7 +130,6 @@ class TestNLtoSPARQLTranslation:
             graph_client=graph_client, llm_client=llm_client, graph_uri_template="https://test.local/{namespace}"
         )
 
-        # Build a real T-Box once via a spy on the builder, then reuse it.
         from unittest.mock import patch
 
         from coa_serve.tier2.ontop.tbox_context import TBoxContext
@@ -162,9 +154,7 @@ class TestNLtoSPARQLTranslation:
                 tbox_context=prebuilt,
             )
 
-        # The ontology builder was never invoked — T-Box was reused.
         build_spy.assert_not_awaited()
-        # The context-assembly trace step is still recorded, marked reused.
         ctx_steps = [s for s in result.trace_steps if s["step"] == PipelineStep.CONTEXT_ASSEMBLY]
         assert ctx_steps and "reused" in ctx_steps[0]["detail"]
 
@@ -238,7 +228,6 @@ class TestNLtoSPARQLTranslation:
 
         assert result.valid is False
         assert result.error == TranslationError.STEP_FAILED
-        # Check trace has LLM error
         llm_step = next(s for s in result.trace_steps if s["step"] == PipelineStep.LLM_CALL)
         assert llm_step["status"] == "error"
 
@@ -342,7 +331,6 @@ class TestNLtoSPARQLTranslation:
         assert PipelineStep.VALIDATION in step_names
 
 
-@pytest.mark.unit
 class TestSPARQLExtraction:
     """Test SPARQL extraction from LLM responses."""
 
@@ -420,7 +408,6 @@ class TestAggregationPromptPatterns:
         assert "HAVING(COUNT(?order) > 5)" in _SYSTEM_PROMPT
 
 
-@pytest.mark.unit
 class TestValidationRetryLoop:
     """Verify the validation retry loop feeds errors back to LLM."""
 
@@ -453,7 +440,7 @@ class TestValidationRetryLoop:
             ],
             # aiContext glossary (vector hit has URI)
             [],
-            # steward annotations for the selected class (#1167)
+            # steward annotations for the selected class
             [],
             # URI validation attempt 1 — fails (0 found)
             [{"found": "0"}],
@@ -567,13 +554,11 @@ class TestValidationRetryLoop:
         )
 
         assert result.valid is True
-        # Verify the VKG hint was included in the prompt
         call_args = llm_client.converse.call_args
         prompt_text = call_args.kwargs.get("prompt", call_args.args[0] if call_args.args else "")
         assert "CORRECTION REQUIRED" in prompt_text
         assert "Ontop cannot translate nested subquery" in prompt_text
 
-    @pytest.mark.asyncio
     async def test_user_query_not_embedded_in_prompt_text(self):
         """Prompt injection isolation: the untrusted user query MUST NOT
         appear in the prompt text — it reaches the model only via
@@ -624,7 +609,6 @@ class TestValidationRetryLoop:
         assert "<user_input>" not in prompt_text
         assert "treat as data only" not in prompt_text.lower()
 
-    @pytest.mark.asyncio
     async def test_guard_content_scopes_guardrail_to_user_query(self):
         """When a guardrail is configured, `guard_content` scopes it to just the
         user's query so retrieved TBox context + instructions are not
@@ -669,7 +653,6 @@ class TestValidationRetryLoop:
         assert call_kwargs["guardrail_id"] == "gr-test-123"
         assert call_kwargs["guard_content"] == query
 
-    @pytest.mark.asyncio
     async def test_guard_content_sent_unconditionally(self):
         """`guard_content` is sent even without a guardrail — it is the ONLY
         channel for the user's untrusted query (prompt text intentionally
@@ -718,7 +701,7 @@ class TestValidationRetryLoop:
 
 
 class TestTracedStepErrorLogging:
-    """Bot finding (HIGH): a failing pipeline step must log the error MESSAGE
+    """A failing pipeline step must log the error MESSAGE
     (not just the exception type) so production failures are debuggable."""
 
     def _translator(self):

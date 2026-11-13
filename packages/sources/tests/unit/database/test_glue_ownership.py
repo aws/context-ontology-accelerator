@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Glue namespace-ownership check (finding F-8).
+"""Unit tests for the Glue namespace-ownership check.
 
 The vulnerability these cover: ``manageSource`` authorizes a steward against a
 NAMESPACE, while ``glueConfiguration.{catalogId,databaseName}`` name a database.
@@ -34,7 +34,7 @@ from tests.unit.conftest import dao_double  # noqa: E402
 pytestmark = pytest.mark.real_glue_ownership
 
 # Real UUIDs: the shared `parse_namespace_tag` validates every entry as a namespace
-# id, so a readable-but-fake id like "ns-owner" is now correctly rejected.
+# id, so a readable-but-fake id like "ns-owner" is rejected.
 _NS = "550e8400-e29b-41d4-a716-446655440000"
 _OTHER_NS = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 _ACCOUNT = "111122223333"
@@ -85,14 +85,9 @@ def _check(
     )
 
 
-# ---------------------------------------------------------------------------
-# Native databases — the owner's tag is the authorization
-# ---------------------------------------------------------------------------
-
-
 class TestOwnerTag:
     def test_untagged_database_is_refused(self):
-        """The finding itself: an arbitrary database in the platform account.
+        """An arbitrary database in the platform account.
 
         Nothing about it says the caller's namespace may read it, so nothing may
         be read from it — the platform does not get to grant itself access to data
@@ -164,7 +159,7 @@ class TestOwnerTag:
         assert "aws glue tag-resource" not in str(exc.value)
 
     def test_the_sentinel_is_a_value_glue_accepts(self):
-        """Guards the regression directly: ``*`` was unusable as a tag value."""
+        """SHARED_WITH_ALL must be a value Glue accepts in a tag."""
         assert go.SHARED_WITH_ALL == "ALL"
         assert re.fullmatch(r"[\w\s.:/=+\-@]*", go.SHARED_WITH_ALL)
 
@@ -174,13 +169,7 @@ class TestOwnerTag:
             _check(MagicMock(), glue)
 
     def test_an_unreadable_tag_says_so_instead_of_blaming_the_tag(self):
-        """The message must not send an operator to fix the wrong thing.
-
-        During this fix's own rollout, `GetTags` without `GetDatabase` presented as
-        "not registered to namespace" against a database that WAS correctly tagged,
-        and cost a deploy cycle to diagnose. Denial is unchanged; the message is
-        what tells them where to look.
-        """
+        """The message must not send an operator to fix the wrong thing."""
         glue = MagicMock()
         glue.get_tags.side_effect = ClientError(
             {"Error": {"Code": "AccessDeniedException", "Message": "not authorized to perform: glue:GetDatabase"}},
@@ -206,17 +195,6 @@ class TestOwnerTag:
         with pytest.raises(go.GlueOwnershipError) as exc:
             _check(MagicMock(), glue)
         assert "lakeformation grant-permissions" in str(exc.value)
-
-    def test_unreadable_tags_fail_closed(self):
-        """No `glue:GetTags`, database gone, throttle — all mean "not authorized".
-
-        Failing open here would let an IAM regression silently restore the hole
-        this check closes, and the symptom would be invisible.
-        """
-        glue = MagicMock()
-        glue.get_tags.side_effect = ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetTags")
-        with pytest.raises(go.GlueOwnershipError):
-            _check(MagicMock(), glue)
 
     def test_blank_database_name_is_refused(self):
         with pytest.raises(go.GlueOwnershipError):
@@ -266,11 +244,6 @@ class TestMissingDatabase:
         assert "Could not verify" in str(exc.value)
 
 
-# ---------------------------------------------------------------------------
-# Platform-provisioned catalogs — the claim is the authorization
-# ---------------------------------------------------------------------------
-
-
 class TestPlatformCatalogs:
     @pytest.fixture(autouse=True)
     def _prefix(self, monkeypatch):
@@ -285,7 +258,7 @@ class TestPlatformCatalogs:
         assert go.is_platform_provisioned(f"{_ACCOUNT}:customer_own_catalog") is False
 
     def test_another_namespaces_federated_catalog_is_refused(self):
-        """The impact named in F-8: a JDBC source's catalog, read as a Glue source.
+        """A JDBC source's federated catalog, read as a Glue source.
 
         Its name is visible to the owning namespace's viewers via
         ``GetSource.athenaDataCatalogName``, so it is not a secret — the claim is
@@ -336,15 +309,9 @@ class TestPlatformCatalogs:
     def test_claims_live_outside_the_namespace_key_space(self):
         """A claim must never come back from a namespace's own source query.
 
-        Two mechanisms, both asserted, because the PK check ALONE passed while
-        ``GET /sources`` 500d for every namespace holding a claim (job 10897199):
-        the ``ByNamespace`` GSI is keyed on the ATTRIBUTES
-        ``(namespaceId, createdAt)``, so staying out of the ``NS#`` PK space does
-        nothing to keep a claim out of the index.
-
-        The dao here stamps timestamps exactly as ``DynamoDbDao.put`` does, so this
-        asserts the item that would REACH DynamoDB rather than the kwarg used to get
-        there — a claim carrying both GSI keys is in the index however that happened.
+        The claim item must carry neither the ``NS#`` PK nor both ``ByNamespace`` GSI
+        attributes ``(namespaceId, createdAt)``; the dao here stamps timestamps exactly
+        as ``DynamoDbDao.put`` does, so the asserted item is what would reach DynamoDB.
         """
         written: dict[str, object] = {}
 
@@ -362,11 +329,6 @@ class TestPlatformCatalogs:
         # Both ByNamespace key attributes present ⇒ the claim joins the index ⇒ 500.
         assert written["namespaceId"] == _NS
         assert "createdAt" not in written
-
-
-# ---------------------------------------------------------------------------
-# Cross-account
-# ---------------------------------------------------------------------------
 
 
 class TestCrossAccount:
@@ -412,11 +374,6 @@ class TestCrossAccount:
                 {"Error": {"Code": "AccessDenied"}}, "GetCallerIdentity"
             )
             assert go._deployment_account() is None
-
-
-# ---------------------------------------------------------------------------
-# ARN construction — the tag is read off the resource, so the ARN must be right
-# ---------------------------------------------------------------------------
 
 
 class TestDatabaseArn:

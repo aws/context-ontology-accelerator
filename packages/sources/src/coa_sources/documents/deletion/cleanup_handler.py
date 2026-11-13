@@ -59,9 +59,7 @@ def _delete_s3_prefix(bucket: str, prefix: str) -> int:
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Step Functions task handler — cleanup S3 files only.
 
-    Does NOT delete the DynamoDB record — that is handled by the state machine
-    as a final step after all pipeline stages succeed, ensuring the record
-    remains available for status updates if any stage fails.
+    Does NOT delete the DynamoDB record; the state machine does that last.
     """
     namespace_id: str = event["namespace_id"]
     doc_source_id: str = event["doc_source_id"]
@@ -77,7 +75,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     )
 
     raw_deleted = 0
-    staging_deleted = 0
 
     # Only delete raw files from the platform bucket for "upload" type sources.
     # For "s3" type, raw files live in the customer's bucket — we don't touch those.
@@ -95,17 +92,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     staging_prefix = f"{namespace_id}/staging/{doc_source_id}/"
     staging_deleted = _delete_s3_prefix(bucket_name, staging_prefix)
 
-    # Scan-result diagnostics reports written by preprocessing (issue 104):
+    # Scan-result diagnostics reports written by preprocessing:
     # {namespaceId}/scan-results/{docSourceId}/. They carry the customer's full
     # object keys for every failed file, so they must not outlive the source.
     scan_results_prefix = f"{namespace_id}/scan-results/{doc_source_id}/"
     scan_results_deleted = _delete_s3_prefix(bucket_name, scan_results_prefix)
 
-    # Bedrock batch-inference input/output written by kg-build when batch
-    # inference is used (now the default): {namespaceId}/batch-inference/{docSourceId}/
-    # (BatchConfig.key_prefix in graph_build.py). The input JSONL and model output
-    # are copies of the customer's extracted document text, so they must not
-    # outlive the source — DeleteSource promises to remove all associated data.
+    # Bedrock batch-inference input/output: {namespaceId}/batch-inference/{docSourceId}/.
+    # They are copies of the customer's extracted document text, so they must not
+    # outlive the source.
     batch_inference_prefix = f"{namespace_id}/batch-inference/{doc_source_id}/"
     batch_inference_deleted = _delete_s3_prefix(bucket_name, batch_inference_prefix)
 

@@ -6,10 +6,6 @@ import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import { ProposalStatus } from "@coa/control-plane-client";
 import type { AppTranslate } from "../../../i18n/LocaleProvider";
 
-export function shortId(id: string, len = 8): string {
-  return id.length > len ? `${id.slice(0, len)}…` : id;
-}
-
 /**
  * Human-readable source-type label for a proposal. ``source_type`` is a
  * first-class field on the proposal (not inside ``metadata``); pre-schema-delta
@@ -35,10 +31,8 @@ export function proposalSourceTypeLabel(
  *     written by the unstructured induction path; tables are not processed).
  *
  * ``null`` when nothing meaningful is recorded (e.g. an in-flight
- * ``inducing`` stub row that has no metadata yet). ``source_type`` lives
- * on the proposal itself (a first-class column, not inside ``metadata``);
- * pre-schema-delta rows lack it and are treated as structured, matching
- * the backend's asymmetric backfill in ``dynamo_store.list_proposals``.
+ * ``inducing`` stub row that has no metadata yet). ``source_type`` handling is as in
+ * ``proposalSourceTypeLabel``.
  */
 export function proposalScope(
   metadata: Record<string, unknown> | undefined,
@@ -91,9 +85,8 @@ export function proposalScopeSortKey(
  *
  * Values come from the Smithy-generated ``ProposalStatus`` — the API contract is
  * the single source of truth, so a wire value can't drift from what the UI
- * compares against. Single definition on purpose: these were previously compared
- * as inline literals at three separate sites, and missing the Accept-button check
- * would re-enable Accept during a live accept.
+ * compares against. Single definition on purpose: missing the Accept-button
+ * check would re-enable Accept during a live accept.
  */
 export const PROPOSAL_IN_PROGRESS_STATUSES: ReadonlySet<string> = new Set([
   ProposalStatus.ACCEPTING,
@@ -106,7 +99,7 @@ export function isProposalAcceptInProgress(status: string): boolean {
 
 /**
  * Has an in-flight accept reached a terminal FAILURE the poll loop should stop
- * on? (#456/#466/#467)
+ * on?
  *
  *   - ``accept_failed`` — the worker's terminal failure state: a pipeline step
  *     exhausted its retries. Always carries ``accept_error`` naming the step.
@@ -115,9 +108,6 @@ export function isProposalAcceptInProgress(status: string): boolean {
  *     under an older deployment is reported rather than polled to timeout.
  *   - bare ``pending`` (no error) is NOT a failure: it's the initial state of
  *     every fresh proposal, seen while the ``accepting`` flip propagates.
- *
- * Pure helper so the decision is unit-testable without rendering ProposalDetail
- * under jsdom fake timers.
  */
 export function isAcceptTerminalFailure(proposal: {
   status: string;
@@ -144,9 +134,6 @@ export function isAcceptTerminalFailure(proposal: {
  * constraints and a failed S3 fetch. A fetch failure must NOT reject: this is
  * awaited alongside the ontology Turtle, so throwing would blank the whole page
  * over secondary review content. Retrying refresh re-presigns and recovers.
- *
- * ``fetchJson`` is injected so the decision is unit-testable without rendering
- * ProposalDetail (mirrors ``isAcceptTerminalFailure``).
  */
 export async function resolveConstraintConfig(
   proposal: {

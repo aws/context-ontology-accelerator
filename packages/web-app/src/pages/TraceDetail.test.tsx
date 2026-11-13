@@ -10,14 +10,6 @@ import { LocaleProvider } from "../i18n/LocaleProvider";
 import { TraceDetail } from "./TraceDetail";
 import type { TraceStep } from "@app-types";
 
-// Regression guards for bug #836:
-//   1. Guardrails badge renders "passed" when the t3.guardrail step succeeded
-//      (previously always rendered "n/a" because the UI only had a boolean).
-//   2. A "Back to Playground" affordance is present on the success path (was
-//      missing entirely — only the error branch had one). Navigation calls
-//      setNamespace(metadata.namespace) so the playground doesn't fall back
-//      to the first namespace on reload/return.
-
 const useTraceDataMock = vi.fn();
 vi.mock("../api-hooks/use-trace-data", () => ({
   useTraceData: () => useTraceDataMock(),
@@ -67,7 +59,7 @@ function renderTraceDetail() {
   );
 }
 
-describe("TraceDetail — Guardrails boundary badge (bug #836)", () => {
+describe("TraceDetail — Guardrails boundary badge", () => {
   beforeEach(() => {
     useTraceDataMock.mockReset();
   });
@@ -116,9 +108,6 @@ describe("TraceDetail — Guardrails boundary badge (bug #836)", () => {
   });
 
   it("falls back to guardrailBlocked=true → blocked for legacy traces without the step", () => {
-    // Traces recorded before the t3.guardrail step existed should still
-    // render "blocked" on the block path so the boundary indicator remains
-    // meaningful for old sessions.
     useTraceDataMock.mockReturnValue({
       data: traceData({
         trace: [{ step: "t3.synthesize", status: "success", durationMs: 100 }],
@@ -133,7 +122,7 @@ describe("TraceDetail — Guardrails boundary badge (bug #836)", () => {
   });
 });
 
-describe("TraceDetail — Back to Playground (bug #836)", () => {
+describe("TraceDetail — Back to Playground", () => {
   beforeEach(() => {
     useTraceDataMock.mockReset();
     setNamespaceMock.mockReset();
@@ -243,9 +232,6 @@ describe("TraceDetail — Tier outcome names the Tier 2 strategy that ran", () =
     expect(screen.getByText("Tier 3 — knowledge")).toBeInTheDocument();
   });
 
-  // #1166 — the full-trace page must follow the same mode-wins rule as the
-  // Rationale panel: a Deep Reasoning answer resolves at tier 3 but is labelled
-  // by its mode, not "Tier 3 — knowledge".
   it("labels a Deep Reasoning answer by mode, not by its tier", () => {
     renderWith(traceData({ tier: 3, executionMode: "deep-reasoning" }));
     expect(screen.getByText("Deep Reasoning")).toBeInTheDocument();

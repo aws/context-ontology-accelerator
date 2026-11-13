@@ -3,16 +3,8 @@
 
 """A principal limited by ``tableAllowlist`` must not see other tables' names.
 
-The SQL firewall already stops a query against a table outside the allowlist.
-Retrieval and the FK walk, though, can put such tables in front of the SQL writer
-without the SQL ever touching them, and their names used to reach the caller in
-the ``t2.sql.generate`` / ``t2.sql.execute`` step details (streamed over SSE) and
-in the response metadata. These tests pin every client-visible table list to the
-grant, through the same allowlist normalization the firewall uses.
-
-The ``t2.sql.generate`` / ``t2.sql.execute`` steps list the tables the SQL reads,
-not the retrieval context, so even an unrestricted caller is never told a query
-read a table it did not (``TestTraceListsTablesTheSqlReads``).
+Every client-visible table list is filtered to the grant, and the
+``t2.sql.generate`` / ``t2.sql.execute`` steps list only the tables the SQL reads.
 """
 
 from __future__ import annotations
@@ -49,9 +41,6 @@ class _Unprintable:
 
     def __str__(self) -> str:
         raise TypeError("not a table name")
-
-
-# ── tables_visible_to ───────────────────────────────────────────────────
 
 
 class TestTablesVisibleTo:
@@ -102,9 +91,6 @@ class TestTablesVisibleTo:
         for table in ("orders", "Customers", "db.orders", "employee_salaries"):
             allowed = not firewall.evaluate(f"SELECT 1 FROM {table}", profile).denied
             assert (tables_visible_to([table], profile) == [table]) is allowed, table
-
-
-# ── NL→SQL strategy: trace streamed over SSE ────────────────────────────
 
 
 def _nl_result(sql="SELECT count(*) AS n FROM orders"):
@@ -217,8 +203,6 @@ class TestNLtoSQLTraceTables:
             await _resolve_streamed(ALLOWLIST_PROFILE, nl_result=nl_result)
 
 
-# ── NL→SQL strategy: trace lists the tables the SQL reads ───────────────
-
 JOIN_SQL = (
     "SELECT c.region, SUM(o.order_total_usd) AS total FROM orders o "
     "JOIN customers c ON o.customer_id = c.customer_id GROUP BY c.region"
@@ -238,10 +222,7 @@ def _context_result(sql):
 class TestTraceListsTablesTheSqlReads:
     @pytest.mark.asyncio
     async def test_resolve_trino_only_row_cast_lists_its_table(self):
-        """Unrestricted grant: the firewall only parses as Trino, and the query runs.
-
-        The trace used to show ``tables: []`` here, plus two parse-error warnings.
-        """
+        """Unrestricted grant: the firewall only parses as Trino, and the query runs."""
         with capture_logs() as logs:
             result, _, events = await _resolve_streamed({"userId": "analyst"}, nl_result=_context_result(ROW_CAST_SQL))
 
@@ -343,9 +324,6 @@ class TestReferencedTables:
             assert firewall.evaluate(JOIN_SQL, {"tableAllowlist": remaining}).denied
 
 
-# ── /invoke response metadata ───────────────────────────────────────────
-
-
 class TestInvokeResponseTables:
     @staticmethod
     def _orchestrator():
@@ -374,9 +352,6 @@ class TestInvokeResponseTables:
 
         assert response.result.metadata["retrieved_tables"] == ["orders", "employee_salaries"]
         assert response.result.metadata["expanded_tables"] == ["orders", *RESTRICTED]
-
-
-# ── deep-reasoning (agentic) strategy ───────────────────────────────────
 
 
 class TestAgenticTraceTables:
@@ -452,9 +427,6 @@ class TestAgenticTraceTables:
         assert execute.detail["tables"] == ["orders"]
         # What the agent inspected is still reported as the retrieval context.
         assert result.retrieved_tables == ["customers", "orders", "products"]
-
-
-# ── Ontop/VKG compile step ──────────────────────────────────────────────
 
 
 class TestVKGCompileTables:

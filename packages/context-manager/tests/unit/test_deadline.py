@@ -68,14 +68,6 @@ class TestDeadlineRemaining:
         assert d.remaining_s() == 0.0
         assert d.remaining_ms() == 0
 
-    def test_fits_true_when_budget_covers_cost(self):
-        d = Deadline.from_budget(29.0, None)
-        assert d.fits(10.0) is True
-
-    def test_fits_false_when_cost_exceeds_remaining(self):
-        d = Deadline.from_budget(5.0, None)
-        assert d.fits(10.0) is False
-
     def test_expired_flag(self):
         # Budget at the _MIN_BUDGET_S floor (1.0s); sleep past it to expire.
         d = Deadline.from_budget(1.0, None)

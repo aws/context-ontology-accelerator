@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Cross-source relationship materialisation (#1088).
+"""Cross-source relationship materialisation.
 
 An APPROVED cross-source foreign key must become an ``owl:ObjectProperty`` whose
 range is the class of the target table in the OTHER datasource — resolved via
@@ -104,11 +104,8 @@ class TestCrossSourceMaterialisation:
         assert onto.value(ns.orders_customerId, RDFS.range) == _ds2_customers_class(tables)
 
     def test_prefix_mismatch_between_fk_and_table_still_resolves(self, strategy):
-        # The REAL production shape (MR !1215 review): the FK's targetDatasourceId
-        # is written by the sources pipeline as a DS#-prefixed id, while
-        # CatalogTable.datasourceId carries the bare uuid passed to /induce. The two
-        # must compare equal or the lookup silently falls through to the ambiguous
-        # bare-name path and no edge is emitted.
+        # FK targetDatasourceId is DS#-prefixed while CatalogTable.datasourceId is
+        # the bare uuid; the two must compare equal or no edge is emitted.
         tables = _tables(target_datasource_id="DS#2", review_status="APPROVED")
         for t in tables:
             t.datasourceId = t.datasourceId.removeprefix("DS#")  # tables: bare; FK: DS#2
@@ -193,7 +190,6 @@ def _canonical_bytes(graph: Graph) -> bytes:
     return "\n".join(sorted(canonical.serialize(format="nt").splitlines())).encode()
 
 
-@pytest.mark.unit
 class TestCrossSourceR2RMLTargetDatasource:
     def test_base_parent_triples_map_matches_owl_range(self, strategy):
         tables = _tables_targeting_source_a()
@@ -258,13 +254,8 @@ class TestCrossSourceR2RMLTargetDatasource:
         assert build(None) == build("DS#source-a")
 
 
-# ── One shared resolver for all four artifacts (!1229 review) ─────────────────
-#
 # OWL ``rdfs:range``, the base R2RML ``rr:parentTriplesMap``, the RIGOR object
-# template and the SHACL ``sh:class`` must name the SAME table. Each used to carry
-# its own (name, datasource) lookup next to ``resolve_fk_target_identity``; the
-# lookups kept whichever same-named table was added last, so they could disagree
-# with the resolver and with each other.
+# template and the SHACL ``sh:class`` must name the SAME table.
 
 
 def _shacl_reference_targets(tables: list[CatalogTable], class_name: str) -> dict[str, str]:
@@ -321,7 +312,7 @@ def _tables_ambiguous_within_hinted_source() -> list[CatalogTable]:
     The hint narrows the target to source A but A still has two ``customers``
     tables, so nothing identifies the parent. ``crm.customers`` is listed AFTER
     ``public.customers`` on purpose: a ``{(name, datasource): identity}`` dict keeps
-    the last one, which is how OWL used to pick ``A::crm.customers`` silently.
+    the last one, which would pick ``A::crm.customers`` silently.
     """
     fk = CatalogConstraint(
         constraintType="FOREIGN_KEY",
@@ -339,11 +330,10 @@ def _tables_ambiguous_within_hinted_source() -> list[CatalogTable]:
     ]
 
 
-@pytest.mark.unit
 class TestSharedFkResolverAcrossArtifacts:
     def test_shacl_target_class_equals_owl_range_and_r2rml_parent(self, strategy):
-        # Kun, !1229 thread 1: OWL and R2RML pointed at A while sh:class still
-        # pointed at B, so every non-null customer_id failed the shape.
+        # If sh:class pointed elsewhere than OWL and R2RML, every non-null
+        # customer_id would fail the shape.
         tables = _tables_targeting_source_a()
         ontology, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
         mapping = strategy.build_r2rml(PREFIX, tables, {table.name for table in tables}, ontology)
@@ -359,8 +349,8 @@ class TestSharedFkResolverAcrossArtifacts:
         assert shacl == {f"{PREFIX}orders_customerId": str(class_a)}
 
     def test_ambiguous_within_hinted_source_degrades_owl_r2rml_and_shacl(self, strategy):
-        # Kun, !1229 thread 2: never resolve outside the hinted datasource, and do
-        # not pick one of several matches inside it. All three degrade together.
+        # Never resolve outside the hinted datasource, and do not pick one of
+        # several matches inside it. All three degrade together.
         tables = _tables_ambiguous_within_hinted_source()
         ontology, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
         mapping = strategy.build_r2rml(PREFIX, tables, {table.name for table in tables}, ontology)
@@ -417,7 +407,6 @@ class TestSharedFkResolverAcrossArtifacts:
         assert _shacl_reference_targets(tables, "Orders") == {f"{PREFIX}orders_customerId": str(class_a)}
 
 
-@pytest.mark.unit
 class TestResolveFkTargetIdentityHint:
     def _resolve(self, tables: list[CatalogTable], hint: str | None) -> str | None:
         from coa_ontology.inducer.strategies.base import reference_index, resolve_fk_target_identity
@@ -440,7 +429,7 @@ class TestResolveFkTargetIdentityHint:
         assert self._resolve(tables, None) == table_identity(tables[2])
 
     def test_hint_naming_no_in_run_table_falls_back_to_the_probe_order(self):
-        # Pinned by test_multi_fk_column's qualifier test (#1150): a hint that
+        # Pinned by test_multi_fk_column's qualifier test: a hint that
         # matches nothing in the run falls back to the unhinted probes. Every
         # artifact uses this same resolver, so they still agree.
         tables = _tables_targeting_source_a()

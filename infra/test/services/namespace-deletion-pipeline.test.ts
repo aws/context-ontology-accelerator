@@ -316,11 +316,8 @@ describe("NamespaceDeletionPipeline", () => {
   });
 });
 
-// GraphRAG doc-KG indexes are namespace-scoped (all doc sources in a namespace
-// share one GraphRAG tenant id), so namespace teardown drops them. Nothing did
-// before, leaving one index set per deleted namespace against a collection AOSS
-// caps at 1000 indexes — past that, every embedding write fails with
-// index_limit_breached.
+// GraphRAG doc-KG indexes are namespace-scoped, so teardown drops them: AOSS
+// caps a collection at 1000 indexes, past which embedding writes fail.
 describe("NamespaceDeletionPipeline GraphRAG index teardown", () => {
   let template: Template;
 

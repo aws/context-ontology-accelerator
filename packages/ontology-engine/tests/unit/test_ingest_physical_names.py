@@ -1,13 +1,9 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""NL->SQL class text names tables and columns by their R2RML physical names (#1287).
+"""NL->SQL class text names tables and columns by their R2RML physical names.
 
-When an accepted ontology's ``rdfs:label`` differs from the database identifier
-(a curated ontology, or a steward relabelling a class in Japanese), the NL->SQL
-prompt used to say ``Table: 受注 | Columns: 合計金額:double`` and the generated SQL
-queried a table that does not exist. The R2RML already says which table and column
-each class and property map to; these tests pin that the class text uses those
-names and keeps the label as a business name.
+When an ontology's ``rdfs:label`` differs from the database identifier, the class
+text uses the R2RML physical names and keeps the label as a business name.
 """
 
 from __future__ import annotations

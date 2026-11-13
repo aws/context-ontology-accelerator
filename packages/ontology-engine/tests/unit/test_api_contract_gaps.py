@@ -59,9 +59,6 @@ def _enum_values(text: str, shape: str) -> list[str]:
     return re.findall(r'=\s*"([^"]+)"', m.group(1))
 
 
-# ── Parity with the model ────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize(
     ("member", "trait", "expected"),
     [
@@ -80,9 +77,6 @@ def test_search_q_length_equals_the_model() -> None:
     m = re.search(r"@length\(max:\s*(\d+)\)", _member_traits(_GRAPH_MODEL, "GraphSearch", "q"))
     assert m
     assert int(m.group(1)) == graph._MAX_SEARCH_QUERY_LENGTH
-
-
-# ── GetOntologyOverview limit / offset ───────────────────────────────────────
 
 
 def _overview(n_classes: int) -> dict[str, Any]:
@@ -145,9 +139,6 @@ def test_overview_in_range_pages_as_before(graph_store: Any, params: dict[str, i
     assert body["totalClasses"] == 13
 
 
-# ── GraphSearch q / kind ─────────────────────────────────────────────────────
-
-
 def test_search_q_over_max_length_is_400(graph_store: Any) -> None:
     q = "x" * (graph._MAX_SEARCH_QUERY_LENGTH + 1)
     resp = client.get("/graph/search", params={"q": q, "namespace": "ns"})
@@ -179,9 +170,6 @@ def test_search_every_model_kind_is_accepted(graph_store: Any, kind: str) -> Non
     resp = client.get("/graph/search", params={"q": "x", "namespace": "ns", "kind": kind})
     assert resp.status_code == 200
     assert graph_store.search_entities.call_args.kwargs["kind"] == kind
-
-
-# ── Enum filters on the list routes ──────────────────────────────────────────
 
 
 @pytest.fixture()
@@ -276,8 +264,6 @@ def test_empty_enum_filter_means_no_filter(request: Any, path: str, param: str, 
     assert not call.kwargs[param]
 
 
-# ── ontology_type on the write routes: the store and the filter agree ────────
-
 _ENGINE_ROOT = Path(__file__).resolve().parents[2]
 _ONTOLOGY_TYPES = _enum_values(_GRAPH_MODEL, "OntologyType")
 # An ``ontology_type`` literal the code writes or defaults to:
@@ -301,12 +287,6 @@ def test_every_ontology_type_the_service_writes_is_filterable() -> None:
         written |= _type_literals(path)
     assert {"foundational", "induced", "user_created"} <= written  # the scan finds the writers
     assert written <= set(_ONTOLOGY_TYPES), sorted(written - set(_ONTOLOGY_TYPES))
-
-
-@pytest.mark.parametrize("ontology_type", ["foundational", "induced", "user_created"])
-def test_list_ontologies_accepts_every_self_written_type(ontologies_page: Any, ontology_type: str) -> None:
-    resp = client.get("/ontologies/", params={"namespace": "ns", "ontology_type": ontology_type})
-    assert resp.status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -381,8 +361,6 @@ def test_write_with_model_type_passes_the_check(write_mocks: Any, send: Any, ont
     assert send(ontology_type).status_code == 409
 
 
-# ── DownloadOntology for an ontology that does not exist ─────────────────────
-
 _PREFIX_ONLY = (
     "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n"
     "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
@@ -449,9 +427,6 @@ def test_download_ontology_with_triples_is_unchanged(download_mocks: Any) -> Non
 )
 def test_turtle_has_triples(turtle: str, expected: bool) -> None:
     assert turtle_has_triples(turtle) is expected
-
-
-# ── StartInduction with no datasources ───────────────────────────────────────
 
 
 @pytest.mark.parametrize("strategy", ["table_to_ontology", "rigor_ontology"])

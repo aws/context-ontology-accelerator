@@ -3,33 +3,16 @@
 
 """Request-scoped deadline propagation.
 
-Serve historically had no request-scoped deadline: the only time limits lived at
-leaf DB clients (fixed ``timeout_seconds=35`` in the NL→SQL executor, ``45.0`` in
-the lexical retriever) plus a single outer ``asyncio.wait_for(timeout=
-RESOLVE_TIMEOUT_S)`` wrapper in ``main.py``. Nothing carried "time remaining" from
-the entrypoint into the strategies, so no inner step could decide *"I cannot fit
-another attempt in the budget left — stop now"*.
+``Deadline`` is created once per request in ``main.py`` from the caller's budget
+and threaded through ``StrategyContext`` so downstream steps (for example the
+NL→SQL correction shot) can skip work that cannot finish in the time left.
 
-That gap is why the NL→SQL two-shot self-correction loop overruns the REST
-transport's hard ceiling: shot 1 is comfortably inside the budget, but shot 2
-pushes total latency past the API Gateway integration timeout, and the request
-504s server-side *after* having computed a usable answer.
-
-``Deadline`` is that missing mechanism. It is created once per request in
-``main.py`` from the caller's budget — ``options.timeoutMs`` when supplied,
-otherwise the transport default already encoded in ``RESOLVE_TIMEOUT_S`` — and is
-threaded through ``StrategyContext`` so downstream steps can be deadline-aware
-without re-deriving or guessing the budget.
-
-Design notes:
-- Monotonic clock only (``time.monotonic``). Wall-clock jumps (NTP steps) must not
-  move a deadline; only elapsed real time matters.
-- The budget is a hard *upper* bound taken as ``min(transport_budget, caller
-  timeoutMs)``. A caller may ask for LESS time than the transport allows, never
-  more — a request cannot outlive the transport that carries it.
+- Monotonic clock only (``time.monotonic``): wall-clock jumps must not move a
+  deadline.
+- The budget is ``min(transport_budget, caller timeoutMs)``: a caller may ask for
+  less time than the transport allows, never more.
 - Absent ``timeoutMs`` yields the transport budget unchanged, so the AgentCore /
-  Playground path (RESOLVE_TIMEOUT_S ~= 170s) keeps its full budget and is NOT
-  clamped down to the REST ceiling. This is the primary regression guard.
+  Playground path keeps its full budget and is not clamped to the REST ceiling.
 """
 
 from __future__ import annotations
@@ -66,17 +49,8 @@ class Deadline:
     ) -> Deadline:
         """Build a deadline from the transport budget and an optional caller budget.
 
-        Args:
-            transport_budget_s: The budget the carrying transport allows (already
-                encoded per-transport in ``RESOLVE_TIMEOUT_S``). Used as-is when the
-                caller does not specify one.
-            caller_timeout_ms: The caller's ``options.timeoutMs`` in milliseconds,
-                or ``None`` when absent. When present, the effective budget is the
-                MINIMUM of it and the transport budget — a caller may request less
-                time, never more.
-
-        Returns:
-            A ``Deadline`` whose clock starts now.
+        A caller budget (``options.timeoutMs``, in milliseconds) can only narrow the
+        transport budget.
         """
         budget_s = float(transport_budget_s)
         if caller_timeout_ms is not None:
@@ -107,11 +81,3 @@ class Deadline:
     def expired(self) -> bool:
         """True once the budget is exhausted."""
         return self.remaining_s() <= 0.0
-
-    def fits(self, cost_s: float) -> bool:
-        """True when a unit of work costing ``cost_s`` seconds fits the time left.
-
-        Used by deadline-aware call sites (e.g. the NL→SQL correction shot) to skip
-        work that cannot complete inside the budget rather than start it and 504.
-        """
-        return self.remaining_s() >= cost_s
