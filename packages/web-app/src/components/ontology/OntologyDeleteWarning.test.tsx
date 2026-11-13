@@ -4,8 +4,7 @@
 /**
  * The warning is rendered standalone rather than through the delete modal:
  * driving a Cloudscape Modal open in happy-dom is flaky, and the copy is the
- * part worth pinning. Both call sites previously hand-wrote their own body, so
- * these assertions are what keep the two descriptions from drifting apart.
+ * part worth pinning. These assertions keep the copy from drifting.
  */
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";

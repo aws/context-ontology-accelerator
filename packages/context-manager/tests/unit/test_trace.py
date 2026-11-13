@@ -13,10 +13,7 @@ from coa_serve.trace import TraceCollector
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.asyncio
 class TestTraceCollector:
-    """Test TraceCollector recording, callback, and flush behavior."""
-
     async def test_record_appends_steps(self):
         trace = TraceCollector()
         trace.record("metric_match", "success", 42, detail="loss_ratio")
@@ -45,13 +42,10 @@ class TestTraceCollector:
         assert trace.steps[1].detail == "no sparql"
 
     async def test_record_carries_graph_seed_mode(self):
-        """AC3 guard: the graph-traversal seed mode (uri_hop/keyword) must be a
-        first-class TraceStep field so it reaches the client response (previously
-        it was set as a local-dict value that never serialized)."""
+        """The graph-traversal seed mode serializes to the client as ``graphSeedMode``."""
         trace = TraceCollector()
         trace.record("t3.graph_traverse", "success", 50, tool_used="neptune", graph_seed_mode="uri_hop")
         assert trace.steps[0].graph_seed_mode == "uri_hop"
-        # serializes to the client payload under the camelCase alias
         assert trace.steps[0].model_dump(by_alias=True)["graphSeedMode"] == "uri_hop"
 
     async def test_add_dicts_carries_graph_seed_mode(self):
@@ -98,10 +92,8 @@ class TestTraceCollector:
         trace.record("second", "success", 20)
         trace.record("third", "success", 30)
 
-        # Before flush, callbacks may not have completed
         await trace.flush()
 
-        # After flush, all callbacks must have completed
         assert set(order) == {"first", "second", "third"}
 
     async def test_flush_is_idempotent(self):
@@ -117,7 +109,6 @@ class TestTraceCollector:
         await trace.flush()
         assert call_count == 1
 
-        # Second flush should be a no-op (tasks already cleared)
         await trace.flush()
         assert call_count == 1
 
@@ -134,7 +125,6 @@ class TestTraceCollector:
         trace.record("bad", "error", 0)
         trace.record("good2", "success", 20)
 
-        # flush should complete without raising, despite the failing callback
         await trace.flush()
 
         assert "good1" in results
@@ -144,7 +134,6 @@ class TestTraceCollector:
         trace = TraceCollector()
         trace.record("step", "success", 10)
 
-        # Should not raise
         await trace.flush()
 
         assert len(trace.steps) == 1
@@ -161,5 +150,4 @@ class TestTraceCollector:
         steps = trace.steps
         steps.append(None)  # type: ignore
 
-        # Original should be unaffected
         assert len(trace.steps) == 1

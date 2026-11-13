@@ -97,13 +97,7 @@ class VKGClient:
             self._http = None
 
     async def _post_with_retry(self, url: str, payload: dict[str, Any]) -> httpx.Response:
-        """POST request with retry on transient errors (503, connection, timeout).
-
-        Uses retryhttp for exponential backoff + jitter. Retries on:
-          - Server errors (503 during VKG reload)
-          - Network errors (ConnectError during rolling deploys)
-          - Timeouts (ReadTimeout, ConnectTimeout)
-        """
+        """POST request with retry on transient errors (503, connection, timeout)."""
 
         @retryhttp.retry(
             max_attempt_number=self._max_retries,
@@ -124,13 +118,6 @@ class VKGClient:
     @instrumented("vkg")
     async def translate(self, sparql: str, *, namespace: str) -> VKGResult:
         """Translate SPARQL to SQL via VKG Service.
-
-        Args:
-            sparql: SPARQL SELECT query to translate.
-            namespace: Ontology namespace for mapping resolution.
-
-        Returns:
-            VKGResult with translated SQL, dialect, and metadata.
 
         Raises:
             VKGTranslationError: On non-retryable errors or exhausted retries.

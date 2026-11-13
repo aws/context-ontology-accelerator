@@ -1,27 +1,19 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Schema visibility for metric reads (ADR: decompose-viewnamespace-schema-visibility).
+"""Schema visibility for metric reads.
 
-A metric definition names physical schema: its SQL ``expression`` and
-``sourceTable`` disclose table/column names (``viewSource``), and its
-``ontologyConcepts`` disclose ontology IRIs (``viewOntology``). A schema-blind
-caller (``data-analyst``) may still list and read metrics by name, description
-and AI context, but those fields are withheld.
+A metric's SQL ``expression`` and ``sourceTable`` disclose table/column names
+(``viewSource``), and its ``ontologyConcepts`` disclose ontology IRIs
+(``viewOntology``). A schema-blind caller (``data-analyst``) may still list and
+read metrics by name, description and AI context, but those fields are withheld.
 
 The rights arrive as ``canViewSource`` / ``canViewOntology`` in the authorizer
-context (names and parsing shared through
-:mod:`coa_authorization.schema_visibility`): the API Gateway authorizer sets both
-on every ``readMetric`` request (``"false"`` when it cannot evaluate them), and
-the MCP server sets both on its direct invocations. Only an explicit
-non-``"true"`` value withholds.
-
-Deliberate exception to fail-closed (``missing="full"``): a request that carries
-NEITHER flag came through a path that predates them, i.e. the deploy window
-before the new authorizer is live (metric-service deploys first) or dev mode
-without a roles table; withholding there would blank definitions for every
-caller, admins included. Such a request keeps the pre-flag behaviour. A request
-carrying only one flag withholds the other.
+context (parsed by :mod:`coa_authorization.schema_visibility`). Only an explicit
+non-``"true"`` value withholds. Exception to fail-closed (``missing="full"``): a
+request carrying NEITHER flag predates them (deploy window, or dev mode without a
+roles table), and withholding there would blank definitions for every caller. A
+request carrying only one flag withholds the other.
 """
 
 from __future__ import annotations
@@ -29,9 +21,6 @@ from __future__ import annotations
 from typing import Any
 
 from coa_authorization.schema_visibility import SchemaVisibility, from_authorizer_context
-
-# Kept as a name for this service's callers; the shape is the shared one.
-MetricSchemaVisibility = SchemaVisibility
 
 
 def visibility_from_event(event: dict[str, Any]) -> SchemaVisibility:

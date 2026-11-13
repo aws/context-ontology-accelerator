@@ -107,9 +107,8 @@ export const NoSchemaAccessPage: React.FC<{ kind: SchemaKind }> = ({
 /**
  * Route-level gate for source and ontology pages.
  *
- * Probes the namespace's source (or ontology) list for a single item (a
- * positive answer is cached for five minutes; "no access" is re-checked on
- * every visit) and renders {@link NoSchemaAccessPage} on a 403 instead of
+ * Probes the namespace's source (or ontology) list for a single item and
+ * renders {@link NoSchemaAccessPage} on a 403 instead of
  * letting the page render its own error panels. Any other outcome renders the
  * page, which keeps handling its own errors.
  */

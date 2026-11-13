@@ -12,17 +12,16 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { RuntimeConfigContext } from "@components/RuntimeContext";
 import type { RuntimeContext } from "@components/RuntimeContext";
-import { ConnectSource } from "./ConnectSource";
+import {
+  ConnectSource,
+  validateCrossAccountRoleArn as validateRoleArn,
+} from "./ConnectSource";
 // The shim defined by the vi.mock factory below, so `instanceof` inside the page
 // sees the same class a real service error would present.
 import { ControlPlaneServiceServiceException } from "@coa/control-plane-client";
 
 // Wizard tests drive Cloudscape through userEvent and run near vitest's 5s default under CI load.
 vi.setConfig({ testTimeout: 15000 });
-
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
 
 const NS_ID = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -88,8 +87,7 @@ vi.mock("@api-hooks", () => ({
   }),
 }));
 
-// Both DATABASE/DOCUMENTS enums and the exception class are imported in the
-// component; provide a minimal shim that satisfies both call sites.
+// Shim only what the page imports from the client.
 vi.mock("@coa/control-plane-client", () => ({
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
   SparqlStore: { NEPTUNE: "neptune" },
@@ -117,13 +115,8 @@ vi.mock("@utils/helpers", () => ({
   validateS3Prefix: () => null,
 }));
 
-// ---------------------------------------------------------------------------
-// Wrapper
-// ---------------------------------------------------------------------------
-
 // LocaleProvider sits at the app root in production and supplies the wizard's
-// and file upload's built-in strings ("Next", "Choose file", …) that the page
-// no longer hand-writes.
+// and file upload's built-in Cloudscape strings ("Next", "Choose file", …).
 const wrapper = ({ children }: { children: React.ReactNode }) => (
   <LocaleProvider>
     <QueryClientProvider client={new QueryClient()}>
@@ -146,10 +139,6 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
     </QueryClientProvider>
   </LocaleProvider>
 );
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const user = userEvent.setup({ delay: null });
 
@@ -261,10 +250,6 @@ async function fillDocumentUploadStep() {
   fireEvent.change(input);
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 describe("ConnectSource — metadata enrichment toggle", () => {
   beforeEach(() => {
     mockCreate.mockReset();
@@ -335,11 +320,9 @@ describe("ConnectSource — advanced configuration", () => {
   it("renders required field indicators on JDBC form", async () => {
     render(<ConnectSource />, { wrapper });
 
-    // Select JDBC tile
     await user.click(screen.getByLabelText("JDBC database"));
     await clickNext();
 
-    // Required fields should have asterisks
     expect(
       screen.getByText("Source name", { exact: false }),
     ).toBeInTheDocument();
@@ -355,80 +338,58 @@ describe("ConnectSource — advanced configuration", () => {
     await user.click(screen.getByLabelText("JDBC database"));
     await clickNext();
 
-    // Advanced section should be present
     const advancedSection = screen.getByText("Advanced configuration");
     expect(advancedSection).toBeInTheDocument();
 
-    // Expand it
     await user.click(advancedSection);
 
-    // New exclude filter fields should be present
     expect(screen.getByText("Schema exclude filter")).toBeInTheDocument();
     expect(screen.getByText("Table exclude filter")).toBeInTheDocument();
   });
 
-  // Types out several long fields character-by-character across a multi-step
-  // wizard — exceeds the 5000ms vitest default under CI load.
-  it(
-    "submits schemaExcludeFilter and tableExcludeFilter for JDBC when provided",
-    { timeout: 15000 },
-    async () => {
-      render(<ConnectSource />, { wrapper });
+  it("submits schemaExcludeFilter and tableExcludeFilter for JDBC when provided", async () => {
+    render(<ConnectSource />, { wrapper });
 
-      await user.click(screen.getByLabelText("JDBC database"));
-      await clickNext();
+    await user.click(screen.getByLabelText("JDBC database"));
+    await clickNext();
 
-      // Fill required fields
-      await user.type(
-        screen.getByPlaceholderText("My JDBC Database"),
-        "test-db",
-      );
-      await user.click(screen.getByText("Select an engine"));
-      await user.click(screen.getAllByText("PostgreSQL")[0]);
-      await user.type(
-        screen.getByPlaceholderText("db.example.com"),
-        "localhost",
-      );
-      await user.type(screen.getByPlaceholderText("my_database"), "testdb");
-      await user.type(
-        screen.getByPlaceholderText("arn:aws:secretsmanager:..."),
-        "arn:aws:secretsmanager:us-east-1:123456789012:secret:db",
-      );
+    await user.type(screen.getByPlaceholderText("My JDBC Database"), "test-db");
+    await user.click(screen.getByText("Select an engine"));
+    await user.click(screen.getAllByText("PostgreSQL")[0]);
+    await user.type(screen.getByPlaceholderText("db.example.com"), "localhost");
+    await user.type(screen.getByPlaceholderText("my_database"), "testdb");
+    await user.type(
+      screen.getByPlaceholderText("arn:aws:secretsmanager:..."),
+      "arn:aws:secretsmanager:us-east-1:123456789012:secret:db",
+    );
 
-      // Expand advanced config
-      await user.click(screen.getByText("Advanced configuration"));
+    await user.click(screen.getByText("Advanced configuration"));
 
-      // Fill exclude filters
-      await user.type(
-        screen.getByPlaceholderText("temp_*|staging_*"),
-        "temp_*|test_*",
-      );
-      await user.type(
-        screen.getByPlaceholderText("tmp_*|staging_*"),
-        "tmp_*|scratch_*",
-      );
+    await user.type(
+      screen.getByPlaceholderText("temp_*|staging_*"),
+      "temp_*|test_*",
+    );
+    await user.type(
+      screen.getByPlaceholderText("tmp_*|staging_*"),
+      "tmp_*|scratch_*",
+    );
 
-      await clickNext(); // → enrichment
-      await clickNext(); // → review
-      await user.click(
-        screen.getByRole("button", { name: /^connect source$/i }),
-      );
+    await clickNext(); // → enrichment
+    await clickNext(); // → review
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
 
-      expect(mockCreate).toHaveBeenCalledTimes(1);
-      const cfg =
-        mockCreate.mock.calls[0][0].body.databaseSource.jdbcConfiguration;
-      expect(cfg.schemaExcludeFilter).toBe("temp_*|test_*");
-      expect(cfg.tableExcludeFilter).toBe("tmp_*|scratch_*");
-    },
-  );
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const cfg =
+      mockCreate.mock.calls[0][0].body.databaseSource.jdbcConfiguration;
+    expect(cfg.schemaExcludeFilter).toBe("temp_*|test_*");
+    expect(cfg.tableExcludeFilter).toBe("tmp_*|scratch_*");
+  });
 
   it("renders tableExcludeFilter for Glue in advanced config", async () => {
     render(<ConnectSource />, { wrapper });
 
-    // Glue is default
     await clickNext();
 
-    // Fill required fields
     await user.type(screen.getByPlaceholderText("My Glue Database"), "test-db");
     await user.type(
       screen.getByPlaceholderText("123456789012"),
@@ -436,10 +397,8 @@ describe("ConnectSource — advanced configuration", () => {
     );
     await user.type(screen.getByPlaceholderText("my_glue_db"), "testdb");
 
-    // Expand advanced config
     await user.click(screen.getByText("Advanced configuration"));
 
-    // New exclude filter field should be present
     expect(screen.getByText("Table exclude filter")).toBeInTheDocument();
   });
 
@@ -454,7 +413,6 @@ describe("ConnectSource — advanced configuration", () => {
     );
     await user.type(screen.getByPlaceholderText("my_glue_db"), "testdb");
 
-    // Expand advanced and fill exclude filter
     await user.click(screen.getByText("Advanced configuration"));
     await user.type(
       screen.getByPlaceholderText("tmp_*|staging_*"),
@@ -471,7 +429,7 @@ describe("ConnectSource — advanced configuration", () => {
     expect(cfg.tableExcludeFilter).toBe("tmp_*|backup_*");
   });
 
-  it("does not offer engines withheld from the product", async () => {
+  it("offers every engine in the picker", async () => {
     render(<ConnectSource />, { wrapper });
 
     await user.click(screen.getByLabelText("JDBC database"));
@@ -496,22 +454,8 @@ describe("ConnectSource — advanced configuration", () => {
 });
 
 describe("ConnectSource — cross-account IAM role validation", () => {
-  /**
-   * Validate cross-account IAM role ARN format.
-   * Backend IAM policy restricts AssumeRole to roles matching:
-   *   arn:aws:iam::*:role/{prefix}-{env}-datasource-access-*
-   * Default prefix is "coa", default env is "dev", so pattern becomes:
-   *   arn:aws:iam::ACCOUNT:role/coa-dev-datasource-access-SUFFIX
-   */
-  function validateCrossAccountRoleArn(arn: string): string | undefined {
-    if (!arn.trim()) return undefined;
-    const roleArnPattern =
-      /^arn:aws:iam::\d{12}:role\/[a-zA-Z0-9_+=,.@-]+-datasource-access-[a-zA-Z0-9_+=,.@-]+$/;
-    if (!roleArnPattern.test(arn.trim())) {
-      return "Role ARN must match pattern: arn:aws:iam::ACCOUNT:role/{prefix}-datasource-access-*";
-    }
-    return undefined;
-  }
+  const validateCrossAccountRoleArn = (arn: string) =>
+    validateRoleArn(arn, (message) => message);
 
   it("accepts empty role ARN (optional field)", () => {
     expect(validateCrossAccountRoleArn("")).toBeUndefined();
@@ -574,10 +518,6 @@ describe("ConnectSource — cross-account IAM role", () => {
     mockCreateAsync.mockReset();
   });
 
-  // Types out several long fields (including a full IAM role ARN)
-  // character-by-character via user-event across a 3-step wizard, which is
-  // consistently slower than the 5000ms vitest default under CI load —
-  // bump the timeout for this test rather than the global default.
   it("submits the Glue cross-account role ARN and never sends an external ID", async () => {
     render(<ConnectSource />, { wrapper });
 
@@ -609,7 +549,7 @@ describe("ConnectSource — cross-account IAM role", () => {
     // A caller-supplied ExternalId would defeat the namespace binding, so the
     // form has no such input and the payload must never carry one.
     expect(cfg.externalId).toBeUndefined();
-  }, 15000);
+  });
 
   it("shows the namespace-derived External ID for the role's trust policy", async () => {
     render(<ConnectSource />, { wrapper });
@@ -622,7 +562,7 @@ describe("ConnectSource — cross-account IAM role", () => {
     expect(
       screen.queryByPlaceholderText("optional-external-id"),
     ).not.toBeInTheDocument();
-  }, 15000);
+  });
 
   it("blocks navigation to next step when Glue cross-account role ARN is invalid", async () => {
     render(<ConnectSource />, { wrapper });
@@ -643,7 +583,6 @@ describe("ConnectSource — cross-account IAM role", () => {
     );
     await clickNext();
 
-    // Should show error and block navigation
     expect(
       screen.getByText(/Role ARN must match pattern/i),
     ).toBeInTheDocument();
@@ -653,11 +592,6 @@ describe("ConnectSource — cross-account IAM role", () => {
     ).not.toBeInTheDocument();
   });
 
-  // Types out several long fields (engine selection, host, database, a
-  // Secrets Manager ARN, and a full IAM role ARN) character-by-character via
-  // user-event across the wizard, which is consistently slower than the 5000ms
-  // vitest default under CI load — bump the timeout for this test rather than
-  // the global default.
   it("blocks navigation to next step when JDBC cross-account role ARN is invalid", async () => {
     render(<ConnectSource />, { wrapper });
 
@@ -673,7 +607,6 @@ describe("ConnectSource — cross-account IAM role", () => {
       "arn:aws:secretsmanager:us-east-1:123456789012:secret:db",
     );
 
-    // Expand advanced config
     await user.click(screen.getByText("Advanced configuration"));
 
     // Type an invalid role ARN (no prefix before datasource-access)
@@ -685,7 +618,6 @@ describe("ConnectSource — cross-account IAM role", () => {
     );
     await clickNext();
 
-    // Should show error and block navigation
     expect(
       screen.getByText(/Role ARN must match pattern/i),
     ).toBeInTheDocument();
@@ -693,7 +625,7 @@ describe("ConnectSource — cross-account IAM role", () => {
     expect(
       screen.queryByText(/Enable AI metadata enrichment/i),
     ).not.toBeInTheDocument();
-  }, 15000);
+  });
 
   it("omits cross-account fields from the Glue payload when left blank", async () => {
     render(<ConnectSource />, { wrapper });
@@ -745,7 +677,6 @@ describe("ConnectSource — Glue execution engine", () => {
   it("does not show the Redshift workgroup field until Redshift is selected", async () => {
     render(<ConnectSource />, { wrapper });
     await clickNext();
-    // On the Glue config step, the workgroup input is hidden by default (Athena).
     expect(
       screen.queryByPlaceholderText("my-workgroup"),
     ).not.toBeInTheDocument();
@@ -762,11 +693,9 @@ describe("ConnectSource — Glue execution engine", () => {
     );
     await user.type(screen.getByPlaceholderText("my_glue_db"), "my_db");
 
-    // Open the Execution engine Select and pick Redshift Serverless.
     await user.click(screen.getByText("Athena (default)"));
     await user.click(screen.getByText("Redshift Serverless"));
 
-    // The workgroup field now appears; fill it.
     await user.type(
       screen.getByPlaceholderText("my-workgroup"),
       "my-workgroup",
@@ -781,7 +710,7 @@ describe("ConnectSource — Glue execution engine", () => {
       mockCreate.mock.calls[0][0].body.databaseSource.glueConfiguration;
     expect(cfg.executionEngine).toBe("REDSHIFT");
     expect(cfg.redshiftWorkgroup).toBe("my-workgroup");
-  }, 15000);
+  });
 
   it("blocks Next when Redshift is selected but no workgroup is entered", async () => {
     render(<ConnectSource />, { wrapper });
@@ -803,7 +732,7 @@ describe("ConnectSource — Glue execution engine", () => {
       screen.getByText(/Redshift workgroup is required/i),
     ).toBeInTheDocument();
     expect(mockCreate).not.toHaveBeenCalled();
-  }, 15000);
+  });
 
   it("hides the Athena DataCatalog field when Redshift is selected (Athena-only concept)", async () => {
     render(<ConnectSource />, { wrapper });
@@ -823,7 +752,7 @@ describe("ConnectSource — Glue execution engine", () => {
       screen.queryByPlaceholderText("my_federated_catalog"),
     ).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText("my-workgroup")).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("omits athenaDataCatalogName from the payload on the Redshift path", async () => {
     render(<ConnectSource />, { wrapper });
@@ -850,7 +779,7 @@ describe("ConnectSource — Glue execution engine", () => {
       mockCreate.mock.calls[0][0].body.databaseSource.glueConfiguration;
     expect(cfg.executionEngine).toBe("REDSHIFT");
     expect(cfg.athenaDataCatalogName).toBeUndefined();
-  }, 15000);
+  });
 });
 
 describe("ConnectSource — Athena Query Federation connector", () => {
@@ -874,7 +803,7 @@ describe("ConnectSource — Athena Query Federation connector", () => {
     expect(
       screen.getByText(/Enable AI metadata enrichment/i),
     ).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("submits customConnectorConfiguration and nothing else", async () => {
     render(<ConnectSource />, { wrapper });
@@ -897,7 +826,7 @@ describe("ConnectSource — Athena Query Federation connector", () => {
     // configuration sent is what selects the sub-type.
     expect(databaseSource.glueConfiguration).toBeUndefined();
     expect(databaseSource.jdbcConfiguration).toBeUndefined();
-  }, 15000);
+  });
 
   it("asks for exactly one connector ARN, with no metadata/record split", async () => {
     render(<ConnectSource />, { wrapper });
@@ -913,7 +842,7 @@ describe("ConnectSource — Athena Query Federation connector", () => {
       screen.queryByText(/metadata function arn/i),
     ).not.toBeInTheDocument();
     expect(screen.getByText(/connector function arn/i)).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("submits the table filters when provided", async () => {
     render(<ConnectSource />, { wrapper });
@@ -955,7 +884,7 @@ describe("ConnectSource — Athena Query Federation connector", () => {
       screen.getByText(/Connector function ARN is required/i),
     ).toBeInTheDocument();
     expect(mockCreate).not.toHaveBeenCalled();
-  }, 15000);
+  });
 
   it("rejects a partial Lambda ARN — an unqualified name resolves to the wrong account", async () => {
     render(<ConnectSource />, { wrapper });
@@ -1009,14 +938,13 @@ describe("ConnectSource — Athena Query Federation connector", () => {
     // asked about.
     expect(screen.queryByText(/composite handler/i)).not.toBeInTheDocument();
     expect(screen.queryByText("Record function ARN")).not.toBeInTheDocument();
-  }, 15000);
+  });
 });
 
 describe("ConnectSource — Databricks SQL Warehouse", () => {
   beforeEach(() => {
     mockCreate.mockReset();
     mockCreateAsync.mockReset();
-    resetNamespaceQuery();
   });
 
   it("offers the warehouse as a step-1 source kind, named for the connection surface", () => {
@@ -1392,7 +1320,7 @@ describe("ConnectSource — server-formatted registration errors", () => {
     expect(message.textContent).toBe(ASSUME_DENIED_MESSAGE);
     // Collapsed onto one line, the customer cannot tell which cause applies.
     expect(message).toHaveClass("coa-preserve-newlines");
-  }, 15000);
+  });
 
   it("backs the class with a newline-preserving rule", () => {
     // Vitest runs with `css: false`, so there is no computed style and no bundled
@@ -1432,7 +1360,7 @@ describe("ConnectSource — document upload failures", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Upload failed")).toBeInTheDocument();
     expect(mockCreateAsync).not.toHaveBeenCalled();
-  }, 15000);
+  });
 
   it("leaves a failed create to the mutation's alert and adds no second one", async () => {
     const failure = new ControlPlaneServiceServiceException(
@@ -1455,7 +1383,7 @@ describe("ConnectSource — document upload failures", () => {
     expect(screen.getByText("Failed to connect source")).toBeInTheDocument();
     // Two alerts carrying the same sentence read as two separate failures.
     expect(screen.queryByText("Upload failed")).toBeNull();
-  }, 15000);
+  });
 });
 
 describe("ConnectSource — document chunk size", () => {
@@ -1718,10 +1646,6 @@ describe("ConnectSource — External ID unavailable state", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// RDF_SPARQL (graph) source — reachability verify, no enrichment step
-// ---------------------------------------------------------------------------
-
 const SPARQL_ENDPOINT_PLACEHOLDER =
   "my-graph.cluster-xxxx.us-east-1.neptune.amazonaws.com";
 
@@ -1822,9 +1746,9 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
       screen.getByRole("button", { name: /^connect source$/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/coa_import:dataSourceName/)).toBeInTheDocument();
-  }, 15000);
+  });
 
-  it("submits only sparqlConfiguration, with the LLD field names", async () => {
+  it("submits only sparqlConfiguration with the API field names", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
     await fillSparqlStep();
     await submitFromReview();
@@ -1846,7 +1770,7 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
     expect(databaseSource.customConnectorConfiguration).toBeUndefined();
     expect(databaseSource.databricksSqlWarehouseConfiguration).toBeUndefined();
     expect(databaseSource.metadataEnrichmentEnabled).toBeUndefined();
-  }, 15000);
+  });
 
   it("sends the optional region and named graph when given", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
@@ -1861,7 +1785,7 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
       mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration;
     expect(cfg.region).toBe("eu-west-1");
     expect(cfg.dataNamedGraph).toBe("https://coa.example.com/graphs/support");
-  }, 15000);
+  });
 
   it("omits the port when it is cleared, so the server default applies", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
@@ -1871,21 +1795,21 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
     expect(
       mockCreate.mock.calls[0][0].body.databaseSource.sparqlConfiguration.port,
     ).toBeUndefined();
-  }, 15000);
+  });
 
   it("warns that only port 8182 is reachable", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
     await user.click(screen.getByLabelText("Graph database (SPARQL)"));
     await clickNext();
     expect(screen.getByText(/allow only port 8182/)).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("shows authentication as read-only SigV4 / IAM", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
     await user.click(screen.getByLabelText("Graph database (SPARQL)"));
     await clickNext();
     expect(screen.getByDisplayValue("SigV4 / IAM")).toHaveAttribute("readonly");
-  }, 15000);
+  });
 
   it("blocks Next without an endpoint", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
@@ -1900,14 +1824,14 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
       screen.getByText("SPARQL endpoint is required."),
     ).toBeInTheDocument();
     expect(mockCreate).not.toHaveBeenCalled();
-  }, 15000);
+  });
 
   it("rejects an endpoint that is not a host or https URL", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
     await fillSparqlStep("http://db.example.com");
     await clickNext();
     expect(screen.getByText(/Must be a host/)).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("rejects a named graph that could break out of an IRI", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
@@ -1920,7 +1844,7 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
     expect(
       screen.getByText(/Must be an absolute http\(s\) IRI/),
     ).toBeInTheDocument();
-  }, 15000);
+  });
 
   it("rejects an out-of-range port", async () => {
     render(<ConnectSource />, { wrapper: graphOnWrapper });
@@ -1930,7 +1854,7 @@ describe("ConnectSource — RDF_SPARQL graph source", () => {
     await user.type(port, "70000");
     await clickNext();
     expect(screen.getByText(/between 1 and 65535/)).toBeInTheDocument();
-  }, 15000);
+  });
 });
 
 describe("ConnectSource — Japanese document configuration", () => {

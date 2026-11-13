@@ -13,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 
 def _make_token(claims: dict) -> str:
-    """Create an unsigned JWT with given claims."""
+    """JWT signed with a throwaway key (the parser does not verify)."""
     return jwt.encode(claims, "secret", algorithm="HS256")
 
 
@@ -68,7 +68,6 @@ class TestTokenClaimsFromRequestContext:
     """Tests for from_request_context (AgentCore HTTP path)."""
 
     def test_extracts_from_request_headers_dict(self):
-        """Primary path: context.request_headers is a dict."""
         token = _make_token({"sub": "user-abc", "email": "u@x.com"})
         ctx = MagicMock()
         ctx.request_headers = {"authorization": f"Bearer {token}"}
@@ -78,7 +77,6 @@ class TestTokenClaimsFromRequestContext:
         assert claims.email == "u@x.com"
 
     def test_extracts_from_request_headers_capitalized(self):
-        """request_headers with capitalized key."""
         token = _make_token({"sub": "user-cap"})
         ctx = MagicMock()
         ctx.request_headers = {"Authorization": f"Bearer {token}"}
@@ -95,18 +93,15 @@ class TestTokenClaimsFromRequestContext:
         assert TokenClaims.from_request_context(ctx) is None
 
     def test_returns_none_when_request_headers_not_dict(self):
-        """If request_headers is something unexpected, returns None."""
         ctx = MagicMock()
         ctx.request_headers = "not-a-dict"
         assert TokenClaims.from_request_context(ctx) is None
 
     def test_returns_none_when_no_request_headers_attr(self):
-        """If context has no request_headers attribute at all."""
         ctx = MagicMock(spec=[])
         assert TokenClaims.from_request_context(ctx) is None
 
     def test_extracts_groups_from_jwt(self):
-        """Groups claim is extracted from the JWT."""
         token = _make_token({"sub": "user-g", "groups": ["admin", "viewer"]})
         ctx = MagicMock()
         ctx.request_headers = {"authorization": f"Bearer {token}"}

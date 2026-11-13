@@ -88,30 +88,16 @@ _STREAM_QUEUE_TIMEOUT_S = 300
 
 # Model ids observed to reject `inferenceConfig.temperature` with a
 # ValidationException (newer Anthropic models deprecated the parameter).
-#
-# Process-wide and never invalidated: a model's parameter surface does not change
-# under a running container, and the cost of being wrong is one omitted sampling
-# parameter, not a failure. Without this the fallback below re-learned the same
-# rejection on EVERY call — a measured 79 of 117 Converse calls in one
-# integ-test run (68%) each paid a doomed request plus a full retry, against a
-# mean Converse latency of 6.5s. Plain set, no lock: CPython's `add`/`in` on a
-# set of str is atomic under the GIL, and a lost race just costs one more
-# rejected call.
+# Process-wide, never invalidated, no lock: CPython's `add`/`in` on a set of str
+# is atomic under the GIL, and a lost race just costs one more rejected call.
 _MODELS_REJECTING_TEMPERATURE: set[str] = set()
 
-# Model ids observed to reject an effort level (``output_config.effort`` in
-# additionalModelRequestFields). Same learn-once, lock-free rationale: a caller's
-# effort option must degrade to the model's default on a model without effort
-# levels, never fail the call.
+# Model ids observed to reject an effort level (``output_config.effort``); the
+# effort option then degrades to the model's default.
 _MODELS_REJECTING_EFFORT: set[str] = set()
 
-# Model ids observed to reject `inferenceConfig.topP` with a ValidationException.
-# Symmetric to _MODELS_REJECTING_TEMPERATURE: the SAME newer Anthropic models
-# (e.g. claude-sonnet-5) deprecated `top_p` alongside `temperature`, returning
-# "`top_p` is deprecated for this model." NL→SPARQL sets topP=0 for determinism,
-# so without this the determinism change itself makes every SPARQL-path Converse
-# fail-closed on those models (temperature drop alone is not enough — the retry
-# still carries topP and fails again). Same process-wide, lock-free rationale.
+# Model ids observed to reject `inferenceConfig.topP` with a ValidationException
+# (the same models deprecated `top_p` alongside `temperature`).
 _MODELS_REJECTING_TOP_P: set[str] = set()
 
 
@@ -154,13 +140,10 @@ def _assessment_is_unparsed(assessment: dict) -> bool:
       that we do not parse (e.g. ``contextualGroundingPolicy``), which could be a
       block we never saw.
 
-    Unknown keys that carry NO action are benign metadata and are ignored, rather
-    than blindly treating every unrecognized key as dangerous. That is what lets
-    real traces through: Bedrock always attaches ``appliedGuardrailDetails`` (and
-    ``invocationMetrics``) to each assessment, and the old name-allowlist rejected
-    the ones it had not been told about — downgrading merely-masked answers to
-    UNKNOWN and discarding them. Keying off the presence of an action instead
-    survives Bedrock adding new metadata without reopening the fail-open hole.
+    Unknown keys that carry NO action are benign metadata and are ignored:
+    Bedrock always attaches ``appliedGuardrailDetails`` (and
+    ``invocationMetrics``) to each assessment, and keying off the presence of an
+    action survives Bedrock adding new metadata without failing open.
     """
     for policy_key, items_key in _GUARDRAIL_POLICY_PATHS:
         try:
@@ -187,10 +170,8 @@ def _trace_has_unparsed_shape(guardrail_trace: dict) -> bool:
     downgrade the verdict to UNKNOWN rather than be ignored.
 
     Deliberately walks the RAW trace rather than :func:`assessments_from_trace`,
-    which silently drops non-dict sides and entries. Relying on the flattened view
-    made this check blind to exactly the malformed input it exists to catch: a
-    readable ANONYMIZED beside an unreadable sibling was reported as plain masking,
-    i.e. it failed OPEN.
+    which silently drops non-dict sides and entries, so a readable ANONYMIZED
+    beside an unreadable sibling is not reported as plain masking.
 
     Only assessment *sides* are inspected. Other top-level trace keys are metadata
     that carry no action, and treating them as unparsed would suppress every
@@ -260,8 +241,7 @@ def _redacted_assessment_actions(guardrail_trace: dict) -> list[str]:
 
     Guardrail traces carry the RAW matched text (``{"type": "NAME", "action":
     "ANONYMIZED", "match": "<a real person's name>"}``). Logging the trace object
-    would therefore write plaintext PII to CloudWatch — which is why enabling the
-    trace and redacting the log have to land together.
+    would therefore write plaintext PII to CloudWatch.
     """
     out: list[str] = []
     for assessment in assessments_from_trace(guardrail_trace):
@@ -365,7 +345,6 @@ class BedrockLLMClient:
     def _get_client(self):
         if self._client is None:
             with self._client_lock:
-                # Double-check after acquiring lock
                 if self._client is None:
                     self._client = boto3.client(
                         "bedrock-runtime",
@@ -466,16 +445,14 @@ class BedrockLLMClient:
 
         # Classify what the guardrail DID. stop_reason alone is insufficient — it
         # fires for masking and blocking alike — so the trace is requested (see
-        # _build_kwargs) and read across BOTH assessments.
+        # _build_converse_kwargs) and read across BOTH assessments.
         if stop_reason in _GUARDRAIL_STOP_REASONS:
             guardrail_trace = response.get("trace", {}).get("guardrail", {})
         outcome = _classify_guardrail(stop_reason, guardrail_trace)
         blocked = outcome is GuardrailOutcome.BLOCKED
 
         if outcome is not GuardrailOutcome.NONE:
-            # NEVER log the trace object: it carries the raw matched values (a real
-            # person's name under a PII NAME match), so logging it would write
-            # plaintext PII to CloudWatch. Only derived labels.
+            # NEVER log the trace object (see _redacted_assessment_actions).
             logger.info(
                 "guardrail_trace",
                 outcome=outcome.value,
@@ -487,7 +464,7 @@ class BedrockLLMClient:
         # Emitted before the no-text check below: a hard block is the decision we
         # most need counted, and it is also the case most likely to return no
         # text. Only when a guardrail was actually applied — counting unguarded
-        # calls as ALLOW would make the block rate meaningless (#111 AC10/AC11).
+        # calls as ALLOW would make the block rate meaningless.
         #
         # ``blocked`` drives GuardrailBlocked and is therefore True only for a
         # CONFIRMED block; UNKNOWN is suppressed but reported under its own
@@ -518,9 +495,8 @@ class BedrockLLMClient:
                 )
             raise ValueError(f"No text content in Bedrock response: stopReason={stop_reason}")
 
-        # Join ALL text blocks. The Converse API may split a response across several
-        # content blocks; taking only the first silently truncated the generation
-        # (and for NL→SQL / NL→SPARQL that means a query cut off mid-statement).
+        # Join ALL text blocks: the Converse API may split a response across several
+        # content blocks.
         text = "".join(text_blocks)
 
         # UNKNOWN means we could not classify the intervention, so the text may be
@@ -650,11 +626,8 @@ class BedrockLLMClient:
                             usage_seen = True
                             record_usage(tracker, handle, event["metadata"].get("usage"))
                     # Safely ignore: messageStart, contentBlockStart, contentBlockStop
-                # Signal the guardrail outcome if it acted. Classified here rather
-                # than as a bare bool so an unexplained intervention (no trace) is
-                # distinguishable from a confirmed block — previously a traceless
-                # intervention left was_blocked False and raised NOTHING, so a real
-                # block passed through silently.
+                # Classified rather than a bare bool so a traceless intervention is
+                # UNKNOWN, not allowed.
                 if guardrail_triggered:
                     loop.call_soon_threadsafe(
                         queue.put_nowait,
@@ -689,25 +662,12 @@ class BedrockLLMClient:
         except TimeoutError:
             pending_exception = TimeoutError("Bedrock stream timed out waiting for next token")
         finally:
-            # Do NOT await the worker here.
-            #
-            # The worker iterates boto3's SYNCHRONOUS EventStream in a thread-pool
-            # thread and has no cancellation point, so awaiting it blocked for up to
-            # BEDROCK_READ_TIMEOUT (120s) more — which defeated the 300s idle-timeout
-            # guard above: it fired, then this line waited again.
-            #
-            # Worse, on early generator close (the SSE consumer in main.py cancelling
-            # resolve_task when the client disconnects) `GeneratorExit` is thrown in
-            # at the `yield`, and suspending on an await inside the resulting
+            # Do NOT await the worker here: it iterates boto3's synchronous
+            # EventStream in a thread with no cancellation point, and on early
+            # generator close (GeneratorExit thrown at the `yield`) awaiting in this
             # `finally` makes CPython raise "async generator ignored GeneratorExit".
-            #
-            # Instead: signal the worker to stop, close the stream from this side to
-            # unblock it, then detach it with a done-callback that surfaces any
-            # error. The generator finalizes synchronously, and the worker cannot
-            # keep consuming the Bedrock stream (and billing tokens) after the
-            # client is gone. Setting the flag as well as closing covers the window
-            # where the API call has not returned yet, so there is no stream to
-            # close — see the comment on ``abandoned``.
+            # Signal the worker to stop, close the stream to unblock it, and detach
+            # it with a done-callback that surfaces any error (see ``abandoned``).
             abandoned.set()
             _close_stream_quietly(stream_holder.get("stream"))
             task.add_done_callback(_log_detached_worker_result)
@@ -715,9 +675,6 @@ class BedrockLLMClient:
         if pending_exception:
             raise pending_exception
 
-        # Streaming telemetry. This path emitted NO guardrail metrics before, so a
-        # block on the streamed path was invisible on the dashboard that exists to
-        # count blocks. Emitted once, after classification, before any raise.
         if guardrail_id:
             emit_guardrail_decision(
                 component=COMPONENT_NL_TO_SPARQL,
@@ -727,16 +684,10 @@ class BedrockLLMClient:
                 decision=_decision_for(guardrail_outcome),
             )
 
-        # KNOWN LIMITATION (deliberate, not an oversight): tokens are yielded above
-        # as they arrive, so by the time the outcome is known some content may
-        # already have reached the caller. Raising here cannot recall it. True
-        # pre-emptive suppression would require buffering the whole guarded output
-        # and giving up streaming, which is out of scope for this change.
-        #
-        # ANONYMIZE is not a block — the tokens already contain the masked values, so
-        # only BLOCKED and UNKNOWN raise. UNKNOWN raises because an intervention we
-        # cannot explain must not be treated as permission; previously a traceless
-        # intervention raised nothing at all, so a genuine block passed silently.
+        # Known limitation: tokens are yielded as they arrive, so raising here cannot
+        # recall content already sent. ANONYMIZE is not a block (the tokens already
+        # carry the masked values), so only BLOCKED and UNKNOWN raise; an
+        # intervention we cannot explain must not be treated as permission.
         if guardrail_outcome in (GuardrailOutcome.BLOCKED, GuardrailOutcome.UNKNOWN):
             raise GuardrailBlockedError(f"guardrail_{guardrail_outcome.value}")
 
@@ -784,8 +735,8 @@ class BedrockLLMClient:
                         learned=True,
                     )
 
-        # Retry loop: at most two learnings (temperature, then topP, or vice
-        # versa). Each ValidationException naming a deprecated sampling param is
+        # Retry loop: at most three learnings (effort, temperature, topP). Each
+        # ValidationException naming a deprecated param is
         # learned, the param stripped, and the call retried; any other error, or
         # running out of strippable params, re-raises.
         for _ in range(4):
@@ -825,11 +776,7 @@ class BedrockLLMClient:
                     )
                     continue
                 raise
-        # Exhausted the retry budget without a return. Only three params (effort,
-        # temperature, topP) can ever be shed, so four iterations should always
-        # succeed or re-raise above; reaching here means an unforeseen loop state.
-        # Fail loudly rather than issuing a 5th unguarded call whose exception
-        # would be indistinguishable from a normal failure.
+        # Unreachable: at most three params can be shed, so the loop returns or re-raises.
         raise RuntimeError("converse retry loop exhausted without returning or raising")
 
     def _build_converse_kwargs(
@@ -844,25 +791,7 @@ class BedrockLLMClient:
         guard_content: str | None = None,
         model_id: str | None = None,
     ) -> dict[str, Any]:
-        """Build kwargs dict shared between converse() and converse_stream().
-
-        Args:
-            prompt: The main prompt text (context + question combined, or just context).
-            system: System instruction text.
-            guardrail_id: Bedrock guardrail identifier.
-            max_tokens: Max output tokens.
-            temperature: Sampling temperature; omitted from inferenceConfig when None.
-            top_p: Nucleus-sampling cutoff; omitted from inferenceConfig when None.
-                Set alongside temperature=0 by determinism-sensitive callers
-                (NL→SPARQL) as belt-and-suspenders: on models that reject/deprecate
-                `temperature` (see _MODELS_REJECTING_TEMPERATURE) it is popped before
-                the call, leaving top_p as the only surviving sampling constraint.
-            guard_content: If provided, this text is wrapped in a guardContent block
-                and appended as a separate content item. The guardrail evaluates ONLY
-                this block for prompt attack detection — the main prompt text is not
-                checked. Per AWS best practices for RAG applications.
-            model_id: Per-call model override. When None, uses self._model_id.
-        """
+        """Build kwargs dict shared between converse() and converse_stream()."""
         effective_model_id = model_id or self._model_id
         if model_id and model_id != self._model_id:
             logger.info("using_model_override", override=model_id, default=self._model_id)
@@ -870,28 +799,16 @@ class BedrockLLMClient:
         # the schema names in it are recorded so the response scrub can redact them
         # where the model could have copied them into a constant (no-op otherwise).
         note_prompt_schema(prompt, system, guard_content)
-        # Build message content blocks
         content: list[dict[str, Any]] = []
         if prompt:
             content.append({"text": prompt})
         if guard_content:
-            # guardContent tag tells Bedrock guardrail to evaluate only this
-            # block for prompt attacks, leaving retrieved context untouched.
-            # Callers that use guardContent as their SOLE channel for untrusted
-            # user text (tier2 nl_to_sql / nl_to_sparql, tier3 synthesizer, per
-            # the tier3 pattern) depend on the text reaching the model either
-            # way, so with no guardrail it is sent as an ordinary text block.
-            #
-            # It cannot stay a guardContent block: Converse REJECTS one when no
-            # guardrailConfig accompanies it — "The guardrail can't assess the
-            # content in the guardContent field. The guardrail configuration is
-            # missing." (ValidationException, ~110ms, reproducible against
-            # bedrock-runtime directly). So an unguarded deployment — which
-            # ALLOW_NO_GUARDRAIL permits and SERVE_GUARDRAILS_DISABLED creates —
-            # failed EVERY Tier-2 generation, returning empty SQL: 135/135
-            # questions on the first benchmark run of this switch. Nothing is
-            # guardrail-scored in that configuration either way, so the only
-            # difference the tag makes is whether the call is accepted at all.
+            # guardContent tells the guardrail to evaluate only this block for
+            # prompt attacks. Callers that use it as their sole channel for untrusted
+            # user text depend on the text reaching the model either way, so with no
+            # guardrail it is sent as an ordinary text block: Converse rejects a
+            # guardContent block without a guardrailConfig ("The guardrail
+            # configuration is missing.", ValidationException).
             if guardrail_id:
                 content.append({"guardContent": {"text": {"text": guard_content}}})
             else:
@@ -912,25 +829,16 @@ class BedrockLLMClient:
             kwargs["guardrailConfig"] = {
                 "guardrailIdentifier": guardrail_id,
                 "guardrailVersion": self._guardrail_version,
-                # REQUIRED, not diagnostic. Bedrock returns the guardrail trace only
-                # when asked, and without it an intervention is unclassifiable: a
-                # merely-anonymized answer is indistinguishable from a blocked one,
-                # which is what made serve delete correct answers. Matches
-                # libs/common/src/coa_common/bedrock.py, which already sets it.
+                # Required, not diagnostic: Bedrock returns the guardrail trace only
+                # when asked, and without it an intervention is unclassifiable.
+                # Matches libs/common/src/coa_common/bedrock.py.
                 "trace": "enabled",
             }
         return kwargs
 
     @instrumented("bedrock")
     async def embed(self, text: str) -> list[float]:
-        """Embed query text into a vector using the shared search-query embedder.
-
-        Args:
-            text: The query text to embed.
-
-        Returns:
-            The embedding vector as a list of floats.
-        """
+        """Embed query text into a vector using the shared search-query embedder."""
         # Serve embeds search QUERIES — use search_query input_type (Cohere) via
         # the shared embedder so vectors match the search_document embeddings
         # written at ingestion time.

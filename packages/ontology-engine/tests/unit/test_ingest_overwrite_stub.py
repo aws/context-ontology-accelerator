@@ -34,13 +34,7 @@ def _md() -> IngestMetadata:
 
 def _run(monkeypatch, existing_row, overwrite_stub):
     monkeypatch.setattr(ingest_mod.dynamo_store, "get_ontology_registry", lambda ns, oid: existing_row)
-    # Everything past the conflict guard is store I/O — stub it so the call
-    # either raises the conflict (the branch under test) or proceeds far enough
-    # to prove no conflict was raised. A sentinel on create_ontology tells us the
-    # fresh-write path was entered.
-    entered = {"created": False}
     gs = MagicMock()
-    gs.create_ontology.side_effect = lambda *a, **k: entered.update({"created": True})
     monkeypatch.setattr(ingest_mod.dynamo_store, "put_ontology_registry", lambda *a, **k: {"uri": "http://ex/onto"})
     monkeypatch.setattr(ingest_mod.dynamo_store, "put_namespace_meta", lambda *a, **k: None)
 

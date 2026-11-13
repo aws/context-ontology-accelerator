@@ -4,18 +4,9 @@
 
 # Deploy-preflight check for the container engine CDK builds image assets with.
 #
-# CDK shells out to $CDK_DOCKER (default: docker). Five service stacks (mcp,
-# ontology, serve, sources, vkg) build container images, and a full deploy
-# deploys all of them, so without an engine the deploy builds and synthesizes
-# for ~20 minutes and then fails at the first image asset. Unlike Lambda
-# bundling there is no local fallback for an image, so a missing engine is an
-# error, not a warning.
-#
-# One legitimate engine-less case exists: CDK checks ECR before building and
-# skips the engine entirely for an image that is already published, so a
-# redeploy in which no image changed succeeds without one. An operator who knows
-# that is the case opts in with SCL_ALLOW_NO_CONTAINER_ENGINE=1, which turns the
-# error back into a warning.
+# Image assets have no local fallback, so a missing engine is an error. If no image changed
+# since the last deploy (CDK reuses images already in ECR), SCL_ALLOW_NO_CONTAINER_ENGINE=1
+# turns the error into a warning.
 #
 # Sourced, not run. Plain bash 3.2, since the scripts also run on macOS. The
 # caller provides ok/warn/err (see preflight-deploy.sh):

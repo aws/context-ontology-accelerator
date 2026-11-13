@@ -22,7 +22,6 @@ const COLORS = {
 
 function tokenize(turtle: string): Array<{ text: string; color?: string }> {
   const tokens: Array<{ text: string; color?: string }> = [];
-  // Process line by line for simplicity
   const lines = turtle.split("\n");
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li];
@@ -30,14 +29,12 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
     while (pos < line.length) {
       let matched = false;
 
-      // Comment
       if (line[pos] === "#" && (pos === 0 || line[pos - 1] !== "<")) {
         tokens.push({ text: line.slice(pos), color: COLORS.comment });
         pos = line.length;
         matched = true;
       }
 
-      // @prefix / @base
       if (!matched && line.slice(pos).match(/^@(prefix|base)\b/)) {
         const m = line.slice(pos).match(/^@(prefix|base)\b/)!;
         tokens.push({ text: m[0], color: COLORS.prefix });
@@ -45,7 +42,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         matched = true;
       }
 
-      // Full IRI <...>
       if (!matched && line[pos] === "<") {
         const end = line.indexOf(">", pos);
         if (end !== -1) {
@@ -55,7 +51,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         }
       }
 
-      // String literal "..."
       if (!matched && line[pos] === '"') {
         let end = pos + 1;
         while (end < line.length && line[end] !== '"') {
@@ -68,7 +63,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         matched = true;
       }
 
-      // Datatype ^^
       if (!matched && line.slice(pos, pos + 2) === "^^") {
         const m = line.slice(pos).match(/^\^\^[\w:]+/);
         if (m) {
@@ -78,7 +72,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         }
       }
 
-      // Keyword 'a' (rdf:type shorthand)
       if (
         !matched &&
         line.slice(pos).match(/^a\s/) &&
@@ -89,7 +82,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         matched = true;
       }
 
-      // Prefixed name (ns:localName)
       if (!matched && line.slice(pos).match(/^[\w-]+:[\w-]*/)) {
         const m = line.slice(pos).match(/^[\w-]+:[\w-]*/)!;
         tokens.push({ text: m[0], color: COLORS.prefixed });
@@ -97,7 +89,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         matched = true;
       }
 
-      // Punctuation
       // eslint-disable-next-line no-useless-escape
       if (!matched && /^[;,.\[\]()]/.test(line[pos])) {
         tokens.push({ text: line[pos], color: COLORS.punctuation });
@@ -105,7 +96,6 @@ function tokenize(turtle: string): Array<{ text: string; color?: string }> {
         matched = true;
       }
 
-      // Plain text (whitespace or identifiers)
       if (!matched) {
         // eslint-disable-next-line no-useless-escape
         const m = line.slice(pos).match(/^[^\s<"#;,.\[\]()^]+|\s+/);
@@ -149,13 +139,9 @@ const PRE_STYLE: React.CSSProperties = {
 };
 
 export function TurtleHighlight({ children }: { children: string }) {
-  // Build the highlighted markup as a single HTML string (one DOM subtree)
-  // rather than one React <span> per token. The per-token React elements
-  // exploded the fiber tree and froze expand/collapse on large Turtle; a single
-  // innerHTML mounts and unmounts in one operation. Token text is HTML-escaped
-  // to prevent injection (only fixed color hex values reach the style attr).
-  // Only truly massive files (>1 MB) fall back to plain text, where even the
-  // raw DOM node count is too heavy for the browser to paint smoothly.
+  // One HTML string instead of a React <span> per token, which is too many
+  // fibers for large Turtle. Token text is HTML-escaped (only fixed colour hex
+  // values reach the style attr). Files over 1 MB fall back to plain text.
   const html = React.useMemo(() => {
     if (children.length > 1_000_000) return null;
     return tokenize(children)

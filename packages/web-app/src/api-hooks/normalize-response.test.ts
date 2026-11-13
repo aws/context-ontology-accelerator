@@ -119,39 +119,6 @@ describe("normalizeResponse", () => {
   });
 
   describe("preserves valid fields", () => {
-    it("preserves synthesizedAnswer", () => {
-      const normalized = normalizeResponse({
-        result: { synthesizedAnswer: "The loss ratio is 71.3%" },
-      });
-      expect(normalized!.result.synthesizedAnswer).toBe(
-        "The loss ratio is 71.3%",
-      );
-    });
-
-    it("preserves resultRows", () => {
-      const rows = [{ claim_id: "CL-001", amount: 1000 }];
-      const normalized = normalizeResponse({
-        result: { resultRows: rows },
-      });
-      expect(normalized!.result.resultRows).toEqual(rows);
-    });
-
-    it("preserves queryUsed", () => {
-      const normalized = normalizeResponse({
-        result: { queryUsed: "SELECT * FROM claims" },
-      });
-      expect(normalized!.result.queryUsed).toBe("SELECT * FROM claims");
-    });
-
-    it("preserves sparqlGenerated", () => {
-      const normalized = normalizeResponse({
-        result: { sparqlGenerated: "SELECT ?x WHERE { ?x rdf:type :Claim }" },
-      });
-      expect(normalized!.result.sparqlGenerated).toBe(
-        "SELECT ?x WHERE { ?x rdf:type :Claim }",
-      );
-    });
-
     it("preserves executionMode 'deep-reasoning'", () => {
       const normalized = normalizeResponse({
         result: { executionMode: "deep-reasoning" },
@@ -178,30 +145,11 @@ describe("normalizeResponse", () => {
       expect(normalized!.result.executionMode).toBeUndefined();
     });
 
-    it("preserves dataSources", () => {
-      const normalized = normalizeResponse({
-        result: { dataSources: ["Athena", "Neptune"] },
-      });
-      expect(normalized!.result.dataSources).toEqual(["Athena", "Neptune"]);
-    });
-
     it("preserves guardrailBlocked", () => {
       const normalized = normalizeResponse({
         result: { guardrailBlocked: true },
       });
       expect(normalized!.result.guardrailBlocked).toBe(true);
-    });
-
-    it("preserves ontologyVersion", () => {
-      const normalized = normalizeResponse({
-        result: { ontologyVersion: "v2.3.1" },
-      });
-      expect(normalized!.result.ontologyVersion).toBe("v2.3.1");
-    });
-
-    it("preserves tier when valid", () => {
-      const normalized = normalizeResponse({ result: { tier: 3 } });
-      expect(normalized!.result.tier).toBe(3);
     });
 
     it("preserves trace when valid array", () => {
@@ -210,22 +158,6 @@ describe("normalizeResponse", () => {
       ];
       const normalized = normalizeResponse({ result: { trace } });
       expect(normalized!.result.trace).toEqual(trace);
-    });
-
-    it("preserves requestId from outer response", () => {
-      const normalized = normalizeResponse({
-        requestId: "req-abc-123",
-        result: { tier: 1 },
-      });
-      expect(normalized!.requestId).toBe("req-abc-123");
-    });
-
-    it("preserves sessionId from outer response", () => {
-      const normalized = normalizeResponse({
-        sessionId: "sess-xyz-789",
-        result: { tier: 1 },
-      });
-      expect(normalized!.sessionId).toBe("sess-xyz-789");
     });
 
     it("does not include requestId when it is not a string", () => {

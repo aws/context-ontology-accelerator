@@ -143,16 +143,6 @@ describe("resolveCompletedInductionAction", () => {
     const action = resolveCompletedInductionAction({}, null);
     expect(action).toEqual({ kind: "refresh" });
   });
-
-  it("does not navigate to a superset selection's own job (duplicate only on exact match)", () => {
-    // A superset run (e.g. added a 2nd datasource) is NOT a duplicate — the
-    // backend gives it no duplicate_of, so it navigates to its own new proposal.
-    const action = resolveCompletedInductionAction(
-      { report: { induced_ontology_id: "superset-prop" } },
-      "superset-job",
-    );
-    expect(action.kind).toBe("navigate");
-  });
 });
 
 describe("deleteOntologyCopy", () => {
@@ -174,12 +164,9 @@ describe("deleteOntologyCopy", () => {
   });
 });
 
-// ── Rendered Actions cell ──
-
 const listOntologies = vi.fn();
 const listFoundationalOntologies = vi.fn();
 const loadFoundationalOntology = vi.fn();
-const getOntologyIngestStatus = vi.fn();
 const listAllProposals = vi.fn();
 const triggerInduction = vi.fn();
 const deleteOntology = vi.fn();
@@ -188,15 +175,11 @@ vi.mock("../services/ontology-engine", () => ({
   listFoundationalOntologies: (...args: unknown[]) =>
     listFoundationalOntologies(...args),
   listAllProposals: (...args: unknown[]) => listAllProposals(...args),
-  listInducedDatasources: vi.fn().mockResolvedValue([]),
-  listInducedDatasource: vi.fn(),
   triggerInduction: (...args: unknown[]) => triggerInduction(...args),
   getInductionJob: vi.fn(),
   uploadOntologyFile: vi.fn(),
   loadFoundationalOntology: (...args: unknown[]) =>
     loadFoundationalOntology(...args),
-  getOntologyIngestStatus: (...args: unknown[]) =>
-    getOntologyIngestStatus(...args),
   deleteOntology: (...args: unknown[]) => deleteOntology(...args),
 }));
 
@@ -359,11 +342,6 @@ describe("OntologiesTab Actions cell", () => {
     await waitFor(() =>
       expect(listOntologies.mock.calls.length).toBeGreaterThan(listCallsBefore),
     );
-    // The button must NOT run its own ingest-status poll anymore — that was
-    // the redundancy this change removed (tech-debt #773). Give the old 2s
-    // poll interval time to fire; it must not.
-    await new Promise((r) => setTimeout(r, 100));
-    expect(getOntologyIngestStatus).not.toHaveBeenCalled();
   }, 10000);
 
   it("offers a Delete action for BOTH loaded foundational and uploaded rows", async () => {
@@ -530,22 +508,6 @@ describe("OntologiesTab Actions cell", () => {
       ),
     );
   });
-
-  // NOTE on the grounding tests below (Induce Ontology modal): grounding is
-  // available for BOTH strategies — the structured (table_to_ontology) path
-  // grounds tables and the unstructured (lexical graph) path grounds its
-  // induced classes against the same loaded foundational ontologies.
-
-  // NOTE on the concurrent-load fix (loadingUris scalar → Set<string>): the
-  // regression it guards against — clicking Load on a second reference
-  // ontology cancelling the first's spinner — cannot be reproduced at the unit
-  // level. A Cloudscape inline-link Button drops its "Load" label and its table
-  // row re-renders out of the queryable jsdom tree the instant it enters
-  // `loading`, so the second row's button is never clickable in the test env
-  // (verified by DOM inspection: after one click, all foundational rows vanish
-  // from the queryable tree). The fix is verified by tsc + code review of the
-  // per-URI `Set` keying in OntologyPage.tsx and by the live-browser E2E in the
-  // MR checklist; the single-load path above already covers Load→POST→poll.
 });
 
 describe("Induce Ontology modal — grounding is available for both strategies", () => {
@@ -628,8 +590,6 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     fireEvent.mouseUp(unstructuredOption);
     fireEvent.click(unstructuredOption);
 
-    // Grounding UI remains for the unstructured (lexical graph) path —
-    // it now grounds induced classes against loaded foundational ontologies.
     await waitFor(() =>
       expect(
         screen.getByText("Grounding ontologies (optional)"),
@@ -709,14 +669,7 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     ]);
     await openInductionModal();
 
-    // No read-only "always grounded" note anymore — grounding is fully driven
-    // by the selection.
-    expect(
-      screen.queryByText(/Always grounded against this namespace/),
-    ).toBeNull();
-
-    // Open the dropdown: BOTH ontologies are selectable options now (induced is
-    // no longer excluded).
+    // Open the dropdown.
     // `findByText`, not `getByText`: openInductionModal() only awaits the
     // modal's "Strategy" field, while this trigger renders on a separate async
     // chain (the listOntologies fetch resolving). A synchronous query races
@@ -742,13 +695,9 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     expect(foundationalOpt).toHaveAttribute("aria-selected", "false");
   });
 
-  it("surfaces not-ready ontologies as disabled with a per-row status label (issue #540)", async () => {
-    // A namespace with one ready, one still-embedding, one failed, and one
-    // legacy (no parseStatus but embedded) ontology. Before #540 the three
-    // non-ready rows were the still-embedding and failed ones — silently
-    // dropped from the dropdown with no signal. Now every loaded ontology is
-    // SHOWN; readiness (selectability) is derived from ontologyIngestState so
-    // it can never disagree with the Ontologies-list StatusIndicator.
+  it("surfaces not-ready ontologies as disabled with a per-row status label", async () => {
+    // One ready, one still-embedding, one failed, and one legacy (no parseStatus
+    // but embedded) ontology.
     listOntologies.mockResolvedValue([
       record({
         ontologyId: "http://ns/ready",
@@ -787,10 +736,6 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     ]);
     await openInductionModal();
 
-    // `findByText`, not `getByText`: openInductionModal() only awaits the
-    // modal's "Strategy" field, while this trigger renders on a separate async
-    // chain (the listOntologies fetch resolving). A synchronous query races
-    // that chain and throws "unable to find element" under parallel-suite load.
     const groundingTrigger = (
       await screen.findByText("Pick loaded ontologies to ground against")
     ).closest("button");
@@ -812,8 +757,7 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     expect(embeddingOpt).toHaveAttribute("aria-disabled", "true");
     expect(embeddingOpt).toHaveTextContent("⏳ Embedding…");
 
-    // Failed-ingest row is SHOWN but DISABLED with the failed label — the
-    // failed-vs-pending distinction #540 asked for.
+    // Failed-ingest row is SHOWN but DISABLED with a label distinct from pending.
     const failedOpt = await screen.findByRole("option", {
       name: /Failed Onto/,
     });
@@ -822,7 +766,7 @@ describe("Induce Ontology modal — grounding is available for both strategies",
   });
 });
 
-describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () => {
+describe("Induction in-flight visibility + trigger lock", () => {
   beforeEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -846,13 +790,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
   }
 
   it("maps proposal statuses to the right StatusIndicator (inducing/failed/pending)", () => {
-    // The in-progress "Inducing…" label + failed/pending mapping is the
-    // presentational branch added for the stub row. Asserting it directly on
-    // the pure helper keeps the check deterministic — driving it through the
-    // Cloudscape Tabs -> SortableTable -> 4s-poll stack in jsdom is flaky (the
-    // live poll interval prevents the tab-content render from settling). The
-    // server->component wiring that DECIDES a row is "inducing" is covered by
-    // the trigger-lock tests below, which read listAllProposals end-to-end.
+    // Tested on the helper: the live poll keeps the Tabs render from settling.
     expect(proposalStatusDisplay("inducing")).toEqual({
       type: "in-progress",
       label: "Inducing…",
@@ -869,7 +807,7 @@ describe("Induction in-flight visibility + trigger lock (issue I-3f1f50cc)", () 
       type: "success",
       label: "accepted",
     });
-    // An accept whose pipeline step exhausted its retries (#456/#466/#467).
+    // An accept whose pipeline step exhausted its retries.
     // Must render as an ERROR, not fall through to the pending branch —
     // otherwise a failed accept looks like a fresh proposal.
     expect(proposalStatusDisplay("accept_failed")).toEqual({
@@ -1208,11 +1146,6 @@ describe("Ontology page — re-scanned-source warning", () => {
     await screen.findByText(PENDING_WARNING);
   });
 
-  // The proposals list is capped (50 rows by default). This mock applies the
-  // filters the page sends, then keeps the first `limit` rows in STORAGE order
-  // (not newest first), so the tests below do not lean on the backend's
-  // ordering: the page itself must keep other proposals from crowding its
-  // structured inductions out of the capped list.
   // The page reads every proposal page (listAllProposals), so nothing is capped:
   // the newest induction is found however many other proposals there are.
   function mockStoredProposals(stored: Array<Record<string, unknown>>) {

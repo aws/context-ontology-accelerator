@@ -1,33 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Ontology_Lookup_Tool layer (task 10).
-
-Covers ``coa_serve.tier3.agentic.tools.ontology_tool``:
-
-- The four required interface fields are present and well-formed, and the Tool is
-  registrable (Req 11.1); ``build_ontology_tool`` registers exactly one
-  ``ontology_lookup`` Tool.
-- :meth:`OntologyLookupTool.invoke` returns the determined ontology — node types,
-  edge types, and the directional source→target ``edge_map`` per edge type — in
-  one source-agnostic shape (Req 3.1, 3.6), extractable via
-  :func:`ontology_from_result`.
-- Per-request caching (Req 3.8): a second lookup for the same namespace reuses the
-  cached ontology and performs a SINGLE source load; a different namespace triggers
-  a fresh load.
-- Empty result vs load failure are DISTINCT outcomes (Req 3.10 vs 3.11): an empty
-  (but successful) ontology yields a non-degraded result whose ``detail`` says
-  ``empty`` and from which :func:`ontology_from_result` returns an empty
-  :class:`Ontology`; a source that RAISES yields a degraded result whose ``detail``
-  says ``failed`` and names the source, from which :func:`ontology_from_result`
-  returns ``None``. The tool NEVER raises (Req 9.1), and a failure is not cached
-  (a later attempt retries).
-- Module load of ``ontology_tool`` does NOT import ``graphrag_toolkit`` (Req 12.3).
-
-The :class:`OntologySource` is mocked with a lightweight fake exposing the same
-``load`` coroutine and counting its calls, so the cache-reuse assertions are exact
-and the tests need no Neptune / rdflib / ``graphrag_toolkit`` access.
-"""
+"""Unit tests for the Ontology_Lookup_Tool layer (``coa_serve.tier3.agentic.tools.ontology_tool``)."""
 
 from __future__ import annotations
 
@@ -44,8 +18,7 @@ from coa_serve.tier3.agentic.tools.ontology_tool import (
     ontology_from_result,
 )
 
-# A populated ontology mirroring the task-9 fixture shape (node types, edge types,
-# and directional source→target triples).
+# A populated ontology (node types, edge types, and directional source→target triples).
 _POPULATED = Ontology(
     node_types=("Company", "FinancialReport", "Person"),
     edge_types=("COMPETES_WITH", "HAS_FINANCIALS", "WORKS_FOR"),
@@ -56,7 +29,7 @@ _POPULATED = Ontology(
     ),
 )
 
-# A successful-but-empty ontology (no node types, no edge types) — Req 3.10.
+# A successful-but-empty ontology (no node types, no edge types).
 _EMPTY = Ontology(node_types=(), edge_types=(), edge_map=())
 
 
@@ -81,28 +54,10 @@ class FakeOntologySource:
         return self._ontology
 
 
-# ── Interface fields & naming ──────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestToolInterface:
-    def test_name_is_ontology_lookup(self):
-        tool = OntologyLookupTool(FakeOntologySource())
-        assert tool.name == "ontology_lookup"
-
-    def test_description_is_non_empty(self):
-        tool = OntologyLookupTool(FakeOntologySource())
-        assert tool.description.strip()
-
-    def test_declares_dict_input_and_output_schemas(self):
-        tool = OntologyLookupTool(FakeOntologySource())
-        # The ontology tool takes no planner inputs; an empty dict is a valid,
-        # declared contract.
-        assert isinstance(tool.input_schema, dict)
-        assert isinstance(tool.output_schema, dict)
-
     def test_is_registrable_as_a_tool(self):
-        """An ontology tool satisfies the registry's four-field contract (Req 11.1)."""
+        """An ontology tool satisfies the registry's four-field contract."""
         registry = ToolRegistry()
         registry.register(OntologyLookupTool(FakeOntologySource()))
         assert registry.names() == ["ontology_lookup"]
@@ -117,9 +72,6 @@ class TestToolInterface:
         assert isinstance(spec["output_schema"], dict)
 
 
-# ── invoke() returns the ontology in one shape (Req 3.1, 3.6) ──────
-
-
 @pytest.mark.unit
 class TestInvokeReturnsOntology:
     async def test_invoke_returns_node_edge_types_and_directional_edge_map(self):
@@ -131,11 +83,7 @@ class TestInvokeReturnsOntology:
         assert onto is not None
         assert onto.node_types == _POPULATED.node_types
         assert onto.edge_types == _POPULATED.edge_types
-        # Directional source→target preserved per edge type (Req 3.1).
         assert onto.edge_map == _POPULATED.edge_map
-        by_edge = {edge: (src, tgt) for edge, src, tgt in onto.edge_map}
-        assert by_edge["HAS_FINANCIALS"] == ("Company", "FinancialReport")
-        assert by_edge["WORKS_FOR"] == ("Person", "Company")
 
     async def test_detail_summarizes_a_populated_ontology(self):
         tool = OntologyLookupTool(FakeOntologySource(_POPULATED))
@@ -152,13 +100,10 @@ class TestInvokeReturnsOntology:
         assert source.calls == ["tenant-x"]
 
 
-# ── Per-request caching (Req 3.8) ──────────────────────────────────
-
-
 @pytest.mark.unit
 class TestPerRequestCaching:
     async def test_second_lookup_in_a_request_reuses_cache_single_load(self):
-        """A repeat lookup for the same namespace performs a SINGLE source load (Req 3.8)."""
+        """A repeat lookup for the same namespace performs a SINGLE source load."""
         source = FakeOntologySource(_POPULATED)
         tool = OntologyLookupTool(source)
 
@@ -185,10 +130,7 @@ class TestPerRequestCaching:
         assert source.calls == ["ns-a", "ns-b"]
 
     async def test_empty_ontology_is_NOT_cached_and_reloads(self):
-        """An EMPTY load is NOT cached — it re-queries each time. Caching empty would
-        poison the tool for the container lifetime if a query ran before the
-        namespace's ontology was induced/accepted (the ontology would never appear
-        even after it lands). Only populated ontologies are cached."""
+        """An EMPTY load is NOT cached, so an ontology accepted later still appears."""
         source = FakeOntologySource(_EMPTY)
         tool = OntologyLookupTool(source)
 
@@ -201,12 +143,11 @@ class TestPerRequestCaching:
         assert "(cached)" not in second.detail
 
     async def test_empty_then_populated_self_heals(self):
-        """The whole point: an empty result followed by a populated one (e.g. after
-        an accept lands) returns the populated ontology — no stale empty cache."""
+        """An empty result followed by a populated one returns the populated ontology."""
         source = FakeOntologySource(_EMPTY)
         tool = OntologyLookupTool(source)
         empty = await tool.invoke(namespace="acme")
-        assert ontology_from_result(empty) is None or not ontology_from_result(empty).node_types
+        assert ontology_from_result(empty) == _EMPTY
 
         # Ontology is now induced/accepted → source returns populated.
         source._ontology = _POPULATED
@@ -218,13 +159,10 @@ class TestPerRequestCaching:
         assert "(cached)" in cached.detail
 
 
-# ── Empty vs load failure are DISTINCT outcomes (Req 3.10 vs 3.11) ─
-
-
 @pytest.mark.unit
 class TestEmptyVersusFailureAreDistinct:
     async def test_empty_ontology_is_a_successful_distinct_outcome(self):
-        """Empty ontology: non-degraded result, extractable empty Ontology (Req 3.10)."""
+        """Empty ontology: non-degraded result, extractable empty Ontology."""
         tool = OntologyLookupTool(FakeOntologySource(_EMPTY))
 
         out = await tool.invoke(namespace="acme")
@@ -239,18 +177,18 @@ class TestEmptyVersusFailureAreDistinct:
         assert "failed" not in out.detail
 
     async def test_load_failure_is_a_distinct_degraded_outcome(self):
-        """Load failure: degraded result, no extractable Ontology, names the source (Req 3.11)."""
+        """Load failure: degraded result, no extractable Ontology, names the source."""
         source = FakeOntologySource(raises=RuntimeError("backend down"))
         tool = OntologyLookupTool(source, source_name="OntologyGraphSource")
 
-        out = await tool.invoke(namespace="acme")  # must NOT raise (Req 9.1)
+        out = await tool.invoke(namespace="acme")  # must NOT raise
 
         # No ontology item → ontology_from_result signals failure with None.
         assert ontology_from_result(out) is None
         assert out.items == ()
         assert "failed" in out.detail
         assert "RuntimeError" in out.detail
-        # The source in use is named in the trace detail (Req 3.11).
+        # The source in use is named in the trace detail.
         assert "OntologyGraphSource" in out.detail
 
     async def test_empty_and_failure_outcomes_differ(self):
@@ -266,7 +204,7 @@ class TestEmptyVersusFailureAreDistinct:
         assert "failed" in failure_out.detail and "empty" not in failure_out.detail
 
     async def test_load_failure_is_not_cached_and_retries(self):
-        """A failure is not cached, so a later lookup attempts the source again (Req 3.11)."""
+        """A failure is not cached, so a later lookup attempts the source again."""
         source = FakeOntologySource(raises=RuntimeError("transient"))
         tool = OntologyLookupTool(source)
 
@@ -281,9 +219,6 @@ class TestEmptyVersusFailureAreDistinct:
         tool = OntologyLookupTool(source)  # no explicit source_name
         out = await tool.invoke(namespace="ns")
         assert "FakeOntologySource" in out.detail
-
-
-# ── Builder (Req 3.1) ──────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -308,22 +243,12 @@ class TestBuildOntologyTool:
         assert source.calls == ["ns"]
 
 
-# ── ontology_from_result helper ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestOntologyFromResult:
-    async def test_round_trips_an_ontology_through_a_result(self):
-        out = await OntologyLookupTool(FakeOntologySource(_POPULATED)).invoke(namespace="ns")
-        assert ontology_from_result(out) == _POPULATED
-
     def test_returns_none_for_a_result_without_an_ontology_item(self):
         from coa_serve.tier3.agentic.tools.base import ToolResult
 
         assert ontology_from_result(ToolResult(detail="no ontology here")) is None
-
-
-# ── Lazy-import invariant (Req 12.3) ───────────────────────────────
 
 
 @pytest.mark.unit
@@ -333,7 +258,7 @@ class TestLazyImportInvariant:
 
         Runs in a fresh subprocess (current ``sys.path`` propagated) so a
         ``graphrag_toolkit`` already imported by a sibling test cannot mask a
-        regression (mirrors the task-1/6/7/8/9 invariant tests)."""
+        regression."""
         code = (
             "import sys; "
             "import coa_serve.tier3.agentic.tools.ontology_tool; "

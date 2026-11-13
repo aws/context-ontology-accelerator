@@ -9,17 +9,8 @@ inspecting candidate schemas and their FKs) before writing SQL, then executes an
 self-corrects. On the multi-source Spider 2.0 regime that iterative schema
 inspection is the main lever over single-shot retrieval.
 
-This module is only the WIRING: it owns the prompt and the turn-by-turn
-translation between the model and the capabilities it may use. It owns no
-retrieval, no SQL generation and no execution of its own —
-
-  * ``search_tables`` / ``get_table_schema`` → :class:`TableCatalog` (Tier 2)
-  * ``generate_sql``                        → :class:`SqlAuthoringTool` (Tier 2)
-  * ``explore_graph`` (opt-in)              → :class:`OntologyGraphTool` (Tier 2)
-  * ``execute_sql``                         → :class:`SqlExecutionService`
-
-— so the agent is one consumer of the shared tools rather than their owner, and
-the same tools back any other consumer (an MCP tool, an HTTP route) unchanged.
+This module is only the WIRING (prompt and turn translation); the tools live in
+:mod:`coa_serve.tier2.tools` and :mod:`coa_serve.sql_execution`.
 
 **No arbitrary SQL execution.** The agent never gets a "run this SQL" tool. Every
 statement it can execute must have come from ``generate_sql``, which returns an
@@ -167,13 +158,9 @@ share a real foreign key. Ignore irrelevant candidates.
 - Output the final verified SQL in <sql>...</sql>."""
 
 
-# Appended to the system prompt ONLY when SERVE_DEEP_REASONING_INTENT_REVIEW is on. Targets
-# the confidently-wrong-on-plausible-rows failure mode: the agent runs SQL, sees
-# non-empty rows, and finalizes without questioning whether its reading of the
-# question's ambiguous terms is the intended one. This adds a mandatory
-# interpretation-reconciliation turn BEFORE finalizing — model-driven, no rule
-# catalogue. Safe by construction on this path: the last successful SQL is sticky,
-# so a re-run during review cannot downgrade an already-good answer to empty.
+# Appended ONLY when SERVE_DEEP_REASONING_INTENT_REVIEW is on. Targets the agent
+# finalizing on plausible rows without questioning its reading of ambiguous terms.
+# Safe: the last successful SQL is sticky, so a review re-run cannot downgrade it.
 INTENT_REVIEW_BLOCK = """
 
 BEFORE you output the final <sql>, run this interpretation check (it is NOT optional):
@@ -189,21 +176,8 @@ for that reading, execute_sql it, and compare the two results before choosing.
 - Only then output the final verified SQL in <sql>...</sql>."""
 
 
-# NO PROMPT BLOCK FOR explore_graph — deliberately.
-#
-# An earlier revision appended a paragraph describing the tool and MANDATING it
-# ("you MUST call explore_graph before generate_sql"). Strands already passes each
-# tool's docstring to the model, so that was a SECOND description of the same tool,
-# and repetition in a prompt is itself a nudge: the agent called it on 81 of 135
-# Spider 2.0 questions for +1.1pp EX (p=0.69), i.e. it fired everywhere and paid for
-# itself nowhere. Trajectories show why — hop-1 FK neighbours are already in the text
-# ``get_table_schema`` returns, so most calls re-fetched context the agent had.
-#
-# Keeping the prompt byte-identical whether or not the tool is wired also makes the
-# flag a clean A/B: the only difference between arms is the tool's availability, and
-# whether the model reaches for it on its own merits is then a real signal. If call
-# volume drops to zero, the follow-up is one line on WHEN it earns its cost (a join
-# the search missed), never a re-description of what it does.
+# No prompt block for explore_graph: Strands already sends the tool docstring, and a
+# prompt description made the agent call it indiscriminately.
 
 
 def build_system_prompt(intent_review: bool | None = None) -> str:
@@ -332,7 +306,7 @@ class SqlAgent:
             execution: Shared execute-with-authz primitive.
             graph: Tier-2 FK-traversal tool. When None (the default) the agent is
                 offered the same four tools and the same prompt as baseline; when
-                given, it also gets ``explore_graph`` plus the block describing it.
+                given, it also gets ``explore_graph``.
             region: Bedrock region for the agent's own model provider.
             model_id: Model the agent reasons with; None uses the provider default.
             exec_timeout_s: Per-statement execution timeout; None reads
@@ -446,12 +420,8 @@ class SqlAgent:
             logger.warning("agentic_strands_unavailable", error=str(e))
             return SqlAgentOutcome(unavailable=True, duration_ms=int((time.perf_counter() - t_start) * 1000))
 
-        # Capture request_id from the bound contextvars HERE (we're on the
-        # entrypoint's asyncio task, where main.py bound it) and stamp it
-        # explicitly on every agentic_turn line. merge_contextvars already adds it
-        # to in-loop async tools, but Strands may run a tool in a thread executor
-        # (contextvars are NOT copied across run_in_executor), so we stamp it
-        # explicitly to make trajectory join-by-request_id robust either way.
+        # Stamp request_id explicitly: Strands may run a tool in a thread executor,
+        # which does not copy contextvars.
         req_id = structlog.contextvars.get_contextvars().get("request_id", "")
         outcome = SqlAgentOutcome()
 
@@ -576,14 +546,9 @@ class SqlAgent:
             Args:
                 table_names: Exact table names (lowercase) to use as context.
             """
-            # Self-correction is the whole point of this arm: if a prior execution
-            # exists, hand the writer that SQL + its observation so a
-            # re-generation REVISES the failed/wrong query instead of returning
-            # byte-identical SQL (the writer is a stateless temp-0 function of
-            # (question, schema), so without this the retry loop is a no-op).
-            # Empty on the FIRST generate → identical to single-shot.
-            # Generations are capped too (twice the executions), so a model that keeps
-            # regenerating without executing cannot spend writer calls until the deadline.
+            # Feed the last attempt back so a re-generation revises it (the writer is a
+            # stateless temp-0 function of (question, schema)). Generations are capped
+            # at twice the executions.
             if executions["count"] >= self._max_executions or executions["generations"] >= 2 * self._max_executions:
                 return json.dumps({"error": _BUDGET_EXHAUSTED})
             executions["generations"] += 1
@@ -605,10 +570,6 @@ class SqlAgent:
             pending_sql[handle] = generated.sql
             pending_confidence[handle] = generated.confidence
             note = f" (note: no schema for {generated.missing_tables}, ignored)" if generated.missing_tables else ""
-            # Trajectory log (for offline error analysis): the candidate SQL the
-            # writer produced this turn, the tables it saw, and whether a prior
-            # attempt was fed back. Stamped with the question so turns group per
-            # question in CloudWatch.
             logger.info(
                 "agentic_turn",
                 phase="generate",
@@ -688,10 +649,7 @@ class SqlAgent:
             outcome.confidence = confidence
             outcome.data_source_id = result.data_source_id
             preview = result.rows[:_PREVIEW_ROWS]
-            # Record the executed attempt + a compact observation so that if the
-            # agent judges these rows wrong and re-calls generate_sql, the writer
-            # can revise from what actually came back (not just from re-reading
-            # the schema). Empty/zero-row results are the strongest wrong-signal.
+            # Record the attempt so a re-call of generate_sql can revise from it.
             obs = (
                 f"executed OK, returned {result.row_count} row(s); "
                 f"columns={result.columns}; preview={json.dumps(preview, default=str)[:_LOG_OBS_CHARS]}"

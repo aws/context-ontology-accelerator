@@ -1,10 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the cross-script ``PruneStatements`` patch (#1263).
+"""Tests for the cross-script ``PruneStatements`` patch.
 
 These run the toolkit's real ``PopulateStatementStrs`` -> ``RerankStatements`` (tfidf)
--> ``PruneStatements`` chain on statements taken from the #1263 reproduction: English
+-> ``PruneStatements`` chain on statements from a reported cross-script failure: English
 statements about circular trading, plus Japanese statements about other rules that
 share ``取引先`` / ``疑いがある`` with the longer question.
 """

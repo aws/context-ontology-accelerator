@@ -4,7 +4,7 @@
 /**
  * Pure geometry helpers for projecting the position of an edge label.
  *
- * Shared by `FloatingEdge` (SVG label render) and `attributeOverlay` (which
+ * Shared by `FloatingEdge` (HTML label render) and `attributeOverlay` (which
  * needs to know where a hovered node's incident labels will land so the
  * attribute glyphs can be pushed off them). Keeping the math here means
  * both callers compute the same point, and the behaviour is unit-testable

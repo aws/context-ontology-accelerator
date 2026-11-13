@@ -39,7 +39,6 @@ class TokenClaims:
         """Extract claims from the AgentCore HTTP request context.
 
         AgentCore passes allowlisted headers via context.request_headers (dict).
-        Requires requestHeaderAllowlist: ["Authorization"] on the Runtime config.
 
         Returns None if no Authorization header or missing 'sub' claim.
         """
@@ -73,9 +72,7 @@ class TokenClaims:
             logger.warning("jwt_missing_sub", present_claims=sorted(claims.keys()))
             return None
 
-        # groups feed Cedar namespace authorization. Parsing is the
-        # shared libs/common helper so IdP claim-shape handling has exactly one
-        # implementation across the control-plane authorizer and serve.
+        # groups feed Cedar namespace authorization.
         groups = extract_groups_claim(claims, _GROUP_CLAIM_NAME)
 
         return cls(user_id=sub, email=str(claims.get("email", "")), groups=groups)

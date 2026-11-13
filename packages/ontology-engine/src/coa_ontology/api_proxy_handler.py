@@ -149,9 +149,6 @@ _QUERY_ALIASES: dict[str, dict[str, str]] = {
     "/graph/schema": {
         "maxResults": "max_results",
         "includeProperties": "include_properties",
-        # ``classFilter`` matches the Smithy DescribeSchema input. FastAPI
-        # binds ``class_filter`` on the ontology-engine route; without this
-        # rename the param would survive the trip and be silently dropped.
         "classFilter": "class_filter",
     },
 }

@@ -1,32 +1,17 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Shared utility for invoking AgentCore /invocations endpoint.
- *
- * Consolidates the OIDC token fetch, header construction, POST request,
- * and SSE frame parsing that was duplicated across use-sessions.ts,
- * use-session-history.ts, and use-playground-stream.ts.
- */
+/** Shared utility for invoking the AgentCore /invocations endpoint. */
 import { OIDCProvider } from "@auth";
 import { deriveRuntimeSessionId } from "./runtime-session-id";
 
 export interface AgentCoreRequestOptions {
-  /** AgentCore Runtime endpoint URL. */
   queryEndpoint: string;
-  /** OIDC config for token retrieval. */
   oidcConfig: { authority: string; clientId: string };
-  /** JSON payload to send in the request body. */
   payload: Record<string, unknown>;
-  /** Optional AbortSignal for cancellation. */
   signal?: AbortSignal;
   /** Timeout in milliseconds (default: 30000). */
   timeoutMs?: number;
-}
-
-export interface AgentCoreResponse {
-  /** Parsed JSON from the first SSE data frame (or raw JSON fallback). */
-  data: unknown;
 }
 
 /** Error thrown when the server returns 401, indicating token expiry. */
@@ -57,11 +42,9 @@ export async function invokeAgentCore(
     timeoutMs = 30000,
   } = options;
 
-  // Build an internal AbortController that respects both caller signal and timeout
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-  // Link caller's signal to our controller
   if (signal) {
     if (signal.aborted) {
       clearTimeout(timeoutId);
@@ -135,7 +118,6 @@ export async function parseFirstSseFrame(response: Response): Promise<unknown> {
       }
     }
   }
-  // Fallback: try raw JSON
   try {
     return JSON.parse(buffer.trim());
   } catch {

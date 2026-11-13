@@ -205,15 +205,6 @@ def _fuzzy_class_match(golden_local: str, induced_local: str) -> bool:
     return len(g) >= 4 and (g in i or i in g)
 
 
-def _fuzzy_property_match(golden_local: str, induced_local: str) -> bool:
-    """Return True if two property local-names plausibly refer to the same property.
-
-    Uses the same relaxed matching as classes, with extra tolerance for
-    camelCase/snake_case swap (e.g., 'claimNumber' ↔ 'claim_number').
-    """
-    return _fuzzy_class_match(golden_local, induced_local)
-
-
 def _extract_class_info(g: Graph) -> dict[str, dict]:
     """Return {local_name: {uri, label, grounded_to_iri}}.
 
@@ -323,8 +314,6 @@ def compare_to_golden(
     matched_induced_classes: set[str] = set()
     golden_by_local = dict(golden_classes)
 
-    # Helper to classify a grounded_to IRI via the optional tier_classifier.
-    # Returns ('customer', 'foundational', or None).
     def _classify_tier(grounded_iri: str | None) -> str | None:
         if not grounded_iri or not tier_classifier:
             return None
@@ -429,7 +418,7 @@ def compare_to_golden(
                 continue
             fuzzy_hit = None
             for ind_local in induced_props:
-                if _fuzzy_property_match(golden_local, ind_local):
+                if _fuzzy_class_match(golden_local, ind_local):
                     fuzzy_hit = ind_local
                     break
             if fuzzy_hit:

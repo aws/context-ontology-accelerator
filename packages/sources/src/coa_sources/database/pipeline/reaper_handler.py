@@ -78,10 +78,6 @@ def handler(event: dict[str, Any], context: Any) -> None:
     is still in an active status, marks it ``SCAN_FAILED``. A malformed event
     (unparseable input or missing keys) is logged and ignored — never raised —
     so a single bad event cannot poison the rule for every subsequent one.
-
-    Args:
-        event: EventBridge "Step Functions Execution Status Change" event.
-        context: Lambda context (unused).
     """
     detail = event.get("detail", {})
     status = detail.get("status", "UNKNOWN")

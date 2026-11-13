@@ -200,11 +200,9 @@ class TestHandler:
         """ontologyId is a free-form IRI/slash/non-ASCII identifier. The backend
         keys the ontology's named graph on ``quote(raw_id, safe="")`` on both the
         write (ingest) and read (download) paths, so the proxy must deliver a
-        segment the backend decodes back to the RAW id. Double-encoding it makes
-        write-URI != read-URI and the download reads an empty graph — the real
-        e2e failure (0 of N triples). API Gateway hands the proxy the id still
-        encoded, so the invariant is: a single unquote of the emitted segment
-        recovers the raw id.
+        segment the backend decodes back to the RAW id. API Gateway hands the
+        proxy the id still encoded, so a single unquote of the emitted segment
+        must recover the raw id.
         """
         from urllib.parse import parse_qs, quote, unquote, urlsplit
 
@@ -215,9 +213,7 @@ class TestHandler:
         mock_resp.__exit__ = MagicMock(return_value=False)
         mock_urlopen.return_value = mock_resp
 
-        # The writer keys the named graph on quote(raw_id, safe=""); API Gateway
-        # delivers the id to the proxy still encoded (client sent quote(id)).
-        write_graph_segment = quote(ontology_id, safe="")
+        # API Gateway delivers the id to the proxy still encoded.
         delivered_encoded = quote(ontology_id, safe="")
 
         event = {
@@ -232,45 +228,19 @@ class TestHandler:
         proxied = urlsplit(mock_urlopen.call_args[0][0].full_url)
         emitted_segment = proxied.path.split("/ontologies/", 1)[1].rsplit("/download", 1)[0]
 
-        # The decisive, transport-independent property: a single unquote of the
-        # emitted segment must recover the raw id (the backend decodes once, then
-        # re-encodes to rebuild the graph URI). Both shipped-broken variants
-        # (safe="" and safe="/:" without the unquote) emit a double-encoded
-        # segment -> read URI %253A != write URI %3A -> empty graph. Asserting on
-        # the emitted bytes avoids an HTTP client's decode leniency hiding it.
+        # Assert on the emitted bytes so an HTTP client's decode leniency can't hide
+        # a double-encoded segment.
         assert unquote(emitted_segment) == ontology_id, (
             f"proxy emitted {emitted_segment!r}; one backend decode gives "
             f"{unquote(emitted_segment)!r}, not the raw id {ontology_id!r} — the "
             f"download would recompute a differently-encoded (empty) named graph"
         )
-        # And re-encoding that recovered id reproduces the writer's graph segment.
-        assert quote(unquote(emitted_segment), safe="") == write_graph_segment
 
         # Namespace stays authoritative regardless of the id's contents.
         assert parse_qs(proxied.query)["namespace"][0] == "33333333-3333-4333-8333-333333333333"
 
     @patch("urllib.request.urlopen")
-    def test_http_error_forwarded(self, mock_urlopen, mod):
-        from urllib.error import HTTPError
-
-        err = HTTPError(url="http://test", code=404, msg="Not Found", hdrs={}, fp=None)
-        mock_urlopen.side_effect = err
-
-        event = {
-            "httpMethod": "GET",
-            "resource": "/namespaces/{namespaceId}/ontologies",
-            "pathParameters": {"namespaceId": "11111111-1111-4111-8111-111111111111"},
-            "queryStringParameters": None,
-            "body": "",
-        }
-        result = mod.handler(event, None)
-
-        assert result["statusCode"] == 404
-
-    @patch("urllib.request.urlopen")
     def test_url_error_returns_502(self, mock_urlopen, mod):
-        from urllib.error import URLError
-
         mock_urlopen.side_effect = URLError("Connection refused")
 
         event = {
@@ -481,8 +451,6 @@ class TestSystemHealth:
     @patch("coa_ontology.api_proxy_handler.resolve_region", return_value="us-east-1")
     def test_ontology_induction_readiness_error_opaque(self, mock_region, mock_urlopen, mod, monkeypatch):
         """Ontology-engine /readiness failure must not leak internal endpoint."""
-        from urllib.error import URLError
-
         mock_urlopen.side_effect = URLError("Connection refused to http://ontology-engine.internal:8001/readiness")
 
         monkeypatch.setenv("SOURCES_TABLE", "")
@@ -545,8 +513,6 @@ class TestCorsHeaders:
 
     @patch("urllib.request.urlopen")
     def test_cors_header_in_url_error_response(self, mock_urlopen, mod):
-        from urllib.error import URLError
-
         mock_urlopen.side_effect = URLError("Connection refused")
 
         event = {

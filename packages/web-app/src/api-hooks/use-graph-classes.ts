@@ -13,7 +13,7 @@ import {
  * slice per page (see {@link CLASS_DISPLAY_PAGE_SIZE}) and only triggers the
  * next backend fetch when the user pages into not-yet-loaded territory — so a
  * multi-thousand-class namespace stays a handful of round-trips, not one per
- * displayed page. Matches the original wildcard fetch size.
+ * displayed page.
  */
 export const CLASS_FETCH_CHUNK_SIZE = 100;
 
@@ -22,27 +22,13 @@ export const CLASS_DISPLAY_PAGE_SIZE = 20;
 
 /**
  * Paginated class listing for the Ontology Explorer, backed by the graph-search
- * endpoint's ``{hits, total_count}`` envelope. Fetches classes in chunks of
- * {@link CLASS_FETCH_CHUNK_SIZE} via ``useInfiniteQuery``; ``total_count`` (the
- * same on every page) lets the caller render a known Cloudscape page count.
+ * endpoint's ``{hits, total_count}`` envelope, in chunks of
+ * {@link CLASS_FETCH_CHUNK_SIZE}.
  *
- * The empty/whitespace query is sent to the backend as ``*`` (its match-all
- * wildcard), so the default view lists every class in the namespace — pageable
- * in full, not capped at one chunk. A non-empty query pages across all matches.
- *
- * When ``ontologyId`` is set, results are restricted to that ontology's named
- * graph (the backend ``ontology_id`` filter); when undefined, all ontologies in
- * the namespace are searched. The ontology id is part of the query key, so
- * switching ontologies fetches (and caches) an independent paged result set.
- *
- * `getNextPageParam` advances the offset by the number of hits actually
- * returned and stops as soon as a chunk comes back short — the backend returns
- * exactly ``min(limit, remaining)`` distinct classes, so a short chunk means
- * the end of the result set.
- *
- * Pass ``enabled: false`` to hold the query off entirely (in addition to the
- * namespace-id guard). The Explorer uses this so the Graph view doesn't spend a
- * class-chunk fetch plus a full-namespace COUNT it never renders.
+ * An empty query is sent as ``*`` (the backend's match-all wildcard).
+ * ``ontologyId`` restricts results to that ontology's named graph. The backend
+ * returns exactly ``min(limit, remaining)`` classes, so a short chunk means the
+ * end of the result set. ``enabled: false`` holds the query off entirely.
  */
 export function useGraphClasses(
   namespaceId: string | undefined,
@@ -67,8 +53,6 @@ export function useGraphClasses(
     },
     initialPageParam: 0,
     getNextPageParam: (lastPage, allPages) => {
-      // Short chunk → no more results. Otherwise the next offset is the total
-      // number of hits fetched so far.
       if (lastPage.hits.length < CLASS_FETCH_CHUNK_SIZE) return undefined;
       const loaded = allPages.reduce((n, p) => n + p.hits.length, 0);
       return loaded < lastPage.total_count ? loaded : undefined;

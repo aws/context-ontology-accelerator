@@ -195,17 +195,11 @@ class SourcesRegistry:
             self._dynamodb = boto3.resource("dynamodb", region_name=self._region, config=sync_boto_config())
         else:
             self._dynamodb = None
-        self._db_cache: dict[str, tuple[str, float]] = {}
         self._ns_cache: dict[str, tuple[str, float]] = {}
-        # Single source-of-truth cache for the raw SRC# records of a namespace,
-        # keyed by namespace. All derived signals (sole DATABASE source, source
-        # composition) read from here, so one request no longer fires the same
-        # SRC# query multiple times across gating + Tier-2 routing. Bounded LRU so
-        # a long-lived process serving high-cardinality namespaces cannot grow
-        # without bound. Truncated/uncertain reads are never cached (see
-        # _query_sources), so the cache only ever holds complete result sets.
+        # Cache of the raw SRC# records per namespace, shared by every derived
+        # signal. Bounded LRU; truncated/uncertain reads are never cached, so it
+        # only holds complete result sets.
         self._items_cache: OrderedDict[str, tuple[list[dict[str, Any]], float]] = OrderedDict()
-        self._cache_lock = asyncio.Lock()
         # Namespace language is immutable once the namespace exists, so a value
         # read from its METADATA item never goes stale. Bounded LRU, no TTL.
         self._language_cache: OrderedDict[str, str] = OrderedDict()
@@ -244,7 +238,7 @@ class SourcesRegistry:
         try:
             table = self._dynamodb.Table(self._namespaces_table)
             return resolve_namespace_id(namespace, table)
-        except (ValueError, Exception):
+        except Exception:
             return namespace
 
     async def namespace_exists(self, namespace: str) -> bool | None:
@@ -534,7 +528,7 @@ class SourcesRegistry:
         ``None`` means the source inventory is unavailable or incomplete and must
         be treated as a deny by the query executor. A partial inventory cannot
         safely authorize a qualified reference: it could omit an owned source, but
-        allowing on uncertainty reopens F-3's cross-namespace catalog escape.
+        allowing on uncertainty would allow a cross-namespace catalog reference.
         """
         items = await self._query_sources(namespace)
         if items is None:
@@ -548,22 +542,12 @@ class SourcesRegistry:
                 continue
 
             catalog = str(item.get("athenaDataCatalogName") or "").lower()
-            # `POST /sources` copied the caller's
-            # `glueConfiguration.athenaDataCatalogName` into this attribute until
-            # 217d7c5fa (2026-09-03), and onboarding clients passed
-            # `AwsDataCatalog`, so a deployment that onboarded Glue before then
-            # still has such records. Filed as a federated
-            # (awsdatacatalog, schema) pair they authorized nothing:
-            # validate_namespace_sql_scope checks an `awsdatacatalog` reference
-            # ONLY against `native_databases`, so the qualifier's own rewrite
-            # ("awsdatacatalog"."bank_risk"."risk_ecl") was denied as outside the
-            # namespace. Such a Glue record falls through to the native path
-            # below, which authorizes its own `athenaDatabase` — the database a
-            # bare query already runs against (the executor and the qualifier
-            # still read the record as catalog `AwsDataCatalog` + its discovered
-            # schema, which names the same database). Limited to Glue records: a
-            # connector that carried this value would otherwise be granted a root
-            # database it never owned.
+            # Legacy Glue records may carry `athenaDataCatalogName = AwsDataCatalog`.
+            # validate_namespace_sql_scope checks an `awsdatacatalog` reference only
+            # against `native_databases`, so such a record falls through to the
+            # native path below, which authorizes its own `athenaDatabase`. Limited
+            # to Glue records: a connector that carried this value would otherwise be
+            # granted a root database it never owned.
             legacy_root_glue = catalog == _ROOT_CATALOG_LC and item.get("sourceSubType") == _GLUE_SUB_TYPE
             if catalog and not legacy_root_glue:
                 for schema in item.get("discoveredSchemas") or []:
@@ -579,29 +563,17 @@ class SourcesRegistry:
             if legacy_root_glue and _glue_database_mismatch(item, database, namespace):
                 continue
 
-            # A native Glue source can sit in a DISTINCT (non-root) Athena catalog,
-            # declared at create and recorded in ``athenaCatalog`` (NOT the
-            # system-managed ``athenaDataCatalogName``, which is unset for Glue).
-            # The executor addresses it as ``<athenaCatalog>.<database>.<table>``
-            # (AthenaQueryExecutor._resolve_catalog_and_database's glue_nested path),
-            # so the qualifier attributes that catalog to its tables. It must be
-            # authorized under that catalog, not folded into AwsDataCatalog — else a
-            # correctly-qualified cross-catalog reference is denied. Key it by the
-            # Glue DATABASE (the schema part of the three-part name), matching the
-            # executor. A root ``athenaCatalog`` means "no nested catalog" and stays
-            # on the native-database path below.
+            # A native Glue source can sit in a non-root Athena catalog recorded in
+            # ``athenaCatalog``; the executor addresses it as
+            # ``<athenaCatalog>.<database>.<table>``, so authorize it under that
+            # catalog, keyed by the Glue database. A root ``athenaCatalog`` stays on
+            # the native-database path below.
             glue_catalog = str(item.get("athenaCatalog") or "").lower()
-            if glue_catalog and glue_catalog != "awsdatacatalog":
-                # Authorize the nested catalog ONLY when source-create recorded that
-                # its ownership was verified (assert_namespace_may_catalog ran at
-                # POST /sources). `athenaCatalog` itself is derived from a
-                # caller-supplied `catalogId` and a legacy or seeded row can carry a
-                # name it never owned, so trusting the raw field would let a
-                # declared-but-unowned catalog become an authorization grant. A row
-                # without the marker (legacy, or a source onboarded before this
-                # field existed) is NOT authorized 3-part here; it falls through to
-                # the native-database path and must be re-onboarded to regain nested
-                # addressing — the fail-closed direction.
+            if glue_catalog and glue_catalog != _ROOT_CATALOG_LC:
+                # Authorize the nested catalog only when source-create recorded that
+                # its ownership was verified: `athenaCatalog` derives from a
+                # caller-supplied `catalogId`, so a row without the marker falls
+                # through to the native-database path (fail closed).
                 if item.get("athenaCatalogOwnershipVerified") is True:
                     if _IDENTIFIER_PATTERN.fullmatch(glue_catalog) and _IDENTIFIER_PATTERN.fullmatch(database):
                         federated_catalog_schemas.add((glue_catalog, database))
@@ -670,7 +642,7 @@ class SourcesRegistry:
         database source of the namespace is one of these Glue databases: a JDBC
         (or nested-catalog) source cannot be listed the same way, so a same-named
         table there would be invisible and the guess could pick the wrong source.
-        Such a table stays unplaced and is refused downstream, as before. A
+        Such a table stays unplaced and is refused downstream. A
         non-queryable database source, or a Glue record whose two database fields
         disagree, turns the lookup off for the same reason. A table whose id names
         some other source is never looked up: it is not a Glue table.
@@ -718,7 +690,7 @@ class SourcesRegistry:
         name look shared, and a name only one of them holds is not returned. A
         database two sources both register maps to ``AMBIGUOUS_SOURCE``. ``{}``
         when the namespace holds fewer than two such databases, or when any of
-        them cannot be listed (the caller then behaves as before).
+        them cannot be listed.
 
         Args:
             namespace: Namespace whose sources bound the lookup.
@@ -795,7 +767,7 @@ class SourcesRegistry:
         try:
             owners = await asyncio.wait_for(loop.run_in_executor(self._executor, _list), timeout=_RESOLVE_TIMEOUT_S)
         except Exception as e:
-            # Degrade to "unplaced": the table stays bare and is handled as before.
+            # Degrade to "unplaced": the table stays bare.
             logger.warning("glue_table_owners_failed", namespace=namespace, error=f"{type(e).__name__}: {str(e)[:120]}")
             owners = None
         self._glue_tables_cache[key] = (owners, time.monotonic())
@@ -838,17 +810,12 @@ class SourcesRegistry:
             return SourceComposition.unknown_composition()
 
         if items is None:
-            # Timeout / truncated / unavailable — uncertain, fail open. Not cached
-            # (the shared cache only holds complete result sets), so the next
-            # request retries rather than being pinned to "run everything".
+            # Timeout / truncated / unavailable — uncertain, fail open (not cached).
             return SourceComposition.unknown_composition()
 
         if not items:
-            # No SRC# records at all — an empty or not-yet-provisioned namespace, or a
-            # name that does not resolve. This is NOT a reliable "namespace has zero
-            # DATABASE and zero DOCUMENTS sources" signal (that would skip every tier);
-            # it's an ambiguous case that must fail OPEN. Treat empty as unknown so
-            # gating never drops a tier on a namespace it can't see.
+            # No SRC# records is ambiguous (empty namespace or unresolvable name),
+            # not a zero-sources signal, so fail open.
             return SourceComposition.unknown_composition()
 
         has_structured_source = any(item.get("sourceType") == _SOURCE_TYPE_DATABASE for item in items)
@@ -866,63 +833,6 @@ class SourcesRegistry:
             has_unstructured_source=has_unstructured_source,
             structured_backends=frozenset(structured_backends),
         )
-
-    async def resolve_database_name(self, namespace: str, data_source_id: str = "") -> str:
-        """Resolve the Glue database / Athena catalog name for a source.
-
-        Resolution order:
-        1. TTL cache hit
-        2. Top-level ``glueDatabaseName`` (native Glue sources)
-        3. Top-level ``athenaDataCatalogName`` (JDBC federation)
-        4. ``configuration.databaseName`` (stored at source creation)
-
-        When data_source_id is empty or "default", finds any DATABASE source
-        in the namespace.
-
-        Returns empty string if unresolvable (caller falls back to env var).
-        """
-        if not self.available:
-            return ""
-
-        cache_key = f"{namespace}:{data_source_id or 'default'}"
-        cached = self._db_cache.get(cache_key)
-        if cached:
-            value, ts = cached
-            if time.monotonic() - ts < _CACHE_TTL_S:
-                return value
-
-        async with self._cache_lock:
-            cached = self._db_cache.get(cache_key)
-            if cached and time.monotonic() - cached[1] < _CACHE_TTL_S:
-                return cached[0]
-
-            try:
-                if data_source_id and data_source_id != "default":
-                    item = await self.get_source(namespace, data_source_id)
-                else:
-                    item = await self.find_database_source(namespace)
-
-                if not item:
-                    self._db_cache[cache_key] = ("", time.monotonic())
-                    return ""
-
-                db_name = item.get("glueDatabaseName") or item.get("athenaDataCatalogName") or ""
-                if not db_name:
-                    config = self.parse_configuration(item)
-                    db_name = config.get("databaseName", "")
-
-                if db_name and not _IDENTIFIER_PATTERN.match(db_name):
-                    logger.warning("invalid_database_name", database=db_name, namespace=namespace)
-                    db_name = ""
-
-                if db_name:
-                    logger.debug("resolved_database", namespace=namespace, source=data_source_id, database=db_name)
-
-                self._db_cache[cache_key] = (db_name, time.monotonic())
-                return db_name
-            except Exception as e:
-                logger.warning("database_resolve_failed", namespace=namespace, source=data_source_id, error=str(e))
-                return ""
 
     async def resolve_workgroup(self, namespace: str) -> str:
         """Resolve the Athena workgroup name from the namespaces table.

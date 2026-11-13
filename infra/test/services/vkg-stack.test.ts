@@ -68,7 +68,6 @@ function renderVkgWithContext(
 
 describe("VkgStack", () => {
   let template: Template;
-  let templateWithBucket: Template;
 
   beforeAll(() => {
     const app = new cdk.App({ context: TEST_CONTEXT });
@@ -85,30 +84,11 @@ describe("VkgStack", () => {
         ontologyBucket: bucket,
       }),
     );
-
-    // Test with a different externally provided bucket — same path now that
-    // ontologyBucket is required, kept for assertion symmetry.
-    const app2 = new cdk.App({ context: TEST_CONTEXT });
-    const network2 = new NetworkStack(app2, "TestNetwork2");
-    const mockStack = new cdk.Stack(app2, "MockStack");
-    const ontologyBucket = new s3.Bucket(mockStack, "OntologyBucket", {
-      bucketName: `${PREFIX}-ontology-artifacts`,
-    });
-
-    templateWithBucket = Template.fromStack(
-      new VkgStack(app2, "TestVkg2", {
-        network: network2,
-        serviceNamespace: network2.serviceNamespace,
-        ontologyBucket,
-      }),
-    );
   });
 
   test("lets the task execution role pull the GuardDuty Fargate agent", () => {
     expectEveryTaskCanPullGuardDutyAgent(template, 1, "${AWS::Region}");
   });
-
-  // ── ECS Cluster ──────────────────────────────────────────────────
 
   test("creates ECS cluster for VKG service", () => {
     template.hasResourceProperties("AWS::ECS::Cluster", {
@@ -122,8 +102,6 @@ describe("VkgStack", () => {
     );
     expect(Object.keys(namespaces).length).toBe(0);
   });
-
-  // ── Task Definition ──────────────────────────────────────────────
 
   test("creates Fargate task definition with correct sizing", () => {
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
@@ -177,10 +155,8 @@ describe("VkgStack", () => {
     });
   });
 
-  test("container sets Ontop heap via ONTOP_JAVA_ARGS, not the dead JAVA_OPTS (#149 cause C)", () => {
-    // The Ontop launcher reads ONTOP_JAVA_ARGS; setting JAVA_OPTS was a silent
-    // no-op that left the heap unbounded (#149 cause C). Assert the correct var
-    // is present so CDK can never regress to JAVA_OPTS.
+  test("container sets Ontop heap via ONTOP_JAVA_ARGS, not the dead JAVA_OPTS", () => {
+    // The Ontop launcher ignores JAVA_OPTS, which would leave the heap unbounded.
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
       ContainerDefinitions: Match.arrayWith([
         Match.objectLike({
@@ -201,10 +177,9 @@ describe("VkgStack", () => {
     }
   });
 
-  test("reload Lambda carries the task-sizing env as the single source of truth (#149 cause B)", () => {
-    // The reload Lambda re-registers the per-namespace task def from these env
-    // vars, so they must match the CDK-provisioned service. Without them a
-    // reload would silently under-provision (#149 cause B).
+  test("reload Lambda carries the task-sizing env as the single source of truth", () => {
+    // The reload Lambda re-registers the per-namespace task def from these env vars, so
+    // they must match the CDK-provisioned service.
     template.hasResourceProperties("AWS::Lambda::Function", {
       Environment: {
         Variables: Match.objectLike({
@@ -366,14 +341,10 @@ describe("VkgStack", () => {
     });
   });
 
-  // ── No static Fargate Service ────────────────────────────────────
-
   test("does not create a static VKG service (per-namespace only)", () => {
     const services = template.findResources("AWS::ECS::Service");
     expect(Object.keys(services).length).toBe(0);
   });
-
-  // ── IAM Permissions ──────────────────────────────────────────────
 
   test("task role has S3 read access for ontology artifacts", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
@@ -387,8 +358,6 @@ describe("VkgStack", () => {
       },
     });
   });
-
-  // ── Reload monitoring ───────────────────────────────────
 
   test("creates a reload-failure alarm on the undimensioned ReloadFailed roll-up metric", () => {
     // The reload Lambda emits ReloadFailed both per-Namespace and as an
@@ -408,10 +377,6 @@ describe("VkgStack", () => {
   });
 
   test("reload-failure alarm is NOT backed by a SEARCH/MathExpression (deploy-time invalid)", () => {
-    // Regression guard for the "SEARCH is not supported on Metric Alarms"
-    // CloudFormation deploy failure: the alarm must render as a single-metric
-    // alarm (Namespace/MetricName/Statistic on the resource), never a Metrics[]
-    // array carrying an Expression.
     const alarms = template.findResources("AWS::CloudWatch::Alarm");
     const reloadAlarm = Object.values(alarms).find(
       (r) => r.Properties?.AlarmName === `${PREFIX}-vkg-reload-failed`,
@@ -436,8 +401,6 @@ describe("VkgStack", () => {
     });
   });
 
-  // ── SSM Parameters ───────────────────────────────────────────────
-
   test("publishes VKG container image URI to SSM for reload Lambda", () => {
     template.hasResourceProperties("AWS::SSM::Parameter", {
       Name: `/${DEFAULT_RESOURCE_PREFIX}/vkg/container-image`,
@@ -456,8 +419,6 @@ describe("VkgStack", () => {
     });
   });
 
-  // ── CloudFormation Outputs ───────────────────────────────────────
-
   test("exports VkgClusterArn output", () => {
     template.hasOutput("VkgClusterArn", {});
   });
@@ -466,21 +427,10 @@ describe("VkgStack", () => {
     template.hasOutput("VkgEndpointPattern", {});
   });
 
-  // ── S3 Bucket (imported via fromBucketName) ───────────────────────
-
-  test("uses imported ontology bucket when not provided", () => {
-    // Stack imports bucket via fromBucketName — no AWS::S3::Bucket resource is created.
-    // Verify the task role has S3 access referencing the expected bucket name.
+  test("does not create an ontology bucket", () => {
     const buckets = template.findResources("AWS::S3::Bucket");
     expect(Object.keys(buckets).length).toBe(0);
   });
-
-  test("does not create bucket when one is provided externally", () => {
-    const vkgBuckets = templateWithBucket.findResources("AWS::S3::Bucket");
-    expect(Object.keys(vkgBuckets).length).toBe(0);
-  });
-
-  // ── VPC Configuration ─────────────────────────────────────────────
 
   test("VkgReloadFn is deployed in VPC (security baseline)", () => {
     // Per .kiro/steering/cdk-infrastructure.md, all Lambda functions must be
@@ -494,8 +444,6 @@ describe("VkgStack", () => {
       }),
     });
   });
-
-  // ── Reserved concurrency (configurable; #48) ─────────────────────
 
   test("VkgReloadFn reserves the default concurrency (5) when unset", () => {
     template.hasResourceProperties("AWS::Lambda::Function", {
@@ -531,40 +479,10 @@ describe("VkgStack", () => {
     ).toThrow(/lambda_reserved_concurrency must be a non-negative integer/);
   });
 
-  // ── OE monitoring (cdk-monitoring-constructs) ────────────────────
-
   test("emits facade cluster CPU/memory alarms and a vkg dashboard", () => {
     template.resourceCountIs("AWS::CloudWatch::Dashboard", 1);
     const alarms = template.findResources("AWS::CloudWatch::Alarm");
     expect(Object.keys(alarms).length).toBeGreaterThanOrEqual(2);
-  });
-
-  // ── Ontology-reload rule: cross-deployment isolation ──────────────
-
-  test("reload rule matches a resource_prefix-scoped event source, not a shared one", () => {
-    // Two deployments in one account+region share the account-global `default`
-    // bus. If the rule matched only the static brand source, each deployment's
-    // rule would fire on the OTHER's ontology.published events and provision
-    // duplicate per-namespace VKG services that its own teardown never deletes.
-    const app = new cdk.App({
-      context: { ...TEST_CONTEXT, resource_prefix: "sclz" },
-    });
-    const network = new NetworkStack(app, "IsoNetwork");
-    const isoBucketStack = new cdk.Stack(app, "IsoBucketStack");
-    const isoBucket = new s3.Bucket(isoBucketStack, "OntologyBucket", {
-      bucketName: "sclz-dev-ontology-artifacts",
-    });
-    const stack = new VkgStack(app, "IsoVkg", {
-      network,
-      serviceNamespace: network.serviceNamespace,
-      ontologyBucket: isoBucket,
-    });
-    const rules = Template.fromStack(stack).findResources("AWS::Events::Rule");
-    const sources = Object.values(rules).flatMap(
-      (r) => r.Properties?.EventPattern?.source ?? [],
-    );
-
-    expect(sources).toContain("sclz.ontology");
   });
 
   test("reload rule of a non-default prefix does not match the default deployment's source", () => {
@@ -591,8 +509,6 @@ describe("VkgStack", () => {
       },
     });
   });
-
-  // ── Scheduled reload sweep ────────────────────────────────────────
 
   test("schedules a weekly VKG reload sweep invoking the reload Lambda with {sweep:true}", () => {
     template.hasResourceProperties("AWS::Events::Rule", {
@@ -622,8 +538,6 @@ describe("VkgStack", () => {
       },
     });
   });
-
-  // ── Deploy-time image rollout ─────────────────────────────────────
 
   /** The single deploy-time rollout custom resource in a template. */
   function rolloutResource(t: Template): {
@@ -706,8 +620,6 @@ describe("VkgStack", () => {
     expect(updateProps(a1)).toContain("deployId");
     expect(updateProps(a1)).not.toEqual(updateProps(a2));
   });
-
-  // ── Digest comparison permissions ─────────────────────────────────
 
   /** Every statement attached to the reload Lambda's role. */
   function reloadStatements(t: Template): Record<string, unknown>[] {

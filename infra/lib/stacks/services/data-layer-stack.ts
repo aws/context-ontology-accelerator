@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Data Layer Stack — Lambda handler for runtime query/retrieval APIs.
- *
- * Provisions:
- * - Data Layer API Lambda (thin adapter to Context Manager via AgentCore Runtime)
- * - IAM permissions for bedrock-agentcore:InvokeAgentRuntime
- * - SSM parameter publishing the Lambda ARN for the API stack
+ * Data Layer Stack — Lambda handler for runtime query/retrieval APIs, a thin
+ * adapter to the Context Manager on AgentCore Runtime.
  */
 import * as cdk from "aws-cdk-lib";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
@@ -61,11 +57,8 @@ export class DataLayerStack extends SCLStack {
     // The handler imports from ``coa_common`` (constants + smithy_shapes).
     // Importing any ``coa_common`` submodule runs its package ``__init__``,
     // which eagerly imports pydantic (authnz_types), pydantic-settings (config)
-    // and structlog — so those MUST be in the bundle or the Lambda
-    // ImportModuleErrors at cold start and API Gateway returns 502 on every
-    // route. boto3/botocore are provided by the Lambda runtime and are not
-    // bundled. (Regression guard: handler.py had no coa_common import before the
-    // MCP/data-layer parity refactor, so the bundle shipped zero pip deps.)
+    // and structlog, so those must be bundled or cold start fails with
+    // ImportModuleError. boto3/botocore come from the Lambda runtime.
     const lambdaCode = bundlePython({
       srcDirs: [fromRoot("packages/data-layer/src"), Paths.commonLib],
       requirementsFile: fromRoot("packages/data-layer/requirements.lock.txt"),

@@ -47,7 +47,7 @@ describe("ControlPlaneClientProvider", () => {
     vi.clearAllMocks();
   });
 
-  it("returns the ID token's expiry so the SDK refreshes instead of caching it forever (#136)", async () => {
+  it("returns the ID token's expiry so the SDK refreshes instead of caching it forever", async () => {
     const exp = Math.floor(Date.now() / 1000) + 300;
     vi.mocked(OIDCProvider.build).mockReturnValue({
       getIdToken: vi.fn().mockResolvedValue("id-token"),
@@ -60,9 +60,6 @@ describe("ControlPlaneClientProvider", () => {
 
     const identity = await capturedConfig!.token();
     expect(identity.token).toBe("id-token");
-    // Without an expiration the smithy memoize layer never re-invokes this
-    // provider, so a stale token is sent until page reload. Assert it is set
-    // and matches the ID token's own exp claim.
     expect(identity.expiration).toEqual(new Date(exp * 1000));
   });
 

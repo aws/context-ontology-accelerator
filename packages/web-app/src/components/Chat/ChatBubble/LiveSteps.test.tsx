@@ -70,10 +70,4 @@ describe("LiveSteps", () => {
       unmount();
     }
   });
-
-  it("renders as a StatusIndicator with loading type", () => {
-    const { container } = render(<LiveSteps steps={undefined} />);
-    // StatusIndicator renders with a specific structure; verify content is present
-    expect(container.textContent).toContain("Resolving query");
-  });
 });

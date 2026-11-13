@@ -2,27 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Session management hooks via HTTP POST to AgentCore /invocations.
- *
- * Session operations (create, list, restore, delete, paginate history) use the
- * same /invocations endpoint as queries, differentiated by the "action" field.
- * This replaces the WebSocket-based session actions from use-session-restore.ts.
- *
- * Mirrors all UX behaviors from the WS hook:
- * - Restore timeout (15s) with delayed spinner (300ms)
- * - Generation counter to reject stale responses on rapid namespace switch
- * - deleteSession auto-fetches next session
- * - createSession updates sessions list
+ * Session management via HTTP POST to AgentCore /invocations, differentiated
+ * from queries by the "action" field. Restore has a 15s timeout with a 300ms
+ * delayed spinner, and a generation counter rejects stale responses on a rapid
+ * namespace switch.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { SessionSummary } from "@app-types/playground";
 import type { PlaygroundAction } from "./playground-reducer";
 import { invokeAgentCore, AuthExpiredError } from "@utils/invoke-agentcore";
 import {
   isRecentSessionResponse,
   isSessionHistoryResponse,
   isCreateSessionResponse,
-  isListSessionsResponse,
 } from "@utils/sse-type-guards";
 
 const RESTORE_TIMEOUT_MS = 15000;
@@ -53,26 +44,16 @@ export interface UseSessionsReturn {
   restoreTimedOut: boolean;
   /** Dismiss the restore timeout warning. */
   dismissRestoreWarning: () => void;
-  /** List of sessions for the history sidebar. */
-  sessions: SessionSummary[];
   /** Whether older history is available for scroll-back. */
   hasMoreHistory: boolean;
   /** Whether older history is currently loading. */
   isLoadingOlderHistory: boolean;
   /** Create a new chat session for the current namespace. */
   createSession: () => Promise<void>;
-  /** Load the session list for the current namespace. */
-  listSessions: (pageToken?: string) => Promise<void>;
-  /** Delete a session by ID. */
-  deleteSession: (id: string) => Promise<void>;
   /** Load older messages (scroll-back pagination). */
   loadOlderHistory: () => Promise<void>;
-  /** Switch to a different session. */
-  switchSession: (id: string) => Promise<void>;
   /** Capture a session ID from a streaming response. */
   captureSessionId: (sid: string) => void;
-  /** Reset session state (e.g., on namespace switch). */
-  resetSession: () => void;
 }
 
 export function useSessions({
@@ -85,7 +66,6 @@ export function useSessions({
   const [isRestoring, setIsRestoring] = useState(true);
   const [showRestoreSpinner, setShowRestoreSpinner] = useState(false);
   const [restoreTimedOut, setRestoreTimedOut] = useState(false);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [isLoadingOlderHistory, setIsLoadingOlderHistory] = useState(false);
   const cursorRef = useRef<number | null>(null);
@@ -146,7 +126,6 @@ export function useSessions({
     [queryEndpoint, oidcConfig],
   );
 
-  // ── Restore recent session ──────────────────────────────────────────
   const requestRestore = useCallback(
     async (ns: string) => {
       const currentGen = generationRef.current;
@@ -215,7 +194,6 @@ export function useSessions({
     [invokeAction, dispatch, clearTimers],
   );
 
-  // ── Namespace change trigger ────────────────────────────────────────
   useEffect(() => {
     if (!namespace || !queryEndpoint || !oidcConfig) {
       setIsRestoring(false);
@@ -233,7 +211,6 @@ export function useSessions({
       abortInflight();
       clearTimers();
       setSessionId(null);
-      setSessions([]);
       setHasMoreHistory(false);
       cursorRef.current = null;
       setRestoreTimedOut(false);
@@ -256,8 +233,6 @@ export function useSessions({
     requestRestore,
   ]);
 
-  // ── Session CRUD operations ─────────────────────────────────────────
-
   const createSession = useCallback(async () => {
     if (!namespace) return;
     try {
@@ -275,77 +250,11 @@ export function useSessions({
         setHasMoreHistory(false);
         cursorRef.current = null;
         dispatch({ type: "RESET" });
-        setSessions((prev) => [
-          {
-            sessionId: result.sessionId,
-            title: "",
-            lastActiveAt: new Date().toISOString(),
-            messageCount: 0,
-            namespaceId: namespace,
-          },
-          ...prev,
-        ]);
       }
     } catch {
       // AuthExpired or other errors handled silently for session ops
     }
   }, [namespace, invokeAction, dispatch]);
-
-  const listSessions = useCallback(
-    async (pageToken?: string) => {
-      if (!namespace) return;
-      try {
-        const result = await invokeAction({
-          action: "listSessions",
-          namespace,
-          profile: {},
-          ...(pageToken && { pageToken }),
-        });
-        if (isListSessionsResponse(result) && !result.error) {
-          const newSessions = result.sessions ?? [];
-          setSessions((prev) =>
-            pageToken ? [...prev, ...newSessions] : newSessions,
-          );
-        }
-      } catch {
-        // Silent failure for list
-      }
-    },
-    [namespace, invokeAction],
-  );
-
-  const deleteSession = useCallback(
-    async (id: string) => {
-      try {
-        const result = await invokeAction({
-          action: "deleteSession",
-          sessionId: id,
-          profile: {},
-        });
-        // Only update UI if the server confirmed deletion
-        if (
-          !result ||
-          (typeof result === "object" &&
-            (result as Record<string, unknown>).error)
-        ) {
-          return;
-        }
-        setSessions((prev) => prev.filter((s) => s.sessionId !== id));
-        if (sessionIdRef.current === id) {
-          setSessionId(null);
-          setHasMoreHistory(false);
-          cursorRef.current = null;
-          dispatch({ type: "RESET" });
-          if (namespace) {
-            void requestRestore(namespace);
-          }
-        }
-      } catch {
-        // Silent failure for delete
-      }
-    },
-    [invokeAction, dispatch, namespace, requestRestore],
-  );
 
   const loadOlderHistory = useCallback(async () => {
     if (
@@ -381,54 +290,11 @@ export function useSessions({
     }
   }, [invokeAction, dispatch]);
 
-  const switchSession = useCallback(
-    async (id: string) => {
-      generationRef.current += 1;
-      restoreGenerationRef.current = generationRef.current;
-      setSessionId(id);
-      setHasMoreHistory(false);
-      cursorRef.current = null;
-      dispatch({ type: "RESET" });
-
-      try {
-        const result = await invokeAction({
-          action: "getSessionHistory",
-          sessionId: id,
-          profile: {},
-        });
-        if (isSessionHistoryResponse(result) && !result.error) {
-          const messages = result.messages ?? [];
-          setHasMoreHistory(result.hasMore ?? false);
-          cursorRef.current = result.cursor ?? null;
-          if (messages.length > 0) {
-            dispatch({ type: "RESTORE_HISTORY", messages });
-          }
-        }
-      } catch {
-        // Silent failure for switch
-      }
-    },
-    [invokeAction, dispatch],
-  );
-
   const captureSessionId = useCallback((sid: string) => {
     if (!sessionIdRef.current) {
       setSessionId(sid);
     }
   }, []);
-
-  const resetSession = useCallback(() => {
-    generationRef.current += 1;
-    abortInflight();
-    clearTimers();
-    setSessionId(null);
-    setHasMoreHistory(false);
-    cursorRef.current = null;
-    setSessions([]);
-    setIsRestoring(false);
-    setShowRestoreSpinner(false);
-    setRestoreTimedOut(false);
-  }, [abortInflight, clearTimers]);
 
   const dismissRestoreWarning = useCallback(() => {
     setRestoreTimedOut(false);
@@ -443,15 +309,10 @@ export function useSessions({
     showRestoreSpinner,
     restoreTimedOut,
     dismissRestoreWarning,
-    sessions,
     hasMoreHistory,
     isLoadingOlderHistory,
     createSession,
-    listSessions,
-    deleteSession,
     loadOlderHistory,
-    switchSession,
     captureSessionId,
-    resetSession,
   };
 }
