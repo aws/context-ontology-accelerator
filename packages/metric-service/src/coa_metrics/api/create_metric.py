@@ -4,14 +4,6 @@
 """Create Metric Lambda handler.
 
 POST /namespaces/{namespaceId}/metrics → 201 Created
-
-Flow:
-1. Parse and validate request body (via Smithy-generated Pydantic model)
-2. Validate dialect values against SqlDialect enum
-3. Write to Neptune as :GoverningMetric subclass
-4. Embed in OpenSearch for Tier 0 routing
-5. Emit EventBridge event (coa.metric.published, action=CREATE)
-6. Return 201 with metric definition + any soft warnings
 """
 
 from __future__ import annotations
@@ -59,8 +51,6 @@ from coa_metrics.validator import (
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-# ── Singleton clients (reused across warm invocations) ──────────────────
-
 _neptune: MetricNeptuneClient | None = None
 _opensearch: MetricOpenSearchClient | None = None
 _eventbridge: Any | None = None
@@ -87,9 +77,6 @@ def _get_eventbridge() -> Any:
     return _eventbridge
 
 
-# ── Handler ─────────────────────────────────────────────────────────────
-
-
 @idempotent(operation="CreateMetric")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics.
@@ -102,7 +89,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     caller = get_caller_identity(event)
     logger.info("create_metric", namespace=namespace, caller=caller)
 
-    # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
     except (json.JSONDecodeError, TypeError):
@@ -122,7 +108,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if label_error:
         return api_response(400, {"message": label_error})
 
-    # Build metric definition (includes SqlDialect validation)
     try:
         metric = _build_metric_definition(request, caller)
     except ValueError as exc:
@@ -148,19 +133,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if source_error:
         return api_response(400, {"message": source_error})
 
-    # Check for conflicts (metric already exists)
     existing = _get_neptune().get_metric(namespace, metric.name)
     if existing is not None:
         return api_response(409, {"message": f"Metric '{metric.name}' already exists in namespace '{namespace}'"})
 
-    # Validation findings. Only the SQL syntax + shape checks (1/1b) gate
-    # onboarding: the serve-time SQL firewall enforces the same SELECT-only rule,
-    # so a metric that fails them would be persisted only to fail at query time
-    # (#617/#1050). Block by check name (BLOCKING_CHECKS), not severity — the
-    # metadata checks (2-6) can also be ERROR-severity (e.g. table_reference on
-    # provable absence) but have their own dedicated gate (check_source_table_exists
-    # above) and must stay non-blocking here (Kun's review, !1133). Note
-    # _validate_soft surfaces the check name under the "field" key.
+    # Only the SQL syntax and shape checks block (BLOCKING_CHECKS): the serve-time
+    # SQL firewall enforces the same SELECT-only rule. table_reference has its own
+    # gate (check_source_table_exists above). _validate_soft surfaces the check
+    # name under the "field" key.
     findings = _validate_soft(request, namespace, data_source_lookup=data_source_lookup)
     blocking = [f for f in findings if f.get("field") in BLOCKING_CHECKS]
     if blocking:
@@ -174,7 +154,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("ontology_concept_resolution_failed", error=str(exc))
 
-    # Write to Neptune
     try:
         _get_neptune().create_metric(namespace, metric)
     except Exception as exc:
@@ -193,7 +172,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("eventbridge_emit_failed", error=str(exc), name=metric.name)
 
-    # Build response
     response_body: dict[str, Any] = {
         "metric": _metric_to_dict(metric),
     }
@@ -201,9 +179,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         response_body["warnings"] = warnings
 
     return api_response(201, response_body)
-
-
-# ── Validation ──────────────────────────────────────────────────────────
 
 
 def _validate_soft(
@@ -226,9 +201,6 @@ def _validate_soft(
     if data_source_lookup is LOOKUP_NOT_PROVIDED:
         return validate_soft(metric_body, namespace)
     return validate_soft(metric_body, namespace, data_source_lookup=data_source_lookup)
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────
 
 
 def _build_metric_definition(request: CreateMetricRequestContent, caller: str) -> MetricDefinition:

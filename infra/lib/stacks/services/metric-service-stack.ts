@@ -339,9 +339,8 @@ export class MetricServiceStack extends SCLStack {
         // cannot overlap Neptune writes with a retrying delivery.
         IMPORT_OFFSET_LEASE_SECONDS: "960",
         // SMUS catalog access — dataset resolution during async import.
-        // Without these the worker's data source lookup can never initialize,
-        // which previously silently degraded to the permissive (accept-all)
-        // fallback and now fails the job (fail-closed).
+        // Without these the worker's data source lookup cannot initialize and
+        // the job fails closed.
         DATA_SOURCES_TABLE: sourcesTableName,
         NAMESPACES_TABLE: namespacesTableName,
         SMUS_DOMAIN_ID: smusDomainId,

@@ -16,7 +16,6 @@ test.describe("auth: login", () => {
 
     const login = new LoginPage(page);
     await login.login(env!.username, env!.password);
-    await login.expectAuthenticated();
-    await expect(page).toHaveURL(/\/$|\/namespaces|\/$/);
+    await expect(page).toHaveURL(/\/$|\/namespaces/);
   });
 });

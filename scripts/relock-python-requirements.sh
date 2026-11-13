@@ -8,7 +8,7 @@
 # their floors. requirements.lock.txt next to it pins the whole tree with
 # hashes, and infra/lib/utils/python-bundling.ts installs the bundle from the
 # lock with --require-hashes, so two deploys of one commit ship the same
-# dependencies and an upstream release cannot change a deploy (#1376).
+# dependencies and an upstream release cannot change a deploy.
 #
 # Relock after editing requirements.txt, or after bumping a pin in the lock:
 # the existing pins are kept as preferences, so only what the edit requires

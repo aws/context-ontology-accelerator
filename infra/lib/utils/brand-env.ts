@@ -9,21 +9,11 @@ import { IConstruct } from "constructs";
 import { resolveContext } from "../context";
 
 /**
- * Data-plane brand tokens for the runtime.
- *
- * These are static by design (see the BRAND block in
- * libs/ts-shared/src/constants.ts) and the Python defaults in
- * libs/common/constants.py already match them, so injection is not what makes
- * them agree. What it buys is:
- *
- *  1. The documented CDK context overrides `graph_base_uri` and
- *     `event_source_prefix` actually reach the runtime. They were resolved in
- *     `resolveContext` but never passed to any compute, so setting either had no
- *     effect on the services that consume them.
- *  2. The runtime stops inferring graph IRIs from RESOURCE_PREFIX, which CDK
- *     injects as `{prefix}-{env}-`. That inference produced
- *     `http://scl-dev.amazon.com/vocab/scl-dev#` under `resource_prefix=scl`,
- *     matching nothing ontology-engine had written.
+ * Data-plane brand tokens for the runtime. They are static by design (see the
+ * BRAND block in libs/ts-shared/src/constants.ts). Injecting them lets the
+ * `graph_base_uri` and `event_source_prefix` context overrides reach the
+ * runtime, and stops the runtime inferring graph IRIs from RESOURCE_PREFIX
+ * (`{prefix}-{env}-`), which would not match the IRIs already in the graph.
  */
 export function brandEnv(node: IConstruct["node"]): Record<string, string> {
   const { graphBaseUri, eventSourcePrefix } = resolveContext(node);

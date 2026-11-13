@@ -4,18 +4,9 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * Playwright configuration for the Context Ontology Accelerator web-app E2E suite.
- *
- * Topology:
- *   - "setup"  runs auth.setup.ts once, persisting a storageState to .auth/user.json
- *   - "auth"   tests the login gate itself (no stored state)
- *   - feature-area projects depend on "setup" and reuse the stored state
- *
- * The base URL comes from E2E_BASE_URL (CI passes the deployed environment URL),
- * defaulting to the local Vite dev server. Credentials are read from the
- * environment by the fixtures; when absent, environment-dependent tests skip.
- *
- * Paths are relative to this config file (no __dirname — the package is ESM).
+ * Playwright configuration for the web-app E2E suite. Credentials come from the
+ * environment; when absent, environment-dependent tests skip. Paths are
+ * relative to this file (no __dirname: the package is ESM).
  */
 
 const baseURL = process.env.E2E_BASE_URL ?? "http://localhost:5173";

@@ -57,15 +57,8 @@ def handler(event, context):
     restricted to ``knn``/``bool``/``match_all`` shapes, and the result size is
     capped to guard against large data exfiltration.
 
-    Args:
-        event: Lambda event with ``action``, and for searches ``index`` and a
-            ``body`` dict holding the OpenSearch query.
-        context: Lambda runtime context (unused).
-
-    Returns:
-        A dict with a ``statusCode`` and either a ``body`` (on success) or an
-        ``error`` message (on validation or execution failure). A missing index
-        yields a 200 with an empty hit set.
+    Returns ``statusCode`` plus a ``body`` or an ``error``; a missing index yields
+    a 200 with an empty hit set.
     """
     try:
         action = event.get("action", "search")
@@ -84,7 +77,6 @@ def handler(event, context):
         if not isinstance(body, dict):
             return {"statusCode": 400, "error": "body must be a dict"}
 
-        # Validate query shape — only allow knn, bool, and match_all queries
         query = body.get("query", {})
         if query:
             allowed_keys = {"knn", "bool", "match_all"}

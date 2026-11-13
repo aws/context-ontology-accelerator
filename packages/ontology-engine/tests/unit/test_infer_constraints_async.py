@@ -3,21 +3,9 @@
 
 """Async infer-constraints endpoint contract.
 
-``POST /proposals/{id}/infer-constraints`` used to run the Bedrock
-constraint-inference call inline and return the result 200. The LLM call
-(up to 4096 output tokens) can exceed API Gateway's 29s integration
-timeout, so it is now asynchronous: the endpoint returns 202 + an
-in-memory job handle immediately and runs the inference on a background
-thread (same pattern as ``validate``). ``GET .../infer-constraints/jobs/{job}``
-polls it.
-
-These tests pin the new async contract:
-
-  * POST returns 202 + a PENDING job with a job_id (no inline result).
-  * The job GET eventually flips to ``completed`` and carries
-    ``result.inferred_constraints`` (the LLM is mocked).
-  * The worker records ``failed`` + a message when the LLM raises.
-  * 404 on unknown proposal / mismatched job.
+The Bedrock call can exceed API Gateway's 29s integration timeout, so
+``POST /proposals/{id}/infer-constraints`` returns 202 + a job handle and
+runs the inference on a background thread.
 """
 
 from __future__ import annotations
@@ -116,7 +104,6 @@ def test_infer_constraints_job_polls_to_completed(monkeypatch, persisted):
     deadline = time.monotonic() + 5
     while persisted[-1:] != ["completed"] and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert job is not None
     assert job["status"] == "completed"
     assert job["result"]["inferred_constraints"]["classes"][0]["class_uri"] == "https://example.org/Policy"
     assert job["error"] is None
@@ -193,7 +180,7 @@ def test_infer_constraints_job_get_404_on_mismatch(monkeypatch):
 
 
 class TestEvictTerminalJobs:
-    """The in-memory job cap must never evict a still-running job (finding #10)."""
+    """The in-memory job cap must never evict a still-running job."""
 
     def test_eviction_skips_running_jobs(self):
         from coa_ontology.proposals import _evict_terminal_jobs

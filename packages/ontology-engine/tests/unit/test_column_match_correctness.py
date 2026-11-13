@@ -4,17 +4,8 @@
 """A propagated search failure from AOSS must NOT silently degrade to an
 all-novel ontology.
 
-Root cause: three call sites — the column-match (`pipeline._search_one`), the
-grounding recall (`grounding._recall`), and the strategy's outer handler
-(`table_to_ontology.induce`) — each caught a propagated search failure
-(exhausted-retry / connection fault) and converted it into an empty result →
-every real ontology class wrongly marked `match_type="novel"`. `oss_retry`
-already retries transient 429/5xx 6× and re-raises on exhaustion; terminal 4xx
-propagate immediately. The fix is to STOP re-swallowing those raises so a loud,
-re-runnable job failure beats a silently corrupt all-novel ontology.
-
-The three catch points are ONE atomic unit: narrowing the inner swallows is
-useless unless the outer handler also stops catching them.
+Search failures must propagate from the column match, the grounding recall and
+the strategy's outer handler; a successful-but-empty search stays novel.
 """
 
 from __future__ import annotations
@@ -67,9 +58,6 @@ def _benign_novel_table_match() -> ConceptMatch:
     )
 
 
-# ── column search error must propagate, not become novel ──
-
-
 @pytest.mark.parametrize(
     "exc",
     [
@@ -101,9 +89,7 @@ def test_search_error_does_not_become_novel(exc):
 
 
 def test_empty_search_result_is_novel():
-    """Regression guard: a SUCCESSFUL-but-empty search (returns []) must STILL
-    classify the column 'novel'. Proves the fix removed only the error swallow,
-    not the legitimate empty-result path."""
+    """A SUCCESSFUL-but-empty search (returns []) must STILL classify the column 'novel'."""
     oc = MagicMock()
     oc.search_embeddings.return_value = []
     pipeline = InductionPipeline(None, None, oc)
@@ -120,9 +106,6 @@ def test_empty_search_result_is_novel():
     col_matches = [m for m in matches if m.source_column == "total"]
     assert len(col_matches) == 1
     assert col_matches[0].match_type == "novel"
-
-
-# ── grounding recall error must propagate, not become novel ──
 
 
 @pytest.mark.parametrize(
@@ -153,9 +136,6 @@ def test_recall_error_propagates(exc):
         )
 
 
-# ── strategy outer handler must re-raise transport errors ──
-
-
 @pytest.mark.parametrize(
     "exc",
     [
@@ -168,9 +148,7 @@ def test_recall_error_propagates(exc):
 def test_strategy_reraises_transport_error_not_all_novel(exc):
     """When match_concepts raises a genuine search/transport error, the
     strategy's outer handler must RE-RAISE (so _run_induction marks the job
-    FAILED) rather than fall back to an all-novel matches list. This is the
-    handler that would otherwise defeat the inner re-raises — a propagated raise
-    currently just becomes all-novel here."""
+    FAILED) rather than fall back to an all-novel matches list."""
     from coa_ontology.inducer.strategies.table_to_ontology import TableToOntologyStrategy
 
     class _RaisingPipeline:

@@ -15,11 +15,8 @@ and never echoes the rejected value.
 
 ``MetricLabel`` is the exception to "the generated model is enough": its
 Unicode rules cannot be written as a ``@pattern`` every generated validator
-understands, so :func:`check_metric_label` is called on every write path:
-CreateMetric, UpdateMetric, ValidateMetric, :func:`check_metric_definition`
-(OSI import) and the import worker's plan-payload parser, which re-checks the
-label when it replays a stored v3 plan. A stricter rule therefore also applies
-to plans already in flight.
+understands, so :func:`check_metric_label` is called on every write path,
+including when the import worker replays a stored plan.
 """
 
 from __future__ import annotations

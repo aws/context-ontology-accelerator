@@ -191,10 +191,8 @@ describe("Auth", () => {
   });
 
   it("routes back to login on UserUnloaded without re-attempting silent renew", async () => {
-    // The ad-hoc renewal path in getIdToken/getAccessToken drops the user on
-    // failure, firing UserUnloaded (issue #136). Auth must flip to
-    // unauthenticated directly — NOT call signinSilent again, which would also
-    // run during signOut()'s removeUser().
+    // Auth must flip to unauthenticated without calling signinSilent again,
+    // which would also run during signOut()'s removeUser().
     const handlers: { unloaded?: () => void } = {};
     const userManager = {
       events: {

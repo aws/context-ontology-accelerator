@@ -4,10 +4,8 @@
 import { describe, it, expect } from "vitest";
 import { normalizeLoadedDialect } from "./MetricForm";
 
-// #140: a metric imported before the OSI parser fix can carry a mis-cased dialect
-// (e.g. "redshift"). The edit form matches dialect options case-sensitively, so it
-// must upper-case a loaded value that resolves to a known option — otherwise the
-// Select silently falls back to its first option (PostgreSQL).
+// A loaded dialect can be mis-cased, and the Select matches options case-sensitively,
+// so a mis-cased value would fall back to the first option.
 describe("normalizeLoadedDialect", () => {
   it("upper-cases a mis-cased known dialect so it matches its option", () => {
     expect(normalizeLoadedDialect("redshift")).toBe("REDSHIFT");

@@ -87,20 +87,8 @@ done
 echo "✓ TypeScript clients copied"
 
 # ── Build TypeScript clients ─────────────────────────────────────────────────
-# The Smithy codegen produces raw .ts source files. Consumers expect compiled
-# dist-cjs/, dist-es/, and dist-types/ directories (per package.json "main",
-# "module", "types" fields). Build them now so pnpm can resolve the packages.
-# The generated package.json uses yarn: prefix syntax in the build script —
-# replace it with sequential pnpm runs since yarn may not be available.
-#
-# The clients are workspace packages (pnpm-workspace.yaml), and `rm -rf` above
-# removed their pnpm-linked node_modules. Install the workspace from the committed
-# lockfile, once, at the root, so each client's node_modules is the root install's
-# with the lockfile's versions, as setup-dev.sh installs it. A private `npm install`
-# per client is another install with npm's versions, and the gate's node-deps check
-# refuses it. --frozen-lockfile never rewrites the lockfile: a
-# codegen change to a client's dependencies fails here, loudly, until the lockfile
-# is updated on purpose.
+# The generated package.json uses a yarn: build script; replace it with pnpm runs.
+# The root frozen-lockfile install matches setup-dev.sh and never rewrites the lockfile.
 echo ""
 echo "Building TypeScript clients..."
 

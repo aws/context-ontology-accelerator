@@ -33,7 +33,6 @@ Usage::
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from coa_ontology.inducer.unstructured.services.description_generator import (
@@ -209,10 +208,3 @@ def build_class_schema_contexts_from_schema_result(
         class_label_to_canonical=class_label_to_canonical,
         namespace_language=namespace_language,
     )
-
-
-# Helper to encourage callers to use ``Iterable`` for the relations
-# argument; not part of the public API itself.
-def _iter_relations(rels: Iterable[RelationRecord]) -> list[RelationRecord]:
-    """Materialise an iterable into a list; used by the test scaffolding."""
-    return list(rels)

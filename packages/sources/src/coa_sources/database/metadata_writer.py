@@ -6,13 +6,11 @@
 Creates DataZone assets for each discovered table, with column metadata
 stored as forms. Supports idempotent upsert via CreateAssetRevision.
 
-Scalability (see COE for the all-schemas bird-DB scan timeout):
-  * Existing assets are pre-fetched ONCE via a paginated search scoped to the
-    data source, instead of a per-table search (the old N+1 that doubled the
-    DataZone call count and made 1k+ table scans exceed the 15-min Lambda
-    timeout). Absence from the pre-fetched map is authoritative — the search is
-    fully paginated — so a missing entry means "create", with no per-table
-    lookup.
+Scalability:
+  * Existing assets are pre-fetched once via a paginated search scoped to the
+    data source, so a large scan stays inside the 15-min Lambda timeout. Absence
+    from the pre-fetched map is authoritative (the search is fully paginated), so
+    a missing entry means "create", with no per-table lookup.
   * Asset writes are parallelized with a bounded ThreadPoolExecutor
     (DATAZONE_WRITE_PARALLELISM, default 10) — mirrors the bulk-review worker.
     Each table needs a single DataZone write (create OR revise).
@@ -115,7 +113,7 @@ def write_to_datazone(
     if not tables:
         return {"assets_created": 0, "assets_revised": 0}
 
-    # One paginated read instead of a per-table search (de-N+1). On a fresh
+    # One paginated read instead of a per-table search. On a fresh
     # source this returns an empty map and every table is a create.
     try:
         existing = _build_existing_asset_map(client, project_id, data_source_id)

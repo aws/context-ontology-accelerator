@@ -30,9 +30,6 @@ class Tier2SkipDecision(Enum):
     ``SKIP``    — proven that Tier 2 cannot contribute; prune it (→ fall to Tier 3).
     ``RUN``     — positive evidence Tier 2 could contribute; run it.
     ``ABSTAIN`` — undetermined (no signal / error / disabled); fail open → run Tier 2.
-
-    The orchestrator skips Tier 2 ONLY on ``SKIP``; ``RUN`` and ``ABSTAIN`` both
-    mean "run Tier 2", so callers never need to special-case uncertainty.
     """
 
     SKIP = "skip"

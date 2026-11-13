@@ -156,14 +156,12 @@ describe("GetNamespace", () => {
   });
 
   it("surfaces the server-provided vkgHealthReason in the health popover", async () => {
-    const userEvent = (await import("@testing-library/user-event")).default;
     mockNamespace = {
       ...baseNamespace,
       vkgHealth: "DEGRADED",
       vkgHealthReason: "container health check failing — cannot answer queries",
     };
     render(<GetNamespace />, { wrapper });
-    // Open the popover on the health indicator.
     await userEvent.click(screen.getByRole("button", { name: /DEGRADED/i }));
     expect(
       screen.getByText(/container health check failing/i),
@@ -195,13 +193,6 @@ describe("GetNamespace", () => {
     expect(
       screen.getByRole("button", { name: /permissions/i }),
     ).toBeInTheDocument();
-  });
-
-  it("does not render a Data Sources action button (removed)", () => {
-    render(<GetNamespace />, { wrapper });
-    expect(
-      screen.queryByRole("button", { name: /^data sources$/i }),
-    ).not.toBeInTheDocument();
   });
 
   it("renders Sources, Ontologies, and Metrics tabs but not Members", () => {

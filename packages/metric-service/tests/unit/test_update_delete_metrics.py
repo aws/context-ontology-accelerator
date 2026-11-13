@@ -33,9 +33,6 @@ def _permissive_source_lookup(monkeypatch: pytest.MonkeyPatch):
     yield
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
 def _make_update_event(body: dict | None = None, namespace: str = "test-ns", name: str = "revenue") -> dict:
     return {
         "httpMethod": "PUT",
@@ -72,9 +69,6 @@ def _existing_metric() -> MetricDefinition:
         defined_by="original@example.com",
         effective_from="2026-01-01",
     )
-
-
-# ── Update tests ────────────────────────────────────────────────────────
 
 
 class TestUpdateDataSourceIdFormat:
@@ -149,7 +143,6 @@ class TestUpdateMetric:
         body = json.loads(resp["body"])
         assert body["metric"]["description"] == "Updated description"
         assert body["metric"]["definedBy"] == "updater@example.com"
-        # effectiveFrom preserved from existing
         assert body["metric"]["effectiveFrom"] == "2026-01-01"
 
     @patch("coa_metrics.api.update_metric._get_neptune")
@@ -227,8 +220,6 @@ class TestUpdateMetric:
         assert detail["namespace"] == "ns-alpha"
         assert detail["metricName"] == "revenue"
 
-    # ── SQL persistence validation (#617 / #1050) ────────────────────────
-
     @patch("coa_metrics.api.update_metric._validate_soft")
     @patch("coa_metrics.api.update_metric._get_eventbridge")
     @patch("coa_metrics.api.update_metric._get_opensearch")
@@ -240,8 +231,7 @@ class TestUpdateMetric:
         mock_eventbridge: MagicMock,
         mock_validate_soft: MagicMock,
     ) -> None:
-        """#617/#1050: a fragment is rejected on update too — the serve firewall
-        would reject it. Must 400 and not persist."""
+        """A fragment is rejected on update too, and not persisted."""
         mock_neptune.return_value.get_metric.return_value = _existing_metric()
         mock_eventbridge.return_value.put_events.return_value = {}
         body = _valid_update_body()
@@ -304,9 +294,9 @@ class TestUpdateMetric:
         mock_validate_soft: MagicMock,
         mock_eventbridge: MagicMock,
     ) -> None:
-        """!1133 (Kun's review): an ERROR-severity table_reference finding must
-        not independently 400 update — the dedicated check_source_table_exists
-        gate owns that decision; onboarding blocks only on sql_syntax/sql_shape."""
+        """An ERROR-severity table_reference finding does not 400 an update.
+
+        check_source_table_exists owns that decision; only sql_syntax/sql_shape block."""
         mock_neptune.return_value.get_metric.return_value = _existing_metric()
         mock_eventbridge.return_value.put_events.return_value = {}
         mock_check.return_value = None  # can't prove absence → publish
@@ -406,9 +396,6 @@ class TestUpdateOntologyConceptsAndBlankFields:
         mock_neptune.return_value.update_metric.assert_not_called()
 
 
-# ── APPROVED-source enforcement on update (#564) ────────────────────────
-
-
 class TestUpdateSourceApprovalEnforcement:
     """Edit must enforce the same APPROVED/COMPLETED source gate as create."""
 
@@ -466,9 +453,6 @@ class TestUpdateSourceApprovalEnforcement:
         update_handler(_make_update_event(body=_valid_update_body(), namespace="ns-alpha"), None)
 
         assert mock_check.call_args[0][0] == "ns-alpha"
-
-
-# ── Delete tests ────────────────────────────────────────────────────────
 
 
 class TestDeleteMetric:

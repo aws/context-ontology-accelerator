@@ -75,11 +75,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# ── App ─────────────────────────────────────────────────────────────────
-# Orphaned-job recovery is fully on-demand — the lazy ``get_job`` sweep, the
-# ``count_active_jobs`` self-heal, and ``acquire_induction_lock``'s stale-takeover
-# each recover a hard-killed worker's row without a boot-time scan, so no
-# startup-reconcile lifespan is wired here.
 app = FastAPI(
     title="Ontology Workbench",
     description=(
@@ -154,11 +149,8 @@ async def _neptune_memory_limit_handler(_request: StarletteRequest, _exc: Neptun
 
 
 # ── Config ──────────────────────────────────────────────────────────────
-# After MR !39 consolidation, the ontology-catalog + embedding-generator
-# routes are served by this same FastAPI app. Default these URLs to
-# localhost:8001 (the consolidated engine's default port) so internal
-# self-calls resolve without requiring Docker-Compose DNS. Override via
-# env vars for multi-service deployments if you ever bring them back.
+# The ontology-catalog and embedding-generator routes are served by this app,
+# so these URLs default to its own port; override via env vars.
 _DEFAULT_ENGINE_SELF_URL = "http://localhost:8001"
 app.state.config = {
     "data_catalog_url": os.getenv("DATA_CATALOG_URL", "http://localhost:8003"),
@@ -166,10 +158,8 @@ app.state.config = {
     "ontology_catalog_url": os.getenv("ONTOLOGY_CATALOG_URL", _DEFAULT_ENGINE_SELF_URL),
     "llm_model_id": os.getenv("LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "llm_region": os.getenv("LLM_REGION", "us-east-1"),
-    # Grounding rerank defaults to Haiku (FALLBACK_CHAT_MODEL_ID) — a cheap
-    # reranker — overridable with GROUNDING_LLM_MODEL_ID for a region-valid id
-    # (GH #236). `or` so an empty variable falls through to the Haiku default,
-    # exactly parallel to how LLM_MODEL_ID falls back to its Sonnet literal.
+    # Grounding rerank defaults to Haiku; `or` so an empty
+    # GROUNDING_LLM_MODEL_ID falls through to the default.
     "grounding_llm_model_id": (os.getenv("GROUNDING_LLM_MODEL_ID") or FALLBACK_CHAT_MODEL_ID),
     "description_llm_model_id": os.getenv("DESCRIPTION_LLM_MODEL_ID", "us.anthropic.claude-sonnet-4-6"),
     "description_mode": os.getenv("DESCRIPTION_MODE", "schema"),

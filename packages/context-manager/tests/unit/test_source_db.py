@@ -76,12 +76,7 @@ class TestSourceDBQueryExecutor:
 
     @patch("coa_serve.clients.source_db.boto3")
     async def test_execute_delegates_to_adapter(self, mock_boto3, _reg):
-        """execute() resolves ONE adapter and delegates inject_limit + run to it.
-
-        This is the core of the maintainability refactor: the executor holds no
-        engine ``if`` — it calls the adapter returned by _get_connection. A spy
-        adapter proves inject_limit and run are both invoked and the rows flow back.
-        """
+        """execute() resolves ONE adapter and delegates inject_limit + run to it."""
         from coa_serve.clients.source_db import SourceDBQueryExecutor
 
         executor = SourceDBQueryExecutor(data_sources_table="test-table")
@@ -209,7 +204,7 @@ class TestSourceDBQueryExecutor:
     async def test_resolve_credentials_defaults_port_per_engine(self, mock_source_boto3, _reg):
         """When the config omits ``port``, the engine adapter's default_port is used.
 
-        MySQL -> 3306, SQL Server -> 1433 (vs the historical PostgreSQL 5432).
+        MySQL -> 3306, SQL Server -> 1433.
         """
         from coa_serve.clients.source_db import SourceDBQueryExecutor
 
@@ -382,10 +377,6 @@ class TestSourceDBQueryExecutor:
         with pytest.raises(ValueError, match="data_sources_table must be provided"):
             SourceDBQueryExecutor(data_sources_table="")
 
-    # ------------------------------------------------------------------
-    # Connection cache — now delegates disposal to the per-key adapter.
-    # ------------------------------------------------------------------
-
     @patch("coa_serve.clients.source_db.boto3")
     async def test_close_disposes_via_adapter(self, mock_boto3, _reg):
         """close() calls the cached adapter's close() for every cached connection."""
@@ -430,14 +421,12 @@ class TestSourceDBQueryExecutor:
         executor._resolve_credentials = _fake_resolve  # type: ignore[method-assign]
 
         def _fake_get_adapter(engine_type):
-            # A fresh spy adapter per call, tagged so eviction assertions can find it.
             adapter = MagicMock()
             adapter.engine_type = "POSTGRESQL"
             adapter.sqlglot_dialect = "postgres"
             handle = object()
             adapter.open_connection = AsyncMock(return_value=handle)
             adapter.close = AsyncMock()
-            adapter._handle = handle
             return adapter
 
         with patch.object(source_db_mod, "get_adapter", side_effect=_fake_get_adapter):
@@ -581,10 +570,6 @@ class TestSourceDBQueryExecutor:
         assert conn is not None
         assert "ns:dsX" in executor._conn_cache
         assert "ns:ds0" not in executor._conn_cache
-
-    # ------------------------------------------------------------------
-    # search_path resolution (still lives in source_db; PG-only consumers).
-    # ------------------------------------------------------------------
 
     def test_resolve_search_path_prefers_discovered_schemas(self, _reg):
         """_resolve_search_path uses discoveredSchemas (authoritative) over the glob."""

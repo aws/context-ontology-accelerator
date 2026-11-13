@@ -44,10 +44,6 @@ from coa_sources.documents.preprocessing.processors import (
     process_txt,
 )
 
-# ---------------------------------------------------------------------------
-# Pass-through processors
-# ---------------------------------------------------------------------------
-
 
 @pytest.mark.unit
 class TestProcessTxt:
@@ -89,11 +85,6 @@ class TestProcessMd:
         assert ext == ".md"
 
 
-# ---------------------------------------------------------------------------
-# DOCX processor
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestProcessDocx:
     @patch("unstructured.partition.docx.partition_docx")
@@ -114,11 +105,6 @@ class TestProcessDocx:
         text, ext = process_docx(b"fake", "empty.docx")
         assert text == ""
         assert ext == ".md"
-
-
-# ---------------------------------------------------------------------------
-# Scanned PDF detection
-# ---------------------------------------------------------------------------
 
 
 def _make_pdf(pages_text: list[str]) -> bytes:
@@ -214,11 +200,6 @@ class TestIsScannedPdf:
         assert any("treating as scanned" in r.getMessage() for r in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# Textract extraction
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestProcessPdfTextract:
     def test_single_page_calls_textract_with_real_png(self):
@@ -262,13 +243,8 @@ class TestProcessPdfTextract:
             doc.close()
         assert len(expected_pngs) == 3, "pages must render to distinct PNGs"
 
-        # process_pdf_textract OCRs pages concurrently, so the stub must key off
-        # the page bytes, not call order: a side_effect *list* is consumed in the
-        # order threads happen to call, which makes the assertion below flaky.
-        # Do not "simplify" this back into a list.
-        # The descending sleep makes pages finish in reverse order, so the
-        # assertion deterministically catches a reassembly that appends in
-        # completion order instead of indexing by page.
+        # Pages are OCR'd concurrently, so the stub keys off page bytes (not call
+        # order) and sleeps in reverse page order to catch completion-order reassembly.
         def _detect(Document):  # noqa: N803 - matches the boto3 kwarg name
             idx = expected_pngs[Document["Bytes"]]
             time.sleep(0.05 * (3 - idx))
@@ -330,19 +306,9 @@ class TestProcessPdfTextract:
         assert result == "ok\n\nok"
 
 
-# ---------------------------------------------------------------------------
-# PDF processor — Textract AnalyzeDocument(TABLES) path
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestProcessPdfTextractTables:
-    """Cover process_pdf_textract_tables end-to-end with real rendered PNGs.
-
-    Mirrors TestProcessPdfTextract's no-mock-pdfium style: real PDF bytes are
-    rendered by the real library and the boto3 client is the only stub, so the
-    render/guard/reassembly path is exercised for real.
-    """
+    """Cover process_pdf_textract_tables end-to-end with real rendered PNGs."""
 
     @staticmethod
     def _table_blocks(header: str, cell: str) -> list[dict]:
@@ -374,14 +340,11 @@ class TestProcessPdfTextractTables:
 
         result = process_pdf_textract_tables(_make_pdf(["table page"]), "policy.pdf", textract)
 
-        # analyze_document (not detect_document_text) is the TABLES entry point.
         textract.analyze_document.assert_called_once()
         assert textract.analyze_document.call_args.kwargs["FeatureTypes"] == ["TABLES"]
-        # The reassembled Markdown carries the header + cell as a pipe-table.
         assert "Policy" in result and "P-100" in result
         assert "|" in result
 
-        # The bytes handed to Textract are a real PNG at 300 DPI.
         png_bytes = textract.analyze_document.call_args.kwargs["Document"]["Bytes"]
         assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
 
@@ -421,10 +384,8 @@ class TestProcessPdfTextractTables:
         assert process_pdf_textract_tables(_make_pdf(["x"]), "empty.pdf", textract) == ""
 
     def test_textract_error_on_page_yields_empty_not_crash(self):
-        """A Textract API error (throttling, invalid param, ...) on a page must
-        be isolated to that page — return empty for it, never propagate out of
-        pool.map and abort the whole document. Regression guard for the review
-        finding on _analyze_page."""
+        """A Textract API error on a page is isolated to that page: it returns empty
+        for it and never aborts the whole document."""
         textract = MagicMock()
         textract.analyze_document.side_effect = Exception("ThrottlingException")
         # single page -> whole result is empty, but no exception escapes
@@ -507,11 +468,6 @@ class TestProcessPdfTextractTables:
             result = processors.process_pdf_textract_tables(pdf_bytes, "boom.pdf", textract)
         assert result == ""
         textract.analyze_document.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# PDF processor (routing logic)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
@@ -611,11 +567,6 @@ class TestProcessPdf:
         mock_partition.assert_called_once()
 
 
-# ---------------------------------------------------------------------------
-# elements_to_markdown
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestElementsToMarkdown:
     def _make_element(self, category: str, text: str) -> MagicMock:
@@ -681,11 +632,6 @@ class TestElementsToMarkdown:
         assert result == "plain text"
 
 
-# ---------------------------------------------------------------------------
-# get_page_count
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestGetPageCount:
     def test_pdf_returns_count(self):
@@ -708,11 +654,6 @@ class TestGetPageCount:
         assert get_page_count(b"docx-bytes", ".docx") == 0
 
 
-# ---------------------------------------------------------------------------
-# Processor dispatch table
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestProcessorDispatchTable:
     def test_has_txt(self):
@@ -727,16 +668,8 @@ class TestProcessorDispatchTable:
         assert ".docx" in _PROCESSORS
         assert _PROCESSORS[".docx"] is process_docx
 
-    def test_pdf_not_in_table(self):
-        assert ".pdf" not in _PROCESSORS
-
     def test_no_unexpected_keys(self):
         assert set(_PROCESSORS.keys()) == {".txt", ".md", ".docx"}
-
-
-# ---------------------------------------------------------------------------
-# _blocks_to_markdown — Textract AnalyzeDocument(TABLES) reassembly
-# ---------------------------------------------------------------------------
 
 
 def _word(wid: str, text: str) -> dict:
@@ -838,12 +771,10 @@ class TestBlocksToMarkdown:
             _table("t1", ["c1", "c2", "c3", "c4"]),
         ]
         md = _blocks_to_markdown(blocks)
-        # Prose survives.
         assert "Intro paragraph" in md
         # Inside-table LINEs are not emitted as prose (would double-count).
         assert "Header Value" not in md
         assert "Row1 10" not in md
-        # Table is present.
         assert "| Header | Value |" in md
         assert "| Row1 | 10 |" in md
 
@@ -870,10 +801,9 @@ class TestBlocksToMarkdown:
         assert md == "Just prose"
 
     def test_block_without_id_is_skipped_not_crashed(self):
-        """Hardening: a block missing "Id" must not KeyError the whole page.
-        The by_id map skips it; a well-formed LINE still emits."""
+        """A block missing "Id" is skipped by the by_id map; a well-formed LINE still emits."""
         blocks = [
-            {"BlockType": "PAGE"},  # no "Id" — pre-hardening this raised KeyError
+            {"BlockType": "PAGE"},  # no "Id"
             _line("L1", "survives", ["w1"]),
             _word("w1", "survives"),
         ]

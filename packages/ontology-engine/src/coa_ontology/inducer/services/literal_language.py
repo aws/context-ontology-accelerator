@@ -9,7 +9,7 @@ detects a language from text. It only decides whether a literal COA generated is
 lexically compatible with the configured namespace language, and it fails closed:
 a false tag is worse than an omitted one, and untagged literals stay readable.
 
-The rules (namespace-language LLD, section 2.2.4):
+The rules:
 
 1. Callers pass only COA-generated natural-language text. Physical identifiers,
    copied source-authored values and values with missing or mixed provenance

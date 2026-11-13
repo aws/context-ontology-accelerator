@@ -36,7 +36,6 @@ export const RuntimeConfigContext = createContext<RuntimeContext | undefined>(
  * Loads `/runtime-config.json` at mount and provides it via {@link RuntimeConfigContext}.
  *
  * Required fields: `region`, `authority`, `clientId`.
- * Optional fields: `apiEndpoint`.
  *
  * Renders an error message if the config is missing or invalid.
  * Should be the outermost provider wrapping {@link Auth} in `main.tsx`.

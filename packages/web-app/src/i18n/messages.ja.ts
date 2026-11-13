@@ -2,15 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Japanese message catalogue (data only).
- *
- * Every UI string the app renders must have an entry here; t(...) will not
- * compile without it; keep placeholders identical to the English key.
- *
- * The keys are the English copy verbatim (see ./appMessages for why English is
- * the key and for the formatter/type wiring). To add another locale, create a
- * sibling messages.<locale>.ts and register it in CATALOGUES — TypeScript then
- * requires it to cover every key.
+ * Japanese message catalogue (data only), keyed by the English copy (see
+ * ./appMessages). Keep placeholders identical to the English key.
  */
 export const MESSAGES_JA = {
   Info: "情報",
@@ -889,7 +882,7 @@ export const MESSAGES_JA = {
   Columns: "列",
   Enriched: "エンリッチ済み",
   "Review status": "レビューステータス",
-  // Foreign-key / relationship review table (#1088). The review state itself
+  // Foreign-key / relationship review table. The review state itself
   // (PENDING_REVIEW / APPROVED / REJECTED) is a service enum rendered verbatim,
   // so only the column headings and the steward's two actions are translated.
   Review: "レビュー",

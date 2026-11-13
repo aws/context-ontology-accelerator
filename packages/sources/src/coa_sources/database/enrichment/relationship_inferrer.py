@@ -79,10 +79,7 @@ def build_relationship_prompt(tables: list[Table]) -> str:
         schema_lines.append(f"  {name}: {cols}")
 
         for fk in table.foreign_keys:
-            if fk.source in (
-                EnrichmentSource.DETERMINISTIC,
-                EnrichmentSource.STEWARD_SPECIFIED,
-            ):
+            if fk.source in _PROTECTED_FK_SOURCES:
                 known_relationships.append(f"  {name}.{fk.column} -> {fk.target_table}.{fk.target_column}")
 
     prompt = "Schema:\n" + "\n".join(schema_lines)
@@ -273,8 +270,7 @@ def _has_unrepresentable_fk_target(table: Table, column: str) -> bool:
 
     Discovery drops a key whose target no discovered table can stand for and
     records the declared target on the column instead (see
-    ``Column.unrepresentable_fk_target``). That dropped key used to be what
-    ``_has_protected_fk`` saw; this keeps the column protected without it.
+    ``Column.unrepresentable_fk_target``).
     """
     return any(c.name == column and c.unrepresentable_fk_target for c in table.columns)
 

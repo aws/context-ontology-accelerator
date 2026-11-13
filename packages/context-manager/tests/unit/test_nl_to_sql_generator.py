@@ -25,7 +25,6 @@ from coa_serve.tier2.nl_to_sql.sql_generator import (
     _resolve_data_source_from_hits,
     _resolve_data_source_from_sql,
     _resolve_data_source_from_table_sources,
-    build_fk_adjacency,
     sql_table_routing,
     table_sources_need_preparation,
 )
@@ -605,32 +604,6 @@ class TestExtractConfidence:
 
     def test_zero(self):
         assert _extract_confidence("Confidence: 0.0") == 0.0
-
-
-@pytest.mark.unit
-class TestBuildFKAdjacency:
-    def test_bidirectional(self):
-        meta = {
-            "orders": {"foreignKeys": [{"targetTable": "customers"}]},
-            "customers": {"foreignKeys": []},
-        }
-        adj = build_fk_adjacency(meta)
-        assert "customers" in adj["orders"]
-        assert "orders" in adj["customers"]
-
-    def test_empty_metadata(self):
-        assert build_fk_adjacency({}) == {}
-
-    def test_missing_fk_key(self):
-        meta = {"orders": {}}
-        adj = build_fk_adjacency(meta)
-        assert adj == {"orders": set()}
-
-    def test_case_normalization(self):
-        meta = {"Orders": {"foreignKeys": [{"targetTable": "CUSTOMERS"}]}}
-        adj = build_fk_adjacency(meta)
-        assert "customers" in adj["orders"]
-        assert "orders" in adj["customers"]
 
 
 @pytest.mark.unit

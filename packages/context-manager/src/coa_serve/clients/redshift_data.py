@@ -83,15 +83,6 @@ class RedshiftDataAPIExecutor:
     workgroup and Glue database are resolved per-source from the source registry
     (``redshiftWorkgroup`` column + Glue ``databaseName``), mirroring how
     ``AthenaQueryExecutor`` resolves ``athenaCatalog``/``athenaDatabase``.
-
-    Args:
-        region: AWS region for the redshift-data client. Defaults to the
-            resolved deployment region.
-        sources_registry: Source-metadata registry used to resolve the workgroup
-            and Glue database for a ``data_source_id``.
-        database: Redshift database whose search path exposes the ``awsdatacatalog``
-            external schema (the Serverless namespace's default DB). Defaults to
-            the ``REDSHIFT_SERVE_DATABASE`` env or ``dev``.
     """
 
     def __init__(
@@ -198,8 +189,6 @@ class RedshiftDataAPIExecutor:
         """No-op close for executor symmetry; the boto3 client is stateless."""
         return None
 
-    # ── SQL preparation ──────────────────────────────────────────────────
-
     async def _authorize_qualified_references(self, sql: str, namespace: str) -> None:
         """Deny cross-namespace Glue references before Redshift rewrites them.
 
@@ -278,15 +267,11 @@ class RedshiftDataAPIExecutor:
         try:
             parsed = sqlglot.parse_one(sql, dialect="redshift")
         except sqlglot.errors.SqlglotError as exc:
-            # SQL may carry caller-supplied literal values (potential PII), and sqlglot
-            # error messages echo a snippet of it. Log length + error type only.
             logger.warning(
                 "redshift_awsdatacatalog_rewrite_parse_failed", sql_len=len(sql), error_type=type(exc).__name__
             )
             return sql
 
-        # CTE aliases are query-local names, not Glue tables — collect them so a
-        # bare reference to a CTE isn't rewritten into awsdatacatalog.<db>.<cte>.
         cte_names = {cte.alias for cte in parsed.find_all(sqlglot.exp.CTE) if cte.alias}
 
         for table in parsed.find_all(sqlglot.exp.Table):
@@ -344,8 +329,6 @@ class RedshiftDataAPIExecutor:
         except Exception:
             return f"{sql.rstrip(';')} LIMIT {int(max_rows)}"
 
-    # ── Source resolution ────────────────────────────────────────────────
-
     async def _resolve_workgroup_and_database(self, namespace: str, data_source_id: str) -> tuple[str, str]:
         """Resolve the Redshift workgroup + Glue database for a Glue source.
 
@@ -374,8 +357,6 @@ class RedshiftDataAPIExecutor:
             config = self._sources.parse_configuration(source)
             glue_database = config.get("databaseName", "")
         return workgroup, glue_database
-
-    # ── Redshift Data API calls ──────────────────────────────────────────
 
     async def _start_statement(self, sql: str, workgroup: str) -> str:
         loop = asyncio.get_running_loop()
@@ -442,6 +423,5 @@ class RedshiftDataAPIExecutor:
             if cell.get("isNull"):
                 row[col] = None
                 continue
-            # Exactly one typed key per cell; take its value.
             row[col] = next(iter(cell.values()), None)
         return row

@@ -7,11 +7,9 @@ import { turtleToGraph } from "@components/graph/turtleToGraph";
 
 const OWL_OBJECT_PROPERTY = "http://www.w3.org/2002/07/owl#ObjectProperty";
 
-// Compact prefixed serialization — the exact shape the inducer emits. The
-// grounded subject is written ``ind:ClinicalTrial skos:exactMatch <…>`` while
-// the graph node id is the ABSOLUTE IRI ``http://ex.org/ind#ClinicalTrial``.
-// The regressed string-scan compared those two and never matched; the fix
-// reads the parsed ``data.isGrounded`` flag instead.
+// Compact prefixed serialization, the shape the inducer emits: the grounded
+// subject is written ``ind:ClinicalTrial skos:exactMatch <…>`` while the graph
+// node id is the absolute IRI ``http://ex.org/ind#ClinicalTrial``.
 const GROUNDED_TURTLE = `
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -35,7 +33,7 @@ describe("nodeKindFromData (ProposalDetail flow-node color coding)", () => {
     const { nodes } = turtleToGraph(GROUNDED_TURTLE);
     const ct = nodes.find((n) => n.id === "http://ex.org/ind#ClinicalTrial");
     expect(ct?.data.isGrounded).toBe(true);
-    // The load-bearing assertion for BUG 3: the flow-node kind is "grounded".
+    // The flow-node kind is "grounded".
     expect(nodeKindFromData(ct!.data)).toBe("grounded");
   });
 

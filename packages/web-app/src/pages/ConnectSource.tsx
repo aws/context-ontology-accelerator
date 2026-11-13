@@ -49,11 +49,7 @@ import {
   useGetNamespace,
   useGetSourceUploadUrls,
 } from "@api-hooks";
-import {
-  ControlPlaneServiceServiceException,
-  SourceType,
-  SparqlStore,
-} from "@coa/control-plane-client";
+import { SourceType, SparqlStore } from "@coa/control-plane-client";
 import "./pages.css";
 
 /** Read-only display of the ExternalId a cross-account role's trust policy must pin.
@@ -111,46 +107,11 @@ function CrossAccountExternalIdField({
   );
 }
 
-/** Extract a human-readable message from any thrown value.
- *  Smithy sets `message = "UnknownError"` for unmodeled error responses;
- *  in that case we fall back to the raw response body's `error` field. */
-function extractErrorMessage(
-  err: unknown,
-  fallback = "An unexpected error occurred.",
-): string {
-  if (err instanceof ControlPlaneServiceServiceException) {
-    // For unmodeled errors the Smithy client sets message === name === "UnknownError".
-    if (err.message && err.message !== "UnknownError") return err.message;
-
-    // The Smithy REST-JSON deserializer copies unknown fields from the parsed
-    // response body onto the exception object directly. Our API returns
-    // {"error": "..."} so check for that field first.
-    const anyErr = err as unknown as Record<string, unknown>;
-    if (typeof anyErr["error"] === "string") return anyErr["error"];
-
-    // Try to pull the `error` field out of the raw HTTP response body.
-    const body = (err as unknown as { $response?: { body?: unknown } })
-      .$response?.body;
-    if (typeof body === "string") {
-      try {
-        const parsed = JSON.parse(body) as Record<string, unknown>;
-        if (typeof parsed.error === "string") return parsed.error;
-        if (typeof parsed.message === "string") return parsed.message;
-      } catch {
-        // body wasn't JSON — ignore
-      }
-    }
-    return fallback;
-  }
-  if (err instanceof Error && err.message) return err.message;
-  return fallback;
-}
 import { SUPPORTED_UPLOAD_CONTENT_TYPES, MAX_UPLOAD_FILES } from "@coa/shared";
 import { S3_ARN_RE, validateS3Prefix } from "@utils/helpers";
+import { extractErrorMessage } from "@utils/errors";
 import { useAppI18n, type AppTranslate } from "../i18n/LocaleProvider";
 import type { AppMessage } from "../i18n/appMessages";
-
-// ── Source type options ───────────────────────────────────────────────────────
 
 // Six-way selection shown in step 1
 type SourceKind =
@@ -186,8 +147,6 @@ const SOURCE_KIND_LABELS: Record<SourceKind, AppMessage> = {
   RDF_SPARQL: "Graph database (SPARQL)",
   DOCUMENTS: "Documents",
 };
-
-// ── Constants ─────────────────────────────────────────────────────────────────
 
 // Mirror the Smithy SparqlEndpoint / SparqlRegion / NamedGraphIri patterns. The
 // named graph is interpolated into GRAPH <...> server-side, so the pattern excludes
@@ -269,8 +228,6 @@ function resolveContentType(file: File): string {
   return EXT_TO_MIME[ext] ?? file.type;
 }
 
-// ── Form model ────────────────────────────────────────────────────────────────
-
 interface Model {
   // RDF_SPARQL graph source. Bring-your-own-ontology: registration only checks
   // the endpoint is reachable; classes come from an imported ontology.
@@ -279,7 +236,6 @@ interface Model {
   sparqlRegion: string;
   sparqlPort: string;
   sparqlNamedGraph: string;
-  // Step 1 — source kind (replaces the old two-step category + type)
   sourceKind: SourceKind;
   // Glue database config
   dbName: string;
@@ -290,10 +246,6 @@ interface Model {
   glueTableExcludeFilter: string;
   glueAthenaDataCatalogName: string;
   glueCrossAccountRoleArn: string;
-  // How this Glue/Iceberg source's queries execute at serve time.
-  // "ATHENA" (default) or "REDSHIFT" (Redshift Serverless awsdatacatalog
-  // auto-mount). NOTE: this is the *execution engine* for a Glue source — it is
-  // NOT the same as onboarding a Redshift database (that's a JDBC source).
   glueExecutionEngine: GlueExecutionEngine;
   // Redshift Serverless workgroup — required only when glueExecutionEngine is REDSHIFT.
   glueRedshiftWorkgroup: string;
@@ -371,7 +323,7 @@ type ChunkSizeMode = "default" | "large" | "custom";
 const TOOLKIT_CHUNK_OVERLAP = 25;
 // A 256-token chunk holds far fewer characters of Japanese than of English, so
 // a table that fits one English chunk is cut mid-row, and sometimes mid-number,
-// in Japanese (#1286). 1024 keeps such a table in one chunk.
+// in Japanese. 1024 keeps such a table in one chunk.
 const LARGE_CHUNK_SIZE = 1024;
 // ExtractionConfig's @range on chunkSize and chunkOverlap is 0-4096 and 0-512,
 // where 0 means "use the toolkit default". Custom accepts 1 and up, because the
@@ -406,10 +358,8 @@ export type VocabularyMode = "infer" | "custom";
 /** How topic names are chosen. */
 export type TopicMode = "auto" | "custom";
 
-// RadioGroup hands back a plain string, so narrow it with a guard rather than
-// asserting — project convention, see .claude/rules/frontend-typescript.md. An
-// unrecognised value leaves the current selection alone instead of writing a
-// mode the rest of the form cannot interpret.
+// RadioGroup hands back a plain string. An unrecognised value leaves the
+// current selection unchanged.
 const isVocabularyMode = (value: string): value is VocabularyMode =>
   value === "infer" || value === "custom";
 const isTopicMode = (value: string): value is TopicMode =>
@@ -545,10 +495,7 @@ function vocabularyWarning(
     );
   }
   if (rewritten.length > 0) {
-    // List every affected label, not a truncated sample: this warning exists to
-    // tell users which of their labels will be renamed on ingest, and hiding some
-    // behind "and N more" defeats it. The set is naturally small — only labels
-    // whose recorded form differs from what was typed.
+    // List every renamed label; the set holds only labels whose stored form differs.
     const shown = rewritten
       .map((r) =>
         t("“{typed}” as “{stored}”", {
@@ -655,16 +602,8 @@ const initialModel: Model = {
   chunkOverlap: "",
 };
 
-// ── Validation ────────────────────────────────────────────────────────────────
-
-/**
- * Validate cross-account IAM role ARN format.
- * Backend IAM policy restricts AssumeRole to roles matching:
- *   arn:aws:iam::*:role/{prefix}-{env}-datasource-access-*
- * Default prefix is "coa", default env is "dev", so pattern becomes:
- *   arn:aws:iam::ACCOUNT:role/coa-dev-datasource-access-SUFFIX
- */
-function validateCrossAccountRoleArn(
+/** Shape-check an optional role ARN: a role whose name contains `-datasource-access-`. */
+export function validateCrossAccountRoleArn(
   arn: string,
   t: AppTranslate,
 ): string | undefined {
@@ -1033,8 +972,6 @@ function validateStep2(
   return errs;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
 export const ConnectSource: React.FC = () => {
   const { t } = useAppI18n();
   const graphSourcesEnabled =
@@ -1082,7 +1019,6 @@ export const ConnectSource: React.FC = () => {
     model.sourceKind === "CUSTOM_CONNECTOR" ||
     model.sourceKind === "DATABRICKS_SQL_WAREHOUSE";
 
-  // ── Mutations ──────────────────────────────────────────────────────
   const {
     mutate: createSource,
     mutateAsync: createSourceAsync,
@@ -1104,7 +1040,6 @@ export const ConnectSource: React.FC = () => {
 
   const isSubmitting = isCreating || isGettingUrls || uploadProgress !== null;
 
-  // ── Prefix helpers ─────────────────────────────────────────────────
   // Use functional setModel updates so these callbacks have stable identities
   // and don't trigger a recompute of the steps useMemo on every render.
   const updatePrefix = useCallback((id: number, value: string) => {
@@ -1129,7 +1064,6 @@ export const ConnectSource: React.FC = () => {
     }));
   }, []);
 
-  // ── Submit ─────────────────────────────────────────────────────────
   const handleSubmit = async () => {
     const step2Errs = validateStep2(model, docTab, t, resourcePrefix);
     if (step2Errs.step1) {
@@ -1215,9 +1149,6 @@ export const ConnectSource: React.FC = () => {
           databaseSource: {
             name: model.customConnectorName.trim(),
             metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
-            // customConnectorConfiguration only: the backend rejects a payload carrying
-            // more than one of glue/jdbc/athena configuration, since the
-            // configuration present is what selects the sub-type.
             customConnectorConfiguration: {
               connectorFunctionArn: model.customConnectorFunctionArn.trim(),
               databaseName: model.customConnectorDatabaseName.trim(),
@@ -1238,8 +1169,9 @@ export const ConnectSource: React.FC = () => {
           sourceType: SourceType.DATABASE,
           databaseSource: {
             name: model.sparqlName.trim(),
-            // One configuration only — it selects the sub-type. No enrichment:
-            // a graph source has no schema to scan.
+            // One configuration only: the backend rejects more than one, since the
+            // configuration present selects the sub-type. No enrichment: a graph
+            // source has no schema to scan.
             sparqlConfiguration: {
               store: SparqlStore.NEPTUNE,
               dataEndpoint: model.sparqlEndpoint.trim(),
@@ -1263,8 +1195,6 @@ export const ConnectSource: React.FC = () => {
           databaseSource: {
             name: model.databricksName.trim(),
             metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
-            // One configuration only: the backend rejects a payload carrying more
-            // than one, since the configuration present selects the sub-type.
             databricksSqlWarehouseConfiguration: {
               workspaceHostname: model.databricksWorkspaceHostname.trim(),
               httpPath: model.databricksHttpPath.trim(),
@@ -1305,11 +1235,8 @@ export const ConnectSource: React.FC = () => {
     // DOCUMENTS — upload mode
     setUploadError(null);
     setUploadProgress(0);
-    // Which call threw decides which alert reports the failure, so record it.
-    // The error's class decides nothing here: the upload-URL request throws the
-    // same service exception the create call does, and that mutation's error
-    // state is never rendered, so a failure there cleared the progress bar and
-    // showed nothing at all.
+    // Routes a failure to the right alert: the upload-URL mutation's error state
+    // is never rendered, and both calls throw the same exception class.
     let createStarted = false;
     try {
       const result = await getUploadUrls({
@@ -1370,7 +1297,6 @@ export const ConnectSource: React.FC = () => {
     }
   };
 
-  // ── Steps ──────────────────────────────────────────────────────────
   const step2Errs = useMemo(
     () =>
       showErrors[1] ? validateStep2(model, docTab, t, resourcePrefix) : {},
@@ -1387,7 +1313,7 @@ export const ConnectSource: React.FC = () => {
   );
 
   const steps: WizardProps.Step[] = useMemo(() => {
-    // ── Step 1: Choose source type (3 tiles) ──────────────────────────
+    // ── Step 1: Choose source type ────────────────────────────────
     const step1: WizardProps.Step = {
       title: t("Choose source type"),
       description: t("Select the type of source you want to connect."),
@@ -1880,8 +1806,6 @@ export const ConnectSource: React.FC = () => {
                     placeholder="tmp_*|staging_*"
                   />
                 </FormField>
-                {/* Snowflake-specific fields — shown when the user selects
-                    SNOWFLAKE as the engine. */}
                 {model.dbEngine === "SNOWFLAKE" && (
                   <>
                     <FormField
@@ -2626,13 +2550,6 @@ export const ConnectSource: React.FC = () => {
                 },
               ]}
             />
-            {/* Its own section: this configures what the extractor looks for,
-                which is a different concern from the document-lifecycle toggles
-                in "Advanced options" below. Keeping them apart avoids implying a
-                relationship that does not exist. The header names both fields
-                rather than just the first, and "vocabulary" is no longer reused
-                as a field label — it was previously both the section name and
-                the name of one of the two things inside it. */}
             <ExpandableSection
               headerText={t("Entity classes and topics (optional)")}
               variant="container"

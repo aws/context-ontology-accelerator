@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""#143: large ontologies must not be inlined through the 6 MB Lambda response cap.
+"""Large ontologies must not be inlined through the 6 MB Lambda response cap.
 
 /download offloads the Turtle to S3 and returns a presigned URL; ontology-overview
 pages each collection and reports the un-paged totals. Both are exercised at the

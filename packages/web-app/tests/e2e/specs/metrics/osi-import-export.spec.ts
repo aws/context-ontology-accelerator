@@ -30,7 +30,5 @@ test.describe("metrics: OSI import/export", () => {
 
     // A new namespace has no metrics, so Export OSI is disabled.
     await expect(metricsPage.exportButton).toBeDisabled();
-
-    // Namespace teardown is handled by the fixture.
   });
 });

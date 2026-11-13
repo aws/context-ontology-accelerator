@@ -48,14 +48,6 @@ _CATALOG = {
     ]
 }
 
-# ── Fixtures for the cheap (names-only) catalog path ──────────────────────
-#
-# Existence and column lookups no longer go through read_approved_catalog: the
-# lookup indexes table NAMES from DataZone search pages and fetches ONE asset's
-# form when a caller actually needs its columns or review status. These build the
-# two seams that replaced it. `_CATALOG` above is still used by
-# data_source_exists, which keeps the full read.
-
 # What read_asset_names_for_datasource returns: table name (lower) → asset id.
 _NAMES = {"orders": "asset-orders"}
 
@@ -248,10 +240,7 @@ class TestSmusCatalogDataSourceLookup:
 
     @patch("coa_metrics.lookups.read_asset_names_for_datasource")
     def test_catalog_available_false_on_read_failure(self, mock_names):
-        """#161: table_exists() fails OPEN (False) on a read failure, so it
-        cannot distinguish 'absent' from 'unknown'. catalog_available() is the
-        signal that makes absence provable — without it a hard sourceTable
-        block would reject valid metrics whenever the catalog is down."""
+        """table_exists() fails open on a read failure, so catalog_available() must say the catalog is down."""
         mock_names.side_effect = RuntimeError("catalog down")
         lookup = _lookup()
 
@@ -301,16 +290,8 @@ class TestSmusCatalogDataSourceLookup:
 class TestSmusCatalogReadCost:
     """The cost of a lookup must not scale with the source's table count.
 
-    These assert CALL COUNTS, not results, because the defect they guard is
-    invisible in output. ``check_source_table_exists`` used to reach
-    ``read_approved_catalog``, which issues one ``get_asset_forms`` per asset. On
-    an 88-table source that measured 0.186s x 88 = 16s of DataZone round-trips,
-    and ``POST /metrics`` returned a 504 at API Gateway's 29s ceiling while every
-    assertion about the RESULT still passed (job 10909663; reproduced on demand at
-    29.74s and 29.93s against two namespaces, versus 10.65s for a 2-table source).
-
-    A regression here reads as latency, not as a wrong answer, so the only test
-    that catches it is one that counts the calls.
+    These assert call counts, not results: a regression shows up as latency, not
+    as a wrong answer.
     """
 
     @patch("coa_metrics.lookups.read_table_for_asset")
@@ -369,14 +350,7 @@ class TestSmusCatalogReadCost:
     @patch("coa_metrics.lookups.read_table_for_asset")
     @patch("coa_metrics.lookups.read_asset_names_for_datasource")
     def test_transient_asset_read_failure_stays_fail_open(self, mock_names, mock_asset):
-        """#161: a transient asset-form read error must NOT become provable absence.
-
-        The name index loaded fine, so ``catalog_available()`` would otherwise stay
-        True while ``table_exists`` returned False — making a valid, approved table
-        look provably absent (a hard 400). The failure must instead flip
-        ``catalog_available()`` to False (degrading to the soft warning) and must
-        not be cached, so a later lookup retries once the service recovers.
-        """
+        """A transient asset read failure must flip catalog_available() to False and not be cached."""
         mock_names.return_value = _NAMES
         mock_asset.side_effect = RuntimeError("datazone down")
         lookup = _lookup()

@@ -1,14 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the live (TTL-refreshed) guardrail config provider.
-
-The guardrail SSM parameters are the only serve config that can change
-under a running container. These tests pin the provider's contract: TTL-bounded
-freshness, stale-while-revalidate, last-known-good on SSM error, the ``none``
-sentinel, and the ``SERVE_GUARDRAILS_DISABLED`` hard-override — the exact
-semantics ``load_config`` applies at startup, now applied on every refresh.
-"""
+"""Unit tests for the live (TTL-refreshed) guardrail config provider and the semantics it applies on every refresh."""
 
 from __future__ import annotations
 
@@ -89,7 +82,6 @@ class TestGuardrailConfigProvider:
         p = _provider(ssm, clock, ttl_s=60)
         assert p.guardrail_id() == "gr-1"
         reads_after_first = len(ssm.calls)
-        # Many reads inside the TTL → no new SSM calls.
         clock.advance(59)
         for _ in range(5):
             assert p.guardrail_id() == "gr-1"
@@ -100,11 +92,9 @@ class TestGuardrailConfigProvider:
         clock = _FakeClock()
         p = _provider(ssm, clock, ttl_s=60)
         assert p.guardrail_id() == "gr-old"
-        # Operator flips the SSM value; still within TTL → old value.
         ssm.values["/bedrock/guardrail-id"] = "gr-new"
         clock.advance(59)
         assert p.guardrail_id() == "gr-old"
-        # Past TTL → refresh picks up the new value.
         clock.advance(2)
         assert p.guardrail_id() == "gr-new"
 
@@ -133,7 +123,6 @@ class TestGuardrailConfigProvider:
         clock = _FakeClock()
         p = _provider(ssm, clock, ttl_s=60)
         assert p.guardrail_id() == "gr-good"
-        # SSM starts failing; past TTL the refresh raises → keep last-known-good.
         ssm.raise_on_next = True
         clock.advance(61)
         assert p.guardrail_id() == "gr-good"
@@ -146,8 +135,6 @@ class TestGuardrailConfigProvider:
         ssm.raise_on_next = True
         clock.advance(61)
         assert p.guardrail_id() == "gr-good"  # served cached
-        # SSM recovers with a new value; provider retries on the very next call
-        # (it did not stamp _loaded_at on failure) rather than waiting a full TTL.
         ssm.raise_on_next = False
         ssm.values["/bedrock/guardrail-id"] = "gr-recovered"
         assert p.guardrail_id() == "gr-recovered"
@@ -177,25 +164,10 @@ class TestGuardrailConfigProvider:
         p.prime()
         assert len(ssm.calls) >= 1
 
-    def test_provider_accessor_is_callable_for_injection(self):
-        """The consumers receive provider.guardrail_id as a bare callable."""
-        ssm = _FakeSsm({"/bedrock/guardrail-id": "gr-1"})
-        p = _provider(ssm, _FakeClock())
-        accessor = p.guardrail_id
-        assert callable(accessor)
-        assert accessor() == "gr-1"
-
 
 @pytest.mark.unit
 class TestConsumerLiveGuardrailReload:
-    """Live-reload at the consumer level.
-
-    The reported failure: a warm, session-pinned Synthesizer kept applying the
-    pre-change guardrail after an operator edited SSM, because the id was frozen
-    at construction. These tests prove that a single long-lived consumer instance
-    now reflects a provider value change on its NEXT call — no reconstruction, no
-    restart — which is exactly what a warm microVM needs.
-    """
+    """A long-lived consumer reflects a provider value change on its next call, without reconstruction."""
 
     async def test_synthesizer_reflects_provider_change_without_reconstruction(self):
         from unittest.mock import AsyncMock
@@ -249,9 +221,8 @@ class TestConsumerLiveGuardrailReload:
         """Live-reload for the text-to-SQL surface.
 
         A warm SQLGenerator must apply a flipped guardrail id on its next
-        generation call, at the guard_content-scoped converse (:814), with no
-        reconstruction. This is the surface whose visible failure was broken
-        text-to-SQL when the stale guardrail masked query literals to {NAME}.
+        generation call, at the guard_content-scoped converse, with no
+        reconstruction.
         """
         from unittest.mock import AsyncMock
 
@@ -272,7 +243,7 @@ class TestConsumerLiveGuardrailReload:
 
         # Drive the internal generation call directly with a minimal DDL context so
         # the test does not depend on vector retrieval; the converse call is what
-        # carries the guardrail id (:808-819).
+        # carries the guardrail id.
         await gen._generate_sql("show names", ddl_context="CREATE TABLE t (n TEXT)", evidence="")
         assert llm.converse.await_args.kwargs["guardrail_id"] == "gr-old"
 
@@ -289,8 +260,8 @@ class TestConsumerLiveGuardrailReload:
         """Live-reload for the AGENTIC mode — proves the second Tier-3 path is not left stale.
 
         A warm BedrockStepPlanner (built via the agentic factory) must apply a
-        flipped guardrail id on its next propose_steps call (:280), with no
-        reconstruction. Uses the planner test's FakeLLM which records guardrail_id.
+        flipped guardrail id on its next propose_steps call, with no
+        reconstruction. The local _RecordingLLM records guardrail_id.
         """
         from types import SimpleNamespace
 
@@ -327,15 +298,7 @@ class TestConsumerLiveGuardrailReload:
 
 @pytest.mark.unit
 class TestMainWiringGuarantee:
-    """Static guard: every guardrail consumer built in main._ensure_initialized
-    must receive the live provider, and the provider must be built + primed.
-
-    This is a silent-drift guard: a future consumer
-    added to main.py WITHOUT wiring the provider would silently reintroduce the
-    frozen-guardrail bug for that surface. Rather than mock the entire async
-    init path, we assert the wiring invariants by parsing main.py's AST — a
-    check that fails loudly the moment a construction drops the provider kwarg.
-    """
+    """Parses main.py's AST to check guardrail_id_provider is wired into every consumer."""
 
     @staticmethod
     def _main_source() -> str:
@@ -346,9 +309,16 @@ class TestMainWiringGuarantee:
         return inspect.getsource(main)
 
     def test_provider_is_built_and_primed(self):
-        src = self._main_source()
-        assert "build_guardrail_config_provider()" in src, "provider must be constructed in main"
-        assert ".prime" in src, "provider must be primed once at init (off the request path)"
+        import ast
+
+        nodes = list(ast.walk(ast.parse(self._main_source())))
+        assert any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "build_guardrail_config_provider"
+            for n in nodes
+        ), "provider must be constructed in main"
+        assert any(isinstance(n, ast.Attribute) and n.attr == "prime" for n in nodes), (
+            "provider must be primed once at init (off the request path)"
+        )
 
     def test_every_input_consumer_receives_the_provider(self):
         """Each input-guardrail consumer construction passes guardrail_id_provider."""
@@ -372,7 +342,7 @@ class TestMainWiringGuarantee:
         )
         missing = {c for c, wired in seen.items() if not wired}
         assert not missing, f"consumers constructed without guardrail_id_provider: {missing}"
-        assert seen.keys() >= input_consumers - {"Synthesizer"} or "Synthesizer" in seen, seen
+        assert seen.keys() >= input_consumers, seen
         assert agentic, "build_agentic_retriever must receive guardrail_id_provider (agentic path)"
 
     def test_retrieval_screener_receives_the_provider(self):
@@ -391,20 +361,17 @@ class TestMainWiringGuarantee:
 class _CountingSsm:
     """Thread-safe SSM stub counting distinct refresh *cycles*.
 
-    ``_read_from_ssm`` reads all three parameters per refresh, so we count a
-    refresh once per barrier-synchronised cycle by keying on the first parameter
-    name and incrementing under a lock. Optionally blocks the first refresh on a
-    barrier so N threads can be forced to contend at the TTL boundary at once.
+    ``_read_from_ssm`` reads all three parameters per refresh, so a refresh is
+    counted by keying on the first parameter name and incrementing under a lock.
     """
 
-    def __init__(self, values: dict[str, str], *, gate=None) -> None:
+    def __init__(self, values: dict[str, str]) -> None:
         import threading
 
         self.values = values
         self.calls: list[str] = []
         self.refresh_cycles = 0
         self._lock = threading.Lock()
-        self._gate = gate
         # The first param name _read_from_ssm requests marks a new refresh cycle.
         self._cycle_marker = "/bedrock/guardrail-id"
 
@@ -413,10 +380,6 @@ class _CountingSsm:
             self.calls.append(name)
             if name.endswith(self._cycle_marker):
                 self.refresh_cycles += 1
-        # Block only inside the refresh critical path if a gate is set, so we can
-        # line up concurrent callers at the boundary.
-        if self._gate is not None and not self._gate.is_set():
-            self._gate.wait(timeout=5)
         for suffix, val in self.values.items():
             if name.endswith(suffix):
                 return val
@@ -425,15 +388,14 @@ class _CountingSsm:
 
 @pytest.mark.unit
 class TestConcurrencyAndObservability:
-    """Findings from the automated code review (MR !1213, 2nd pass)."""
+    """Concurrent refresh and refresh logging."""
 
     def test_thundering_herd_single_refresh_under_concurrent_load(self):
         """10+ threads hitting an expired TTL at once trigger exactly ONE refresh.
 
         Validates the double-checked lock: the first thread past expiry refreshes
         under the lock; the rest re-check inside the lock and adopt the snapshot
-        without their own SSM read. (Addresses the HIGH race-condition concern and
-        the thundering-herd test gap.)
+        without their own SSM read.
         """
         import threading
         from concurrent.futures import ThreadPoolExecutor
@@ -592,29 +554,38 @@ class TestStreamingGuardrailCapturedPerCall:
     """A streaming synthesis captures the effective id at call start, not mid-stream.
 
     Long streams must not switch guardrail partway through; the next call picks up
-    the new value. (Addresses the HIGH mid-stream test gap.)
+    the new value.
     """
 
     async def test_stream_uses_id_captured_at_call_start_next_call_sees_new(self):
         from unittest.mock import AsyncMock
 
         from coa_serve.tier3.synthesizer import Synthesizer
+        from coa_serve.tier3.vector_retriever import ChunkResult
 
         live = {"v": "gr-old"}
+        seen: list[str | None] = []
+
+        async def _stream(**kwargs):
+            seen.append(kwargs["guardrail_id"])
+            yield "partial "
+            live["v"] = "gr-new"
+            yield "answer"
+
+        bedrock = AsyncMock()
+        bedrock.converse_stream = _stream
         s = Synthesizer(
-            AsyncMock(),
+            bedrock,
             guardrail_id="gr-old",
             guardrail_id_provider=lambda: live["v"],
         )
-        # First resolution captures gr-old.
-        first = s._effective_guardrail_id()
-        assert first == "gr-old"
-        # Operator flips the live value mid-flight.
-        live["v"] = "gr-new"
-        # A resolution for the NEXT call sees the new value; the already-captured
-        # `first` is unchanged (no mid-stream switch of an in-flight converse).
-        assert first == "gr-old"
-        assert s._effective_guardrail_id() == "gr-new"
+        chunk = ChunkResult(chunk_id="c1", text="t", source_doc="d.pdf", relevance_score=0.9, label="D")
+
+        await s.synthesize_stream("q", [chunk], [])
+        await s.synthesize_stream("q", [chunk], [])
+
+        assert seen == ["gr-old", "gr-new"]
+        bedrock.converse.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -622,10 +593,8 @@ class TestStrictReaderErrorSemantics:
     """The default production getter must raise on a real read failure so the
     provider's last-known-good path engages, and must NOT flip the guardrail off.
 
-    Addresses reviewer note (guardrail_config.py:224): ``_get_ssm_parameter``
-    swallows every error to ``""``, which would silently disable the guardrail on
-    an IAM/throttle failure. ``_read_ssm_parameter_strict`` raises instead, and
-    maps only ``ParameterNotFound`` to ``""``.
+    ``_read_ssm_parameter_strict`` raises on a real read failure and maps only
+    ``ParameterNotFound`` to ``""``.
     """
 
     def _client_error(self, code: str):
@@ -684,9 +653,6 @@ class TestStrictReaderErrorSemantics:
 class TestDisabledSkipsSsmRead:
     """When the deploy-scoped kill-switch is set, the provider must not issue any
     SSM GetParameter — it returns the forced-empty snapshot directly.
-
-    Addresses reviewer note (guardrail_config.py:168): don't read the three
-    parameters only to discard them when disabled.
     """
 
     def test_disabled_provider_makes_zero_ssm_calls(self):

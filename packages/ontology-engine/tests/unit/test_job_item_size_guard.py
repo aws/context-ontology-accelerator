@@ -1,20 +1,16 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Write-site regression guard: the induction Store/completed DDB writes must
-never carry an unbounded per-table list inline (DynamoDB 400 KB item cap, #8).
+"""The induction Store/completed DDB writes must never carry an unbounded
+per-table list inline (DynamoDB 400 KB item cap).
 
-``7522b2c0`` offloaded the ``datasources`` manifest to S3; this pins BOTH that
-fix AND its sibling ``novel_tables`` (dropped to a scalar count) by driving the
-REAL ``_run_induction`` and asserting on the exact kwargs the production code
-hands ``create_proposal`` / ``update_job_status``. Re-adding any inline blob at
-a write site turns these RED — unlike a hand-built-dict size check, which stays
-green even if the write site regresses (the tautology this file replaces).
+Drives the real ``_run_induction`` and asserts on the kwargs it hands
+``create_proposal`` / ``update_job_status``: the ``datasources`` manifest is
+offloaded to S3 and ``novel_tables`` is a scalar count.
 """
 
 from __future__ import annotations
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -171,16 +167,7 @@ def test_create_proposal_drops_novel_tables_keeps_count(captured_writes):
 
 
 def test_datasources_offloaded_not_inline_at_write_site(captured_writes):
-    """Finding #3 regression lock for the 7522b2c0 datasources offload: the real
-    write site must pass the S3 key, never the inline manifest."""
+    """The real write site must pass the S3 key, never the inline manifest."""
     call = _datasources_call(captured_writes)
     assert "datasources" not in call.kwargs, "datasources manifest must be offloaded to S3, not written inline"
     assert "datasources_s3_key" in call.kwargs
-
-
-def test_would_be_inline_novel_tables_list_exceeds_ddb_scalar_budget():
-    """Bug premise: at 20k tables the sorted list is a six-figure byte blob while
-    the count is a handful of bytes — this is why the count-only write is safe."""
-    big_list = sorted(f"schema.novel_table_{i:05d}" for i in range(20000))
-    assert len(json.dumps(big_list).encode("utf-8")) > 300_000
-    assert len(json.dumps(len(big_list)).encode("utf-8")) < 10

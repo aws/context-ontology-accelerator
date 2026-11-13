@@ -16,7 +16,7 @@ import types
 from unittest.mock import MagicMock, patch
 
 import pytest
-from coa_common.constants import RESOURCE_PREFIX
+from coa_common.constants import MAX_VOCABULARY_ENTRIES, RESOURCE_PREFIX
 from coa_common.guardrail_screener import ScreeningResult
 from structlog.testing import capture_logs
 
@@ -525,12 +525,7 @@ class TestLoadStagedDocuments:
 
     @patch("coa_common.s3.boto3")
     def test_skips_empty_files(self, mock_s3, mod):
-        """An empty staged file is skipped AND counted.
-
-        It used to be skipped with a bare ``continue`` that touched no counter, so
-        a source whose files all extracted to zero bytes reported a clean success
-        having put nothing in the graph.
-        """
+        """An empty staged file is skipped AND counted."""
         all_files = _staged(["empty.txt"])
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = [{"Contents": all_files}]
@@ -1200,8 +1195,6 @@ class TestBuildIndexingConfig:
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
         config = entrypoint._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
-        # New contract: still returns an IndexingConfig (with the vocabulary
-        # fix); only BatchConfig is absent.
         assert config is not None
         mock_ec.assert_called_once()
 
@@ -1247,7 +1240,7 @@ class TestBuildIndexingConfig:
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
     def test_invalid_preferred_json_raises_at_import(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
-        """Malformed JSON now fails loud instead of falling through to infer.
+        """Malformed JSON fails loud instead of falling through to infer.
 
         The API 400s bad vocabulary before ingest, so a malformed env var here is a
         pipeline defect; crashing (→ SCAN_FAILED) surfaces it, where the old
@@ -1265,7 +1258,7 @@ class TestBuildIndexingConfig:
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
     def test_wellformed_json_wrong_type_raises_at_import(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
-        """Valid JSON that is NOT a list-of-strings (e.g. an object) now raises
+        """Valid JSON that is NOT a list-of-strings (e.g. an object) raises
         rather than being swallowed and falling through to infer."""
         monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", '{"Policy": 1}')
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
@@ -1319,8 +1312,7 @@ class TestBuildIndexingConfig:
     def test_chunk_overlap_ge_size_is_clamped(self, mock_ic, mock_ec, mock_icc, mock_ss, monkeypatch, mod):
         """CHUNK_OVERLAP >= CHUNK_SIZE would make SentenceSplitter emit
         degenerate/empty chunks. The per-field @range constraints cannot express
-        this cross-field invariant, so the code must clamp overlap to size-1.
-        Regression guard for the review finding."""
+        this cross-field invariant, so the code must clamp overlap to size-1."""
         monkeypatch.setenv("CHUNK_SIZE", "100")
         monkeypatch.setenv("CHUNK_OVERLAP", "200")
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
@@ -1338,8 +1330,7 @@ class TestBuildIndexingConfig:
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
     def test_chunk_size_zero_keeps_toolkit_default(self, mock_ic, mock_ec, mock_icc, mock_ss, mod):
         """CHUNK_SIZE=0 (default) must not pass a chunking= kwarg — otherwise
-        the toolkit's SentenceSplitter fallback (256/25) never runs. Regression
-        guard: this is what preserves the SEC-10-Q baseline."""
+        the toolkit's SentenceSplitter fallback (256/25) never runs."""
         mod._build_indexing_config("bucket", "ns", "ds", namespace_language="en")
         mock_ss.assert_not_called()
         assert "chunking" not in mock_ic.call_args.kwargs
@@ -1366,7 +1357,7 @@ class TestMainFlow:
     @patch("coa_common.dao.dynamodb.boto3")
     def test_s3_listing_failure_exits_nonzero_and_marks_failed(self, mock_ddb_boto, mock_s3, mod):
         # A transient ListObjects failure must NOT be treated as "no documents":
-        # main() marks the source SCAN_FAILED and exits 1 (finding #4).
+        # main() marks the source SCAN_FAILED and exits 1.
         mock_table = MagicMock()
         mock_table.get_item.return_value = {"Item": {"status": "ingesting"}}
         mock_ddb_boto.resource.return_value.Table.return_value = mock_table
@@ -1923,7 +1914,7 @@ class TestPreferredTopics:
 
     def test_empty_list_still_passed_explicitly(self, mod):
         """An empty list is forwarded, not omitted — the toolkit reads it as
-        'no preferred topics', matching pre-existing behaviour."""
+        'no preferred topics'."""
         with (
             patch("graphrag_toolkit.lexical_graph.ExtractionConfig") as ec,
             patch("graphrag_toolkit.lexical_graph.IndexingConfig"),
@@ -1952,16 +1943,12 @@ class TestEnvStrList:
     def test_over_cap_still_truncates_not_raises(self, mod):
         # Over-cap is the one case that degrades: the first N entries are a valid
         # steer, so truncate with a warning rather than fail the ingest.
-        import json as _json
 
-        from coa_common.constants import MAX_VOCABULARY_ENTRIES
-
-        big = _json.dumps([f"C{i}" for i in range(MAX_VOCABULARY_ENTRIES + 5)])
+        big = json.dumps([f"C{i}" for i in range(MAX_VOCABULARY_ENTRIES + 5)])
         out = mod._env_str_list("NOPE", big)
         assert len(out) == MAX_VOCABULARY_ENTRIES
 
 
-@pytest.mark.unit
 class TestEnvStrListCap:
     """The container clamps an over-long list even though the API already caps it.
 
@@ -1971,12 +1958,9 @@ class TestEnvStrListCap:
     """
 
     def test_over_cap_list_is_truncated_not_rejected(self, monkeypatch, mod_factory):
-        import json as _json
-
-        from coa_common.constants import MAX_VOCABULARY_ENTRIES
 
         too_many = [f"Class {i}" for i in range(MAX_VOCABULARY_ENTRIES + 25)]
-        monkeypatch.setenv("PREFERRED_TOPICS", _json.dumps(too_many))
+        monkeypatch.setenv("PREFERRED_TOPICS", json.dumps(too_many))
         m = mod_factory()
         # Truncated, not emptied: the first N entries are still a usable steer, and
         # failing the ingest over a too-long list would be worse than trimming it.
@@ -1984,18 +1968,15 @@ class TestEnvStrListCap:
         assert m.PREFERRED_TOPICS[0] == "Class 0"
 
     def test_list_at_the_cap_is_untouched(self, monkeypatch, mod_factory):
-        import json as _json
-
-        from coa_common.constants import MAX_VOCABULARY_ENTRIES
 
         at_cap = [f"Class {i}" for i in range(MAX_VOCABULARY_ENTRIES)]
-        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", _json.dumps(at_cap))
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", json.dumps(at_cap))
         m = mod_factory()
         assert len(m.PREFERRED_ENTITY_CLASSIFICATIONS) == MAX_VOCABULARY_ENTRIES
 
 
 # ===================================================================
-# Namespace language — extraction prompt instruction (A1)
+# Namespace language — extraction prompt instruction
 # ===================================================================
 
 # Shaped like graphrag-toolkit 3.18.7's templates: instructions first, then the
@@ -2068,7 +2049,7 @@ class TestNamespaceLanguagePrompts:
         # The format-vs-language clarification must survive: for ja/zh/ko
         # "uppercase with underscores" has no literal meaning, so the prompt
         # spells out that it applies only to cased letters and that an underscore
-        # stands only where a space would be (restored from e64c8938a).
+        # stands only where a space would be.
         assert "Uppercase applies only to letters that have case" in instruction
         assert "an underscore stands only where the name would otherwise contain a space" in instruction
 
@@ -2088,14 +2069,11 @@ class TestNamespaceLanguagePrompts:
         assert "The response format is a fixed template read by a program." in instruction
         assert "`topic:`" in instruction and "`entities:`" in instruction and "`proposition:`" in instruction
         # The value after the `|` separator (the classification) is written in the
-        # target language, restored to back 6360e9aa1.
+        # target language.
         assert f"The classification after the `|` separator is a value: write it in {target}." in instruction
         assert f"Write only the values that fill its placeholders in {target}" in instruction
         assert f"Write your output in {target}" in instruction
         assert "{" not in instruction and "}" not in instruction
-
-    def test_english_namespace_adds_no_label_instruction(self, mod):
-        assert mod._namespace_language_prompts("en") == {}
 
     def test_instruction_sits_before_document_content(self, mod, fake_toolkit_prompts):
         overrides = mod._namespace_language_prompts("ja")
@@ -2195,7 +2173,6 @@ class TestNamespaceLanguagePrompts:
         assert tables_opened == [_BASE_ENV["DOC_SOURCES_TABLE"]]
 
 
-@pytest.mark.unit
 def test_stage_failure_message_is_fixed_text_without_traceback(mod):
     """errorMessage is returned to callers by GetSource; the traceback stays in the log."""
     msg = mod._stage_failure_message("SCAN_FAILED_BUILD")

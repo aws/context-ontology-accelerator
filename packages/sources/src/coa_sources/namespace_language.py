@@ -3,8 +3,7 @@
 
 """Namespace language for source processing.
 
-The namespace owns one immutable language (see
-``internal-docs/adrs/namespace-language-adr.md``). Sources never carry their own:
+The namespace owns one immutable language. Sources never carry their own:
 
 * the Sources API resolves it from the namespace item after namespace
   authorization, once, when a scan or ingestion job is triggered, and puts the
@@ -15,10 +14,6 @@ The namespace owns one immutable language (see
 A missing namespace item or a failed read is an error, never an English
 default. Only an item that exists without a ``language`` attribute (a namespace
 created before the field existed) reads as ``en``.
-
-The prompt helpers :func:`needs_language_instruction` and
-:func:`describe_language` live in ``coa_common.language_tags``; they are
-re-exported here for existing imports.
 """
 
 from __future__ import annotations
@@ -29,17 +24,13 @@ from coa_common.dao import DynamoDBDAO
 from coa_common.language_tags import (
     LanguageTagError,
     canonicalize_language_tag,
-    describe_language,
     effective_namespace_language,
-    needs_language_instruction,
 )
 
 __all__ = [
     "NAMESPACE_LANGUAGE_ENV",
     "NamespaceNotFoundError",
-    "describe_language",
     "namespace_language_from_item",
-    "needs_language_instruction",
     "require_language_snapshot",
     "resolve_namespace_language",
 ]
