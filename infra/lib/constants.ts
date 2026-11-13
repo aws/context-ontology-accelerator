@@ -13,7 +13,6 @@ export {
   DEFAULT_GRAPH_BASE_URI,
   DEFAULT_URN_PREFIX,
   DEFAULT_VOCAB_PREFIX,
-  DEFAULT_EVENT_SOURCE_PREFIX,
   DEFAULT_DZ_TYPE_PREFIX,
   BRAND,
   CONNECTOR_TAG_KEY,
@@ -65,24 +64,6 @@ export const DEFAULT_ADMIN_EMAIL = "nobody@amazon.com";
 /** Default admin role name for claim mappings. */
 export const DEFAULT_ADMIN_ROLE = "platform-admin";
 
-// ────────────────────────────────────────────────────────────────────────────
-// Ingestion pipeline constants (subset used by CDK)
-// IngestionStatus and DEFAULT_MAX_FILE_SIZE_MB are also in constants.py
-// ────────────────────────────────────────────────────────────────────────────
-
-/** Status values stored in the doc_sources DynamoDB table. */
-export const IngestionStatus = {
-  PENDING: "pending",
-  INGESTING: "ingesting",
-  COMPLETED: "completed",
-  FAILED: "failed",
-  DELETING: "deleting",
-  DELETE_FAILED: "delete_failed",
-} as const;
-
-export type IngestionStatusType =
-  (typeof IngestionStatus)[keyof typeof IngestionStatus];
-
 /** Unified SourceStatus — used by SourcesStack pipeline and API. */
 export const SourceStatus = {
   REGISTERED: "REGISTERED",
@@ -105,10 +86,6 @@ export const ExtractionMode = {
 
 /** Default per-file size limit in MB for the preprocessing Lambda. */
 export const DEFAULT_MAX_FILE_SIZE_MB = 200;
-
-// ────────────────────────────────────────────────────────────────────────────
-// API Gateway request throttling
-// ────────────────────────────────────────────────────────────────────────────
 
 /**
  * Stage-wide default request throttle applied to every method via the
@@ -170,10 +147,6 @@ export const EXPENSIVE_API_OPERATIONS: ReadonlyArray<{
     path: "/namespaces/{namespaceId}/proposals/{proposalId}/accept",
   },
 ];
-
-// ────────────────────────────────────────────────────────────────────────────
-// WAF rate-based (per-IP) throttling
-// ────────────────────────────────────────────────────────────────────────────
 
 /**
  * Default WAF rate-based rule limit: max requests per rolling 5-minute window

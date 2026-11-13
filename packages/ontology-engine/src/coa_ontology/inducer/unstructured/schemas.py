@@ -1,29 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pydantic schemas for the unstructured ontology induction API.
-
-This module defines three Pydantic models:
-
-- :class:`UnstructuredInductionRequest` — the HTTP request body accepted
-  by ``POST /induce/unstructured/``. All fields are JSON-serializable.
-- :class:`UnstructuredInductionConfig` — the pipeline-internal config
-  consumed by :class:`UnstructuredInductionPipeline.run`. Carries the
-  already-constructed lexical store and Bedrock / LLM clients (so the
-  orchestrator does not need to know how to build them).
-- :class:`UnstructuredInductionReport` — the result returned by the
-  pipeline. Mirrors the structured side's ``InductionReport`` shape plus
-  unstructured-specific counts.
-
-The split between request and config exists so the router can convert
-HTTP input → already-constructed clients before invoking the pipeline,
-keeping the orchestrator decoupled from AWS-client construction (and
-unit-testable with mocks).
-
-References:
-    Requirements 4.1, 4.2, 4.3, 4.5 of
-    ``.kiro/specs/unstructured-ontology-induction-api/requirements.md``.
-"""
+"""Pydantic request, pipeline-config and report schemas for unstructured ontology induction."""
 
 from __future__ import annotations
 
@@ -35,10 +13,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from coa_ontology.bedrock_embeddings import BedrockEmbeddingClient
 
-# Imported at runtime (not under TYPE_CHECKING) because it is used as a
-# Pydantic field annotation on UnstructuredInductionConfig — Pydantic must
-# resolve the type at class-build time. No import cycle: grounding.py does
-# not import this module.
+# Imported at runtime (not under TYPE_CHECKING): Pydantic resolves field
+# annotations at class-build time.
 from coa_ontology.inducer.services.grounding import GroundingService
 from coa_ontology.inducer.unstructured.services.description_generator import (
     LLMDescriptionClient,
@@ -96,8 +72,7 @@ class UnstructuredInductionRequest(BaseModel):
     # Foundational grounding (mirrors the structured table_to_ontology
     # path): when grounding_ontology_ids is non-empty, induced classes are
     # grounded against those loaded ontologies via GroundingService.
-    # Empty / None → no foundational grounding (all-novel), matching the
-    # pre-grounding behavior. grounding_mode is ENHANCED (LLM rerank) or
+    # Empty / None → no foundational grounding (all-novel). grounding_mode is ENHANCED (LLM rerank) or
     # STANDARD (embedding-only); ignored when no ontologies are selected.
     grounding_ontology_ids: list[str] | None = None
     grounding_mode: str = "ENHANCED"
@@ -106,9 +81,7 @@ class UnstructuredInductionRequest(BaseModel):
     # its JSON answer (the rerank then fails loud naming this knob). Bounds
     # mirror the Smithy RerankMaxTokens @range(min: 1, max: 8192).
     rerank_max_tokens: int = Field(default=1000, ge=1, le=8192)
-    # entailment_enabled is always treated as False in v0; the field
-    # exists so the API contract is forward-compatible with the planned
-    # entailment engine (parent spec Task 13).
+    # Reserved for a future entailment stage; treated as False in v0.
     entailment_enabled: bool = False
 
     @field_validator("ontology_uri_prefix")
@@ -158,11 +131,7 @@ class UnstructuredInductionConfig(BaseModel):
     embedding_client: BedrockEmbeddingClient
     description_llm: LLMDescriptionClient
     iri_resolver: IRIResolver
-    # Optional grounding service. Built by the router from the app config's
-    # ontology_catalog_url + embedding_generator_url. None → grounding is
-    # skipped entirely (the pipeline behaves as it did pre-grounding). Kept
-    # optional so existing unit tests that build a config without grounding
-    # keep working unchanged.
+    # None → grounding is skipped.
     grounding_service: GroundingService | None = None
 
 
@@ -176,8 +145,8 @@ class UnstructuredInductionReport(BaseModel):
 
     The ``subclassAxiomCount``, ``equivalenceAxiomCount``, and
     ``disjointnessAxiomCount`` fields are always 0 in v0 because the
-    entailment stage is a pass-through (Requirement 9.2). ``warnings``
-    surfaces the v0 limitations from Requirement 10.3 to the client.
+    entailment stage is a pass-through. ``warnings`` surfaces the v0
+    limitations to the client.
     """
 
     pipeline_run_id: str  # uuid; equal to job_id at the router level
@@ -199,13 +168,8 @@ class UnstructuredInductionReport(BaseModel):
     # matched. Distinct from closeMatchAxiomCount, which also counts the
     # within-run class↔class dedupe links from Rule 1.
     foundationalGroundedCount: int = 0
-    # Per-class grounding ConceptMatch records (one per class that produced
-    # recall candidates, chosen or not). Persisted by the router as the
-    # proposal's metadata.matches (→ matches.json) so the review UI shows the
-    # candidate count and powers the manual grounding-override editor, exactly
-    # like structured proposals. Empty when grounding is disabled.
-    # Typed as list[dict] (model_dump of ConceptMatch) to keep the report
-    # JSON-serializable without importing the inducer schema here.
+    # ConceptMatch.model_dump() per class with recall candidates; persisted as
+    # the proposal's metadata.matches for the review UI and override editor.
     groundingMatches: list[dict] = []
 
     description_mode: str

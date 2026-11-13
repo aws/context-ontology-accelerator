@@ -1,14 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for scan.py — the AWS Security Agent code-review driver.
-
-The emphasis is the failure paths, because the job that runs this fires at 22:00 on
-weeknights with nobody watching: a silent wrong answer is worse here than a crash.
-Specifically covered are the four things that were wrong before this suite existed —
-the bucket ARN, the un-repointed reused review, the `.github` exclusion, and the
-dangling symlink — plus the page bound, which cannot be exercised any other way.
-"""
+"""Unit tests for scan.py, the AWS Security Agent code-review driver."""
 
 from __future__ import annotations
 
@@ -148,8 +141,7 @@ class TestBuildZip:
     def test_skips_cache_dirs_but_keeps_dotgithub(self, tmp_path: Path) -> None:
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "app.py").write_text("x")
-        # `.github` was excluded by the old `'/.git' in root` substring test — the
-        # exact files a security review most wants to read.
+        # `.github` and `.gitlab` must be kept.
         (tmp_path / ".github" / "workflows").mkdir(parents=True)
         (tmp_path / ".github" / "workflows" / "pr.yml").write_text("x")
         (tmp_path / ".gitlab" / "issue_templates").mkdir(parents=True)
@@ -183,16 +175,11 @@ class TestBuildZip:
         assert zipfile.ZipFile(dest).namelist() == ["real.txt"]
 
     def test_dest_inside_root_is_not_self_included(self, tmp_path: Path) -> None:
-        (tmp_path / "a.txt").write_text("x")
+        (tmp_path / "a.txt").write_text("hello")
         dest = tmp_path / "out.zip"
         count = scan.build_zip(str(dest), str(tmp_path))
         assert count == 1
         assert zipfile.ZipFile(dest).namelist() == ["a.txt"]
-
-    def test_produces_a_readable_archive(self, tmp_path: Path) -> None:
-        (tmp_path / "a.txt").write_text("hello")
-        dest = tmp_path / "out.zip"
-        scan.build_zip(str(dest), str(tmp_path))
         assert zipfile.ZipFile(dest).read("a.txt") == b"hello"
 
 

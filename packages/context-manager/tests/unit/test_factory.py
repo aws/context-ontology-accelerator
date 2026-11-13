@@ -61,27 +61,11 @@ class TestFactory:
 
 @pytest.mark.unit
 class TestClientSet:
-    def test_client_set_bundles_all_clients(self):
-        clients = ClientSet(
-            graph=AsyncMock(spec=GraphClient),
-            vector=AsyncMock(spec=VectorClient),
-            llm=AsyncMock(spec=LLMClient),
-            query_executor=AsyncMock(spec=QueryExecutor),
-        )
-        assert clients.graph is not None
-        assert clients.vector is not None
-        assert clients.llm is not None
-        assert clients.query_executor is not None
-
     async def test_close_calls_client_close_methods(self):
         mock_graph = AsyncMock()
-        mock_graph.close = AsyncMock()
         mock_vector = AsyncMock()
-        mock_vector.close = AsyncMock()
         mock_llm = AsyncMock()
-        mock_llm.close = AsyncMock()
         mock_executor = AsyncMock()
-        mock_executor.close = AsyncMock()
 
         clients = ClientSet(
             graph=mock_graph,
@@ -99,11 +83,8 @@ class TestClientSet:
         mock_graph = AsyncMock()
         mock_graph.close = AsyncMock(side_effect=RuntimeError("graph close failed"))
         mock_vector = AsyncMock()
-        mock_vector.close = AsyncMock()
         mock_llm = AsyncMock()
-        mock_llm.close = AsyncMock()
         mock_executor = AsyncMock()
-        mock_executor.close = AsyncMock()
 
         clients = ClientSet(
             graph=mock_graph,

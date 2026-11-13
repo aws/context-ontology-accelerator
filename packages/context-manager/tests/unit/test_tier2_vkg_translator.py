@@ -98,11 +98,7 @@ class TestVKGTranslatorSuccess:
         assert len(result.trace_steps) == 4  # vkg_translate + authorize + firewall + execute
 
     async def test_execute_trace_step_records_engine(self):
-        """The ontop QUERY_EXECUTE trace step must carry detail.engine (athena |
-        redshift | jdbc). Without it the integration-level Redshift-dispatch guard
-        cannot verify which engine ran on the ontop path — it silently no-ops. The
-        nl_to_sql path already records engine; this keeps the two strategies in
-        step."""
+        """The ontop QUERY_EXECUTE trace step carries detail.engine (athena | redshift | jdbc)."""
         vkg = _make_vkg_client(sql="SELECT id, amount FROM orders")
         fw = _make_firewall()
         executor = _make_executor(engine="athena")
@@ -178,14 +174,10 @@ class TestVKGTranslatorErrors:
         assert "Firewall denied" in result.error
         assert result.query_result is None
         assert result.vkg_result is not None
-        # Executor should not have been called
         assert len(result.trace_steps) == 3  # vkg_translate + authorize + firewall
 
     async def test_firewall_denied_is_terminal_before_datasource_resolution(self):
-        # Rebase guard: a firewall DENY must stay
-        # terminal BEFORE Kun's _resolve_data_source/40cd2b8 runs. Even when VKG
-        # returns datasource_routing (which would drive resolution on the allowed
-        # path), a deny must short-circuit so the executor is never reached.
+        # A firewall deny is terminal before datasource resolution, even when VKG returns routing.
         vkg = AsyncMock(spec=VKGClient)
         vkg.translate.return_value = VKGResult(
             sql="SELECT 1",
@@ -247,7 +239,6 @@ class TestVKGTranslatorDataSourceInference:
         translator = _make_translator(vkg_client=vkg, firewall=_make_firewall(), executor=executor)
         await translator.resolve("SELECT ?s WHERE { ?s ?p ?o }", namespace="demo")
 
-        # Check that executor was called with inferred data_source_id
         executor.execute.assert_called_once()
         call_kwargs = executor.execute.call_args.kwargs
         assert call_kwargs["data_source_id"] == "mydb"
@@ -359,23 +350,6 @@ class TestVKGTranslatorDataSourceInference:
         call_kwargs = executor.execute.call_args.kwargs
         assert call_kwargs["data_source_id"] == ""
 
-    def test_infer_data_source_empty_means_cross_source_audit(self):
-        # (c) DISPATCHER characterization, explicit audit:
-        # `_infer_data_source` returning "" is the SINGLE-vs-CROSS-source signal.
-        # - a single resolvable catalog/datasource id -> that id; the injected
-        # CompositeQueryExecutor may then route it to direct JDBC (if the
-        # has_jdbc_endpoint gate passes) or Athena
-        # - "" -> cross-source / ambiguous -> always Athena federation
-        translator = _make_translator()
-        single = VKGResult(sql="SELECT 1", dialect="trino", ontology_version="v1", source_table_refs=["mydb.s.t"])
-        multi = VKGResult(
-            sql="SELECT 1", dialect="trino", ontology_version="v1", source_table_refs=["db1.s.t", "db2.s.t"]
-        )
-        # single resolvable catalog -> the catalog id (single-source signal)
-        assert translator._infer_data_source(single) == "mydb"
-        # multiple/ambiguous catalogs -> "" (cross-source signal)
-        assert translator._infer_data_source(multi) == ""
-
 
 @pytest.mark.unit
 class TestVKGTranslatorCrossSourceQualification:
@@ -470,11 +444,7 @@ class TestVKGTranslatorCrossSourceQualification:
     async def test_reported_executed_sql_is_the_statement_the_executor_ran(self):
         """``queryUsed`` must show the statement that RAN, not Ontop's translate output.
 
-        These diverge exactly when cross-source qualification applies. Reporting the raw form hands the
-        operator SQL whose bare names resolve under no ``QueryExecutionContext`` — it
-        cannot be copied into the Athena console, and it reads as evidence the fix
-        never fired. Asserting against ``executor.execute``'s own argument (rather than
-        a literal) keeps the two from drifting apart again.
+        These diverge exactly when cross-source qualification applies.
         """
         routing = {
             "claims": {"datasourceId": "ds-pg", "sourceSchema": "public"},

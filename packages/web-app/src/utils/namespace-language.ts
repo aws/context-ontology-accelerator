@@ -5,8 +5,8 @@ import type { AppMessage } from "../i18n/appMessages";
 
 /**
  * Namespace languages the console offers at creation. The API accepts any tag
- * in the `language[-Script][-REGION]` subset, but the console only advertises
- * the languages exercised by product UAT (namespace-language LLD §2.2.2).
+ * in the `language[-Script][-REGION]` subset, but the console only offers the
+ * languages it has been tested with.
  */
 export type NamespaceLanguage = "en" | "ja";
 

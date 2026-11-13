@@ -38,10 +38,6 @@ class SSEEmitter:
     Orchestrator callbacks (on_step, on_token) push events to an internal
     asyncio.Queue. The ``stream()`` async generator drains the queue and
     yields event dicts for the @app.entrypoint to yield.
-
-    Args:
-        request_id: Correlation ID included in every event envelope.
-        session_id: Optional AgentCore session ID (included when active).
     """
 
     def __init__(self, request_id: str, session_id: str | None = None) -> None:
@@ -78,7 +74,7 @@ class SSEEmitter:
         if self._closed:
             return
         serialized = step.model_dump(by_alias=True, exclude_none=True)
-        # Match WS StreamingEventEmitter wire format: "stepName" not "step"
+        # The frontend reducer expects "stepName", not "step"
         if "step" in serialized:
             serialized["stepName"] = serialized.pop("step")
         self._queue.put_nowait(self._make_envelope("step", serialized))

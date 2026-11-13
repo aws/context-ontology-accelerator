@@ -3,25 +3,13 @@
 
 """Batch serialization must not fail on models that forbid ``temperature``.
 
-On graphrag <=3.19.1 ``batch_inference_utils.get_request_body`` read
-``inference_parameters['temperature']`` unconditionally, but llama_index drops
-``temperature`` for ``BEDROCK_NO_TEMP_MODELS`` (the default extraction model,
-``claude-sonnet-5``, is one), so the serializer raised ``KeyError('temperature')``
-once a worker reached the Bedrock batch minimum.
+graphrag 3.20.0 no longer reads ``temperature`` unconditionally in
+``get_request_body``; the COA patch is kept as defense in depth, and the tests
+below flip back to asserting a raise if a future toolkit reintroduces the read.
 
-graphrag 3.20.0 rewrote ``get_request_body`` to delegate to per-model providers
-(``_resolve_batch_model_provider(...).build_request(...)``) and no longer reads
-``temperature`` unconditionally, so the unpatched binding no longer raises. The
-COA patch is retained as defense-in-depth (and the tests below document the
-upstream fix); if a future toolkit reintroduces the unconditional read, the
-documentation tests flip back to asserting a raise and the patch does real work
-again.
-
-The two batch extractors import ``get_request_body`` into their OWN namespace and
-call it from ``_get_json``, and extraction runs in spawn-started workers that
-re-import the toolkit fresh — so the patch must reach every binding and re-apply
-in each worker. These tests drive the extractor-module bindings and a real spawn
-worker, not just the utility function. Skipped where the toolkit is absent.
+The two batch extractors import ``get_request_body`` into their own namespace and
+run in spawn-started workers, so these tests drive the extractor-module bindings
+and a real spawn worker. Skipped where the toolkit is absent.
 """
 
 from __future__ import annotations
@@ -59,15 +47,7 @@ _EXTRACTOR_MODULES = (
 
 
 def _spawn_probe_extractor_serializer() -> dict:
-    """Runs in a SPAWN worker: prove the patch re-applies in a fresh interpreter.
-
-    Module-level (picklable) so ProcessPoolExecutor/spawn can import it. A fresh
-    spawn worker re-imports the toolkit unpatched, so the extractor's
-    ``get_request_body`` binding starts unwrapped and gains the
-    ``_coa_no_temp_wrapped`` marker only once the patch runs. graphrag 3.20.0
-    already omits ``temperature`` in the unpatched binding, so the marker — not
-    the absence of temperature — is what proves the patch reached the worker.
-    """
+    """Runs in a SPAWN worker: prove the patch re-applies in a fresh interpreter."""
     import importlib
 
     from coa_sources.documents.kg_build import batch_patches
@@ -110,18 +90,9 @@ def restore_toolkit_bindings():
 
 class TestBatchRequestBodyBindings:
     def test_upstream_extractor_binding_omits_temperature_for_no_temp_model(self, restore_toolkit_bindings):
-        """graphrag 3.20.0 fixed the gap upstream: the extractor's OWN
-        get_request_body (not just the utils one) no longer raises for sonnet-5
-        and omits ``temperature`` from the serialized body. On <=3.19.1 this read
-        ``temperature`` unconditionally and raised ``KeyError``. If a future
-        toolkit reintroduces that read this assertion flips back to a raise,
-        signalling the patch is load-bearing again.
-
-        This must exercise the RAW upstream binding, not the COA wrapper (which
-        also omits temperature and would pass either way). The not-wrapped
-        assertion guards that, and the ``restore_toolkit_bindings`` fixture keeps
-        the global binding from leaking in or out of this test regardless of
-        order."""
+        """The extractor's raw upstream get_request_body omits ``temperature`` for
+        sonnet-5 (fixed in graphrag 3.20.0). Must exercise the unwrapped binding, which
+        the not-wrapped assertion guards."""
         import importlib
 
         topic = importlib.import_module(_EXTRACTOR_MODULES[0])
@@ -198,13 +169,9 @@ class TestBatchWorkerInit:
         assert getattr(topic.get_request_body, "_coa_no_temp_wrapped", False)
 
     def test_patch_applies_inside_a_spawned_worker(self, restore_toolkit_bindings):
-        """A freshly spawned worker re-imports the toolkit fresh (spawn workers do
-        not inherit the parent's patched globals), so the patch must take hold
-        there too. graphrag 3.20.0 already omits temperature in the unpatched
-        binding, so the proof that the patch reached the worker is the
-        ``_coa_no_temp_wrapped`` marker appearing only after the patch runs — not
-        the absence of temperature, which would pass even if the patch never
-        executed."""
+        """A spawn worker re-imports the toolkit fresh, so the patch must take hold
+        there too. The ``_coa_no_temp_wrapped`` marker, not the absence of temperature,
+        proves it did."""
         ctx = multiprocessing.get_context("spawn")
         with ctx.Pool(processes=1) as pool:
             result = pool.apply(_spawn_probe_extractor_serializer)

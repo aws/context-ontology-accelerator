@@ -20,8 +20,3 @@ export const E2E_PREFIX = "e2e";
 export function uniqueName(area: string, workerIndex: number): string {
   return `${E2E_PREFIX}-${area}-${Date.now()}-${workerIndex}`;
 }
-
-/** True when a name was created by the E2E suite. */
-export function isE2EName(name: string): boolean {
-  return name.startsWith(`${E2E_PREFIX}-`);
-}

@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The display-only metric ``label`` (#1259, contract #1295) on every write and read path.
+"""The display-only metric ``label`` on every write and read path.
 
 Covers the value rules (API and OSI YAML alike), ValidateMetric/CreateMetric
 agreement, storage on ``vocab#displayLabel``, the update full-replace, the OSI
@@ -249,9 +249,6 @@ def _import(content: str) -> tuple[dict[str, Any], MagicMock]:
         return import_handler(event, None), neptune.return_value
 
 
-# ── The value rules ─────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize("value", REJECTED.values(), ids=REJECTED.keys())
 def test_check_metric_label_rejects_without_echoing_the_value(value: str) -> None:
     message = contract.check_metric_label(value)
@@ -319,9 +316,6 @@ def test_every_rejected_format_character_is_rejected(code_point: int) -> None:
 @pytest.mark.parametrize("code_point", [0x200C, 0x200D, 0x200E, 0x200F, 0x061C], ids=lambda cp: f"U+{cp:04X}")
 def test_allowed_format_characters_are_accepted(code_point: int) -> None:
     assert contract.check_metric_label(f"売上{chr(code_point)}合計") is None
-
-
-# ── API: create, validate, update ───────────────────────────────────────
 
 
 @pytest.mark.parametrize(("value", "message"), REJECTED_BY_MODEL.values(), ids=REJECTED_BY_MODEL.keys())
@@ -485,9 +479,6 @@ def test_metric_to_dict_includes_label_only_when_set() -> None:
     assert "label" not in _metric_to_dict(_definition())
 
 
-# ── Storage ─────────────────────────────────────────────────────────────
-
-
 def test_label_is_stored_on_display_label_never_on_rdfs_or_skos() -> None:
     triples = MetricNeptuneClient()._build_triples("test-ns", _definition("売上合計"))
     rdfs_labels = [t for t in triples if f"<{RDFS}label>" in t]
@@ -547,9 +538,6 @@ def test_label_is_not_in_the_embedding_text() -> None:
     text = _build_embedding_text(_definition(f"{_MARK}売上合計"))
     assert _MARK not in text
     assert "売上合計" not in text
-
-
-# ── OSI import (YAML path) ──────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("value", REJECTED.values(), ids=REJECTED.keys())
@@ -636,9 +624,6 @@ def test_worker_overwrite_warning_mentions_a_cleared_label_only_when_cleared() -
     assert "label was cleared" in cleared
     assert _MARK not in cleared
     assert "label" not in kept
-
-
-# ── OSI round trip, through the async worker's plan payload ─────────────
 
 
 def _round_trip_document(metric: MetricDefinition) -> OsiDocument:

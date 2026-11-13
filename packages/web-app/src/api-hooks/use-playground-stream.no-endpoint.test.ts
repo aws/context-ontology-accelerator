@@ -10,10 +10,6 @@ import {
 
 const OIDC = { authority: "https://idp.example.test", clientId: "c" };
 
-/**
- * With no query endpoint, submit returned silently, so the
- * Playground showed "Resolving query" forever. It must end the request with a visible error.
- */
 describe("usePlaygroundStream without a query service", () => {
   it.each([
     ["no query endpoint", undefined, OIDC, "r1", "r1"],

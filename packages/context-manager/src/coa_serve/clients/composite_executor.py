@@ -4,7 +4,7 @@
 """Composite Query Executor — single-vs-cross-source dispatch.
 
 Implements the ``QueryExecutor`` protocol by routing each query to the
-cheapest correct engine, per Serve LLD §2.2.1 Option D:
+cheapest correct engine:
 
 - **single-source, JDBC-backed** → ``SourceDBQueryExecutor`` (direct asyncpg,
   ~20-50ms p50)
@@ -12,17 +12,13 @@ cheapest correct engine, per Serve LLD §2.2.1 Option D:
   ~500-800ms p50)
 
 The routing decision reuses the SQL Firewall's AST table extraction
-(``SQLFirewall.extract_tables``) rather than re-parsing — exactly the
-``unique_catalogs(...)`` heuristic the architecture note describes.
+(``SQLFirewall.extract_tables``) rather than re-parsing.
 
-Graceful degradation (MVP safety): the direct-JDBC executor is OPTIONAL. When
-it is not configured (no ``DATA_SOURCES_TABLE``, or it failed to build), the
-composite delegates EVERY query to Athena — i.e. it behaves exactly like the
-deployed Athena-only path. Wiring the composite therefore never regresses the
-current behaviour; it only ADDS the direct-JDBC fast path when that executor is
-available. Authorization is unchanged — both underlying executors run the SQL
-Firewall ``validate()`` themselves, and data-level ``evaluate()`` already ran in
-the caller (Tier-1 orchestrator / Tier-2 VKGTranslator) before dispatch.
+The direct-JDBC executor is optional: when it is not configured (no
+``DATA_SOURCES_TABLE``, or it failed to build), the composite delegates every
+query to Athena. Both underlying executors run the SQL Firewall ``validate()``
+themselves, and data-level ``evaluate()`` already ran in the caller (Tier-1
+orchestrator / Tier-2 VKGTranslator) before dispatch.
 """
 
 from __future__ import annotations
@@ -41,17 +37,7 @@ logger = structlog.get_logger(__name__)
 
 
 class CompositeQueryExecutor:
-    """Routes SQL to a direct-JDBC or Athena executor by source cardinality.
-
-    Args:
-        athena_executor: Cross-source / federation executor. Always required —
-            it is the fallback for every case the JDBC path cannot serve.
-        source_db_executor: Optional single-source direct-JDBC executor. When
-            ``None``, every query goes to Athena (deployed Athena-only behaviour).
-        firewall: SQL Firewall used only for its AST ``extract_tables`` helper
-            (table/catalog extraction for the routing decision). Defaults to a
-            fresh instance; no authorization state is held here.
-    """
+    """Routes SQL to a direct-JDBC or Athena executor by source cardinality."""
 
     def __init__(
         self,
@@ -77,17 +63,8 @@ class CompositeQueryExecutor:
         self._athena = athena_executor
         self._source_db = source_db_executor
         self._firewall = firewall or SQLFirewall()
-        # Optional registry used ONLY for the has_jdbc_endpoint gate:
-        # confirm a candidate single source is direct-JDBC capable before routing
-        # to the JDBC executor. NOTE: get_source() is NOT cached today, so this
-        # adds one DDB GetItem on the JDBC-candidate path (single-source + explicit
-        # id only; cross-source/no-id queries skip it). A cached source-metadata
-        # read is a tracked follow-up if this lookup shows up in latency.
+        # Optional registry used only for the has_jdbc_endpoint gate.
         self._sources = sources_registry
-        # Optional Redshift Serverless executor for Glue/Iceberg sources that opt
-        # into Redshift execution (queryEngine=REDSHIFT). When None, such
-        # sources fall through to Athena — i.e. the deployed Athena-only behaviour
-        # is never regressed; this only ADDS the Redshift path when wired.
         self._redshift = redshift_executor
 
     async def execute(
@@ -159,31 +136,16 @@ class CompositeQueryExecutor:
         # belt-and-braces guard against a stale queryEngine value on the record.
         use_jdbc = is_jdbc_candidate and jdbc_source is not None and self._engine_has_direct_route(jdbc_source)
         if use_jdbc:
-            # VKG translates to Trino dialect; re-transpile to the source engine's
-            # dialect for direct JDBC. Redshift and PostgreSQL diverge on
-            # constructs sqlglot rewrites differently (date arithmetic ->
-            # DATEADD vs INTERVAL, TRY_CAST, type-name normalization); a
-            # postgres-target transpile produces SQL Redshift rejects.
-            # Dialect is derived from the ALREADY-fetched source record (no 2nd lookup).
-            # sqlglot.transpile is fast (~μs per statement) — no need for run_in_executor.
+            # Re-transpile VKG's Trino SQL to the source engine's dialect (see
+            # _target_dialect_for_source).
             target_dialect = self._target_dialect_for_source(jdbc_source)
             try:
                 transpiled_sql = sqlglot.transpile(sql, read="trino", write=target_dialect, identify=False)[0]
             except sqlglot.errors.SqlglotError as exc:
-                # Catch transpilation failures specifically (parse/unsupported/optimize)
-                # — a genuine bug (AttributeError, etc.) must surface, not be silently
-                # rerouted to Athena. Mirrors base.inject_limit's SqlglotError handling.
-                #
-                # `sql` here is post-substitution (contains caller-supplied
-                # dimension values — potential PII). Log length only, not the
-                # statement; mirrors the orchestrator's SQL-log discipline. The
-                # sqlglot error message echoes a SQL snippet, so log its type only.
-                #
-                # Do NOT forward the untranspiled Trino SQL to the JDBC engine:
-                # Trino-only constructs run with different (silently wrong) semantics
-                # on MySQL/Postgres, and a Trino `LIMIT` is invalid T-SQL. Fall back
-                # to Athena, which executes Trino SQL natively — the same safe path
-                # taken when no JDBC executor is configured.
+                # Catch transpilation failures specifically; a genuine bug must
+                # surface. `sql` is post-substitution (potential PII), so log its
+                # length and the error type only. Never forward untranspiled Trino
+                # SQL to the JDBC engine: fall back to Athena, which runs it natively.
                 logger.warning(
                     "jdbc_trino_transpile_failed_fallback_athena",
                     target_dialect=target_dialect,
@@ -234,20 +196,10 @@ class CompositeQueryExecutor:
         # target source is confirmed Redshift-capable — otherwise falls through to
         # Athena (deployed default). Uses the same data_source_id the Athena path
         # would; the Redshift executor rewrites to `awsdatacatalog` 3-part names.
-        #
-        # Guard (mirrors the sole-JDBC guard above): SQL spanning MORE THAN ONE
-        # catalog cannot run on Redshift. Redshift reaches Glue via Spectrum
-        # (`awsdatacatalog` only) and cannot address an Athena federated connector
-        # catalog at all, so a cross-catalog statement must go to Athena — even
-        # when the namespace's sole DATABASE source is Redshift-routed (possible
-        # when the query's other source is Glue/S3, which is not a DATABASE source).
         catalogs, has_bare_table = self._catalog_analysis(sql)
-        # Keep off Redshift anything it cannot address: >=2 distinct catalogs (a
-        # federated Athena catalog is unreachable via Spectrum, which sees only
-        # awsdatacatalog), AND a bare table mixed with a catalog-qualified one —
-        # that mix is ambiguous exactly as it is for the JDBC path
-        # (_select_jdbc_candidate), so it must fall through to Athena rather than
-        # run on Redshift against a guessed catalog. Both go to Athena federation.
+        # Keep off Redshift anything it cannot address: Spectrum sees only
+        # awsdatacatalog, so >=2 distinct catalogs go to Athena, as does a bare
+        # table mixed with a catalog-qualified one (ambiguous, as for the JDBC path).
         redshift_addressable = len(catalogs) < 2 and not (has_bare_table and catalogs)
         if self._redshift is not None and redshift_addressable:
             redshift_source_id = await self._resolve_redshift_source(namespace, data_source_id)
@@ -261,10 +213,8 @@ class CompositeQueryExecutor:
                     max_rows=max_rows,
                     timeout_seconds=timeout_seconds,
                 )
-        # AthenaQueryExecutor.execute() takes NO ``params`` kwarg (it never used
-        # bind params — federation SQL is fully materialized). Forwarding params
-        # here would TypeError, so omit it — this keeps the Athena call shape
-        # bit-for-bit identical to the previously-deployed direct-Athena wiring.
+        # AthenaQueryExecutor.execute() takes no ``params`` kwarg (federation SQL is
+        # fully materialized).
         logger.info("composite_dispatch", route="athena_federation", data_source_id=data_source_id or "")
         return await self._athena.execute(
             sql,
@@ -357,7 +307,7 @@ class CompositeQueryExecutor:
             return len(catalogs) == 0
         # No bare tables and ≤1 catalog: single-source, JDBC-eligible. This is the
         # 3-part-single-catalog case AND the 2-part schema.table case (catalogs is
-        # empty for the latter, which must NOT disqualify it — see the cross-source review).
+        # empty for the latter, which must NOT disqualify it).
         return True
 
     async def _fetch_jdbc_source(self, namespace: str, data_source_id: str) -> dict[str, Any] | None:
@@ -414,13 +364,10 @@ class CompositeQueryExecutor:
         tightened to "unknown engine → no direct route" without rerouting those
         sources to Athena.
 
-        The consequence for a sub-type whose configuration has no ``engine`` member
-        at all — a connector-backed one such as ``DATABRICKS_SQL_WAREHOUSE`` — is
-        that this would answer True for it. It is never asked: the caller only
-        reaches here with a record ``_fetch_jdbc_source`` returned, and that gate
-        requires ``queryEngine == "JDBC"``, which those sub-types never carry (they
-        resolve ATHENA and are served through federation). The two guards are
-        therefore ordered deliberately, and the ordering is pinned by a test.
+        A connector-backed sub-type with no ``engine`` member would answer True,
+        but never reaches here: ``_fetch_jdbc_source`` requires
+        ``queryEngine == "JDBC"``, which those sub-types never carry (pinned by a
+        test).
         """
         if not source or self._sources is None:
             return False
@@ -444,11 +391,7 @@ class CompositeQueryExecutor:
         never drift on the engine->dialect mapping. The source engine lives in the
         ``configuration`` JSON blob under the ``engine`` key. FAILS SAFE to
         ``"postgres"`` (the PostgreSQL adapter) for a missing source or an unknown
-        engine — preserving the previous behavior for every non-mapped source.
-
-        Takes the source dict the caller ALREADY fetched (via _fetch_jdbc_source or
-        _resolve_sole_jdbc_source) so the JDBC fast path performs exactly ONE
-        ``get_source`` DDB lookup, not two.
+        engine.
         """
         if not source or self._sources is None:
             return "postgres"
@@ -564,9 +507,7 @@ class CompositeQueryExecutor:
         """Resolve the sqlglot dialect for NL→SQL generation from the namespace sources.
 
         Returns the target SQL dialect that should be used for LLM SQL generation,
-        matching the dialect the composite executor will use for execution. This
-        ensures the SQL the LLM generates is in the correct dialect for the target
-        engine, avoiding transpilation errors and dialect mismatches.
+        matching the dialect the composite executor will use for execution.
 
         Args:
             namespace: The namespace to resolve sources for.
@@ -582,18 +523,15 @@ class CompositeQueryExecutor:
         if not self._sources:
             return "athena"
 
-        # Explicit source ID provided — fetch it and derive dialect
         if data_source_id and data_source_id != "default":
             source = await self._fetch_jdbc_source(namespace, data_source_id)
             if source:
                 return self._target_dialect_for_source(source)
 
-        # No explicit source or it didn't resolve — try sole-source resolution
         _, sole_source = await self._resolve_sole_jdbc_source(namespace)
         if sole_source:
             return self._target_dialect_for_source(sole_source)
 
-        # Multiple sources or no JDBC sources → federated Athena/Trino
         return "athena"
 
     async def resolve_table_placements(
@@ -621,7 +559,7 @@ class CompositeQueryExecutor:
         return await self._sources.same_name_databases(namespace, tables)
 
     async def health_check(self) -> dict[str, Any]:
-        """Aggregate the Athena (and JDBC, if present) executor health into one dict."""
+        """Aggregate the Athena, JDBC and Redshift executor health into one dict."""
         athena_health = await self._athena.health_check()
         health: dict[str, Any] = {"status": athena_health.get("status", "unknown"), "athena": athena_health}
         if self._source_db is not None:
@@ -631,7 +569,7 @@ class CompositeQueryExecutor:
         return health
 
     async def close(self) -> None:
-        """Close both wrapped executors, logging (not raising) any close errors."""
+        """Close the wrapped executors, logging (not raising) any close errors."""
         for executor in (self._athena, self._source_db, self._redshift):
             close_fn = getattr(executor, "close", None)
             if close_fn and callable(close_fn):

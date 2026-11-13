@@ -29,7 +29,10 @@ import type {
   MetricDialect,
 } from "../api-hooks/use-metrics";
 import type { TimeGrain, SqlDialect } from "@coa/control-plane-client";
-import { SqlDialect as SqlDialectEnum } from "@coa/control-plane-client";
+import {
+  SourceType,
+  SqlDialect as SqlDialectEnum,
+} from "@coa/control-plane-client";
 import { isMetricDefinitionWithheld } from "../api-hooks/metric-withheld";
 import { useListSources } from "../api-hooks/use-list-sources";
 import { useListSourceTables } from "../api-hooks/use-list-source-tables";
@@ -51,11 +54,8 @@ const DIALECT_OPTIONS: Array<{ value: SqlDialect; label: string }> = [
   { value: SqlDialectEnum.MYSQL, label: "MySQL" },
 ];
 
-// Legacy/imported metrics may store a mis-cased dialect (e.g. "redshift" from an
-// OSI import before the parser fix — see #140). The Select matches option values
-// case-sensitively, so normalize a loaded dialect to upper-case when it resolves
-// to a known option; otherwise leave it untouched so an unknown value is not
-// silently coerced to a valid one.
+// A stored dialect can be mis-cased, and the Select matches values case-sensitively:
+// upper-case a known dialect, and leave an unknown one untouched.
 const _DIALECT_VALUES: string[] = DIALECT_OPTIONS.map((o) => o.value);
 export const normalizeLoadedDialect = (raw: string): string => {
   if (!raw) return "";
@@ -138,11 +138,9 @@ export const MetricForm: React.FC = () => {
         })
       : undefined;
 
-  // Fetch sources for the data source dropdown
   const { data: sourcesData } = useListSources(
     namespaceId ?? "",
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    "DATABASE" as any,
+    SourceType.DATABASE,
   );
   const sourceOptions = useMemo(() => {
     const items = sourcesData?.pages.flatMap((p) => p.items ?? []) ?? [];
@@ -154,7 +152,6 @@ export const MetricForm: React.FC = () => {
       }));
   }, [sourcesData]);
 
-  // Fetch tables for the selected source
   const { data: tablesData, isFetching: tablesFetching } = useListSourceTables(
     namespaceId ?? "",
     dataSourceId,
@@ -175,9 +172,7 @@ export const MetricForm: React.FC = () => {
   const [instructions, setInstructions] = useState("");
   const [examples, setExamples] = useState<Array<{ value: string }>>([]);
   const [ontologyConcepts, setOntologyConcepts] = useState<string[]>([]);
-  // Whether the user added or removed a concept. On update an omitted
-  // `ontologyConcepts` keeps the stored list, so the field is sent only when
-  // the user changed it or the loaded metric carried it.
+  // Whether the user added or removed a concept.
   const [conceptsTouched, setConceptsTouched] = useState(false);
   const changeConcepts = (next: string[]) => {
     setConceptsTouched(true);
@@ -265,11 +260,7 @@ export const MetricForm: React.FC = () => {
       if (m.aiContext?.examples) {
         setExamples(m.aiContext.examples.map((e: string) => ({ value: e })));
       }
-      if ((existingData.metric as MetricDefinition).ontologyConcepts) {
-        setOntologyConcepts(
-          (existingData.metric as MetricDefinition).ontologyConcepts ?? [],
-        );
-      }
+      if (m.ontologyConcepts) setOntologyConcepts(m.ontologyConcepts);
     }
   }, [isEdit, existingData]);
 
@@ -348,10 +339,7 @@ export const MetricForm: React.FC = () => {
       }),
       ...(unit.trim() && { unit: unit.trim() }),
       ...(returnType.trim() && { returnType: returnType.trim() }),
-      // Sent untrimmed: the service normalizes it and decides which characters
-      // it accepts. A field that is only whitespace counts as blank, so it is
-      // left out, which clears the label, instead of reaching the service's
-      // "no visible character" check.
+      // Sent untrimmed; the service normalizes it.
       ...(label.trim() !== "" && { label }),
     };
 

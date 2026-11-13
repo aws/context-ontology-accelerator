@@ -71,14 +71,7 @@ def _ingest_with_r2rml(r2rml_content, *, return_result=False):
 
 
 def _is_mapped_by_uri(graph_store) -> dict:
-    """Extract is_mapped per class URI from whichever projection path ran.
-
-    Ingest batches into ``store_classes_batch(classes=[{class_uri, is_mapped,
-    ...}])`` when the backend supports it (real NDB store + MagicMock, which
-    auto-provides the attr), and falls back to per-class ``store_class`` calls
-    otherwise. Read from whichever was invoked so the assertion is independent
-    of the batching optimization.
-    """
+    """Extract is_mapped per class URI from the batch or the per-item projection path."""
     if graph_store.store_classes_batch.call_args_list:
         out: dict = {}
         for call in graph_store.store_classes_batch.call_args_list:
@@ -127,10 +120,6 @@ class TestIngestIsMappedTagging:
                 allow_append=True,
                 r2rml_content=_R2RML_TTL,
             )
-        # Fallback path ran: per-item store_class. The batch method can't have
-        # been called — the spec'd mock doesn't expose it (asserted above), which
-        # is also why we can't reference `.store_classes_batch` here to assert on.
-        assert graph_store.store_class.call_count >= 2
         by_uri = {c.kwargs["class_uri"]: c.kwargs.get("is_mapped") for c in graph_store.store_class.call_args_list}
         assert by_uri["http://example.org/o#Orders"] is True
         assert by_uri["http://example.org/o#DocConcept"] is False

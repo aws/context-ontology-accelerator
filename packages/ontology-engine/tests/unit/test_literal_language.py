@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compatibility vectors for ``languageTagCompatibilityV1`` (LLD section 2.2.4)."""
+"""Compatibility vectors for ``languageTagCompatibilityV1`` ."""
 
 from __future__ import annotations
 

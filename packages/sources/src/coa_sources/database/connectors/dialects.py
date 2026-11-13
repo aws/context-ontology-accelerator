@@ -60,11 +60,7 @@ _DEFAULT_PROBE_TIMEOUT_MS = 30_000  # 30 s — enough for healthy tables, fast-f
 def _positive_int_env(name: str, default: int) -> int:
     """Positive int from the environment, falling back to *default* on bad input.
 
-    Non-numeric, zero and negative all fall back and warn. Zero in particular
-    must NOT be honoured: for a timeout it would mean "expire immediately" and
-    for a row cap "read nothing", and for either the operator's intent is far
-    more likely a typo than a deliberate request to break sampling. Never raises,
-    so a misconfigured value cannot fail Lambda cold start.
+    Non-numeric, zero and negative values fall back with a warning; never raises.
     """
     raw = os.environ.get(name)
     if raw is None:
@@ -79,17 +75,10 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-# Session-level statement_timeout (ms) applied before the cardinality probe.
-# Bounds the COUNT / COUNT(DISTINCT …) query that was previously unbounded, so a
-# single wide column can no longer consume the entire 15-minute Lambda budget.
+# Per-statement timeout (ms) applied before the cardinality probe.
 PROBE_TIMEOUT_MS = _positive_int_env("PROBE_TIMEOUT_MS", _DEFAULT_PROBE_TIMEOUT_MS)
 
-# Max rows the cardinality probe may READ per column. The statement timeout above
-# bounds how long a probe may run; this bounds how much work it may do at all,
-# which is the difference between "a slow column is cut off" and "every column
-# costs O(cap) regardless of table size". Needed because a timeout only fires
-# once per statement: a table with 50 string columns could still spend 50 × the
-# timeout, and the engine-independent way to stop that is to stop scanning.
+# Max rows the cardinality probe reads per column.
 _DEFAULT_PROBE_MAX_ROWS = 100_000
 PROBE_MAX_ROWS = _positive_int_env("PROBE_MAX_ROWS", _DEFAULT_PROBE_MAX_ROWS)
 
@@ -97,16 +86,9 @@ PROBE_MAX_ROWS = _positive_int_env("PROBE_MAX_ROWS", _DEFAULT_PROBE_MAX_ROWS)
 def probe_gate_sql(q_col: str, q_from: str, where: str, *, row_cap: int, top_n: bool = False) -> str:
     """``COUNT(*)``/``COUNT(DISTINCT …)`` over at most *row_cap* rows.
 
-    The counts come from a row-capped subquery rather than the whole table, so
-    the probe's cost is bounded by the cap instead of by table size. Past the cap
-    both numbers describe a prefix of the table, not all of it — see
-    :func:`probe_values_sql` for why that stays self-consistent.
-
-    The prefix is whatever order the engine scans in (no ``ORDER BY``, which
-    would reintroduce a full sort). For enum detection that is acceptable: the
-    question is "does this column hold a small set of repeated labels", and a
-    100k-row sample answers it. The cost is that a rare value beyond the cap is
-    invisible, so a near-enum column can read as an enum.
+    Past the cap both counts describe a prefix in the engine's scan order (no
+    ``ORDER BY``), so a rare value beyond the cap is invisible and a near-enum
+    column can read as an enum.
 
     *top_n* selects ``SELECT TOP n`` for engines without ``LIMIT`` (SQL Server).
     """
@@ -121,12 +103,7 @@ def probe_gate_sql(q_col: str, q_from: str, where: str, *, row_cap: int, top_n: 
 def probe_values_sql(q_col: str, q_from: str, where: str, *, row_cap: int, limit: int, top_n: bool = False) -> str:
     """Up to *limit* distinct values, read from the same capped prefix as the gate.
 
-    The cap is applied here too, and that is the point: if the gate measured a
-    100k-row prefix but this query scanned the whole table, a column the gate
-    called low-cardinality could return values the gate never saw — and the
-    expensive full scan the cap exists to prevent would happen anyway, one
-    statement later. Both queries read the same prefix, so the values are always
-    the ones the gate's counts describe.
+    Both queries read the same prefix, so the values are the ones the gate's counts describe.
     """
     inner = (
         f"SELECT TOP {row_cap} {q_col} AS probe_col FROM {q_from} {where}"
@@ -180,15 +157,9 @@ def _run(conn: Any, sql: str, params: tuple[Any, ...] | Mapping[str, Any] = ()) 
         cursor.execute(sql, params)
         return cursor.fetchall() or []
     except Exception:
-        # Postgres-family engines abort the whole transaction on any statement
-        # error (SQLSTATE 25P02) and reject every later statement on the same
-        # connection until a rollback. discover_metadata() reuses ONE
-        # (autocommit=False) connection across the whole pass, and the _safe_*
-        # helpers swallow-and-log by design — so without this rollback a single
-        # incidental catalog-query error poisons the connection and every
-        # subsequent query fails with a misleading 25P02 (issue #129). Roll back
-        # at this single choke point so it covers every dialect. Guard the
-        # rollback itself so it can never mask the original error.
+        # Postgres-family engines reject every later statement on the connection
+        # after an error (SQLSTATE 25P02) until a rollback, and discovery reuses
+        # one autocommit=False connection. The rollback must not mask the error.
         try:
             conn.rollback()
         except Exception:
@@ -208,7 +179,7 @@ def _run_mappings(conn: Any, sql: str) -> list[dict[str, Any]]:
     names are lowercase; ``lower()`` is only a safeguard.
 
     Shares ``_run``'s rollback-on-error handling so a failed statement cannot
-    poison a reused (autocommit=False) connection for later queries (issue #129).
+    poison a reused (autocommit=False) connection for later queries.
     """
     cursor = conn.cursor()
     try:
@@ -244,67 +215,19 @@ class Dialect:
     identifier_quote: str = '"'
 
     def connect(self, *, host: str, port: int, database: str, user: str, password: str, options: dict | None = None):
-        """Open a DB-API connection to the engine.
-
-        Args:
-            host: Database host name.
-            port: TCP port to connect on.
-            database: Database (or service) name.
-            user: Login user name.
-            password: Login password.
-            options: Engine-specific extras (e.g. Snowflake ``warehouse``/``role``).
-
-        Returns:
-            An open DB-API connection.
-
-        Raises:
-            NotImplementedError: Always; subclasses must implement this.
-        """
+        """Open a DB-API connection; ``options`` carries engine extras (e.g. Snowflake ``warehouse``)."""
         raise NotImplementedError
 
     def list_schemas(self, conn: Any) -> list[str]:
-        """Return every schema name visible on the connection.
-
-        Args:
-            conn: An open DB-API connection.
-
-        Returns:
-            Schema names (unfiltered; system-schema filtering happens upstream).
-
-        Raises:
-            NotImplementedError: Always; subclasses must implement this.
-        """
+        """Return every schema name visible on the connection, unfiltered."""
         raise NotImplementedError
 
     def list_tables(self, conn: Any, schema: str) -> list[str]:
-        """Return the table and view names in a schema.
-
-        Args:
-            conn: An open DB-API connection.
-            schema: Schema to enumerate.
-
-        Returns:
-            Table/view names within ``schema``.
-
-        Raises:
-            NotImplementedError: Always; subclasses must implement this.
-        """
+        """Return the table and view names in a schema."""
         raise NotImplementedError
 
     def fetch_columns(self, conn: Any, schema: str, tables: list[str]) -> list[ColumnRow]:
-        """Return column metadata for the given tables.
-
-        Args:
-            conn: An open DB-API connection.
-            schema: Schema the tables live in.
-            tables: Table names to fetch columns for.
-
-        Returns:
-            ``(table, column, data_type, nullable)`` rows.
-
-        Raises:
-            NotImplementedError: Always; subclasses must implement this.
-        """
+        """Return ``(table, column, data_type, nullable)`` rows for the given tables."""
         raise NotImplementedError
 
     def fetch_constraints(self, conn: Any, schema: str, tables: list[str]) -> Constraints:
@@ -312,14 +235,6 @@ class Dialect:
 
         Default returns empty mappings; engines that expose key metadata override
         this.
-
-        Args:
-            conn: An open DB-API connection.
-            schema: Schema the tables live in.
-            tables: Table names to inspect.
-
-        Returns:
-            A ``(primary_keys, foreign_keys)`` pair keyed by table name.
         """
         return {}, {}
 
@@ -469,21 +384,10 @@ class InformationSchemaDialect(Dialect):
     ) -> dict[str, list[str]]:
         """Sample distinct values for low-cardinality *categorical* string columns.
 
-        Two-stage, per candidate column:
-
-        1. A cheap aggregate (``COUNT(*)`` / ``COUNT(DISTINCT col)`` over non-null,
-           non-empty values) decides whether the column looks like an enum. A
-           column is kept only when it has at least one distinct value, no more
-           than ``max_distinct`` distinct values, *and* meaningful repetition
-           (``total >= MIN_REPETITION_FACTOR * distinct`` — i.e. each value recurs
-           on average). The repetition test is what excludes unique identifiers:
-           a count-only cap misses them in *small* tables, where a fully-unique
-           id column (``distinct == total``) still has ≤ ``max_distinct`` values.
-        2. For columns that pass, one ``SELECT DISTINCT ... LIMIT max_distinct``
-           pulls the actual values.
-
-        Identifiers are quoted to prevent SQL injection (they originate from the
-        information_schema, not user input, but we quote defensively anyway).
+        A capped ``COUNT(*)``/``COUNT(DISTINCT)`` gate keeps a column with 1 to
+        ``max_distinct`` distinct values and ``total >= MIN_REPETITION_FACTOR * distinct``
+        (which excludes unique ids even in small tables); a second query then reads
+        the values. Identifiers are quoted defensively.
         """
         result: dict[str, list[str]] = {}
         q = self.identifier_quote
@@ -502,10 +406,6 @@ class InformationSchemaDialect(Dialect):
                 if not count_rows:
                     continue
                 total, distinct = int(count_rows[0][0] or 0), int(count_rows[0][1] or 0)
-                # Enum-like: bounded distinct set with average per-value repetition.
-                # Excludes unique-identifier columns (distinct ≈ total) regardless
-                # of table size. Both numbers describe the capped prefix, so the
-                # ratio test is unchanged in meaning — it just runs on a sample.
                 if not (1 <= distinct <= max_distinct and total >= MIN_REPETITION_FACTOR * distinct):
                     continue
                 rows = _run(
@@ -520,9 +420,6 @@ class InformationSchemaDialect(Dialect):
                     ),
                 )
                 values = [str(r[0])[:100] for r in rows if r[0] is not None]
-                # VALUE-SHAPE backstop: drop free-text columns that pass the
-                # cardinality gate (long / sentence-like values are not enum
-                # labels, e.g. a low-cardinality "comment" column).
                 if values and values_look_categorical(values):
                     result[col] = values
             except Exception as exc:
@@ -539,7 +436,6 @@ class InformationSchemaDialect(Dialect):
                     )
                 else:
                     logger.debug("distinct_values failed for column %r in %s.%s", col, schema, table, exc_info=True)
-                continue
         return result
 
 
@@ -631,10 +527,6 @@ class RedshiftDialect(PostgresDialect):
     unreliable and commonly returns **no rows**, so schemas are listed from
     ``pg_catalog.pg_namespace`` instead (which Redshift populates correctly).
 
-    Redshift's ``information_schema`` also lacks ``position_in_unique_constraint``
-    which breaks the ANSI FK discovery query. FK constraints are therefore
-    discovered via ``pg_constraint`` + ``pg_attribute`` (Redshift's pg_catalog).
-
     The system-schema exclude also covers Redshift's extra internal schemas
     (``pg_internal``, ``pg_auto_copy``, ``pg_automv``, ``pg_mv``, ``pg_s3``,
     ``catalog_history``, …) so only real user schemas (e.g. ``public``) remain.
@@ -660,7 +552,6 @@ class RedshiftDialect(PostgresDialect):
         placeholders = ", ".join(["%s"] * len(tables))
         params = (schema, *tables)
 
-        # Primary keys
         pk: dict[str, list[str]] = {}
         for table_name, column_name in _run(
             conn,
@@ -676,7 +567,6 @@ class RedshiftDialect(PostgresDialect):
         ):
             pk.setdefault(table_name, []).append(column_name)
 
-        # Foreign keys
         fk: dict[str, list[tuple[str, str, str]]] = {}
         for fk_table, fk_col, ref_table, ref_col in _run(
             conn,
@@ -705,7 +595,7 @@ class RedshiftDialect(PostgresDialect):
         the default output for many dbt models) never populate
         ``information_schema.columns``: the column list is resolved at query time,
         so the inherited query returns zero rows for them with no error, and the
-        view shows up with 0 columns (issue #134). Any requested table that comes
+        view shows up with 0 columns. Any requested table that comes
         back with no columns is retried through ``pg_get_late_binding_view_cols()``,
         Redshift's own introspection for these views.
 
@@ -730,7 +620,6 @@ class RedshiftDialect(PostgresDialect):
             "ORDER BY viewname, columnnum",
             (schema, *missing),
         )
-        # pg_get_late_binding_view_cols has no is_nullable -> default nullable=True.
         rows.extend((v, c, dt or "unknown", True) for (v, c, dt) in late_rows)
         return rows
 
@@ -741,8 +630,6 @@ class MySqlDialect(InformationSchemaDialect):
     engines = frozenset({"MYSQL"})
     default_port = 3306
     system_schema_pattern = r"^(information_schema|mysql|performance_schema|sys)$"
-    # MySQL/MariaDB quote identifiers with backticks; "x" is a string literal
-    # under the default sql_mode. Enum-value sampling would otherwise fail.
     identifier_quote = "`"
 
     def connect(self, *, host, port, database, user, password, options=None):
@@ -757,8 +644,6 @@ class MySqlDialect(InformationSchemaDialect):
 
     def fetch_constraints(self, conn: Any, schema: str, tables: list[str]) -> Constraints:
         """Discover PK/FK constraints from ``KEY_COLUMN_USAGE`` (MySQL has no constraint_column_usage)."""
-        # MySQL has no information_schema.constraint_column_usage; FK targets are
-        # on KEY_COLUMN_USAGE itself (referenced_table_name/_column_name).
         if not tables:
             return {}, {}
         placeholders = ", ".join(["%s"] * len(tables))
@@ -829,7 +714,6 @@ class SqlServerDialect(InformationSchemaDialect):
 
         return pytds.connect(server=host, port=port, database=database, user=user, password=password)
 
-    # SQL Server has no LIMIT clause — row-limiting uses SELECT TOP N.
     row_limit_uses_top = True
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
@@ -958,7 +842,7 @@ class SnowflakeDialect(InformationSchemaDialect):
     Snowflake DOES expose PK/FK metadata, but not through the ANSI
     ``information_schema.key_column_usage`` view the base dialect uses (that view
     does not exist in Snowflake). ``fetch_constraints`` is overridden to read PK/FK
-    from ``SHOW PRIMARY KEYS`` / ``SHOW IMPORTED KEYS`` instead (see #191).
+    from ``SHOW PRIMARY KEYS`` / ``SHOW IMPORTED KEYS`` instead.
     """
 
     engines = frozenset({"SNOWFLAKE"})
@@ -993,14 +877,12 @@ class SnowflakeDialect(InformationSchemaDialect):
         )
 
     def probe_timeout_statements(self) -> Sequence[str]:
-        """Session-level statement timeout bounding the cardinality probe (GH-219).
+        """Session-level statement timeout bounding the cardinality probe.
 
         Snowflake's equivalent of Postgres' ``statement_timeout`` is the session
         parameter ``STATEMENT_TIMEOUT_IN_SECONDS`` (a SECONDS value, not ms), so
         a single hung probe query is cut off rather than running toward the
-        Lambda's 15-minute limit. Without this override Snowflake inherited the
-        base no-op — GH-131 only bounded the Postgres family, which is exactly
-        the gap GH-219 reports (a 99-table Snowflake source timing out).
+        Lambda's 15-minute limit.
 
         ``max(1, …)``: ``PROBE_TIMEOUT_MS`` under 1000 ms floors to 0 s, and
         Snowflake reads 0 as *no timeout* — the opposite of the intent — so we
@@ -1053,7 +935,7 @@ class SnowflakeDialect(InformationSchemaDialect):
         ``information_schema.key_column_usage``, a view that does not exist in
         Snowflake, so it raises and ``_safe_constraints`` swallows it, leaving the
         scan reporting success with empty PK/FK — losing deterministic constraints
-        that would otherwise seed relationship inference (#191).
+        that would otherwise seed relationship inference.
 
         ``SHOW PRIMARY KEYS`` / ``SHOW IMPORTED KEYS`` run under any role with
         USAGE + SELECT on the schema. Their output columns are service-defined, so
@@ -1084,12 +966,8 @@ class SnowflakeDialect(InformationSchemaDialect):
         # it passed in, so a key that differs in case would silently miss.
         resolve_table = _snowflake_table_resolver(tables)
 
-        # Quote identifiers with the dialect's quote char (doubled to escape),
-        # matching the defensive quoting in _limited_distinct_values. schema and
-        # database come from the catalog (list_schemas), not user input, but an
-        # unquoted name containing a space, dot, or reserved word would otherwise
-        # build a malformed SHOW ... IN SCHEMA. SHOW needs a fully-qualified
-        # DATABASE.SCHEMA when the session's current database differs.
+        # Quote so a name with a space, dot or reserved word still builds a valid
+        # SHOW ... IN SCHEMA; SHOW needs DATABASE.SCHEMA when the session database differs.
         q = self.identifier_quote
         q_schema = f"{q}{schema.replace(q, q + q)}{q}"
         database = getattr(conn, "database", None) or ""
@@ -1154,12 +1032,8 @@ class OracleDialect(Dialect):
 
     def list_tables(self, conn: Any, schema: str) -> list[str]:
         """List tables and views for an owner from ``all_tables`` / ``all_views``."""
-        # `:owner` is a NAMED bind, deliberately: with positional `:1` binds
-        # python-oracledb counts each OCCURRENCE, so reusing `:1` across both
-        # UNION arms demands two values and discovery died on every Oracle
-        # source with
-        #   DPY-4009: 2 positional bind values are required but 1 were provided
-        # A named bind is supplied once and referenced as often as needed.
+        # Named bind: python-oracledb counts each occurrence of a positional `:1`,
+        # so reusing it across both UNION arms fails with DPY-4009.
         rows = _run(
             conn,
             "SELECT table_name FROM all_tables WHERE owner = :owner "
@@ -1237,7 +1111,7 @@ class OracleDialect(Dialect):
         return table_desc, col_desc
 
 
-_IMPLEMENTED_DIALECTS: tuple[Dialect, ...] = (
+_DIALECTS: tuple[Dialect, ...] = (
     PostgresDialect(),
     RedshiftDialect(),
     MySqlDialect(),
@@ -1245,9 +1119,6 @@ _IMPLEMENTED_DIALECTS: tuple[Dialect, ...] = (
     SnowflakeDialect(),
     OracleDialect(),
 )
-
-# All implemented dialects are enabled.
-_DIALECTS: tuple[Dialect, ...] = _IMPLEMENTED_DIALECTS
 
 # Engines for which schema discovery is implemented and enabled (one dialect each).
 DISCOVERY_ENGINES: frozenset[str] = frozenset().union(*(d.engines for d in _DIALECTS))

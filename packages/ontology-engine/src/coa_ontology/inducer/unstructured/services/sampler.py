@@ -132,7 +132,7 @@ def sample(
         # ``min(n, k * 3)`` (or any constant multiple of ``k``) would
         # bias the sample toward whichever entities sit at the front
         # of that traversal — undermining the "stratified random
-        # sample" contract of Req 3.7.
+        # sample" contract.
         fetch_limit = n
         entities = store.get_entities_by_class(
             classification=entity_class_value,

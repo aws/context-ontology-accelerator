@@ -8,22 +8,9 @@ with Athena SQL — ``SHOW DATABASES``, ``SHOW TABLES``, ``DESCRIBE`` — becaus
 Athena metadata *API* drops the column comments this feature depends on. That
 makes correct, complete, loud statement execution a discovery primitive rather
 than a convenience, which is why this is a module of its own rather than a reuse
-of :class:`~.athena_sampler.AthenaSampler`.
-
-``AthenaSampler._run`` is deliberately NOT reused. It is built for a bounded
-sampling query and is unsafe for ``DESCRIBE`` on three counts:
-
-* it issues a single ``get_query_results`` with ``MaxResults=200`` and never
-  follows ``NextToken``, so it silently truncates — a table wider than that
-  loses columns with no error;
-* its deadline is 30 s; and
-* every failure path yields ``[]`` — a non-``SUCCEEDED`` state and a timeout
-  return it directly, and ``_sample_one_guarded`` swallows exceptions one level
-  up. For sampling that degrades to "no sample values", but here it would make a
-  failed ``DESCRIBE`` indistinguishable from a table with no columns.
-  ``DESCRIBE`` is the only source of columns for this connector, so that
-  ambiguity would silently ship a table stripped of its columns, comments, and
-  keys — and enrichment would then backfill AI descriptions over the gap.
+of :class:`~.athena_sampler.AthenaSampler`, which reads one bounded page and
+returns ``[]`` on failure. ``DESCRIBE`` is the only source of columns for this
+connector, so a short or empty answer would ship a table with no columns.
 
 Hence the two rules this module holds to: **paginate to exhaustion**, and **raise
 rather than return a short answer**. Every ``return`` of rows here is a statement
@@ -58,20 +45,12 @@ from coa_common.aws_config import RetryPolicy, async_boto_config, is_throttling_
 
 from coa_sources.database.metrics import emit_metric
 
-# structlog, not stdlib logging — see athena_catalog.py: the Lambda's
-# setup_logging() pins the stdlib root logger to WARNING and omits ExtraAdder,
-# so `extra={...}` on a stdlib logger is silently discarded.
 logger = structlog.get_logger(__name__)
 
 
-# Wall-clock budget for one statement, submission to results, INCLUDING every
-# throttle retry. Well above the sampler's 30 s: a DESCRIBE spins up the
-# customer's connector Lambda, so a cold start plus their own source's latency
-# sits on this path, and the failure mode for being too tight is a table
-# discovered with no columns at all. Kept well under the discovery Lambda's
-# 15-minute timeout so a single pathological statement cannot consume the pass —
-# a Lambda hard-timeout produces no per-table accounting at all, which is
-# strictly worse than the error this module raises.
+# Wall-clock budget for one statement, including every throttle retry. A DESCRIBE
+# pays the customer connector Lambda's cold start; the budget stays well under the
+# discovery Lambda's 15-minute timeout.
 DEFAULT_STATEMENT_TIMEOUT_S = 120.0
 _POLL_INTERVAL_S = 1.0
 # Floor on the poll interval. Zero would busy-loop `get_query_execution` as fast
@@ -89,13 +68,8 @@ _HEADERED_STATEMENT_TYPES = frozenset({"DML"})
 # Athena's DML concurrency limit is ACCOUNT-wide (default ~20-25), not per-scan,
 # so bounding our own fan-out is not enough: a second scan, or serve traffic
 # alongside a scan, can exhaust it and throttle a subset of DESCRIBE statements.
-# An unrecovered throttle costs that table its columns, comments, and keys.
-#
-# This is the ONLY retry layer — the client below is built with max_attempts=1
-# deliberately. Leaving botocore's standard mode on would multiply: 5 statement
-# attempts x 3 transport attempts = 15 submissions for one statement, deepening
-# the very account-wide queue being waited on, and making the effective retry
-# count something no single constant expresses.
+# This is the only retry layer: the client is built with max_attempts=1 so
+# botocore's retries do not multiply with these.
 _THROTTLE_ATTEMPTS = 5
 # Substrings that mark a terminal FAILED state as a throttle rather than a
 # genuine statement error. Athena reports quota exhaustion both ways: as a
@@ -197,25 +171,9 @@ def _is_throttling_reason(reason: str) -> bool:
 def _is_retryable_call_error(exc: BaseException | None) -> bool:
     """Whether an AWS call failure is worth another attempt.
 
-    Wider than :func:`is_throttling_error` on purpose. This module builds its client
-    with ``max_attempts=1`` to stop botocore's retries multiplying with its own, but
-    that also gave up the two classes botocore's standard mode WOULD have retried
-    and this module's own layer did not cover:
-
-    * **Transient 5xx.** ``InternalServerException`` is not a throttle code, so a
-      single one used to propagate.
-    * **Timeouts and dropped connections.** These are ``BotoCoreError``s with no
-      ``response`` attribute at all, so the throttle check — which reads
-      ``exc.response`` — could never match them.
-
-    Either one lost a table's entire schema: ``_describe_tables`` fail-softs the
-    table into ``failed``, it ships with no columns, no comments and no ``@pk``/
-    ``@fk``, and enrichment then invents descriptions over the gap. That is exactly
-    the silent loss this module's docstring promises not to allow, so retrying here
-    is not scope creep — it is the promise.
-
-    Deliberately narrow: 4xx other than 429 stays fatal, because a malformed
-    statement or a missing catalog will fail identically on every attempt.
+    Retries throttles, transient 5xx and transport errors (``BotoCoreError`` has no
+    ``response``), which botocore would have retried had the client not been built
+    with ``max_attempts=1``. 4xx other than 429 stays fatal.
     """
     if is_throttling_error(exc):
         return True
@@ -495,8 +453,6 @@ class AthenaStatementRunner:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                # Stop the statement so it does not keep holding a slot in the
-                # account-wide DML quota after we have given up on it.
                 self._stop_quietly(athena, query_id)
                 emit_metric("AthenaStatementTimeout", 1, "Count")
                 raise AthenaStatementTimeout(statement, timeout_seconds)
@@ -508,9 +464,6 @@ class AthenaStatementRunner:
         try:
             athena.stop_query_execution(QueryExecutionId=query_id)
         except Exception:  # noqa: BLE001 - the timeout is the error worth raising
-            # Warning, not debug: a leaked statement keeps holding a slot in the
-            # account-wide DML quota, which is the contention this cancel exists
-            # to relieve.
             logger.warning("athena_stop_query_failed", query_execution_id=query_id, exc_info=True)
 
     def _fetch_rows(
@@ -525,8 +478,7 @@ class AthenaStatementRunner:
     ) -> list[list[str | None]]:
         """Page through the full result set, dropping the header row if present.
 
-        Pagination runs to exhaustion — the truncation this replaces is the whole
-        reason the module exists. The deadline is enforced from the *second* page
+        Pagination runs to exhaustion. The deadline is enforced from the *second* page
         onward: by the time the statement has SUCCEEDED the expensive work (the
         connector's cold start and its own source scan) is already paid and the
         rows are one cheap call away, so discarding them over a deadline the last
@@ -579,16 +531,9 @@ class AthenaStatementRunner:
     def _should_drop_header(statement: str, statement_type: str, header_row: HeaderRowMode) -> bool:
         """Resolve the header-row question for this result set.
 
-        ``auto`` keys on ``StatementType`` because that is what actually
-        distinguishes the two shapes: ``SHOW``/``DESCRIBE`` are ``UTILITY`` and
-        headerless, while ``SELECT`` is ``DML`` and repeats its column names in
-        row 0 (both verified live).
-
-        An absent or unrecognised type **raises** rather than guessing. Guessing
-        "has a header" would eat the first database, table, or column of exactly
-        the statements this module is built for — and losing the first database
-        loses every table and column beneath it, silently. A loud failed table is
-        the better outcome, and callers that know the shape can say so.
+        ``auto`` keys on ``StatementType`` (shapes in the module docstring). An absent
+        or unrecognised type raises rather than guessing, because a wrong guess eats
+        the first database, table or column.
         """
         if header_row == "present":
             return True

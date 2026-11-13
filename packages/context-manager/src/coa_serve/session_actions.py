@@ -39,10 +39,7 @@ async def handle_get_recent_session(
                 "requestId": request_id,
                 "statusCode": 200,
             }
-        # Load the first page of messages for immediate display on session restore.
-        # offset=0, limit=5 returns the 5 most recent turns so the UI renders
-        # instantly without a separate getSessionHistory call. The client uses
-        # the returned cursor to paginate older messages on scroll-back.
+        # Inline the first page so restore needs no separate getSessionHistory call.
         messages, total, has_more = await session_manager.get_rich_history_page(
             user_id=user_id,
             session_id=recent.session_id,
@@ -107,11 +104,8 @@ async def handle_get_session_history(
                 "requestId": request_id,
                 "statusCode": 403,
             }
-        # History is stored per (user, namespace, session). The web client does
-        # not send a namespace on getSessionHistory, so when it's absent resolve
-        # the session's owning namespace from metadata to read the correct
-        # AgentCore Memory actor. An explicit payload namespace (if provided)
-        # takes precedence.
+        # History is keyed per (user, namespace); the web client omits namespace on
+        # getSessionHistory, so resolve it from metadata unless the payload has one.
         if not namespace:
             namespace = await session_metadata.get_session_namespace(user_id, session_id) or ""
 

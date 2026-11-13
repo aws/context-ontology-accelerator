@@ -3,12 +3,11 @@
 
 """Namespace language on the unstructured (document) induction path.
 
-Pins LLD sections 2.2.4 and 2.2.6 for document sources: generated class labels,
+For document sources: generated class labels,
 descriptions, relationship names and topics carry the namespace tag when they
 are lexically compatible; fixed text follows the reviewed ``en``/``ja``
 templates; the class-description prompts carry an output-language instruction
-only for a non-English namespace; an ``en`` namespace is byte-identical to
-``main``.
+only for a non-English namespace; an ``en`` namespace output is unchanged.
 """
 
 from __future__ import annotations

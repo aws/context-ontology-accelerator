@@ -28,8 +28,6 @@ describe("sourceStatusLabel", () => {
 
 describe("sourceStatusType", () => {
   it("treats a re-scan review like a first-scan review", () => {
-    // Both are "waiting on a steward", so they get the same indicator rather
-    // than the neutral info default.
     expect(sourceStatusType("RESCAN_REVIEW")).toBe("warning");
     expect(sourceStatusType("RESCAN_REVIEW")).toBe(
       sourceStatusType("PENDING_REVIEW"),

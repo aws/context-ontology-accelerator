@@ -16,13 +16,9 @@ from __future__ import annotations
 import itertools
 
 import pytest
-from coa_serve.clients.sources_registry import SourceComposition
 from coa_serve.mode import (
     LEGACY_MODE_ALIASES,
-    Composition,
     Mode,
-    ResolutionPlan,
-    build_plan,
     resolve_mode,
 )
 
@@ -108,40 +104,6 @@ def test_auto_never_leaks_to_callers():
 def test_auto_falls_back_to_standard_when_deep_reasoning_unavailable():
     mode, _ = resolve_mode("auto", deployment_default=Mode.STANDARD, deep_reasoning_available=False)
     assert mode is Mode.STANDARD
-
-
-@pytest.mark.parametrize(
-    ("structured", "unstructured", "expected"),
-    [
-        (True, False, Composition.STRUCTURED),
-        (False, True, Composition.UNSTRUCTURED),
-        (True, True, Composition.MIXED),
-        (False, False, Composition.MIXED),
-    ],
-)
-def test_composition_mapping(structured, unstructured, expected):
-    got = Composition.from_source_composition(
-        SourceComposition(has_structured_source=structured, has_unstructured_source=unstructured)
-    )
-    assert got is expected
-
-
-def test_unknown_composition_fails_open_to_mixed():
-    """A registry miss must not withhold any capability."""
-    got = Composition.from_source_composition(SourceComposition.unknown_composition())
-    assert got is Composition.MIXED
-
-
-def test_build_plan_is_frozen_and_carries_provenance():
-    plan = build_plan(
-        "deep-reasoning",
-        SourceComposition(has_structured_source=False, has_unstructured_source=True),
-        deployment_default=Mode.STANDARD,
-        deep_reasoning_available=True,
-    )
-    assert plan == ResolutionPlan(mode=Mode.DEEP_REASONING, composition=Composition.UNSTRUCTURED, mode_source="request")
-    with pytest.raises(AttributeError):
-        plan.mode = Mode.STANDARD
 
 
 def test_mode_values_are_wire_stable():

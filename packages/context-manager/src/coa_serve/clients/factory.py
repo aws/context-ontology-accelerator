@@ -5,10 +5,6 @@
 
 Callers should use `build_clients()` and accept a `ClientSet`.
 The resolution pipeline never imports concrete implementations directly.
-
-IMPORTANT: build_clients() creates synchronous boto3 clients internally.
-Call it during application startup (outside the async event loop) or wrap
-in run_in_executor if calling from async context.
 """
 
 from __future__ import annotations
@@ -28,9 +24,6 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Neptune Analytics detection helpers
-# ---------------------------------------------------------------------------
 
 _NA_GRAPH_ID_RE = re.compile(r"g-[a-z0-9]{10,}")
 
@@ -92,11 +85,6 @@ def _graph_store_uri(neptune_endpoint: str) -> str:
     return f"neptune-db://{host}:8182"
 
 
-# ---------------------------------------------------------------------------
-# Client construction
-# ---------------------------------------------------------------------------
-
-
 def build_clients() -> ClientSet:
     """Construct the client set for the serve component.
 
@@ -116,8 +104,7 @@ def _build_default_clients() -> ClientSet:
         graph=NeptuneGraphClient(),
         vector=OpenSearchVectorClient(),
         llm=BedrockLLMClient(),
-        # Executes authorized SQL against customer relational databases
-        # (PostgreSQL via asyncpg, Athena for cross-source federation).
+        # Executes authorized SQL directly against customer relational databases.
         query_executor=SourceDBQueryExecutor(),
     )
 
@@ -129,41 +116,18 @@ def build_lexical_retriever(
 
     Built on every deployment so a per-request ``options.retrieverStrategy`` can
     trigger graphrag retrieval on-demand, regardless of ``TIER3_STRATEGY``.
-    Whether the *default* (no request field) Tier 3 path uses it is decided in
-    the orchestrator: ``lexical-baseline`` engages a deployment-default
-    strategy, while ``hand-rolled`` only engages graphrag when a request asks
-    for it. Construction is cheap and keeps the graphrag import lazy (the engine
-    is not built until ``retrieve()`` runs), so the hand-rolled startup path and
-    the botocore sync-only invariant are unchanged.
+    Construction is cheap and keeps the graphrag import lazy.
 
-    ``timeout_s`` overrides the per-retrieval timeout. The agentic path passes its
-    own per-tool budget here: the ``BaselineLexicalRetriever`` default (15s) is
-    below what a graphrag traversal strategy needs, so leaving it at the default
-    made every ``strategy:*`` tool time out at 15s even though the agentic budget
-    allowed 45s — the tool reported "degraded ... TimeoutError after 15.0s", the
-    loop scored it as no-progress, and it burned a step escalating (observed live
-    on ``strategy:entity_based`` / ``strategy:chunk_based_semantic``).
+    ``timeout_s`` overrides the per-retrieval timeout (the deep-reasoning path
+    passes its per-tool budget). When None, it falls back to the
+    ``LEXICAL_RETRIEVER_TIMEOUT_S`` env var, default 45s: the retriever's own 15s
+    default is too low for graph-traversal strategies.
 
-    When ``timeout_s`` is None (the STANDARD-mode request path, which does NOT
-    pass a per-tool budget), the timeout falls back to the ``LEXICAL_RETRIEVER_TIMEOUT_S``
-    env var (default 45s). The 15s retriever default is likewise too low for the
-    slower single-shot traversal strategies here: ``topic_beam``'s graph
-    beam-traversal exceeds 15s and would time out to an empty result in standard
-    mode (observed live on the NTSB corpus), even though the AgentCore request
-    ceiling (~180s) leaves ample room. The env var lets a deployment tune this
-    without a code change; the per-deployment production default (15s) stays the
-    code default on the retriever itself.
-
-    Returns None only when the required store endpoints are unset (nothing for
-    graphrag to address).
+    Returns None only when the required store endpoints are unset.
     """
     if not config.neptune_endpoint or not config.opensearch_endpoint:
         return None
 
-    # Standard-mode path (timeout_s is None): honor LEXICAL_RETRIEVER_TIMEOUT_S so
-    # slow traversal strategies (e.g. topic_beam) are not truncated by the 15s
-    # retriever default. The agentic path always passes an explicit budget, which
-    # takes precedence over this fallback.
     if timeout_s is None:
         timeout_s = 45.0  # standard-mode default (see docstring); env var overrides below
         if env_timeout := os.environ.get("LEXICAL_RETRIEVER_TIMEOUT_S", "").strip():
@@ -198,5 +162,5 @@ def build_lexical_retriever(
         graph_store_uri=graph_uri,
         vector_store_uri=vector_store_uri,
         strategy=DEFAULT_SPEC,
-        **({"timeout_s": timeout_s} if timeout_s is not None else {}),
+        timeout_s=timeout_s,
     )

@@ -68,21 +68,8 @@ coa_add_jdbc_peering_context() {
     echo "Peering into test VPC ${SCL_JDBC_PEER_VPC_ID} (${SCL_JDBC_PEER_CIDRS})"
     CONTEXT+=(--context "jdbc_peer_vpc_id=$SCL_JDBC_PEER_VPC_ID" --context "jdbc_peer_cidrs=$SCL_JDBC_PEER_CIDRS")
   else
-    # The stack is optional, so skipping is normal — but say so. Silence here is
-    # indistinguishable from a prefix mismatch resolving the wrong stack name, which
-    # is how this went unnoticed while the default was 'scl'.
-    #
-    # "Skipping" is also the wrong intuition, hence the second line. CDK context is
-    # not persisted between deploys: with these keys absent, serve-stack and the
-    # connector SGs compute an EMPTY remote-CIDR set and CloudFormation deletes any
-    # cross-VPC egress rules a previous deploy created. The next JDBC query then
-    # hangs 60s on a silently dropped SYN, and the stack diff shows only security
-    # group rules being removed — nothing naming peering. Recovering needs the test
-    # stack present, a redeploy, and tests/cdk/scripts/connect-cross-network.sh.
-    #
-    # CI does not have this failure mode: ci/mainline.yml's deploy-dev resolves the
-    # same outputs but `exit 1`s when they are missing, and `needs: deploy-test-stack`
-    # guarantees they exist. Only this human-facing path continues past it.
+    # The stack is optional. Without these keys CloudFormation deletes any cross-VPC egress
+    # rules a previous deploy created, hence the WARNING below.
     echo "No JDBC peering context (stack ${TEST_STACK_NAME} not found or has no VPC outputs) — skipping"
     echo "  WARNING: this REMOVES any cross-VPC JDBC egress rules an earlier deploy created."
     echo "           Deploy ${TEST_STACK_NAME} first if this environment runs JDBC integ tests."

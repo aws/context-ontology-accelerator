@@ -111,7 +111,7 @@ describe("unquoteSqlIdent", () => {
   });
   it("drops the schema qualifier a shared table name carries", () => {
     // The mapping emits "public"."customers" when two datasources both expose
-    // `customers`; consumers here join on the bare name (#965).
+    // `customers`; consumers here join on the bare name.
     expect(unquoteSqlIdent('"\\"public\\".\\"customers\\""')).toBe("customers");
   });
   it("keeps a dot that is part of the table name itself", () => {
@@ -148,7 +148,7 @@ describe("qualifiedSqlIdent", () => {
 // The RIGOR strategy keys its TriplesMap IRI on ``{schema}.{table}``, so both
 // tables of a schema whose bare names collide with another datasource's carry the
 // SAME leading segment. A ``\w+`` join key stopped at the dot, keyed both on
-// ``public``, and the second silently overwrote the first (#965).
+// ``public``, and the second silently overwrote the first.
 const RIGOR_QUALIFIED_R2RML = `
 @prefix ind: <http://ex.org/ind#> .
 @prefix rr: <http://www.w3.org/ns/r2rml#> .
@@ -292,7 +292,7 @@ describe("parseR2rmlByClass (TriplesMap-id + POM-id join)", () => {
     const byClass = parseR2rmlByClass(REAL_R2RML);
     const ct = byClass.get("ClinicalTrial");
     expect(ct).toBeTruthy();
-    // Real source table (not "Unknown" — the old parseR2rml bug).
+    // Real source table, not "Unknown".
     expect(ct?.sourceTable).toBe("clinical_trial");
     // Every predicate joined to its column via the shared POM id.
     const byProp = new Map(ct?.columnMappings.map((c) => [c.property, c]));
@@ -374,7 +374,7 @@ describe("parseR2rmlByClass (TriplesMap-id + POM-id join)", () => {
     expect(parseR2rmlByClass(undefined).size).toBe(0);
   });
 
-  it("joins Japanese TriplesMap and POM ids (#927 Part B1)", () => {
+  it("joins Japanese TriplesMap and POM ids", () => {
     // ``\w`` is ASCII-only: ``POM_設備id`` matched nothing and the panel read
     // "Mapping: Unknown"; ``POM_Id設備`` / ``POM_Id建物`` both keyed on ``Id``.
     const m = parseR2rmlByClass(JA_R2RML);
@@ -492,8 +492,8 @@ describe("parseConceptMatchesEnvelope", () => {
   });
 
   it("preserves every entry (no [:50]-style truncation on the read path)", () => {
-    // 75 table-level matches — the #908 repro count — must all survive the
-    // envelope parse; the fix delivers the full list, not a capped slice.
+    // 75 table-level matches, more than the old 50-entry cap, must all survive
+    // the envelope parse.
     const many = Array.from({ length: 75 }, (_, i) => ({
       source_table: `t${i}`,
       source_column: "",
@@ -566,25 +566,6 @@ describe("buildClassMatchResolver", () => {
     );
     // Column-level match never participates.
     expect(match?.source_column).toBe("");
-  });
-
-  it("falls back to the R2RML TriplesMap-id join when names don't normalize", () => {
-    // A source_table whose normalized key does not equal the class local
-    // name; only the R2RML class→table link recovers it.
-    const oddMatches = parseConceptMatches([
-      {
-        source_table: "clinical_trial",
-        source_column: "",
-        matched_class_uri: "https://parallax.aws/onto/CT",
-        match_type: "high_confidence",
-        candidates: [],
-      },
-    ]);
-    // Class local name "ClinicalTrial" normalizes to "clinicaltrial" which
-    // equals normalizeNameKey("clinical_trial"), so the primary path already
-    // hits. Confirm the resolver returns the match either way.
-    const resolve = buildClassMatchResolver(oddMatches, REAL_R2RML);
-    expect(resolve("ind:ClinicalTrial")?.source_table).toBe("clinical_trial");
   });
 
   it("returns null for a class with no table match", () => {
@@ -829,9 +810,8 @@ describe("normalizeNameKey — script-agnostic", () => {
   );
 
   // The key drives Map lookup and equality, so a label that keys to the empty
-  // string does not merely fail to join: every such label lands in one bucket
-  // and grounding results attach to the wrong class. The previous
-  // [^a-zA-Z0-9] filter did exactly that for any non-Latin script.
+  // string would put every such label in one bucket and attach grounding
+  // results to the wrong class.
   it.each([
     ["ja kanji", "設置場所"],
     ["ja katakana", "メーカー"],
@@ -847,7 +827,7 @@ describe("normalizeNameKey — script-agnostic", () => {
     expect(normalizeNameKey("엘리베이터")).not.toBe(normalizeNameKey("제조사"));
   });
 
-  it("keeps symbols and their attached variation selectors", () => {
+  it("keeps symbols", () => {
     expect(normalizeNameKey("❤️")).toBe("❤️");
     expect(normalizeNameKey("✈️")).toBe("✈️");
     expect(normalizeNameKey("Brand™")).toBe("brand™");
@@ -860,8 +840,6 @@ describe("normalizeNameKey — script-agnostic", () => {
   });
 
   it("keeps the accented letter in a Latin label", () => {
-    // Previously HÖHE keyed to "hhe" and ÓRGÃO to "rgo" — the letter itself was
-    // dropped, not just its case.
     expect(normalizeNameKey("HÖHE")).toBe("höhe");
     expect(normalizeNameKey("ÓRGÃO")).toBe("órgão");
   });

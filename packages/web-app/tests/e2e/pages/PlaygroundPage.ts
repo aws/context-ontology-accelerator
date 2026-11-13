@@ -4,7 +4,7 @@
 import { expect, type Page } from "@playwright/test";
 
 /**
- * Page Object for the Playground (Playground) chat (/playground).
+ * Page Object for the Playground chat (/playground).
  * Uses SSE streaming for query responses. Input is a
  * Cloudscape Input labelled "Query"; submit is the "Run query" icon button.
  * Responses stream into the chat list, so assertions are on visible text.

@@ -84,15 +84,10 @@ class TestCompileFilter:
     def test_unbalanced_bracket_falls_back_to_literal(self):
         # fnmatch.translate escapes an unclosed "[" into a literal, so it never
         # raises — the pattern matches the literal name rather than erroring.
-        # (This is why compile_filter's `except re.error` guard is effectively
-        # unreachable through fnmatch output.)
         rx = compile_filter("orders[", "table_filter")
         assert rx is not None
         assert rx.match("orders[")
         assert not rx.match("orders")
-
-
-# ── #168: filters are globs; regex-looking input gets a hint, never a rejection ──
 
 
 _SCHEMAS = ["public", "target_schema", "analytics", "pg_catalog", "information_schema"]
@@ -111,7 +106,7 @@ _SCHEMAS = ["public", "target_schema", "analytics", "pg_catalog", "information_s
     ],
 )
 def test_glob_matching_is_unchanged(pattern, matches):
-    """The reporter's table: matching itself does not change — only how it's explained."""
+    """Glob matching is unchanged for regex-looking input; only the hint is added."""
     rx = compile_filter(pattern, "schema_filter")
     assert [s for s in _SCHEMAS if rx.match(s)] == matches
 

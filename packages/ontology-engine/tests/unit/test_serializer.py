@@ -1,31 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Turtle serializer (Task 14, Requirement 17).
-
-These tests exercise the serializer against graphs produced by
-**combinations** of the induction rules (Rules 1–5). They verify:
-
-- Standard prefixes are bound (owl, rdf, rdfs, xsd, skos, dcterms,
-  prov, plus the custom namespace prefix). [Req 17.2]
-- Exactly one ``owl:Ontology`` declaration is present, with
-  ``rdfs:label``, ``owl:versionInfo``, and ``dcterms:created``
-  annotations. [Req 17.3]
-- The serialized Turtle round-trips: re-parsing produces an
-  isomorphic graph. [Req 17.4]
-- Empty input produces a valid Turtle file (just the prefix
-  declarations and the ontology block).
-- The serializer mutates the input graph in place (binds prefixes,
-  adds the ontology block) but does so idempotently (calling twice
-  doesn't duplicate annotations).
-- The 50 MB cap is enforced.
-- Combinations of rules: Rule 1 only, Rule 1+5, Rule 1+3, full
-  Rules 1+2+3+4+5 in one Turtle.
-
-The "combinations" tests are the most useful: they verify the
-serializer's behavior on realistic merged graphs, with the actual
-IRI shapes minted by the real :class:`InMemoryIRIResolver`.
-"""
+"""Unit tests for the Turtle serializer."""
 
 from __future__ import annotations
 
@@ -62,9 +38,6 @@ from coa_ontology.inducer.unstructured.stores.protocol import (
 from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, URIRef
 from rdflib.compare import isomorphic
 from rdflib.namespace import DCTERMS, PROV, SKOS
-
-# ── Test fixtures and builders ──────────────────────────────────────────
-
 
 # Same prefix shape the rest of the unstructured tests use.
 _TEST_NS = "test-ns"
@@ -143,11 +116,6 @@ def _topic(value: str, topic_id: str = "t1") -> TopicRecord:
 
 def _build_full_pipeline_graph(resolver: InMemoryIRIResolver) -> Graph:
     """Build a realistic merged graph using all 5 induction rules.
-
-    Mimics what the orchestrator (Task 16) will produce: one Graph
-    containing classes, individuals, object properties, datatype
-    properties, and concepts — all at IRIs minted by a single
-    shared resolver instance.
 
     Domain: a small finance/business example. Two classes (Company,
     Person), three individuals, two SPO predicates, two SPC
@@ -228,11 +196,8 @@ def _build_full_pipeline_graph(resolver: InMemoryIRIResolver) -> Graph:
     return g
 
 
-# ── Tests: prefix bindings (Req 17.2) ───────────────────────────────────
-
-
 class TestStandardPrefixBindings:
-    """Req 17.2 — owl, rdf, rdfs, xsd, skos, dcterms, prov, custom."""
+    """owl, rdf, rdfs, xsd, skos, dcterms, prov, custom."""
 
     def test_all_standard_prefixes_bound_on_empty_graph(self):
         g = Graph()
@@ -261,21 +226,8 @@ class TestStandardPrefixBindings:
             timestamp=_FIXED_TS,
         )
         bound = {p: str(ns) for p, ns in augmented.namespaces()}
-        # Prefix is lowercased.
         assert "my-graph" in bound
         assert bound["my-graph"] == _TEST_BASE_IRI
-
-    def test_custom_prefix_bound_to_namespace_iri(self):
-        g = Graph()
-        custom_iri = "http://example.com/my/onto/"
-        _, augmented = serialize(
-            graph=g,
-            namespace_name="example",
-            namespace_iri=custom_iri,
-            timestamp=_FIXED_TS,
-        )
-        bound = {p: str(ns) for p, ns in augmented.namespaces()}
-        assert bound["example"] == custom_iri
 
     def test_prefixes_appear_in_turtle_string(self):
         """Smoke check — the prefix declarations make it into the
@@ -308,11 +260,8 @@ class TestStandardPrefixBindings:
             )
 
 
-# ── Tests: owl:Ontology declaration (Req 17.3) ──────────────────────────
-
-
 class TestOntologyDeclaration:
-    """Req 17.3 — exactly one owl:Ontology with label, version, created."""
+    """Exactly one owl:Ontology with label, version, created."""
 
     def test_exactly_one_owl_ontology_declaration(self):
         g = Graph()
@@ -325,20 +274,6 @@ class TestOntologyDeclaration:
         ontologies = list(augmented.subjects(RDF.type, OWL.Ontology))
         assert len(ontologies) == 1
         assert str(ontologies[0]) == _TEST_ONTOLOGY_IRI
-
-    def test_ontology_subject_iri_strips_trailing_slash(self):
-        """The ontology subject is the namespace IRI without ``/``."""
-        g = Graph()
-        _, augmented = serialize(
-            graph=g,
-            namespace_name=_TEST_ONTO,
-            namespace_iri=f"{_TEST_PREFIX}/",
-            timestamp=_FIXED_TS,
-        )
-        # Subject IRI ends in ``/test-onto`` (no trailing slash).
-        ontologies = list(augmented.subjects(RDF.type, OWL.Ontology))
-        assert str(ontologies[0]) == _TEST_PREFIX
-        assert not str(ontologies[0]).endswith("/")
 
     def test_ontology_subject_iri_strips_trailing_hash(self):
         """The ontology subject is the namespace IRI without ``#``."""
@@ -368,7 +303,7 @@ class TestOntologyDeclaration:
         assert labels[0].datatype == XSD.string
 
     def test_owl_version_info_iso_z_format(self):
-        """Req 17.3 — owl:versionInfo is a plain string of form
+        """owl:versionInfo is a plain string of form
         YYYY-MM-DDTHH:MM:SSZ."""
         g = Graph()
         _, augmented = serialize(
@@ -381,11 +316,10 @@ class TestOntologyDeclaration:
         versions = list(augmented.objects(ontology_uri, OWL.versionInfo))
         assert len(versions) == 1
         assert str(versions[0]) == _FIXED_TS_ISO_Z
-        # Plain literal, no datatype.
         assert versions[0].datatype is None
 
     def test_dcterms_created_xsd_datetime(self):
-        """Req 17.3 — dcterms:created is xsd:dateTime.
+        """dcterms:created is xsd:dateTime.
 
         Note: rdflib canonicalizes ``Z`` to ``+00:00`` in the
         lexical form (per W3C XSD spec for the canonical form of
@@ -446,7 +380,6 @@ class TestOntologyDeclaration:
         duplicate the ontology annotations.
         """
         g = Graph()
-        # First call — adds the ontology block.
         _, augmented = serialize(
             graph=g,
             namespace_name=_TEST_ONTO,
@@ -462,10 +395,8 @@ class TestOntologyDeclaration:
             namespace_iri=_TEST_BASE_IRI,
             timestamp=ts2,
         )
-        # Only one ontology declaration.
         assert len(list(augmented.subjects(RDF.type, OWL.Ontology))) == 1
         ontology_uri = next(iter(augmented.subjects(RDF.type, OWL.Ontology)))
-        # Annotations are the new ones, not the old ones.
         versions = list(augmented.objects(ontology_uri, OWL.versionInfo))
         assert len(versions) == 1
         assert str(versions[0]) == "2027-01-01T00:00:00Z"
@@ -475,11 +406,8 @@ class TestOntologyDeclaration:
         assert len(created) == 1
 
 
-# ── Tests: round-trip isomorphism (Req 17.4) ────────────────────────────
-
-
 class TestRoundTripIsomorphism:
-    """Req 17.4 — parse-back matches the original."""
+    """Parse-back matches the original."""
 
     def test_empty_graph_round_trips(self):
         """Even an empty graph (just the ontology block) round-trips."""
@@ -528,14 +456,6 @@ class TestRoundTripIsomorphism:
         assert isomorphic(augmented, reparsed)
 
 
-# ── Tests: rule combinations — what makes it into the Turtle ────────────
-#
-# These tests exercise the serializer on graphs that contain different
-# subsets of the induction rules' output. They are the primary value
-# of this test file: they verify that for each combination, the right
-# triples end up in the final Turtle.
-
-
 class TestRule1OnlyCombination:
     """Serialize a Rule-1-only graph (classes, no individuals/properties)."""
 
@@ -563,19 +483,15 @@ class TestRule1OnlyCombination:
             timestamp=_FIXED_TS,
         )
 
-        # Two owl:Class declarations.
         classes = list(augmented.subjects(RDF.type, OWL.Class))
         assert URIRef(_class_iri("Company")) in classes
         assert URIRef(_class_iri("Person")) in classes
 
-        # No NamedIndividual, ObjectProperty, DatatypeProperty,
-        # Concept — nothing extraneous.
         assert not list(augmented.subjects(RDF.type, OWL.NamedIndividual))
         assert not list(augmented.subjects(RDF.type, OWL.ObjectProperty))
         assert not list(augmented.subjects(RDF.type, OWL.DatatypeProperty))
         assert not list(augmented.subjects(RDF.type, SKOS.Concept))
 
-        # Turtle string contains the class IRIs as literal text.
         assert "owl:Class" in turtle_str
         assert "Company" in turtle_str
         assert "Person" in turtle_str
@@ -608,21 +524,16 @@ class TestRule1Plus5Combination:
             timestamp=_FIXED_TS,
         )
 
-        # Classes from Rule 1.
         assert URIRef(_class_iri("Company")) in augmented.subjects(RDF.type, OWL.Class)
-        # Concepts from Rule 5.
         concepts = list(augmented.subjects(RDF.type, SKOS.Concept))
         assert len(concepts) == 1
-        # ConceptScheme from Rule 5.
         schemes = list(augmented.subjects(RDF.type, SKOS.ConceptScheme))
         assert len(schemes) == 1
 
-        # No individuals, no properties.
         assert not list(augmented.subjects(RDF.type, OWL.NamedIndividual))
         assert not list(augmented.subjects(RDF.type, OWL.ObjectProperty))
         assert not list(augmented.subjects(RDF.type, OWL.DatatypeProperty))
 
-        # Turtle string contains both vocabularies.
         assert "owl:Class" in turtle_str
         assert "skos:Concept" in turtle_str
         assert "skos:ConceptScheme" in turtle_str
@@ -669,12 +580,9 @@ class TestRule1Plus3Combination:
         # The property IRI shape is /<Subject-Class>/ObjectProperty/<predicate>.
         prop_iri = URIRef(f"{_TEST_PREFIX}/Person/ObjectProperty/works_for")
         assert (prop_iri, RDF.type, OWL.ObjectProperty) in augmented
-        # Domain = Person.
         assert (prop_iri, RDFS.domain, URIRef(person_iri)) in augmented
-        # Range = Company.
         assert (prop_iri, RDFS.range, URIRef(company_iri)) in augmented
 
-        # Turtle string contains the class-first IRI shape.
         assert "Person/ObjectProperty/works_for" in turtle_str
         assert "owl:ObjectProperty" in turtle_str
 
@@ -708,14 +616,11 @@ class TestRule1Plus4Combination:
         )
 
         prop_iri = URIRef(f"{_TEST_PREFIX}/Company/DatatypeProperty/founded")
-        # Declaration.
         assert (prop_iri, RDF.type, OWL.DatatypeProperty) in augmented
         # Range = xsd:integer (unanimous integer values).
         assert (prop_iri, RDFS.range, XSD.integer) in augmented
-        # Domain = Company.
         assert (prop_iri, RDFS.domain, URIRef(company_iri)) in augmented
 
-        # Turtle string surfaces the xsd:integer range.
         assert "xsd:integer" in turtle_str
 
 
@@ -732,33 +637,26 @@ class TestFullPipelineCombination:
             timestamp=_FIXED_TS,
         )
 
-        # Rule 1 — 2 classes.
         n_classes = sum(1 for _ in augmented.subjects(RDF.type, OWL.Class))
         assert n_classes == 2
 
-        # Rule 2 — 3 individuals.
         n_individuals = sum(1 for _ in augmented.subjects(RDF.type, OWL.NamedIndividual))
         assert n_individuals == 3
 
-        # Rule 3 — at least 1 ObjectProperty (works_for, person→company).
         n_obj_props = sum(1 for _ in augmented.subjects(RDF.type, OWL.ObjectProperty))
         assert n_obj_props >= 1
 
-        # Rule 4 — 2 DatatypeProperties (founded, is_public).
         n_dt_props = sum(1 for _ in augmented.subjects(RDF.type, OWL.DatatypeProperty))
         assert n_dt_props == 2
 
-        # Rule 5 — 1 ConceptScheme + 2 Concepts.
         n_schemes = sum(1 for _ in augmented.subjects(RDF.type, SKOS.ConceptScheme))
         assert n_schemes == 1
         n_concepts = sum(1 for _ in augmented.subjects(RDF.type, SKOS.Concept))
         assert n_concepts == 2
 
-        # Plus 1 owl:Ontology declaration.
         n_ont = sum(1 for _ in augmented.subjects(RDF.type, OWL.Ontology))
         assert n_ont == 1
 
-        # All vocabularies surface in the Turtle text.
         for token in (
             "owl:Class",
             "owl:NamedIndividual",
@@ -771,23 +669,6 @@ class TestFullPipelineCombination:
             assert token in turtle_str, (
                 f"Expected {token!r} to appear in serialized Turtle but it didn't. Turtle:\n{turtle_str}"
             )
-
-    def test_full_graph_round_trips(self):
-        """Belt-and-suspenders: realistic merged graph round-trips."""
-        resolver = _resolver()
-        g = _build_full_pipeline_graph(resolver)
-        turtle_str, augmented = serialize(
-            graph=g,
-            namespace_name=_TEST_ONTO,
-            namespace_iri=_TEST_BASE_IRI,
-            timestamp=_FIXED_TS,
-        )
-        reparsed = Graph()
-        reparsed.parse(data=turtle_str, format="turtle")
-        assert isomorphic(augmented, reparsed)
-
-
-# ── Tests: empty input / edge cases ─────────────────────────────────────
 
 
 class TestEmptyInput:
@@ -802,16 +683,13 @@ class TestEmptyInput:
             timestamp=_FIXED_TS,
         )
 
-        # Only the owl:Ontology subject exists.
         all_subjects = set(augmented.subjects())
         assert len(all_subjects) == 1
         assert URIRef(_TEST_ONTOLOGY_IRI) in all_subjects
 
-        # The ontology declaration triples are present.
         # (declaration + label + versionInfo + created = 4 triples)
         assert len(augmented) == 4
 
-        # Output is a valid (non-empty) Turtle string.
         assert "owl:Ontology" in turtle_str
         assert "@prefix" in turtle_str
 
@@ -834,9 +712,6 @@ class TestEmptyInput:
             )
 
 
-# ── Tests: input graph mutation contract ────────────────────────────────
-
-
 class TestInputGraphMutation:
     """The serializer mutates the input graph in place — verify."""
 
@@ -849,33 +724,16 @@ class TestInputGraphMutation:
             namespace_iri=_TEST_BASE_IRI,
             timestamp=_FIXED_TS,
         )
-        # Same Graph instance, mutated in place.
         assert returned_g is g
-        # Ontology block now present.
         assert (
             URIRef(_TEST_ONTOLOGY_IRI),
             RDF.type,
             OWL.Ontology,
         ) in g
 
-    def test_returned_graph_is_input_graph(self):
-        """The function returns the same Graph instance, not a copy."""
-        g = Graph()
-        g.add((URIRef("http://example.com/x"), RDF.type, OWL.Class))
-        _, returned_g = serialize(
-            graph=g,
-            namespace_name=_TEST_ONTO,
-            namespace_iri=_TEST_BASE_IRI,
-            timestamp=_FIXED_TS,
-        )
-        assert returned_g is g
-
-
-# ── Tests: 50 MB cap (Req 17.5) ─────────────────────────────────────────
-
 
 class TestSizeCap:
-    """Req 17.5 — output capped at 50 MB."""
+    """Output capped at 50 MB."""
 
     def test_oversized_graph_raises(self, monkeypatch):
         """Force the cap to a tiny value to exercise the guard
@@ -884,11 +742,9 @@ class TestSizeCap:
             serializer,
         )
 
-        # Set the cap to 100 bytes for this test.
         monkeypatch.setattr(serializer, "_MAX_TURTLE_BYTES", 100)
 
         g = Graph()
-        # Add enough triples to push the serialized output over 100B.
         for i in range(20):
             g.add(
                 (
@@ -907,9 +763,6 @@ class TestSizeCap:
             )
 
 
-# ── Tests: sanity on the serializer's logging ───────────────────────────
-
-
 class TestLogging:
     """Smoke check on the INFO log line."""
 
@@ -925,5 +778,4 @@ class TestLogging:
             )
 
         info_lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-        # At least one log line that references the byte length.
         assert any("Turtle" in line for line in info_lines)

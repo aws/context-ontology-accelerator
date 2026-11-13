@@ -20,11 +20,6 @@ import pytest
 from moto import mock_aws
 
 # ---------------------------------------------------------------------------
-# Path setup — add the api/ source directory so `sources_handler` can be
-# imported like it would be in the Lambda runtime.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Environment variables — must be set before the handler module is imported
 # because it reads them at cold-start (module level).
 # ---------------------------------------------------------------------------
@@ -33,9 +28,6 @@ _TABLE_NAME = "test-sources"
 os.environ.setdefault("SOURCES_TABLE", _TABLE_NAME)
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"  # valid UUID v4
 _OTHER_NAMESPACE_ID = "660e8400-e29b-41d4-a716-446655440001"
@@ -100,11 +92,6 @@ def _put_source(
     table.put_item(Item=item)
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture()
 def aws_env():
     """Create mocked DynamoDB table, yield handler and table resources.
@@ -163,11 +150,6 @@ def aws_env():
             "handler": handler_module.handler,
             "table": table,
         }
-
-
-# ===================================================================
-# LIST — GET /namespaces/{namespaceId}/sources
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -389,7 +371,6 @@ class TestListSourcesPagination:
                 created_at=f"2026-0{i + 1}-01T00:00:00Z",
             )
 
-        # Page 1
         event1 = _make_event(
             "GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID}, query_params={"maxResults": "2"}
         )
@@ -398,7 +379,6 @@ class TestListSourcesPagination:
         assert len(body1["items"]) == 2
         assert "nextToken" in body1
 
-        # Page 2
         event2 = _make_event(
             "GET",
             _LIST_RESOURCE,
@@ -409,14 +389,8 @@ class TestListSourcesPagination:
         assert status2 == 200
         assert len(body2["items"]) == 2
 
-        # All 4 unique items across both pages
         all_ids = {i["sourceId"] for i in body1["items"]} | {i["sourceId"] for i in body2["items"]}
         assert len(all_ids) == 4
-
-
-# ===================================================================
-# Validation errors
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -491,14 +465,6 @@ class TestValidation:
         event = _make_event("PATCH", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})
         status, _ = _parse_response(aws_env["handler"](event, None))
         assert status == 404
-
-
-# ===================================================================
-# Document detail — KG-build metrics enrichment
-# ===================================================================
-#
-# _build_document_detail is a pure function, so these tests exercise the
-# ProgressMonitor Number-counter reader directly without moto.
 
 
 class TestDocumentDetailMetrics:
@@ -581,10 +547,8 @@ class TestDocumentDetailMetrics:
         assert ec2["chunkOverlap"] == 128 and type(ec2["chunkOverlap"]) is int
 
     def test_extraction_config_uncoercible_int_field_logs_and_survives(self, monkeypatch):
-        """If DDB somehow holds a non-numeric chunk value, coercion must not raise
-        (it would 500 the read). The raw value is left in place and a warning is
-        logged. Regression guard for the review finding on the former
-        contextlib.suppress()."""
+        """A non-numeric chunk value in DDB must not raise (it would 500 the read);
+        the raw value is left in place and a warning is logged."""
         from coa_sources.api import sources_handler
         from coa_sources.api.sources_handler import _build_document_detail
 
@@ -711,10 +675,6 @@ class TestDatabaseDetailEngineProjection:
         assert "redshiftWorkgroup" not in detail.get("glueConfiguration", {})
 
 
-# ===================================================================
-# Database detail — configuration blob is typed by sourceSubType
-# ===================================================================
-
 _GET_RESOURCE = "/namespaces/{namespaceId}/sources/{sourceId}"
 
 _GLUE_CONFIG = {
@@ -736,13 +696,8 @@ _ATHENA_CONFIG = {
 
 @pytest.mark.unit
 class TestDatabaseDetailConfigurationDispatch:
-    """The sources-table keeps every sub-type's configuration in one untyped
-    `configuration` column, so sourceSubType is the only thing that says which
-    response member the blob belongs under — and the shapes are not
-    interchangeable. GlueConfiguration requires catalogId + region, so reporting
-    a CUSTOM_CONNECTOR config as Glue fails GetSourceOutput validation and
-    turns GET into a 500 rather than a cosmetic mislabel.
-    """
+    """sourceSubType says which response member the untyped configuration blob
+    belongs under; reporting a non-Glue config as Glue turns GET into a 500."""
 
     def _get(self, aws_env, sub_type: str, config: dict) -> tuple[int, dict]:
         _put_source(
@@ -786,12 +741,8 @@ class TestDatabaseDetailConfigurationDispatch:
         assert "glueConfiguration" not in details
         assert "customConnectorConfiguration" not in details
 
-    # A row whose sourceSubType is absent or unrecognised cannot be asserted
-    # end-to-end: GetSourceOutput (and SourceSummary) declare sourceSubType
-    # @required, so such a row already fails response validation on that member
-    # alone, on both GET and LIST, regardless of how the configuration blob is
-    # typed. That is a pre-existing shape constraint, out of scope here — so the
-    # fallback is asserted on the projection function instead.
+    # A missing or unrecognised sourceSubType already fails response validation, so
+    # the fallback is asserted on the projection function.
     @pytest.mark.parametrize("sub_type", [{}, {"sourceSubType": "SOME_FUTURE_DATABASE"}])
     def test_absent_or_unrecognised_sub_type_falls_back_to_glue(self, sub_type):
         from coa_sources.api.sources_handler import _build_database_detail
@@ -824,13 +775,8 @@ class TestDatabaseDetailConfigurationDispatch:
         assert shape_members == set(_DETAIL_CONFIG_KEYS.values())
 
     def test_every_database_sub_type_is_mapped(self):
-        """The member check above only catches a new *configuration* member. A
-        new DATABASE sub-type that reuses an existing one — say an
-        AURORA_DATABASE carrying a JdbcConfiguration — adds no member, so it
-        would pass that check while its blob lands in the Glue fallback and GET
-        500s exactly as CUSTOM_CONNECTOR did. Every sub-type must therefore be
-        either mapped or explicitly declared as belonging to DOCUMENTS.
-        """
+        """Every sub-type must be mapped or declared as belonging to DOCUMENTS; the
+        member check above misses a new sub-type that reuses an existing member."""
         from coa_control_plane_server.models.source_sub_type import SourceSubType
         from coa_sources.api.sources_handler import _DETAIL_CONFIG_KEYS
 

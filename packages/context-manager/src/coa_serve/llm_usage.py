@@ -252,8 +252,6 @@ def start_tracked_task[T](coro: Coroutine[Any, Any, T], tracker: LlmUsageTracker
     return asyncio.create_task(coro, context=context)
 
 
-# ── GraphRAG work in flight ────────────────────────────────────────────────────
-#
 # GraphRAG runs its LlamaIndex LLM on serve's lexical worker, where the tracker is
 # bound explicitly, but the toolkit may also call it from its own thread pools,
 # where no tracker is bound. Deliberately untracked retrieval is marked separately:

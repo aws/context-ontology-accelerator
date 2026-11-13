@@ -1,35 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""AI review of a pull request — code review and docs-completeness review.
+"""AI review of a pull request: code review and docs-completeness review.
 
-Replaces the internally-hosted review CI components for the GitHub repository.
 Maintainer-invoked: takes a PR number or URL, reads the diff, asks Claude via
-Bedrock for findings, and posts them as a single review comment using the same
-severity markers the ``github-pr-review`` resolver skill triages — so a finding
-filed here can be resolved by that skill without translation.
+Bedrock for findings, and posts them as a single review comment using the
+severity markers the ``github-pr-review`` resolver skill triages.
 
-Safety properties, in order of importance:
+Constraints:
 
-1. **Maintainer-gated.** ``workflow_dispatch`` already requires write access, but
-   the actor's permission is re-checked here so the gate is explicit and survives
-   someone adding a second trigger later.
-2. **The diff is untrusted.** A pull request author controls it completely. It is
-   passed to the model as delimited data, never interpolated into a shell
-   command, and the prompts state that the block is data and not instructions.
-3. **Findings are advisory.** This posts a comment. It does not approve, request
-   changes, merge, or push code, so a manipulated model response cannot alter
-   the repository state.
-4. **Reasoning and writing are separate jobs.** ``--mode reason`` holds the model
-   credentials and NO write permission; it emits a JSON payload. ``--mode
-   publish`` holds write permission and never touches the model. The payload is
-   the audited handoff between them, so a compromised model response cannot
-   reach a token that can write.
-5. **Model output is scanned before posting.** Credential shapes and internal
-   hostnames are redacted, because the model reads a full diff and its output
-   goes to a public comment.
-6. **Fork-authored content is refused.** Reviewing it would process untrusted
-   content while holding privileged credentials.
+- Maintainer-gated: the actor's permission is re-checked here, not only by the workflow.
+- The diff is untrusted data. It is delimited in the prompt and never interpolated into a shell command.
+- ``--mode reason`` holds model credentials and no write permission; ``--mode publish``
+  holds write permission and never touches the model. The JSON payload is the handoff.
+- Model output is redacted (credential shapes, internal hostnames) before posting.
+- Fork-authored PRs are refused.
 """
 
 from __future__ import annotations
@@ -192,21 +177,14 @@ def assert_not_fork(pr: dict[str, object]) -> None:
 
 
 def marker(review: str, sha: str) -> str:
-    """Idempotency marker, mirroring what the CI review components embed.
-
-    Keyed on review type AND head commit, so a re-dispatch against an unchanged
-    PR is recognised as already reviewed while a new push is reviewed again.
-    """
+    """Idempotency marker keyed on review type and head commit."""
     return f"<!-- ai-pr-review:{review}:{sha} -->"
 
 
 def find_previous_review(repo: str, number: int, mark: str, *, runner: Runner = gh) -> str | None:
     """Return the URL of an existing comment carrying this marker, if any.
 
-    Deliberately fails OPEN, unlike the investigator's issue dedup: if the
-    comment list cannot be read we post anyway. A duplicate comment on one PR is
-    contained and visible, whereas a missing review is silent — the opposite
-    trade-off from issue creation, where duplicates accumulate repo-wide.
+    Fails open: if the comment list cannot be read, the review is posted anyway.
     """
     try:
         raw = runner(["api", f"repos/{repo}/issues/{number}/comments?per_page=100"])
@@ -234,14 +212,9 @@ def truncate_diff(diff: str, max_lines: int = MAX_DIFF_LINES) -> tuple[str, bool
 def parse_diff_anchors(diff: str) -> dict[str, set[int]]:
     """Map each file to the new-side line numbers that can carry an inline comment.
 
-    GitHub rejects a review comment whose line is not part of the diff with a 422,
-    so every anchor must be validated before posting — and one invalid comment
-    fails the ENTIRE review call, taking the valid ones with it. Only added and
-    context lines on the right-hand side are anchorable; deletions are not, since
-    findings are about the post-change state.
-
-    Parsed from the FULL diff, never the truncated copy sent to the model, so
-    truncation cannot silently strip valid anchors.
+    GitHub rejects the whole review with a 422 if any comment's line is not in the
+    diff. Only added and context lines on the right-hand side are anchorable.
+    Parsed from the full diff, not the truncated copy sent to the model.
     """
     anchors: dict[str, set[int]] = {}
     path: str | None = None
@@ -261,16 +234,12 @@ def parse_diff_anchors(diff: str) -> dict[str, set[int]]:
             continue
         if line.startswith("\\"):  # "\ No newline at end of file"
             continue
-        # A diff body line always starts with " ", "+" or "-". Anything else —
-        # including the empty string that split("\n") leaves after a trailing
-        # newline — is not content and must not advance the line counter.
+        # Not content (e.g. the empty string after a trailing newline).
         if not line or line[0] not in " +-":
             continue
         if line.startswith("-"):
             continue  # removed line: no right-hand-side position
-        # Added AND context lines are both inside the hunk, so both are valid
-        # anchors. Restricting to added lines only would divert findings about
-        # unchanged-but-affected code to the summary for no reason.
+        # Context lines are valid anchors too.
         anchors.setdefault(path, set()).add(new_line)
         new_line += 1
     return anchors
@@ -380,8 +349,6 @@ def render_comment(findings: list[Finding], review: str, actor: str, inline_coun
         return f"## {heading}\n\nNo findings. (Requested by @{actor}.)"
     intro = f"{len(findings)} finding(s)"
     if inline_count:
-        # Say so explicitly: a reader seeing 2 here and 5 inline should not think
-        # findings went missing.
         intro += f" that could not be anchored to a diff line, plus {inline_count} posted inline"
     lines = [f"## {heading}", "", f"{intro}. Requested by @{actor}.", ""]
     for f in sorted(findings, key=lambda x: _ORDER[x.severity]):

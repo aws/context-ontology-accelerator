@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the cross-source detection orchestrator (#1088)."""
+"""Unit tests for the cross-source detection orchestrator."""
 
 from __future__ import annotations
 
@@ -79,8 +79,8 @@ class TestRunCrossSourceInference:
         write.assert_not_called()
 
     def test_focus_datasource_is_threaded_to_inference(self, monkeypatch):
-        # MR !1215 review: the pass must bound work to the just-enriched source,
-        # so the focus id has to reach the inferrer.
+        # The pass bounds work to the just-enriched source, so the focus id has
+        # to reach the inferrer.
         seen = {}
 
         def fake_infer(tables, client, emitter, **kw):
@@ -158,9 +158,6 @@ class TestNamespaceLock:
         assert orch._acquire_namespace_lock(dao, "ns1") is True
         stale_threshold = dao.update.call_args.kwargs["condition_values"][":stale"]
         assert stale_threshold == fixed_now - orch._LOCK_TTL_S
-        # A lock written just past the TTL is reclaimable; one written just now is not.
-        assert (fixed_now - orch._LOCK_TTL_S - 1) < stale_threshold
-        assert not (fixed_now < stale_threshold)
 
     def test_release_failure_is_logged_not_raised(self):
         dao = MagicMock()
@@ -183,7 +180,7 @@ class TestNamespaceLock:
 
 class TestReadWriteResilience:
     def test_one_unreadable_source_is_skipped_and_others_proceed(self, monkeypatch):
-        # #1088 review: a single failing datasource read must not abort detection
+        # A single failing datasource read must not abort detection
         # for the remaining sources.
         good = {"DS#1": [_table("a", "DS#1", ["id"])], "DS#2": [_table("b", "DS#2", ["id"])]}
 

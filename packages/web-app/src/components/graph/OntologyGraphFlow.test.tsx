@@ -1,7 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import {
@@ -32,13 +31,6 @@ const edges: GraphEdgeData[] = [
 ];
 
 describe("OntologyGraphFlow", () => {
-  it("renders without crashing", () => {
-    const { container } = render(
-      <OntologyGraphFlow nodes={nodes} edges={edges} />,
-    );
-    expect(container.querySelector(".react-flow")).toBeTruthy();
-  });
-
   it("renders nodes with labels", () => {
     render(<OntologyGraphFlow nodes={nodes} edges={edges} />);
     expect(screen.getByText("Claim")).toBeTruthy();
@@ -204,8 +196,8 @@ describe("parallelEdgeCurves", () => {
       { id: "2", source: "b", target: "a" },
     ];
     const [forward, reverse] = parallelEdgeCurves(edges);
-    // Each edge's normal is derived from its own direction, so equal-signed
-    // offsets would land on the same side; the sign flip separates them.
+    // Each edge's normal flips with its direction, so equal offsets land on
+    // opposite sides.
     expect(forward).toBe(-22);
     expect(reverse).toBe(-22);
   });

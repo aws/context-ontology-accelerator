@@ -14,16 +14,10 @@ import type {
   MetricDialect as _MetricDialect,
   MetricAiContext as _MetricAiContext,
   CreateMetricInput as _CreateMetricInput,
-  CreateMetricOutput as _CreateMetricOutput,
-  ListMetricsOutput as _ListMetricsOutput,
-  ImportOsiOutput as _ImportOsiOutput,
-  ExportOsiOutput as _ExportOsiOutput,
 } from "@coa/control-plane-client";
 
-// Re-export Smithy types with required fields narrowed for UI usage.
-// The generated types mark @required output fields as T | undefined
-// because the OpenAPI generator is conservative. We know the API always
-// returns these fields, so we narrow them here for ergonomic UI code.
+// The generator marks @required output fields as T | undefined, so they are
+// narrowed here.
 
 export type MetricDialect = Required<_MetricDialect>;
 export type MetricAiContext = _MetricAiContext;
@@ -238,73 +232,12 @@ export function useBulkDeleteMetrics(namespaceId: string) {
   });
 }
 
-export function useImportOsi(namespaceId: string) {
-  const client = useApiClient();
-  const queryClient = useQueryClient();
-
-  return useMutation<ImportOsiOutput, Error, string>({
-    mutationFn: (content: string) =>
-      client.post<ImportOsiOutput>(`/namespaces/${namespaceId}/import-osi`, {
-        content,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["metrics", namespaceId] });
-    },
-  });
-}
-
-/** Upload file to S3 via pre-signed URL, then call import with s3Key. */
-export function useImportOsiViaS3(namespaceId: string) {
-  const client = useApiClient();
-  const queryClient = useQueryClient();
-
-  return useMutation<ImportOsiOutput, Error, File>({
-    mutationFn: async (file: File) => {
-      // Step 1: Get pre-signed upload URL
-      const { uploadUrl, s3Key } = await client.post<{
-        uploadUrl: string;
-        s3Key: string;
-      }>(`/namespaces/${namespaceId}/import-osi/upload-url`, {
-        filename: file.name,
-      });
-
-      // Step 2: Upload file to S3
-      const uploadResponse = await fetch(uploadUrl, {
-        method: "PUT",
-        body: file,
-        headers: { "Content-Type": "application/x-yaml" },
-      });
-      if (!uploadResponse.ok) {
-        throw new Error(`S3 upload failed: ${uploadResponse.status}`);
-      }
-
-      // Step 3: Call import with s3Key
-      return client.post<ImportOsiOutput>(
-        `/namespaces/${namespaceId}/import-osi`,
-        { s3Key },
-      );
-    },
-    onSuccess: (result) => {
-      if (result.status === "COMPLETED") {
-        queryClient.invalidateQueries({ queryKey: ["metrics", namespaceId] });
-      }
-    },
-  });
-}
-
 /** Import an OSI file through the pre-signed S3 upload flow.
  *
- *  Always routes via S3 (upload-url → browser PUT → import by `s3Key`), never an
- *  inline `{content}` POST. The inline path went through API Gateway, whose WAF
- *  (`AWSManagedRulesCommonRuleSet`, `SizeRestrictions_BODY`) rejects any request
- *  body over 8 KB — so a typical metrics YAML (~10-15 KB) failed with 403
- *  (issue 103). The S3 object bypasses the WAF; only a small `{s3Key}` reaches
- *  the API.
- *
- *  Requires the browser→S3 PUT to be permitted: the OSI bucket's CORS allows it
- *  and the SPA's CSP `connect-src` includes the region's S3 origin (see
- *  `public-ui-construct.ts`). The backend still accepts an inline `{content}`
- *  body for non-UI callers under the 8 KB limit — only the UI stopped using it. */
+ *  Never an inline `{content}` POST: the API Gateway WAF rule
+ *  `SizeRestrictions_BODY` rejects bodies over 8 KB. The browser PUT to S3
+ *  needs the OSI bucket's CORS and the SPA's CSP `connect-src` to allow it
+ *  (see `public-ui-construct.ts`). */
 export function useImportOsiFile(namespaceId: string) {
   const client = useApiClient();
   const queryClient = useQueryClient();
@@ -344,7 +277,6 @@ export function useGetImportJob(namespaceId: string, jobId: string | null) {
   const queryClient = useQueryClient();
   const hasInvalidated = React.useRef(false);
 
-  // Reset ref when jobId changes
   React.useEffect(() => {
     hasInvalidated.current = false;
   }, [jobId]);

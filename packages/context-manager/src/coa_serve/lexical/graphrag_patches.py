@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Serve-side graphrag-toolkit patch: request ``embedding`` in ``_source``.
+"""Serve-side graphrag-toolkit patches: ``embedding`` in ``_source``, and LLM usage accounting.
 
 Why this exists
 ---------------
@@ -18,10 +18,6 @@ The exception escapes ``get_embeddings`` and is swallowed one level up by
 ``Failed to fetch stored topic embeddings``). Every neighbour is then treated as
 "no stored embedding" and skipped, so the beam collapses to its seed set and the
 retriever returns ~1 node regardless of how good the seeds are.
-
-Measured on the live sec10q collection: a terms query for known topic ids matches
-3/3 docs but ``'embedding' in hit['_source']`` is ``False``; adding an explicit
-``_source`` include returns the full 1024-dim vector for 5681/5681 topic docs.
 
 The fix: explicitly project the fields ``_to_get_embedding_result`` consumes. This
 is a read-path-only patch (serve never writes vectors), and it leaves the

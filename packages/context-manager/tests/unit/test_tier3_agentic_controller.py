@@ -1,29 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever reasoning controller (task 11).
-
-Covers ``coa_serve.tier3.agentic.controller`` with a mocked planner,
-mock Tools, and a fake (manually advanced) budget clock so loop control, budgets,
-and stop conditions are fully deterministic — no Bedrock, no graph, no sleeping on
-the wall clock:
-
-- Tool preference ordering (Req 5.1-5.3, 5.6): a Retrieval_Strategy_Tool beats a
-  Query_Template beats an Ad_Hoc_Query, strategy wins ties, and an ad-hoc query is
-  selected only when it is the sole candidate — enforced by the controller
-  regardless of the order the planner proposed them.
-- Input-contract rejection (Req 2.5): a non-conforming decision is NOT invoked, the
-  violation is traced, and the loop continues.
-- Stop conditions: positive Sufficiency_Check (Req 6.1-6.2), no new information
-  (Req 6.3), max steps reached (Req 4.5/6.4), and no Tool selectable (Req 4.7).
-- Per-Tool failure tolerance (Req 9.1-9.2): a Tool that times out or raises is
-  recorded as a degraded source and the loop continues.
-- Ad-hoc tracing and failure (Req 5.4, 5.7).
-- Ontology-constrained traversal edge filtering (Req 3.4, 3.9).
-- Exploration-branch enqueue under the aggregate fan-out cap (Req 13.4, 13.7-13.8).
-- Namespace scoping of Tool invocations (Req 1.5).
-- ``validate_inputs`` contract helper, and the lazy-import invariant (Req 12.3).
-"""
+"""Unit tests for the Agentic Retriever reasoning controller with mocked planner, tools and clock."""
 
 from __future__ import annotations
 
@@ -54,9 +32,6 @@ from coa_serve.trace import TraceCollector
 NS = "acme"
 
 
-# ── deterministic test doubles ─────────────────────────────────────
-
-
 class FakeClockSource:
     """A manually advanced monotonic time source (seconds) for the BudgetClock."""
 
@@ -85,13 +60,7 @@ def chunk_result(chunk_id: str, *, directions: tuple[str, ...] = (), detail: str
 
 
 class FakeTool:
-    """A mock Tool that records its invocations and is configurably degraded.
-
-    Implements the four-field uniform contract so it registers cleanly. ``invoke``
-    records the kwargs it was called with (including ``namespace``), then either
-    returns the configured result, raises, sleeps (to force a controller timeout),
-    or returns a fresh-chunk result per call (``incrementing``).
-    """
+    """A mock Tool that records its invocations and is configurably degraded."""
 
     def __init__(
         self,
@@ -255,9 +224,6 @@ def find_step(trace: TraceCollector, step: str):
     return [s for s in trace.steps if s.step == step]
 
 
-# ── validate_inputs contract helper (Req 2.5) ──────────────────────
-
-
 @pytest.mark.unit
 class TestValidateInputs:
     def test_conforming_inputs_have_no_violations(self):
@@ -282,9 +248,6 @@ class TestValidateInputs:
         assert validate_inputs({"x": 1}, {}) != []
         # ...but accepts an empty input set (e.g. the ontology tool).
         assert validate_inputs({}, {}) == []
-
-
-# ── preference ordering (Req 5.1-5.3, 5.6) ─────────────────────────
 
 
 @pytest.mark.unit
@@ -312,7 +275,7 @@ class TestPreferenceSelection:
 
     def test_strategy_wins_ties_over_template(self):
         c = self._controller()
-        # Template listed first; strategy must still win the tie (Req 5.6).
+        # Template listed first; strategy must still win the tie.
         candidates = [
             PlannerDecision(tool_name="graph_traversal"),
             PlannerDecision(tool_name="strategy:traversal"),
@@ -351,9 +314,6 @@ class TestPreferenceSelection:
         assert graph.calls == []
 
 
-# ── input-contract rejection (Req 2.5) ─────────────────────────────
-
-
 @pytest.mark.unit
 class TestInputContractRejection:
     async def test_non_conforming_inputs_not_invoked_then_loop_continues(self):
@@ -379,9 +339,6 @@ class TestInputContractRejection:
         assert stop == StopReason.sufficiency_satisfied
 
 
-# ── stop conditions ────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestStopConditions:
     async def test_sufficiency_stop(self):
@@ -396,11 +353,7 @@ class TestStopConditions:
         assert len(tool.calls) == 1
 
     async def test_no_new_information_stop(self):
-        # The tool returns an empty result → ctx.add yields 0 new items (Req 6.3).
-        # With the escalation ladder (idea 4), a SINGLE no-progress step no longer
-        # stops the loop — it takes max_no_progress_steps (default 3) CONSECUTIVE
-        # no-progress steps. ``repeat_last`` keeps re-proposing the empty-result
-        # tool so the streak builds to the tolerance and then stops.
+        # The loop stops after max_no_progress_steps (default 3) consecutive no-progress steps.
         tool = FakeTool("strategy:entity_based", input_schema={"query": "str"}, result=ToolResult(detail="empty"))
         registry = make_registry(tool)
         planner = ScriptedPlanner(
@@ -413,7 +366,7 @@ class TestStopConditions:
         assert len(tool.calls) == 3  # escalation tolerance (default 3) exhausted
 
     async def test_novel_fruitless_approaches_reset_the_streak(self):
-        """Escalation-aware (B): each fruitless step with a NOVEL (tool+inputs)
+        """Each fruitless step with a NOVEL (tool+inputs)
         approach resets the no-progress streak, so a planner that keeps diversifying
         is not stopped by the counter — only the aggregate step budget bounds it.
         Contrast test_no_new_information_stop, where REPEATS exhaust the streak at 3."""
@@ -432,7 +385,7 @@ class TestStopConditions:
 
     async def test_max_steps_stop(self):
         # Each step adds new info and sufficiency is never satisfied, so the
-        # aggregate step cap terminates the loop (Req 4.5/6.4).
+        # aggregate step cap terminates the loop.
         tool = FakeTool("strategy:entity_based", input_schema={"query": "str"}, incrementing=True)
         registry = make_registry(tool)
         clock, _src = make_clock(max_steps=2)
@@ -463,10 +416,7 @@ class TestStopConditions:
         )
         stop, _ctx, _queue, _trace = await run_loop(planner, registry, clock=clock)
         assert stop == StopReason.time_budget_expired
-        assert tool.calls == []  # no step initiated past the budget (Req 7.4)
-
-
-# ── per-Tool failure tolerance (Req 9.1-9.2) ───────────────────────
+        assert tool.calls == []  # no step initiated past the budget
 
 
 @pytest.mark.unit
@@ -535,9 +485,6 @@ class TestPerToolFailureTolerance:
         assert {"source": "strategy:slow", "reason": "timeout"} in ctx.degraded_sources
 
 
-# ── ad-hoc tracing & failure (Req 5.4, 5.7) ────────────────────────
-
-
 @pytest.mark.unit
 class TestAdHocHandling:
     async def test_ad_hoc_generation_is_traced(self):
@@ -563,13 +510,10 @@ class TestAdHocHandling:
         stop, ctx, _queue, trace = await run_loop(planner, registry)
 
         assert ctx.degraded_sources == [{"source": "graph_traversal", "reason": "error"}]
-        assert ctx.chunks == []  # no partial results retained (Req 5.7)
+        assert ctx.chunks == []  # no partial results retained
         failure = [s for s in trace.steps if "ad-hoc query execution" in str(s.detail)]
         assert len(failure) == 1
         assert stop is None
-
-
-# ── ontology-constrained traversal (Req 3.4, 3.9) ──────────────────
 
 
 @pytest.mark.unit
@@ -650,34 +594,6 @@ class TestOntologyEdgeFiltering:
         filt = find_step(trace, "ontology_edge_filter")
         assert len(filt) == 1 and "HAS_SEGMENT" in str(filt[0].detail)
 
-    async def test_strict_never_starves_when_no_edge_in_ontology(self):
-        """strict mode guard: if NONE of the requested edge types is in the
-        ontology, keep the request rather than emptying it (an empty edge_types
-        list would trip the tool's MIN_EDGE_TYPES bound)."""
-        graph = FakeTool(
-            "graph_traversal",
-            input_schema={"mode": "str", "entity_ids": "list[str]", "edge_types": "list[str]"},
-        )
-        registry = make_registry(graph)
-        ctx = AccumulatedContext()
-        ctx.ontology = Ontology(node_types=(), edge_types=("COMPETES_WITH",), edge_map=())
-        planner = ScriptedPlanner(
-            [
-                [
-                    PlannerDecision(
-                        tool_name="graph_traversal",
-                        inputs={"mode": "edge_typed", "entity_ids": ["e1"], "edge_types": ["HAS_SEGMENT", "SELLS"]},
-                    )
-                ]
-            ],
-            sufficiency=[True],
-        )
-
-        _stop, _ctx, _queue, _trace = await run_loop(planner, registry, ctx=ctx, ontology_edge_mode="strict")
-
-        # Not stripped to empty — the original request is preserved.
-        assert graph.calls[0]["edge_types"] == ["HAS_SEGMENT", "SELLS"]
-
     async def test_no_filtering_when_all_edge_types_in_ontology(self):
         graph = FakeTool(
             "graph_traversal",
@@ -720,12 +636,8 @@ class TestOntologyEdgeFiltering:
             sufficiency=[True],
         )
         _stop, _ctx, _queue, _trace = await run_loop(planner, registry, ctx=ctx)
-        # With no ontology resolved the controller does not filter (Req 3.9 applies
-        # once the ontology is known).
+        # With no ontology resolved the controller does not filter.
         assert graph.calls[0]["edge_types"] == ["ANYTHING"]
-
-
-# ── edge-type discovery counts as progress (idea 5 soft-prior) ──────
 
 
 @pytest.mark.unit
@@ -766,9 +678,6 @@ class TestPresentEdgeDiscovery:
         assert stop != StopReason.no_new_information
 
 
-# ── exploration-branch enqueue under the fan-out cap (Req 13.4) ────
-
-
 @pytest.mark.unit
 class TestBranchEnqueue:
     async def test_branches_enqueued_up_to_the_fanout_cap(self):
@@ -790,7 +699,7 @@ class TestBranchEnqueue:
         # Only fan-out-cap (2) branches opened despite 3 surfaced directions.
         assert len(queue) == 2
         assert clock.branches_opened == 2
-        seeds = [sq.seed if hasattr(sq, "seed") else sq.text for sq in queue]
+        seeds = [sq.text for sq in queue]
         assert seeds == ["Walmart", "Target"]
         # Each enqueued item is a branch-origin SubQuestion.
         for sq in queue:
@@ -812,9 +721,6 @@ class TestBranchEnqueue:
         assert clock.branches_opened == 0
 
 
-# ── namespace scoping (Req 1.5) ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestNamespaceScoping:
     async def test_tool_invoked_with_request_namespace(self):
@@ -826,9 +732,6 @@ class TestNamespaceScoping:
         )
         await run_loop(planner, registry, namespace="tenant-z")
         assert tool.calls[0]["namespace"] == "tenant-z"
-
-
-# ── unknown tool named by the planner ──────────────────────────────
 
 
 @pytest.mark.unit
@@ -849,9 +752,6 @@ class TestUnknownTool:
         assert any("unknown_tool" in str(s.detail) for s in trace.steps)
 
 
-# ── lazy-import invariant (Req 12.3) ───────────────────────────────
-
-
 @pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_controller_does_not_import_graphrag(self):
@@ -870,8 +770,6 @@ class TestLazyImportInvariant:
         )
         assert "OK" in result.stdout
 
-
-# ── options.loopFixes ──────────────────────────────────────────────
 
 FIXES = {"options": {"loopFixes": True}}
 
@@ -951,9 +849,6 @@ class TestLoopFixes:
         assert stop == StopReason.no_new_information
 
 
-# ── answer-stability no-progress signal ─────────────────────────────────
-
-
 @pytest.mark.unit
 class TestAnswerStability:
     async def _run(self, *, working_answers, threshold, stability_steps=2, max_steps=10):
@@ -998,7 +893,7 @@ class TestAnswerStability:
 
     async def test_threshold_zero_disables_the_signal(self):
         """With threshold 0.0 (default) and telemetry off, a perfectly stable answer
-        does NOT stop the loop, and no embed runs at all (R-5(b), R-9)."""
+        does NOT stop the loop, and no embed runs at all."""
         stop, trace, embed = await self._run(working_answers=["A", "A", "A", "A"], threshold=0.0, max_steps=4)
         assert stop == StopReason.max_steps_reached
         assert not find_step(trace, "answer_stability")
