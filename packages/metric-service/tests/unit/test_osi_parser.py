@@ -26,9 +26,6 @@ from coa_metrics.osi_parser import (
 pytestmark = pytest.mark.unit
 
 
-# ── Dialect Mapping Tests ───────────────────────────────────────────────
-
-
 class TestDialectMapping:
     """Tests for OSI ↔ internal dialect mapping."""
 
@@ -40,8 +37,7 @@ class TestDialectMapping:
             ("SNOWFLAKE", "SNOWFLAKE"),
             ("Snowflake", "SNOWFLAKE"),
             ("DATABRICKS", "DATABRICKS"),
-            # #140: a real dialect named directly is legitimate input and passes
-            # through case-normalized, not collapsed to POSTGRESQL or lowercased.
+            # A real dialect named directly passes through case-normalized.
             ("REDSHIFT", "REDSHIFT"),
             ("redshift", "REDSHIFT"),
             ("TRINO", "TRINO"),
@@ -79,8 +75,6 @@ class TestDialectMapping:
         with pytest.raises(ValueError, match="No OSI mapping"):
             internal_dialect_to_osi("oracle")
 
-
-# ── Parser Tests ────────────────────────────────────────────────────────
 
 VALID_OSI_YAML = """\
 osi_spec_version: "1.0"
@@ -345,9 +339,6 @@ metrics:
         assert result.document.metrics[0].custom_extensions is None
 
 
-# ── Serializer Tests ────────────────────────────────────────────────────
-
-
 class TestSerializeOsiYaml:
     """Tests for serialize_osi_yaml function."""
 
@@ -431,9 +422,6 @@ class TestSerializeOsiYaml:
         assert doc1.datasets[0].name == doc2.datasets[0].name
 
 
-# ── AI Context Parsing Tests ────────────────────────────────────────────
-
-
 class TestParseAiContext:
     """Tests for _parse_ai_context — structured OSI ai_context parsing."""
 
@@ -477,9 +465,6 @@ class TestParseAiContext:
 
     def test_empty_string_returns_none(self) -> None:
         assert _parse_ai_context("") is None
-
-
-# ── Dataset Source Field Tests ──────────────────────────────────────────
 
 
 class TestDatasetSourceField:
@@ -549,19 +534,14 @@ metrics:
         assert "instructions: Use for revenue. Do not use for forecasting." in yaml_str
 
 
-# ── Vendor Extension Shape ──────────────────────────────────────────────
-
 _EXAMPLES_DIR = Path(__file__).resolve().parents[2] / "examples"
 
 
 class TestShippedExamplesCarryCustomExtensions:
     """The shipped example YAMLs must use the spec-defined ``custom_extensions`` shape.
 
-    They once carried COA metadata under ``x_coa:``, which nothing reads. Importing
-    them parsed cleanly but dropped unit, return_type, time_dimension and
-    ontology_concepts for every metric — and with no ontology_concepts, Check 6 had
-    nothing to validate and raised nothing. These tests pin the samples to the
-    shape the parser (and the exporter) actually speak.
+    COA metadata under ``x_coa:`` is ignored by the parser, so these tests pin the
+    samples to the shape the parser and exporter use.
     """
 
     @pytest.mark.parametrize("example", sorted(p.name for p in _EXAMPLES_DIR.glob("*.yaml")))
@@ -584,7 +564,7 @@ class TestShippedExamplesCarryCustomExtensions:
         assert list(_EXAMPLES_DIR.glob("*.yaml"))
 
     def test_sample_import_keeps_ontology_binding(self) -> None:
-        """The headline sample must round-trip the fields the x_coa bug dropped."""
+        """The headline sample round-trips its ontology binding fields."""
         result = parse_osi_yaml((_EXAMPLES_DIR / "sample-osi-import.yaml").read_text())
         assert result.success
         assert result.document is not None

@@ -1,45 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ontology source abstraction for the Agentic Retriever (Req 3.1, 3.6).
+"""Ontology source abstraction for the Agentic Retriever.
 
-The determined ontology a request needs — the complete set of node types, the
-complete set of edge types, and, for each edge type, the directional mapping of
-its source node type to its target node type (Req 3.1) — can be resolved from
-either of two backends. Both implement the :class:`OntologySource` Protocol and
-return the SAME :class:`Ontology` shape so the Ontology_Lookup_Tool (and the
-reasoning agent that consumes it) is agnostic to which backend resolved it
-(Req 3.6). Crucially, both backends run the SAME SPARQL — the shared SELECT
-bodies / triple patterns and the shared :func:`_build_ontology` row-shaping
-defined in this module — so the file source is a faithful stand-in for the graph
-source, not a parallel reimplementation.
+The determined ontology (node types, edge types, and each edge type's source to
+target node-type mapping) resolves from either of two backends implementing
+:class:`OntologySource`. Both run the SAME SPARQL bodies and the shared
+:func:`_build_ontology` row-shaping, so they return the same :class:`Ontology`:
 
-- :class:`OntologyFileSource` — the CURRENT in-scope path the agentic retriever
-  ships on. It is a deliberate STOPGAP: it materializes the WHOLE ontology by
-  parsing a serialized ``.ttl`` Turtle file with rdflib into an in-memory graph
-  and running the shared SPARQL against it (no ``GRAPH`` wrapper, since a parsed
-  ``.ttl`` lands in the default graph). This is valid precisely while the
-  ontology is small enough to copy wholesale alongside the request. Because it
-  executes the same SPARQL as the graph source via rdflib's in-memory engine, it
-  produces a byte-for-byte identical :class:`Ontology`.
-- :class:`OntologyGraphSource` — the live SPARQL/RDF backend. It queries the RDF
-  **ontology graph(s)** for the namespace through the existing serve-layer
-  :class:`GraphClient` (the same client ``GraphTraverser`` uses), wrapping the
-  shared SPARQL bodies in a ``GRAPH ?g { ... }`` block and filtering
-  ``STRSTARTS(STR(?g), <prefix>)`` — where the prefix comes from
-  ``get_graph_uri_template()`` (default ``urn:coa:{namespace}:published``), the
-  same helper ``GraphTraverser`` uses — so it unions every per-ontology named
-  graph in the namespace. Its live use is DEFERRED to follow-up task 21, which
-  will issue targeted, query-shaped lookups against the ontology graph instead of
-  copying it wholesale; the shape it returns is already identical to the file
-  source's so that switch is a drop-in. This is the SPARQL/RDF side — a different
-  dataset and query language from the graphrag-toolkit property graph the
-  strategy/traversal tools use (see the design's "Two graphs").
+- :class:`OntologyGraphSource` queries the namespace's RDF ontology graph(s)
+  through the serve-layer :class:`GraphClient`.
+- :class:`OntologyFileSource` parses a ``.ttl`` file with rdflib and runs the same
+  SPARQL against the in-memory default graph.
 
-Import discipline (Requirement 12.3): this module imports only the dependency-
-free serve-layer helpers, ``structlog``, ``asyncio``, and ``textwrap`` at load.
-``rdflib`` is imported lazily inside :meth:`OntologyFileSource._load_sync`, and
-nothing here imports ``graphrag_toolkit``.
+Import discipline: ``rdflib`` is imported lazily inside
+:meth:`OntologyFileSource._load_sync`, and nothing here imports ``graphrag_toolkit``.
 """
 
 from __future__ import annotations
@@ -73,30 +48,19 @@ _MAX_ONTOLOGY_GRAPHS = 50
 _GOVERNED_GRAPH = quote(GOVERNED_METRICS_ONTOLOGY_ID, safe="")
 """The last segment of a namespace's governed-metrics graph URI."""
 
-# Inner fast-fail cap on JUST the owl:Ontology graph-IRI resolve (seconds). The
-# resolve is a cheap optimisation that lets the type queries use a constant
-# ``GRAPH <iri>`` instead of a cluster-wide ``STRSTARTS`` scan; it must never
-# itself eat the whole lookup budget. Without this, a single hung resolve burns
-# the full outer ``_ontology_lookup_timeout_s`` and the lookup fails with NOTHING,
-# even though the prefix-filter fallback would have answered within budget. Giving
-# the resolve its own short timeout (so on hang it returns ``None`` and the type
-# queries run with the prefix filter) is exactly what Tier-2's ``graph_tools`` and
-# ``tbox_context`` resolvers do. Kept well under the outer cap so the fallback
-# queries still have budget left to run.
+# Inner fast-fail cap on the owl:Ontology graph-IRI resolve (seconds), so a hung
+# resolve returns ``None`` and leaves budget for the prefix-filter fallback queries
+# instead of burning the whole outer ``_ontology_lookup_timeout_s``.
 _GRAPH_IRI_RESOLVE_TIMEOUT_S = 2.0
 
 
 def _ontology_lookup_timeout_s() -> float:
     """Fast-fail budget for a single graph-backed ontology lookup (seconds).
 
-    The ontology lookup is ONE preparatory step inside the deep-reasoning loop,
-    not the whole answer, so it must fail fast rather than burn a large slice of
-    the shared time budget. The underlying graph client already retries a hung
-    SPARQL post (NEPTUNE_TIMEOUT read x retryhttp attempts), which can stack to
-    ~16s per lookup — long enough to swallow a full reasoning step. This caps the
-    lookup end-to-end so a slow/hung Neptune degrades the ontology to empty (the
-    soft-prior loop still runs) instead of starving the budget. Env-tunable;
-    defaults to a tight 6s and is floored at 1s so it can never be disabled.
+    The graph client already retries a hung SPARQL post, which can stack to ~16s
+    per lookup; this caps the lookup end-to-end so a slow Neptune degrades the
+    ontology to empty instead of starving the shared budget. Env-tunable; defaults
+    to 6s and is floored at 1s so it can never be disabled.
     """
     try:
         return max(1.0, float(os.environ.get("DEEP_REASONING_ONTOLOGY_TIMEOUT_S", "6")))
@@ -106,7 +70,7 @@ def _ontology_lookup_timeout_s() -> float:
 
 @dataclass(frozen=True)
 class Ontology:
-    """The determined ontology for a Namespace in one source-agnostic shape (Req 3.1, 3.6).
+    """The determined ontology for a Namespace in one source-agnostic shape.
 
     Every :class:`OntologySource` returns this exact shape regardless of backend,
     so the Ontology_Lookup_Tool and the reasoning agent treat the graph and file
@@ -121,8 +85,8 @@ class Ontology:
             here; an edge type with no resolvable domain/range still appears here
             but has no ``edge_map`` entry.
         edge_map: The directional source→target mapping per edge type as
-            ``(edge_type, source_node_type, target_node_type)`` triples
-            (Req 3.1), de-duplicated and sorted. ``source_node_type`` is the
+            ``(edge_type, source_node_type, target_node_type)`` triples,
+            de-duplicated and sorted. ``source_node_type`` is the
             edge's domain class label; ``target_node_type`` is its range class
             label.
     """
@@ -134,12 +98,12 @@ class Ontology:
 
 @runtime_checkable
 class OntologySource(Protocol):
-    """Backend that resolves an :class:`Ontology` for a Namespace (Req 3.2).
+    """Backend that resolves an :class:`Ontology` for a Namespace.
 
-    The configured source is selected per deployment (Req 3.3). ``load`` returns
+    The configured source is selected per deployment. ``load`` returns
     the ontology in the uniform :class:`Ontology` shape; on a backend failure it
     raises, leaving the Ontology_Lookup_Tool to record the failure and the source
-    in use (Req 3.11).
+    in use.
     """
 
     async def load(self, namespace: str) -> Ontology:
@@ -147,18 +111,7 @@ class OntologySource(Protocol):
         ...
 
 
-# ── Shared SPARQL, run by BOTH sources ─────────────────────────────
-#
-# The SELECT projections and the WHERE *bodies* (triple patterns) below are the
-# single source of truth for the ontology queries. The only per-source difference
-# is the execution target and how the body is wrapped:
-#   - the NDB graph source wraps each body in ``GRAPH ?g { ... }`` and filters
-#     ``STRSTARTS(STR(?g), <prefix>)`` (prefix from ``get_graph_uri_template()``,
-#     default ``urn:coa:{ns}:published``) to union the namespace's per-ontology
-#     graphs, then ships it to the serve-layer GraphClient;
-#   - the file source runs each body unchanged against the default graph of an
-#     in-memory rdflib graph parsed from a ``.ttl``.
-# Both feed the resulting binding rows into the shared :func:`_build_ontology`.
+# Shared SPARQL, run by BOTH sources.
 
 _ONTOLOGY_PREFIXES = (
     "PREFIX owl: <http://www.w3.org/2002/07/owl#>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>"
@@ -166,7 +119,7 @@ _ONTOLOGY_PREFIXES = (
 
 # The determined node types — every ``owl:Class`` that carries a label. The class
 # IRI and each label's tag are projected so a class with several labels becomes
-# ONE node type, named by the namespace-language preference (LLD §2.2.5).
+# ONE node type, named by the namespace-language preference.
 _NODE_TYPES_SELECT = "SELECT DISTINCT ?classUri ?classLabel (LANG(?classLabel) AS ?classLabelLang)"
 _NODE_TYPES_BODY = "?classUri a owl:Class .\n?classUri rdfs:label ?classLabel ."
 # The variables the node-type query binds, in projection order.
@@ -219,9 +172,7 @@ def _graph_wrapped_query(select: str, body: str, graph_uri_prefix: str, graph_ir
     EVERY graph on the cluster and filters afterwards — correct but cluster-wide,
     so its cost scales with the whole store, not the namespace. The scoped form is
     the same fix Tier-2's FK-edge query uses to stop pinning Neptune's CPU on a
-    many-namespace cluster. (The earlier exact-match on a hardcoded
-    ``urn:orion:{ns}:published`` graph matched nothing, so the ontology always
-    resolved empty even after a successful accept.)
+    many-namespace cluster.
     """
     from ....query_utils import graph_scoped_body
 
@@ -272,8 +223,8 @@ def _build_ontology(node_rows: list[dict[str, Any]], edge_rows: list[dict[str, A
     preference, so a class carrying ``"設備"@ja`` and an untagged ``"Equipment"`` is
     one node type rather than two. A row without an IRI (older fixtures) is keyed
     by its label. An edge row contributes an ``edge_map`` triple only when BOTH a
-    domain and a range label are present so every triple is fully directional
-    (Req 3.1). Shared verbatim by both sources.
+    domain and a range label are present so every triple is fully directional.
+    Shared verbatim by both sources.
     """
     preference = current_label_preference()
 
@@ -319,7 +270,7 @@ def _build_ontology(node_rows: list[dict[str, Any]], edge_rows: list[dict[str, A
 
 
 class OntologyGraphSource:
-    """Live SPARQL/RDF backend for the Ontology_Lookup_Tool (Req 3.2, 3.4).
+    """Live SPARQL/RDF backend for the Ontology_Lookup_Tool.
 
     Reuses the read-only :class:`GraphClient` already used by ``GraphTraverser``
     to run the shared ontology SPARQL over the namespace's per-ontology named
@@ -362,9 +313,9 @@ class OntologyGraphSource:
         Ontology rather than issuing an unscoped query. A lookup that exceeds the
         fast-fail timeout (see :func:`_ontology_lookup_timeout_s`) RAISES
         ``TimeoutError`` — a timeout is a lookup FAILURE, kept distinct from a
-        genuinely empty ontology (Req 3.10 empty vs 3.11 failed). Any other backend
+        genuinely empty ontology. Any other backend
         failure also propagates (the GraphClient ``query`` contract raises), leaving
-        failure handling and trace recording to the Ontology_Lookup_Tool (Req 3.11).
+        failure handling and trace recording to the Ontology_Lookup_Tool.
         """
         from ....query_utils import namespace_graph_prefix
 
@@ -373,17 +324,6 @@ class OntologyGraphSource:
         # Validate before interpolating the namespace into the SPARQL prefix.
         validate_namespace(namespace)
         prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
-        # Fast-fail: a single ontology lookup must not consume a large slice of the
-        # shared reasoning budget if Neptune is slow/hung (the graph client's own
-        # read-timeout x retry can stack to ~16s). Cap the lookup end-to-end. On
-        # timeout we RAISE rather than return an empty Ontology: a timeout is a
-        # lookup FAILURE, not a namespace that genuinely has no ontology, and the
-        # two are distinct outcomes (Req 3.10 empty vs 3.11 failed). Returning empty
-        # here would mislead the planner ("this namespace has no ontology") and hide
-        # the timeout from a trace. OntologyLookupTool.invoke catches every exception
-        # and records a "failed (source=...)" result WITHOUT re-raising, so the
-        # fast-fail intent is preserved — the soft-prior traversal still runs — while
-        # the outcome is labelled correctly.
         timeout_s = _ontology_lookup_timeout_s()
         try:
             node_rows, edge_rows = await asyncio.wait_for(
@@ -398,14 +338,7 @@ class OntologyGraphSource:
     async def _load_scoped(self, prefix: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Resolve the namespace's graph IRIs, then run the scoped type queries.
 
-        Resolve the named-graph IRIs first (a cheap owl:Ontology scan), then scope
-        the type queries to them with a constant ``GRAPH <iri>`` per graph instead
-        of a cluster-wide ``STRSTARTS`` prefix filter — the same fix Tier-2 uses to
-        stop the ontology scan pinning Neptune CPU as the cluster grows. A resolve
-        that fails/empties/exceeds the inlining cap degrades inside
-        :func:`_graph_wrapped_query` to the prefix filter, so this never fails the
-        lookup — it only makes the common (few-graph) case cheap. Kept as one
-        coroutine so the caller's fast-fail timeout bounds the WHOLE sequence
+        One coroutine so the caller's fast-fail timeout bounds the WHOLE sequence
         (resolve + both type queries), not just the type queries.
         """
         graph_iris = await self._resolve_graph_iris(prefix)
@@ -419,13 +352,10 @@ class OntologyGraphSource:
 
         Returns the resolved IRIs, or ``None`` when resolution fails, times out, or
         yields nothing — in which case :func:`_graph_wrapped_query` degrades to the
-        cluster-wide prefix filter (slow but correct). The resolve gets its OWN
-        short timeout (``_GRAPH_IRI_RESOLVE_TIMEOUT_S``, well under the outer
-        lookup cap), so a hung resolve cannot eat the whole lookup budget and leave
-        no time for the prefix-filter fallback — the same reason Tier-2's resolvers
-        bound their resolve. ``graph_scoped_body`` drops any unsafe IRI itself, so
-        no pre-filtering is needed here. Never raises: resolution is a cheap
-        optimisation, not a correctness dependency.
+        cluster-wide prefix filter (slow but correct). Bounded by
+        ``_GRAPH_IRI_RESOLVE_TIMEOUT_S``; ``graph_scoped_body`` drops any unsafe IRI
+        itself. Never raises: resolution is an optimisation, not a correctness
+        dependency.
         """
         from ....query_utils import named_graphs_sparql
 
@@ -445,38 +375,20 @@ class OntologyGraphSource:
 
 
 class OntologyFileSource:
-    """Current shipping STOPGAP: resolve the ontology from a serialized ``.ttl`` (Req 3.5).
+    """Resolve the ontology from a serialized ``.ttl`` file.
 
-    This is the in-scope path the agentic retriever ships on today. It is a
-    deliberate stopgap that materializes the WHOLE ontology by parsing a Turtle
-    file with rdflib and running the SAME shared SPARQL the graph source runs —
-    only against the default graph of the in-memory rdflib graph (no ``GRAPH``
-    wrapper, since a parsed ``.ttl`` has no named graph) and via rdflib's
-    in-memory SPARQL engine instead of Neptune. The resulting binding rows go
-    through the SAME :func:`_build_ontology` shaping, so the :class:`Ontology` it
-    returns is identical to the graph source's. This is valid while the ontology
-    is small enough to copy wholesale; task 21 introduces the live graph path.
-
+    Runs the shared SPARQL against the default graph of an in-memory rdflib graph.
     The ``namespace`` argument to :meth:`load` is accepted for interface parity
-    with :class:`OntologyGraphSource` but not used — a file represents a single
-    ontology.
+    with :class:`OntologyGraphSource` but not used: a file is a single ontology.
 
-    Thread-safety + caching. rdflib's SPARQL parser builds a process-global
-    pyparsing grammar lazily on first ``Graph.query``, and that construction is
-    NOT thread-safe: concurrent first-use from multiple threads (e.g. the
-    ``asyncio.to_thread`` workers behind concurrent requests) races on the shared
-    grammar and raises spurious ``TypeError: Param.postParse2() …`` /
-    ``<lambda>() missing … argument`` errors. Because a ``.ttl`` ontology is
-    static, :meth:`load` parses + queries at most ONCE per ``ttl_path`` and caches
-    the resulting :class:`Ontology`; the parse/query is guarded by a module-level
-    lock so the first (cold) concurrent batch is serialized rather than racing,
-    and every subsequent call returns the cached value without touching rdflib.
+    rdflib builds a process-global pyparsing grammar lazily on first
+    ``Graph.query``, and that construction is NOT thread-safe (concurrent
+    first-use raises spurious ``TypeError: Param.postParse2() …`` errors). So the
+    parse/query runs under a module-level lock, at most once per ``ttl_path``, and
+    the query rows are cached.
     """
 
-    # Process-wide cache of resolved ontologies keyed by ttl_path, plus the lock
-    # that guards both the rdflib parse/query (not thread-safe) and the cache. The
-    # ontology file is immutable for the process lifetime, so a single resolve per
-    # path is correct; the lock makes the first concurrent batch safe.
+    # Query rows keyed by ttl_path; the lock guards rdflib and the cache.
     _cache: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
     _lock = threading.Lock()
 
@@ -493,14 +405,7 @@ class OntologyFileSource:
     async def load(self, namespace: str) -> Ontology:
         """Parse the configured ``.ttl`` and run the shared SPARQL over it.
 
-        ``rdflib`` is imported lazily inside :meth:`_load_sync` (Req 12.3
-        discipline) and the parse + query — a fast, in-memory operation — runs off
-        the event loop. The result is cached per ``ttl_path`` and the rdflib work
-        is serialized by a module-level lock (see the class docstring) so that
-        concurrent cold first-use cannot race rdflib's non-thread-safe SPARQL
-        grammar construction. Raises on a missing/unparseable file, mirroring the
-        graph source's raise-on-failure contract so the Ontology_Lookup_Tool
-        records it uniformly (Req 3.11).
+        Runs off the event loop. Raises on a missing or unparseable file.
         """
         return await asyncio.to_thread(self._load_locked)
 
@@ -531,7 +436,7 @@ class OntologyFileSource:
         through rdflib's in-memory SPARQL engine and returns the shaped rows for
         the shared :func:`_build_ontology`. No hand-walking of triples.
         """
-        from rdflib import Graph  # lazy import (Req 12.3 discipline)
+        from rdflib import Graph  # lazy import
 
         graph = Graph()
         graph.parse(self._ttl_path, format="turtle")

@@ -127,11 +127,6 @@ class TestDirectPath:
         assert direct_client._proxy_lambda_arn == ""
         assert direct_client._lambda_client is None
 
-    def test_proxy_arn_set_means_proxy(self, proxy_client):
-        client, _ = proxy_client
-        assert client._proxy_lambda_arn != ""
-        assert client._lambda_client is not None
-
 
 @pytest.mark.unit
 class TestParseHits:

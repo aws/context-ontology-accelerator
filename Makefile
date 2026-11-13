@@ -51,7 +51,7 @@ coverage:
 ##   INTEG_NAMESPACE_ID  — reuse an existing namespace (skip create)
 test-integ:
 	@if ls packages/*/tests/integ/ >/dev/null 2>&1; then \
-		uv run pytest packages/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib && \
+		uv run pytest packages/*/tests/integ/ coa-ai/*/tests/integ/ -m integ -v --tb=short --import-mode=importlib && \
 		uv run pytest \
 			benchmarks/coa100-benchmark/tests/integ/test_nightly_history_discovery.py \
 			benchmarks/coa100-benchmark/tests/integ/test_rolling_metric_publish.py \

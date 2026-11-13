@@ -37,9 +37,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-# ── Enums ────────────────────────────────────────────────────────────────
-
-
 class StrategyOption(StrEnum):
     """Strategy selection values — used by client (options.strategy) and internally."""
 
@@ -83,9 +80,6 @@ def normalize_strategy_option(value: object) -> object:
     return value
 
 
-# ── Data classes ─────────────────────────────────────────────────────────
-
-
 @dataclass
 class StrategyResult:
     """Unified result from any Tier 2 strategy."""
@@ -94,16 +88,16 @@ class StrategyResult:
     rows: list[dict]
     columns: list[str]
     confidence: float
-    strategy_name: str  # StrategyOption value: "ontop" | "nl_to_sql"
+    strategy_name: str  # StrategyOption value
     trace_steps: list[dict]
     ontop_assembly: bool = False  # True = use ontop assembler (includes sparql, ontology_version)
     data_source_id: str = ""
     row_count: int = 0
     truncated: bool = False
-    sparql: str = ""  # SPARQL generated (ontop path); empty for NL→SQL
+    sparql: str = ""  # SPARQL generated (Ontop / NL→SPARQL); empty for NL→SQL
     # Version of the ontology the VKG executed against (owl:versionInfo, read
     # off the VKG translate response). Empty when the strategy has no VKG leg
-    # or the service could not name one (#986).
+    # or the service could not name one.
     ontology_version: str = ""
     retrieved_tables: list[str] = field(default_factory=list)
     expanded_tables: list[str] = field(default_factory=list)
@@ -119,7 +113,7 @@ class StrategyContext:
     trace: TraceCollector = field(default_factory=TraceCollector)
     model_id: str | None = None
     # Request-scoped time budget. None means "no deadline threaded" — strategies
-    # then fall back to their fixed internal timeouts (pre-A0 behaviour), so an
+    # then fall back to their fixed internal timeouts, so an
     # unwired call site degrades safely instead of erroring.
     deadline: Deadline | None = None
     # The governed metric Tier-1 matched but declined to execute, when its
@@ -127,9 +121,6 @@ class StrategyContext:
     # Tier-1 hit, or a caller that starts at Tier 2). Carries the authored formula
     # forward so Tier 2 extends the business's definition instead of reinventing it.
     declined_metric: DeclinedMetricContext | None = None
-
-
-# ── Protocol ─────────────────────────────────────────────────────────────
 
 
 @runtime_checkable
@@ -146,26 +137,12 @@ class StructuredQueryStrategy(Protocol):
         ...
 
 
-# ── Strategy runner ──────────────────────────────────────────────────────
-
-
 _PARALLEL_STRATEGY_TIMEOUT_S = 90
 
-# Ceiling on rows returned to a caller. Raised from 1000 once
-# AthenaClient._get_results learned to follow NextToken across pages — before
-# that, any value above ~1000 was inert because the fetch read a single page and
-# truncated at 999 rows regardless.
-#
-# Both halves must move together: `_inject_limit` pushes this value into the SQL
-# as a LIMIT (bounding the server-side scan), while `_get_results` pages up to
-# it. Raising one without the other either truncates silently (old behaviour) or
-# scans more than it returns.
-#
-# 10_000 rather than 100_000 deliberately: the result set is serialized as JSON
-# across the Context Manager -> MCP -> client boundary, and there is no payload
-# guard in this path. 10k rows keeps a typical response in the low single-digit
-# MB while covering the long tail of legitimate analytical answers. Callers
-# needing more should page, or read the Athena result file from S3 directly.
+# Ceiling on rows returned to a caller. `_inject_limit` pushes this value into the
+# SQL as a LIMIT (bounding the server-side scan) and `_get_results` pages up to it,
+# so both move together. Capped at 10_000 because the result set is serialized as
+# JSON across the Context Manager -> MCP -> client boundary with no payload guard.
 MAX_RESULT_ROWS = 10_000
 
 # A strategy result with zero rows is accepted as a truthful "no data" answer
@@ -386,8 +363,6 @@ class StructuredQueryTier:
             # The deep-reasoning agent is opt-in only: it runs solely when pinned here,
             # never as a fallback in any of the sequential/parallel paths below.
             return [s for s in self._strategies if s.name == option]
-        # DEEP_REASONING is never part of a fallback chain — it is an expensive tool-use
-        # loop that must not fire implicitly when a cheaper strategy misses.
         backends = structured_backends if structured_backends is not None else _DEFAULT_BACKENDS
         fallback = [
             s for s in self._strategies if s.name != StrategyOption.DEEP_REASONING and s.supported_backends & backends
@@ -408,10 +383,9 @@ class StructuredQueryTier:
         attempted: list[str] = []
         # When the chain includes NL→SPARQL, a non-empty result below the floor does not
         # end it: the orchestrator discards it unless Tier 2 is pinned, so stopping on it
-        # would starve NL→SPARQL (in a mixed namespace it never ran behind a 0.05 Ontop
-        # answer). The best such result is kept and returned only when no later strategy
-        # does better, so a pinned Tier 2 still gets an answer. Without NL→SPARQL (the
-        # flag off, or a SQL-only namespace) the chain is main's: that result ends it.
+        # would starve NL→SPARQL. The best such result is kept and returned only when no
+        # later strategy does better, so a pinned Tier 2 still gets an answer. Without
+        # NL→SPARQL in the chain, that result ends it.
         defers = any(s.name == StrategyOption.NL_TO_SPARQL for s in strategies)
         deferred: StrategyResult | None = None
         for strategy in strategies:
@@ -419,10 +393,6 @@ class StructuredQueryTier:
             try:
                 result = await strategy.resolve(query, namespace, context)
                 if result is not None:
-                    # Confidence-gated empty result (option C): a zero-row result
-                    # from a low-confidence query is more likely a bad query than
-                    # a true empty answer — fall through to the next strategy /
-                    # Tier 3 rather than returning it as the final answer.
                     if is_low_confidence_empty(result):
                         logger.info(
                             "strategy_low_confidence_empty",
@@ -479,10 +449,7 @@ class StructuredQueryTier:
                 )
                 if isinstance(e, (AccessDeniedError, AmbiguousReferenceError)):
                     # Terminal outcomes, not strategy misses: a policy denial (403)
-                    # or an ambiguous-reference refusal (400) is a decision about the
-                    # query itself. Re-raise so the orchestrator surfaces it to the
-                    # client rather than silently falling through to the next
-                    # strategy (which would mask the refusal as an eventual miss).
+                    # or an ambiguous-reference refusal (400) must reach the client.
                     raise
                 # Record a visible step so the trace explains why this strategy
                 # was abandoned and the next one tried (avoids silent transitions
@@ -533,19 +500,13 @@ class StructuredQueryTier:
             return_exceptions=True,
         )
 
-        # Re-raise terminal exceptions (AccessDenied, ambiguous-reference refusal,
-        # cancellation, system exit). A policy denial (403) or an ambiguous-reference
-        # refusal (400) is a decision about the query, not a strategy miss, so it must
-        # reach the client rather than be dropped in favour of another strategy.
+        # Re-raise terminal exceptions (see _resolve_sequential).
         for r in results:
-            if isinstance(
-                r, (AccessDeniedError, AmbiguousReferenceError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-            ):
+            if isinstance(r, (AccessDeniedError, AmbiguousReferenceError)):
                 raise r
             if isinstance(r, BaseException) and not isinstance(r, Exception):
                 raise r
 
-        # Log any strategy errors (timeouts, exceptions) for observability
         errors = [
             (s.name, type(r).__name__, str(r)[:100])
             for s, r in zip(strategies, results, strict=True)
@@ -560,9 +521,6 @@ class StructuredQueryTier:
         valid_with_ctx = [
             (r, ctx) for r, ctx in zip(results, per_strategy_contexts, strict=True) if isinstance(r, StrategyResult)
         ]
-        # Confidence-gated empty result (option C): prefer results that aren't a
-        # low-confidence empty. If every candidate is one, fall through to Tier 3
-        # rather than returning a likely-wrong empty answer.
         acceptable = [
             (r, ctx) for r, ctx in valid_with_ctx if not is_low_confidence_empty(r) and not is_degenerate_result(r)
         ]
@@ -587,34 +545,10 @@ class StructuredQueryTier:
                         },
                     )
             return None
-        # Pick by DETERMINISTIC precedence, not by LLM self-reported confidence.
-        #
-        # Previously: `acceptable.sort(key=lambda p: p[0].confidence, reverse=True)`.
-        # Strategy confidences are self-assessments produced by the model, so two
-        # strategies landing within noise of each other swapped the winner between
-        # otherwise-identical requests — and with it the SQL and the answer. In
-        # benchmarking this showed up as per-question F1 flipping 0 <-> 1 across
-        # identical runs (mean spread 0.037), which exceeded most real effect sizes
-        # and made A/B comparison unreliable.
-        #
-        # Confidence is still USED, but only as an admission floor
-        # (`is_low_confidence_empty` above), never as a ranking key.
-        #
-        # Precedence is EMPIRICAL, not architectural. An earlier revision of this
-        # code ranked by the caller's declared list order on the assumption that an
-        # ontology-grounded answer outranks a free-form one. Measurement on the 22
-        # TPC-H queries contradicted that:
-        #
-        #     strategy=ontop      mean_f1 0.055   execution_rate 0.41
-        #     strategy=nl_to_sql  mean_f1 0.590   execution_rate 1.00
-        #     strategy=best       mean_f1 0.498   execution_rate 1.00
-        #
-        # `best` scored BELOW nl_to_sql alone because parallel selection kept
-        # Ontop's answer on q01/q07/q19. Ontop also reports high confidence on
-        # useless output (0.85 on failures; 0.73 on a degenerate
-        # "SELECT 1 AS uselessVariable" no-mapping result), so neither its own
-        # confidence nor its notional authority is a safe ranking signal today.
-        # Until the VKG path improves, prefer the strategy that measurably works.
+        # Pick by deterministic precedence, not LLM self-reported confidence: model
+        # self-assessments within noise of each other would swap the winner between
+        # identical requests. Confidence is only an admission floor. The precedence
+        # is empirical (NL→SQL measurably outperforms Ontop), not architectural.
         # A NOT_ANSWERABLE refusal ranks below every real answer, so another strategy's rows beat
         # it; it wins only when no strategy produced a real answer (it is then final).
         acceptable.sort(
@@ -643,9 +577,8 @@ class StructuredQueryTier:
                 parallel_group=step.parallel_group,
                 wall_ms=step.wall_ms,
             )
-        # Emit a synthetic step so the UI knows which strategy was chosen (E9)
+        # Emit a synthetic step so the UI knows which strategy was chosen
         context.trace.record(StepId.T2_STRATEGY_SELECTED, "success", 0, detail={"strategy": winner.strategy_name})
-        # Log all candidates for observability (winner + losers)
         logger.info(
             "tier2_parallel_resolved",
             winner=winner.strategy_name,

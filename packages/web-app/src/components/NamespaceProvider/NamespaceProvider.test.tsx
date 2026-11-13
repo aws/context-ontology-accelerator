@@ -8,9 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NamespaceProvider, useCurrentNamespace } from "./index";
 
-// ---------------------------------------------------------------------------
-// Mocks: the real list/get hooks run against a fake control-plane client.
-// ---------------------------------------------------------------------------
+// The real list/get hooks run against a fake control-plane client.
 
 interface FakeCommand {
   kind: "list" | "get";
@@ -36,9 +34,7 @@ vi.mock("@coa/control-plane-client", async (importOriginal) => {
   };
 });
 
-// ---------------------------------------------------------------------------
-// Fixtures: a 2-page list, 25 on page 1 (the API's page size) and 3 on page 2.
-// ---------------------------------------------------------------------------
+// A 2-page list, 25 on page 1 (the API's page size) and 3 on page 2.
 
 function ns(i: number) {
   const id = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
@@ -86,10 +82,6 @@ function getCalls(namespaceId: string) {
   ).length;
 }
 
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
 function Probe() {
   const { current, namespaceId, namespaces, isLoading } = useCurrentNamespace();
   const navigate = useNavigate();
@@ -121,10 +113,6 @@ function renderAt(path: string) {
 }
 
 const text = (id: string) => screen.getByTestId(id).textContent;
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("NamespaceProvider", () => {
   beforeEach(() => {

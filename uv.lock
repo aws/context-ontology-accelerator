@@ -24,6 +24,7 @@ members = [
     "coa-serve",
     "coa-sources",
     "coa-vkg",
+    "coa-workflow-agents",
 ]
 constraints = [
     { name = "aiohttp", specifier = ">=3.14.4" },
@@ -1076,6 +1077,23 @@ requires-dist = [
     { name = "coa-common", editable = "libs/common" },
     { name = "rdflib", specifier = ">=7.0.0" },
     { name = "sqlglot", specifier = ">=20.0.0" },
+]
+
+[[package]]
+name = "coa-workflow-agents"
+version = "0.3.10"
+source = { editable = "coa-ai/workflow-agents" }
+dependencies = [
+    { name = "coa-control-plane-server" },
+    { name = "requests" },
+    { name = "structlog" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "coa-control-plane-server", editable = "smithy-generated/control-plane-python-server" },
+    { name = "requests", specifier = ">=2.34.2" },
+    { name = "structlog", specifier = ">=24.0" },
 ]
 
 [[package]]

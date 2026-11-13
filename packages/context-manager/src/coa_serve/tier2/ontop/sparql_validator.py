@@ -1,11 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate LLM-generated SPARQL: syntax + URI existence check.
+"""Validate LLM-generated SPARQL before execution.
 
-Two-stage validation:
-1. Syntax validation using rdflib's SPARQL parser
-2. URI existence check — extract IRIs, verify against published ontology in Neptune
+Stages: rdflib syntax parse, URI existence against the published ontology in
+Neptune, a conservative domain/range check, and a projection/determinism check.
 
 If validation fails, the pipeline falls through to Tier 3 with the failed
 SPARQL as a hint for the knowledge retriever.
@@ -59,13 +58,7 @@ class SPARQLValidator:
     """Validates LLM-generated SPARQL for syntax correctness and URI existence."""
 
     def __init__(self, graph_client: GraphClient, graph_uri_template: str | None = None):
-        """Bind the graph client and named-graph URI template for validation.
-
-        Args:
-            graph_client: Graph client used for URI existence checks.
-            graph_uri_template: Optional named-graph URI template; a default is
-                resolved when None.
-        """
+        """Bind the graph client and named-graph URI template for validation."""
         self._graph = graph_client
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
 
@@ -85,19 +78,14 @@ class SPARQLValidator:
                 SUBSET of the prefix-matching one, a rejection is always re-checked
                 unscoped before it is returned, so the verdict is unchanged either
                 way -- see :meth:`_validate_uris`.
-
-        Returns:
-            ValidationResult indicating whether the SPARQL is valid.
         """
         if not sparql or not sparql.strip():
             return ValidationResult(valid=False, error="Empty SPARQL")
 
-        # Stage 1: Syntax validation
         syntax_result = self._validate_syntax(sparql)
         if not syntax_result.valid:
             return syntax_result
 
-        # Stage 2: URI existence check
         validate_namespace(namespace)
         uri_result = await self._validate_uris(sparql, namespace, graph_iris=graph_iris)
         if not uri_result.valid:
@@ -113,24 +101,12 @@ class SPARQLValidator:
         if not dr_result.valid:
             return dr_result
 
-        # Stage 4: determinism / projection check (B1a + B1b). Fail-CLOSED on
-        # DETERMINISTICALLY detectable defects only: (a) an aggregate projection with
-        # no explicit `AS ?alias`, or aliased to a non-descriptive bare name that
-        # drifts run-to-run (?count/?value/?result/?n) — the direct cause of the
-        # ~1-in-3 KeyError for typed clients; and (b) a plain COUNT(?v) over a
-        # variable typed as a class instance (?v a :Class), which counts
-        # join-multiplied rows and drifts between COUNT and COUNT(DISTINCT) run to
-        # run (measured 2/10 on the HAVING/GROUP-BY family). Both are wrong
-        # regardless of the question. It does NOT judge LIMIT or the COUNT-vs-DISTINCT
-        # choice for LITERAL-valued counts — those need the NL question's intent (a
-        # prompt-side rule + the determinism regression suite own them); guessing
-        # there would over-block. Column NAME drift between two correct names
-        # (?id vs ?claimId) is likewise left to the prompt — both are valid, so
-        # failing closed would reject correct output.
+        # Stage 4: fail-closed determinism / projection checks on defects detectable
+        # from the SPARQL text alone (unaliased aggregates, plain entity counts).
         return self._validate_projection_aliases(sparql)
 
     # Aggregate functions whose SELECT projection must carry a stable, explicit,
-    # descriptive alias — a bare/absent alias is where B1b column-name drift
+    # descriptive alias — a bare/absent alias is where column-name drift
     # (?productCount vs ?count) originates.
     _AGG_FUNCS = ("COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "SAMPLE")
 
@@ -158,7 +134,7 @@ class SPARQLValidator:
         1. An aggregate projection expression with NO trailing ``AS ?alias`` — the
            engine then invents a column label that varies run-to-run.
         2. An aggregate aliased to a non-descriptive bare name in ``_BARE_ALIASES``
-           — the exact ``?productCount`` → ``?count`` drift B1b documents.
+           — the ``?productCount`` → ``?count`` drift.
 
         Detection walks the SELECT clause's TOP-LEVEL parenthesised projection
         groups (SPARQL only permits an aggregate inside a ``( Expression AS Var )``
@@ -225,17 +201,6 @@ class SPARQLValidator:
                         "?productCount / ?totalRevenue / ?avgPrice."
                     ),
                 )
-        # B1a (entity-count determinism): a plain COUNT(?v) over a variable that is
-        # bound as a CLASS INSTANCE (?v a :Class / ?v rdf:type :Class) counts
-        # join-multiplied rows, not entities — on 1-to-many data it silently
-        # inflates and the SAME question flips between COUNT and COUNT(DISTINCT)
-        # run-to-run (measured N=10: 2/10 drift, answer masked only by a dataset
-        # with no duplicate rows per group). This is decidable from the SPARQL text
-        # ALONE — no NL intent needed — so it meets the same fail-closed bar as the
-        # alias check: counting a typed entity is wrong-shape regardless of the
-        # question. COUNT(?literal) over a datatype-property value (e.g.
-        # COUNT(DISTINCT ?status)) is NOT flagged — only counts of typed entity
-        # subjects are.
         entity_count = self._validate_entity_count_distinct(sparql)
         if not entity_count.valid:
             return entity_count
@@ -260,8 +225,8 @@ class SPARQLValidator:
         ``?v a :Class`` / ``?v rdf:type :Class`` marks ``?v`` as an ENTITY. Counting
         it with a bare ``COUNT`` (no DISTINCT) counts join-multiplied solution rows,
         so on 1-to-many joins the count inflates and the same question drifts between
-        ``COUNT`` and ``COUNT(DISTINCT)`` between runs (the B1a instance measured on
-        the HAVING/GROUP-BY family). Entity counts must be ``COUNT(DISTINCT ?v)``.
+        ``COUNT`` and ``COUNT(DISTINCT)`` between runs. Entity counts must be
+        ``COUNT(DISTINCT ?v)``.
 
         Conservative — fires ONLY when BOTH hold, both read from the SPARQL text:
           1. a plain ``COUNT(?v)`` (single var, not already DISTINCT, not ``*``), and
@@ -273,7 +238,6 @@ class SPARQLValidator:
         # findall returns (var, bnode) tuples (one group empty per match); collect
         # whichever side matched so both ?var and _:bnode typed subjects are covered.
         typed_vars = {v or b for v, b in self._TYPED_SUBJECT_RE.findall(sparql)}
-        typed_vars.discard("")
         if not typed_vars:
             return ValidationResult(valid=True)
         for var in self._PLAIN_COUNT_RE.findall(sparql):
@@ -309,8 +273,6 @@ class SPARQLValidator:
 
         def _blank(m: re.Match[str]) -> str:
             s = m.group(0)
-            if len(s) < 2:
-                return s
             # Preserve the opening/closing quote runs; blank the interior.
             q = "'" if s[0] == "'" else '"'
             n = 3 if s[:3] in ("'''", '"""') else 1
@@ -449,8 +411,7 @@ class SPARQLValidator:
 
         GovernedMetric IRIs (``urn:coa:{ns}:metric:{name}``) are
         well-formed by pattern but not http subjects in the ontology graph, so
-        they are excluded from the http URI-existence check (the regex only
-        matches ``http`` URIs; this comment documents the intentional skip).
+        they are excluded from the http URI-existence check.
         """
         all_uris = re.findall(r"<(http[^>]+)>", sparql)
         return [u for u in all_uris if not u.startswith(self._STANDARD_PREFIXES) and not u.endswith(("#", "/"))]

@@ -63,7 +63,7 @@ class TestTestConnection:
 
 
 class TestLakeFormationSelfGrantGate:
-    """F-8: the self-grant assumes a Lake Formation admin role and can unlock
+    """The self-grant assumes a Lake Formation admin role and can unlock
     SELECT on any database in the account, for the shared serve role as well as
     the connector. It only fires for a target the discovery handler has verified
     belongs to the requesting namespace.
@@ -163,15 +163,7 @@ class TestDiscoverMetadata:
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
     def test_source_owned_fields_are_populated_for_rescan_diff(self, mock_boto3, connector):
         """A discovered Table carries exactly the source-owned fields ``rescan.diff_tables``
-        compares — so a Glue re-scan can actually detect drift.
-
-        Pins: per-column ``data_type`` / ``is_partition_key`` / hardcoded ``nullable``
-        (Glue exposes no nullability: regular cols → True, partition cols → False);
-        ``technical_metadata`` format/location/partition_keys; a Glue Comment surfaced as
-        a ``DETERMINISTIC`` (source-derived) ``business_metadata.description`` — the exact
-        provenance that makes ``diff_tables`` compare it — while a comment-less column is
-        left empty and NOT source-derived (so a no-op re-scan won't flag it); and that no
-        primary/foreign keys are produced (documents the known Glue limitation).
+        compares, so a Glue re-scan can detect drift.
         """
         mock_client = MagicMock()
         paginator = MagicMock()
@@ -422,7 +414,7 @@ class TestDiscoverMetadata:
         An assume with no ExternalId carries no evidence of which namespace asked
         for it, so a caller could point a source at another tenant's role and read
         it. The connector must raise rather than fall back to an unconditioned
-        assume, which is what it used to do.
+        assume.
         """
         mock_sts = MagicMock()
         mock_boto3.client.return_value = mock_sts

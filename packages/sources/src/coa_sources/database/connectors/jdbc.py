@@ -46,7 +46,7 @@ from coa_common.domain_models import (
 
 from .base import ConnectionCheck, ConnectionTestResult
 from .dialects import MAX_ENUM_DISTINCT, Dialect, get_dialect
-from .filters import GLOB_SYNTAX_HINT, compile_filter, regex_hint, split_glob_list, unmatched_regex_warning
+from .filters import GLOB_SYNTAX_HINT, compile_filter, regex_hint, unmatched_regex_warning
 from .sts_assume import assume_datasource_session
 
 logger = logging.getLogger(__name__)
@@ -137,10 +137,7 @@ class JdbcConnector:
             )
             return ConnectionTestResult(success=False, message="Failed to retrieve credentials", checks=checks)
 
-        # Check 3: Database connectivity. The engine is guaranteed to have an
-        # enabled dialect — an unsupported one returned above, before any network
-        # I/O, rather than reporting success on the strength of network+auth alone
-        # (which let a source be created that could never be discovered).
+        # Check 3: database connectivity
         try:
             conn = dialect.connect(
                 host=host, port=port, database=database_name, user=username, password=password, options=config
@@ -210,10 +207,10 @@ class JdbcConnector:
             raise ValueError("database_name is required")
 
         # Compile filter regexes up front so we fail fast on invalid input.
-        schema_include = self._compile_filter(config.get("schema_filter"), "schema_filter")
+        schema_include = compile_filter(config.get("schema_filter"), "schema_filter")
         schema_exclude = self._schema_exclude(dialect, config.get("schema_exclude_filter"))
-        table_include = self._compile_filter(config.get("table_filter"), "table_filter")
-        table_exclude = self._compile_filter(config.get("table_exclude_filter"), "table_exclude_filter")
+        table_include = compile_filter(config.get("table_filter"), "table_filter")
+        table_exclude = compile_filter(config.get("table_exclude_filter"), "table_exclude_filter")
 
         username, password = self._fetch_credentials(
             config.get("credential_secret_arn", ""),
@@ -237,8 +234,8 @@ class JdbcConnector:
             schema_exclude_filter = config.get("schema_exclude_filter")
             if schema_exclude_filter:
                 # Only schemas the exclude could still remove count: the system
-                # schemas are excluded regardless, so a regex naming them (the
-                # issue's example) is reported as having had no effect of its own.
+                # schemas are excluded regardless, so a regex naming them is
+                # reported as having had no effect of its own.
                 system = re.compile(dialect.system_schema_pattern)
                 warning = unmatched_regex_warning(
                     schema_exclude_filter,
@@ -284,10 +281,6 @@ class JdbcConnector:
         )
         return DiscoveredMetadata(tables=tables, filter_warnings=filter_warnings)
 
-    # ------------------------------------------------------------------
-    # Discovery helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _validate_endpoint(config: dict, default_port: int) -> tuple[str, int]:
         """Validate host/port from config; raise ValueError on invalid input."""
@@ -302,21 +295,12 @@ class JdbcConnector:
             raise ValueError("port must be in range 1-65535")
         return host, port
 
-    # Filter compilation lives in ``connectors.filters`` so the JDBC and Glue
-    # connectors share one implementation (they previously drifted — Glue treated
-    # the whole string as a single glob). Thin static wrappers preserve the
-    # existing call sites/tests.
-    _split_glob_list = staticmethod(split_glob_list)
-    _compile_filter = staticmethod(compile_filter)
-
     @staticmethod
     def _schema_exclude(dialect: Dialect, user_filter: str | None) -> re.Pattern[str]:
         """The schema exclusion: the user's filter IN ADDITION TO the engine's system schemas.
 
         The system schemas (``pg_catalog``, ``information_schema`` …) are excluded
-        whether or not the user sets an exclude filter. They used to be replaced by
-        it, so excluding anything at all — even ``staging_*`` — brought the system
-        schemas into the scan.
+        whether or not the user sets an exclude filter.
         """
         system = re.compile(dialect.system_schema_pattern)
         user = compile_filter(user_filter, "schema_exclude_filter")
@@ -393,19 +377,12 @@ class JdbcConnector:
                 if col.name in targets:
                     col.unrepresentable_fk_target = targets[col.name]
         table_desc, column_desc = JdbcConnector._safe_descriptions(dialect, conn, schema_name, kept_table_names)
-        # Schema-level COMMENT — only PG/Redshift/Snowflake expose this; the
-        # default Dialect implementation returns "". Used as the LLM
-        # "External evidence" extra context, distinct from the table's own
-        # description.
         schema_description = JdbcConnector._safe_database_description(dialect, conn, schema_name)
 
         tables: list[Table] = []
         for table_name in kept_table_names:
             cols = columns_by_table.get(table_name, [])
-            # Apply per-column source descriptions to the single canonical
-            # home (``business_metadata.description``) tagged DETERMINISTIC
-            # mirror of how PK/FK constraints from information_schema are
-            # tagged — both come straight from the source catalog.
+            # Source comments are authoritative, so they are tagged DETERMINISTIC.
             col_desc_map = column_desc.get(table_name, {})
             for col in cols:
                 source_comment = col_desc_map.get(col.name, "")
@@ -417,16 +394,8 @@ class JdbcConnector:
                         confidence=1.0,
                     )
 
-            # Sample distinct values for low-cardinality string columns (in place).
-            # Best-effort: never aborts discovery. Feeds serve NL→SQL enum hints.
             JdbcConnector._safe_distinct_values(dialect, conn, schema_name, table_name, cols)
 
-            # Table's own description goes on business_metadata only —
-            # ``database_description`` is reserved for the schema/database-
-            # level description (above) used as LLM evidence.
-            # NOTE: Table review_status stays PENDING_REVIEW at discovery time
-            # regardless of enrichment source. A table must not be APPROVED until
-            # all child columns reach a terminal state (enforced by review_logic).
             table_comment = table_desc.get(table_name, "")
             table_business = (
                 BusinessMetadata(
@@ -514,7 +483,7 @@ class JdbcConnector:
         dialect provides (e.g. ``SET statement_timeout``) so that a single
         pathological column cannot consume the Lambda budget. If those
         statements cannot be applied, sampling is SKIPPED rather than run
-        unbounded (GH-131).
+        unbounded.
         """
         candidates = [
             c.name
@@ -524,13 +493,7 @@ class JdbcConnector:
         if not candidates:
             return
 
-        # Apply the probe timeout bound BEFORE issuing any cardinality queries.
-        # Fail CLOSED: when a dialect declares timeout statements it is telling us
-        # its probe needs bounding, so if we cannot apply that bound we skip
-        # sampling entirely rather than issuing the unbounded COUNT(DISTINCT …)
-        # this guard exists to prevent (GH-131). Sampling is best-effort
-        # enrichment — losing enum detection for one table is strictly cheaper
-        # than burning the whole 15-minute discovery Lambda on one wide column.
+        # Fail closed: skip sampling if the probe timeout cannot be applied.
         for stmt in dialect.probe_timeout_statements():
             try:
                 cursor = conn.cursor()
@@ -622,7 +585,7 @@ class JdbcConnector:
                 check="schema_access", status="failed", message=f"Could not reopen connection for schema probe: {exc}"
             )
         try:
-            include = self._compile_filter(schema_filter, "schema_filter")
+            include = compile_filter(schema_filter, "schema_filter")
             exclude = self._schema_exclude(dialect, schema_exclude_filter)
             schemas = self._list_filtered_schemas(conn, dialect, include, exclude)
         except ValueError as exc:

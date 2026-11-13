@@ -67,10 +67,6 @@ STOP_WORDS: frozenset[str] = frozenset(
     }
 )
 
-# Graph URI template — {namespace} is replaced at query time.
-# Set via GRAPH_URI_TEMPLATE env var (e.g. "https://ontology.example.com/{namespace}").
-# TODO: Resolve graph URIs dynamically from the ontology catalog (DynamoDB registry).
-
 # ``regex`` supplies Unicode extended grapheme clusters (UAX #29). Python ``re``'s
 # ``\w`` excludes combining marks, which split Thai/Indic words and splits
 # ``İstanbul`` after lowercasing (U+0130 -> ``i`` + COMBINING DOT ABOVE).
@@ -207,8 +203,8 @@ class QuerySearchPlan:
     two adjacent words therefore still matches, as does a label that is a
     substring of one longer word. Only the sinks' two-character minimum and their
     row limits bound it. Raising the ceiling needs real per-language segmentation
-    or a stored n-gram/boundary index, which is a larger change than this MR; the
-    alternative today is no CJK/Thai recall at all.
+    or a stored n-gram/boundary index; the alternative is no CJK/Thai recall at
+    all.
 
     Source spelling is retained in both fields so each sink can apply its own
     persisted comparison contract in the correct order: RDF lowercases for SPARQL
@@ -412,13 +408,9 @@ def build_query_search_plan(query: str, *, max_count: int = 10) -> QuerySearchPl
         raise TypeError("query must be a string")
     if len(query) > MAX_QUERY_CODEPOINTS:
         raise ValueError(f"query must be at most {MAX_QUERY_CODEPOINTS} characters")
-    # Strip default-ignorables from the WHOLE query, before segmentation. Doing it
-    # per-candidate reached only the members that can sit inside a run (Mn marks,
-    # the Hangul filler letters); the Cf members — ZWSP, SHY, LRM/RLM, WJ, ZWNBSP —
-    # were still boundaries, so an invisible character inside a word split it and
-    # cost both directions their match. Stripping first also means the grapheme
-    # floors and length bounds below are measured on the text that will actually be
-    # sent, rather than on text that later shrinks past them.
+    # Strip default-ignorables from the WHOLE query before segmentation, so an
+    # invisible character (ZWSP, SHY, LRM/RLM, WJ, ZWNBSP) inside a word cannot
+    # split it, and the bounds below are measured on the text that will be sent.
     query = _DEFAULT_IGNORABLE_RE.sub("", query)
     if max_count <= 0 or not query:
         return QuerySearchPlan(terms=(), containers=())
@@ -485,16 +477,6 @@ DEFAULT_GRAPH_URI_TEMPLATE = os.environ.get("GRAPH_URI_TEMPLATE", "")
 
 def get_graph_uri_template(override: str | None = None) -> str:
     """Return the graph URI template to use, respecting override and env-var fallback.
-
-    Resolution order:
-    1. ``override`` parameter (if non-empty)
-    2. ``GRAPH_URI_TEMPLATE`` environment variable
-
-    Args:
-        override: Caller-supplied template string; ``None`` or empty string to skip.
-
-    Returns:
-        A graph URI template string with a ``{namespace}`` placeholder, or empty string if unconfigured.
 
     Raises:
         ValueError: If the resolved template is non-empty but missing the ``{namespace}`` placeholder.
@@ -614,12 +596,7 @@ def graph_scoped_body(
         # UNION operands must be group graph patterns, hence the extra braces.
         return "\n          UNION\n".join(f"          {{\n{b}\n          }}" for b in blocks)
     if graph_iris:
-        # Resolution SUCCEEDED and we are still falling back, which is the one
-        # degraded case that would otherwise be invisible: the resolver's own cap
-        # (tbox_context._MAX_GRAPHS, 50) is well above this one, so a 9..50-graph
-        # namespace pays the cluster-wide scan while every log line says the
-        # graphs resolved fine. Warn rather than silently degrade — the same
-        # reason class truncation warns.
+        # Resolved graphs exceed the inline cap, so the cluster-wide scan runs.
         logger.warning(
             "graph_scope_not_inlined",
             graphs=len(graph_iris),

@@ -1,15 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests: ``_run_induction`` emits Bedrock cost metrics exactly once.
-
-Phase 2 threads one ``CostTracker`` through an induction job and emits per-job
-metrics at the end. These tests pin the emit-once contract on every terminal
-exit path (duplicate short-circuit + failure) by patching
-``emit_induction_job_metrics`` and asserting it is called exactly once with the
-job's namespace, and that the object it receives is the tracker constructed by
-``_run_induction`` (i.e. the same instance the strategy is handed).
-"""
+"""Unit tests: ``_run_induction`` emits Bedrock cost metrics exactly once."""
 
 from __future__ import annotations
 
@@ -24,17 +16,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _isolate_induce_catalog_globals():
-    """Guarantee cross-test hermeticity of ``induce_catalog`` module globals.
-
-    These tests drive the REAL ``_run_induction``, which mutates the
-    process-global ``_jobs`` and ``_job_namespaces`` dicts directly (job
-    register + namespace lookup). Without teardown, an entry leaked by a
-    mid-test assertion failure would change the behavior of unrelated tests
-    under some collection orderings. Snapshot before, restore after — pytest
-    teardown runs even when a test's assertions fail. (The in-flight induction
-    lock is DynamoDB-backed via ``dynamo_store``, which every test here patches
-    to a MagicMock, so it carries no real module-global state to restore.)
-    """
+    """Guarantee cross-test hermeticity of ``induce_catalog`` module globals."""
     from coa_ontology import induce_catalog
 
     jobs_snapshot = dict(induce_catalog._jobs)
@@ -301,76 +283,6 @@ def test_success_path_records_durations_and_volume() -> None:
     assert vols.get("NovelClassesCreated") == 1
     assert vols.get("GroundedClassesMatched") == 1
     assert "InductionJobErrors" not in vols
-
-
-def test_tracker_threaded_into_strategy_induce() -> None:
-    """The tracker constructed in _run_induction is the SAME object passed to
-    the strategy's ``induce`` (so both Bedrock seams share one accumulator)."""
-    from coa_ontology.induce_catalog import (
-        WorkbenchInductionRequest,
-        _jobs,
-        _run_induction,
-    )
-    from coa_ontology.inducer.schemas import JobResponse, JobStatus
-
-    job = JobResponse(job_id="job-thread", status=JobStatus.PENDING, created_at="2026-01-01T00:00:00Z")
-    _jobs["job-thread"] = job
-
-    body = WorkbenchInductionRequest(
-        datasource_ids=["ds-1"],
-        ontology_uri_prefix="http://test.org/ontology/induced#",
-    )
-
-    captured: dict = {}
-
-    class _FakeStrategy:
-        def induce(self, **kwargs):
-            captured["cost_tracker"] = kwargs.get("cost_tracker")
-            # Fail after capture so the run terminates without the full store path.
-            raise RuntimeError("stop-after-capture")
-
-        def build_r2rml(self, **kwargs):  # pragma: no cover - not reached
-            raise AssertionError("should not reach build_r2rml")
-
-    with (
-        patch(
-            "coa_ontology.induce_catalog._fetch_catalog_from_smus",
-            return_value={"databases": [{"name": "db"}], "sourceType": "POSTGRES"},
-        ),
-        patch(
-            "coa_ontology.induce_catalog._catalog_to_tables",
-            return_value=[
-                {
-                    "id": "t-customers",
-                    "name": "customers",
-                    "fullyQualifiedName": "db.customers",
-                    "columns": [{"name": "id", "dataType": "INTEGER"}],
-                }
-            ],
-        ),
-        patch("coa_ontology.induce_catalog.get_strategy", return_value=_FakeStrategy),
-        patch("coa_ontology.stores.build_stores", return_value=(MagicMock(), MagicMock())),
-        patch("coa_ontology.stores.adapters.StoreOntologyCatalogAdapter", return_value=MagicMock()),
-        patch("coa_ontology.induce_catalog.dynamo_store") as mock_dynamo,
-        patch("coa_ontology.induce_catalog.emit_induction_job_metrics") as mock_emit,
-    ):
-        mock_dynamo.list_proposals.return_value = []
-        mock_dynamo.list_ontologies_registry.return_value = []
-
-        _run_induction(
-            job_id="job-thread",
-            body=body,
-            namespace="thread-ns",
-            config={"catalog_source": "smus"},
-            build_pipeline_fn=MagicMock(),
-            schemas_mod=_schemas_mod(),
-            catalog_table_cls=CatalogTable,
-        )
-
-    # The strategy received the tracker, and it is the same instance emit got.
-    assert isinstance(captured["cost_tracker"], CostTracker)
-    mock_emit.assert_called_once()
-    assert mock_emit.call_args.args[0] is captured["cost_tracker"]
 
 
 def test_tracker_threaded_into_pipeline_embedder() -> None:

@@ -861,6 +861,19 @@ Running AgentCore sessions keep the previous runtime version until they go idle 
 
 The API model always lists the `RDF_SPARQL` sub-type and the `nl_to_sparql` strategy. The switch decides whether a deployment accepts them.
 
+#### IPv4 preference in the service images
+
+The Python images that run in the VPC (Serve, MCP, ontology engine, database scan enrichment and document KG build) prefer IPv4 when an endpoint resolves to both IPv4 and IPv6 addresses. It is **on by default** because it changes nothing where IPv4 works, and it fixes dual-stack subnets without IPv6 egress to AWS, where each IPv6 connect stalls for minutes and signed OpenSearch Serverless requests expire with `403 Forbidden`. Turn it off only if your subnets route IPv6 to AWS and you want IPv6 tried first.
+
+```bash
+# Keep glibc's IPv6-first address order (default: prefer IPv4)
+SCL_PREFER_IPV4=false make deploy-dev
+```
+
+The value must be `true` or `false`; CDK fails synth otherwise. `scripts/deploy.sh` maps it to the CDK context parameter `prefer_ipv4`, so on a direct `cdk deploy` pass `--context prefer_ipv4=false` instead. It is a Docker build argument, so changing it rebuilds the images that CDK builds.
+
+Images passed in pre-built through the `*_image_uri` context keys (`context_manager_image_uri`, `ontology_engine_image_uri`, `sources_db_enrichment_image_uri`, `sources_kg_build_image_uri`), as CI and `scripts/deploy-serve.sh` do, were built without this argument and keep the Dockerfile default, so they prefer IPv4. `prefer_ipv4=false` cannot change them: synth still checks the value and prints a warning naming each such image. To opt out there, build the image with `--build-arg PREFER_IPV4=false`.
+
 ### VKG Task Sizing
 
 Each namespace's Virtual Knowledge Graph runs as a Fargate task hosting Ontop.

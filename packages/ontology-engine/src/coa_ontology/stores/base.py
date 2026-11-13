@@ -140,8 +140,7 @@ class VectorStore(Protocol):
           ``topK.byEmbedding`` with in-query L2² → cosine conversion).
         - ``OpenSearchVectorStore`` — **does NOT yet conform**: returns
           ``_score`` in ``[0, 1]`` (the raw OpenSearch ``cosinesimil``
-          score) without converting. See the OPTIONAL Task 10A.1 in
-          tasks.md for the rollout.
+          score) without converting.
         """
         ...
 

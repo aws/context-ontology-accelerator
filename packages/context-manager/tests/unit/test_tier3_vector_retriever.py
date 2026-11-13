@@ -53,7 +53,6 @@ class TestVectorRetriever:
         await retriever.search([0.1] * 10, "550e8400-e29b-41d4-a716-446655440000")
 
         call_kwargs = mock_opensearch.search.call_args
-        # The index should be chunk_{sha256_prefix}
         assert call_kwargs.kwargs["index"].startswith("chunk_")
 
     async def test_search_empty_results(self):

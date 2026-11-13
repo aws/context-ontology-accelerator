@@ -65,25 +65,15 @@ logger = structlog.get_logger(__name__)
 DEFAULT_RETRIEVAL_K = 7
 DEFAULT_MAX_TABLES = 10
 
-# Output-token budget for a generation. 1024 (the previous hardcoded value) is not
-# enough for the analytic queries this arm is asked for: measured against 867
-# generated Spider 2.0 queries, ~5% exceed 1024 tokens of SQL alone, and on a
-# reasoning model — which spends the SAME budget on its thinking blocks before
-# writing a character of SQL — roughly half exceeded what was left over. A cap hit
-# mid-statement is silent (see ``ConverseResult.stop_reason``): Bedrock returns the
-# partial text with HTTP 200 and ``_extract_sql`` accepts it, so the query fails at
-# execution with a confusing syntax error instead of at generation.
+# Output-token budget for a generation. On a reasoning model the same budget also
+# pays for the thinking blocks written before any SQL. A cap hit mid-statement is
+# silent (see ``ConverseResult.stop_reason``): Bedrock returns the partial text with
+# HTTP 200, so the query fails later at execution with a syntax error.
 #
-# 4096 is the client default and covers every query measured. The env knob exists so
-# a deployment paying for a smaller model, or one that wants to bound worst-case
-# latency, can lower it without a code change.
-#
-# Bounded on BOTH sides. The floor keeps a misconfiguration from truncating every
-# generation; the ceiling is 8x the default and ~16x the longest query measured, and
-# sits under every current Claude model's Converse limit (Opus 5 rejects a request
-# above 128000 outright), so a clamped value can never itself be what makes Bedrock
-# reject the call. Clamping is logged — an operator who asked for more should learn
-# they did not get it.
+# Bounded on both sides: the floor keeps a misconfiguration from truncating every
+# generation, and the ceiling sits under every current Claude model's Converse limit
+# (Opus 5 rejects a request above 128000), so a clamped value cannot itself make
+# Bedrock reject the call. Clamping is logged.
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 _MIN_MAX_OUTPUT_TOKENS = 512
 _MAX_MAX_OUTPUT_TOKENS = 32768
@@ -114,31 +104,12 @@ def _resolve_max_output_tokens() -> int:
     return resolved
 
 
-# Bounds for the OPT-IN ontology-graph expansion (``graph_expander`` on
-# :meth:`SQLGenerator.generate`).
-#
-# HOPS = 1 because this path generates once and cannot recover from a padded
-# prompt: its 2-shot ``correct()`` re-generates on an execution error but never
-# re-retrieves. One FK hop off a hub table already reaches much of a warehouse
-# schema, so hop 2 would trade a missing join table for a haystack.
-#
-# MAX_TABLES bounds the APPENDED block, whose size is otherwise set by FK fan-out
-# rather than by relevance: the walk is unconditional and ranks by hop then label
-# (adjacency, not question similarity), so on a wide schema an uncapped hop-1
-# frontier is dozens of tables and the appended block dominates a prompt whose
-# useful part came from retrieval. The reference point is the retrieved block:
-# retrieval contributes ``DEFAULT_RETRIEVAL_K`` (7) tables, so this roughly doubles
-# the writer's table count.
-#
-# 8 because that is the value the walk was MEASURED at: every cell behind the
-# default-on decision (three repeats each of pooled Spider 2.0, per-DB Spider 2.0,
-# and BIRD) ran with the cap hardcoded to 8, and it bound on 22.3% of the walked
-# questions — so a larger number here would put untested behaviour on roughly a
-# fifth of traffic. It is still a context budget rather than a tuned optimum:
-# ``SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`` moves it without a code change, and
-# raising it is the first thing to try when the missing join table is plausibly
-# further down the FK ordering. :meth:`OntologyGraphTool.expand_from` clamps to
-# ``MAX_NODE_LIMIT`` regardless.
+# Bounds for the ontology-graph expansion (``graph_expander`` on
+# :meth:`SQLGenerator.generate`). One hop because this path never re-retrieves, so a
+# padded prompt cannot be recovered from. MAX_TABLES bounds the appended block, whose
+# size is otherwise set by FK fan-out rather than relevance; it is overridable with
+# ``SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES``, and :meth:`OntologyGraphTool.expand_from`
+# clamps to ``MAX_NODE_LIMIT`` regardless.
 GRAPH_EXPAND_HOPS = 1
 _DEFAULT_GRAPH_EXPAND_MAX_TABLES = 8
 
@@ -146,13 +117,8 @@ _DEFAULT_GRAPH_EXPAND_MAX_TABLES = 8
 def _resolve_graph_expand_max_tables() -> int:
     """Appended-table cap (``SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES``).
 
-    Never raises, matching :func:`_resolve_max_output_tokens`: a bad value degrades
-    to the default rather than taking an opt-in enrichment's caller down. ``0`` is
-    legal and yields no appended tables (``expand_from`` returns ``[]``), which is a
-    way to isolate the flag's other effects; negatives clamp to it. Only the floor
-    is enforced here — the upper bound is ``expand_from``'s ``MAX_NODE_LIMIT``, and
-    duplicating it would put the graph tool's ceiling in two places (and reintroduce
-    the import :class:`GraphExpander` exists to avoid).
+    Never raises: a bad value degrades to the default. ``0`` yields no appended
+    tables; negatives clamp to it. The upper bound is enforced by ``expand_from``.
     """
     raw = os.environ.get("SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES")
     if raw is None:
@@ -432,8 +398,6 @@ class SQLGenerator:
     This component is responsible only for SQL generation — execution is handled
     by the caller (orchestrator), enabling reuse in other tiers (e.g. as a
     parallel retrieval source in Tier 3).
-
-    See :meth:`__init__` for the full parameter list.
     """
 
     def __init__(
@@ -476,12 +440,9 @@ class SQLGenerator:
         self._guardrail_id_provider = guardrail_id_provider
 
     def _effective_guardrail_id(self) -> str | None:
-        """Resolve the guardrail id LIVE via the provider when injected.
+        """Resolve the guardrail id via the provider when injected, else the construction-time id.
 
-        Falls back to the construction-time ``guardrail_id`` otherwise. The
-        stored id is already ``str | None``; an empty provider value collapses to
-        ``None`` (equivalent to the disabled state for a non-empty id, the raw
-        value is passed through unchanged).
+        An empty provider value collapses to ``None``.
         """
         if self._guardrail_id_provider is not None:
             gid = self._guardrail_id_provider()
@@ -543,13 +504,10 @@ class SQLGenerator:
             graph_expander: Optional ontology-FK walker (see
                 :meth:`~coa_serve.tier2.tools.OntologyGraphTool.expand_from`). When
                 supplied, tables one FK hop from the retrieved classes are appended
-                to the schema context with their columns. ``None`` — the default and
-                the only value on the unflagged path — skips the walk entirely, so
-                the prompt is byte-identical to the retrieval-only baseline.
+                to the schema context with their columns. ``None`` skips the walk.
             governed_metric: Optional rendered governed-metric definition that
                 Tier-1 matched but declined (see
-                ``DeclinedMetricContext.prompt_block``). Empty — the default —
-                leaves the prompt byte-identical to the pre-change baseline.
+                ``DeclinedMetricContext.prompt_block``). Empty leaves it out of the prompt.
             table_placements: Optional resolver from ``{bare table: data_source_id}``
                 to ``{bare table: (source_id, database)}``. A table it places is
                 shown to the writer as ``Table: t | Database: db (write it as db.t)``,
@@ -569,9 +527,9 @@ class SQLGenerator:
                 ontology IRIs. Used only when no mapped class is retrieved: the
                 search is retried within those ontologies (an uploaded ontology has
                 no R2RML, so no ``data_source_id``). ``None`` keeps the namespace dark.
-            evidence_max_chars: How much of ``evidence`` reaches the prompt. The
-                default keeps the historical 500-char cap; the deep-reasoning loop
-                raises it when it hands over gathered document evidence.
+            evidence_max_chars: How much of ``evidence`` reaches the prompt (default
+                500); the deep-reasoning loop raises it when it hands over gathered
+                document evidence.
             writer: Per-request opt-in writer adjustments (default: none).
         """
         trace: list[dict[str, Any]] = []
@@ -660,16 +618,9 @@ class SQLGenerator:
                 }
             )
 
-        # Step 3b: ontology-graph expansion (OPT-IN — see the `graph_expander` arg).
-        #
-        # Distinct from step 3 above in both its source and its effect. Step 3 reads
-        # the sources API's declared FK adjacency and only ever adds table *names*:
-        # `_build_raw_context` renders a table solely from a retrieved hit, so a name
-        # with no hit contributes nothing to the prompt. This walks the induced
-        # ontology (the same FK object-properties the agentic arm's explore_graph
-        # tool uses, including the inferred edges the source declares nowhere) and
-        # brings each reached table's COLUMNS back with it, so a table similarity
-        # missed becomes usable rather than merely mentioned.
+        # Step 3b: ontology-graph expansion. Unlike step 3, which only adds table
+        # names, this walks the induced ontology and brings each reached table's
+        # columns back with it.
         graph_tables: list[dict[str, Any]] = []
         if graph_expander is not None:
             start = time.perf_counter()
@@ -708,12 +659,10 @@ class SQLGenerator:
                         "error": type(e).__name__,
                     }
                 )
-            # Retrieval accounting for the walk: `seeds` is how many retrieved hits
-            # carried a class IRI at all. Zero means the index predates IRI stamping
-            # and the treatment cannot have applied — which EX alone cannot tell apart
-            # from a walk that found nothing useful. `max_tables` is logged because
-            # the cap is now an env knob: `added == max_tables` is the signal that the
-            # budget, rather than the FK frontier, decided what the writer saw.
+            # `seeds` is how many retrieved hits carried a class IRI; zero means the
+            # index predates IRI stamping and the walk could not apply.
+            # `added == max_tables` means the cap, not the FK frontier, decided what
+            # the writer saw.
             logger.info(
                 "nl_to_sql_graph_expand",
                 namespace=namespace,
@@ -820,21 +769,11 @@ class SQLGenerator:
             # WHERE literals.
             ddl_context = f"{ddl_context}\n{graph_block}"
             expanded_tables = expanded_tables + graph_added
-        # Log the schema context handed to the LLM so the NL→SQL INPUT is
-        # observable (not just the generated SQL). `has_allowed_values` flags
-        # whether per-column enum literals reached the prompt — the signal that
-        # lets the LLM write correct WHERE values.
-        #
-        # `context_tables` is the authoritative list of what the writer saw.
-        # `context_preview` is capped at 2000 chars, which is 1-4 tables out of a
-        # context that routinely runs past 7000 — it has been read as "only 4 tables
-        # reach the model", so the cap is now flagged explicitly.
-        # `+ graph_added`: a walked table has no retrieved hit behind it, so
-        # `_context_tables` drops it — correct for the retrieved block, wrong for
-        # the log, since the graph block puts that table's schema in the prompt
-        # too. Without this the line reports fewer tables than the writer saw,
-        # which is exactly the misreading the `context_tables` field was added to
-        # stop. Appended once: `expanded_tables` already carries them by here.
+        # `context_tables` is the list of tables the writer saw; `context_preview`
+        # is capped at 2000 chars, so it shows only part of the context.
+        # `has_allowed_values` flags whether per-column enum literals reached the
+        # prompt. `graph_added` is appended because a walked table has no retrieved
+        # hit, so `_context_tables` drops it although its schema is in the prompt.
         context_tables = _context_tables(hits, expanded_tables, class_databases) + graph_added
         logger.info(
             "nl_to_sql_context",
@@ -961,19 +900,16 @@ class SQLGenerator:
         context, the statement that actually executed (on a cross-source query the
         qualified rewrite, which the engine's error positions refer to), and the
         verbatim engine error, and ask it to
-        produce a corrected query. This is deliberately model-driven — no
-        hardcoded error-pattern rules — so the fix generalizes across dialects
-        and error classes (type mismatches, unknown columns, bad casts, GROUP BY
-        omissions, …) instead of a brittle regex catalogue.
+        produce a corrected query. Repair is model-driven, with no hardcoded
+        error-pattern rules, so it generalizes across dialects and error classes.
 
         Reuses the caller's retrieved ``ddl_context`` so no re-embed/re-retrieval
         happens on the retry — only one extra LLM call plus one extra execution.
 
         ``governed_metric`` carries the same first-party definition block the
-        first shot got (see ``DeclinedMetricContext.prompt_block``). It MUST be
-        forwarded here too: without it the correction re-derives the metric from
-        the schema, discarding the governed formula on exactly the retry the writer
-        most needs it — the point of #1116.
+        first shot got (see ``DeclinedMetricContext.prompt_block``). It must be
+        forwarded here too, or the correction re-derives the metric from the
+        schema and discards the governed formula.
 
         Returns (corrected_sql, confidence).
         """
@@ -1102,32 +1038,11 @@ class SQLGenerator:
         evidence_max_chars: int = DEFAULT_EVIDENCE_PROMPT_CHARS,
         writer: WriterOptions = _DEFAULT_WRITER,
     ) -> tuple[str, float]:
-        """Call LLM to generate SQL from question and DDL context.
+        """Call the LLM to generate SQL from the question and DDL context.
 
-        Args:
-            question: Natural language question.
-            ddl_context: Schema context (tables, columns, FKs).
-            evidence: Optional domain hints.
-            model_id: Optional per-call LLM model override.
-            dialect: Optional per-call SQL dialect override.
-            feedback: Optional prior-attempt SQL + observation. When the agentic
-                strategy re-generates after a failed/empty run, this carries the
-                previous query and what executing it returned, so the writer
-                REVISES it instead of re-emitting byte-identical SQL at temp 0.
-            governed_metric: Optional authored metric definition that Tier-1
-                matched but declined to execute (see
-                ``DeclinedMetricContext.prompt_block``). FIRST-PARTY and
-                authoritative — deliberately NOT routed through ``evidence``,
-                which is labelled untrusted user input and truncated to 500
-                chars. Given, the writer extends the governed formula instead of
-                reinventing one.
-            evidence_max_chars: Characters of ``evidence`` placed in the prompt
-                (default: the historical 500-char cap).
-            writer: Per-request opt-in writer adjustments (extra rules, token cap,
-                original question on the guarded channel); default: none.
-
-        Returns:
-            Tuple of (sql_string, confidence_score).
+        ``governed_metric`` is first-party and authoritative, so it is deliberately
+        not routed through ``evidence``, which is labelled untrusted user input.
+        Returns ``(sql, confidence)``.
         """
         evidence_block = (
             (
@@ -1154,16 +1069,8 @@ class SQLGenerator:
             if feedback
             else ""
         )
-        # Prompt-injection scoping via Bedrock guardContent (tier3 pattern):
-        # the user's question is NOT embedded in the prompt text below;
-        # instead it reaches the model as a separate guardContent block on
-        # the converse call (see `guard_content=question` below). That block
-        # is the only channel the untrusted text uses to reach the model,
-        # and it's the segment the Bedrock guardrail evaluates for prompt
-        # attacks — while the retrieved DDL and instructions are guardrail-
-        # exempt. Duplicating the question here in the prompt text would
-        # double the token cost with no additional protection, since the
-        # guardrail can only score the guardContent copy.
+        # The user's question is not embedded in the prompt text: it reaches the
+        # model only as the guardContent block below.
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
             f"{governed_metric_block}"
@@ -1222,11 +1129,6 @@ def _table_name_from_class_text(text: str) -> str:
 
     Class text is stored as "Table: <name> | Description: ... | Columns: ...".
     Anything not in that shape falls back to its first whitespace-delimited token.
-
-    Single definition on purpose: this parse used to be copy-pasted at three call
-    sites, each of which indexed ``text.split()[0]`` behind an ``if text`` guard —
-    which is truthy for whitespace-only text while ``split()`` returns NO tokens,
-    so a blank ``context_text`` raised IndexError and failed the whole request.
     """
     if not text:
         return ""
@@ -1274,15 +1176,9 @@ def _graph_context_block(
     strictly richer, and listing a table twice invites the writer to treat two
     descriptions of one table as two tables.
 
-    The block is labelled with its provenance and with the reason it might be
-    irrelevant. These tables were NOT ranked by similarity to the question, so
-    presenting them indistinguishably from retrieved ones would trade a missing-join
-    failure for a spurious-join one; the writer is told what they are and left to
-    decide, which is also the only division of labour consistent with keeping table
-    selection model-driven.
-
-    Returns ``("", [])`` when nothing survives, so the caller appends
-    unconditionally and the unflagged path stays byte-identical.
+    The block is labelled as not ranked by similarity to the question, so the
+    writer can tell walked tables from retrieved ones. Returns ``("", [])`` when
+    nothing survives.
     """
     have = {t.strip().lower() for t in existing_tables if t and t.strip()}
     databases = databases or {}
@@ -1381,11 +1277,7 @@ def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
     (by class IRI) is marked ``_AMBIGUOUS_SOURCE`` — not just when the two classes
     come from different sources, but also when one source exposes two same-named
     tables in different schemas (``sales.customers`` and ``analytics.customers``).
-    Keying the collision on the source id alone missed that second case: both
-    classes carry the same ``data_source_id``, so the name resolved to that one
-    source and the query silently ran against whichever schema the executor
-    defaulted to — returning a wrong answer as success. The class IRI
-    distinguishes them, and ``_resolve_data_source_from_sql`` /
+    The class IRI distinguishes them, and ``_resolve_data_source_from_sql`` /
     ``sql_table_routing`` both treat a BARE reference to an ambiguous table as
     unroutable so the query is refused rather than mis-routed. Two hits for the
     SAME class (same IRI, e.g. retrieved via different expansions) are not a
@@ -1519,12 +1411,9 @@ def _table_source_for(reference: str, table_sources: dict[str, str]) -> tuple[st
     ambiguity marker.
 
     A ``catalog.database.table`` reference routes to a candidate only when its
-    catalog is the candidates' own (``_CANDIDATE_CATALOG``). Matching on the last
-    two parts alone let ``othercat.crm_db.customers`` route to the ``crm_db``
-    candidate; being fully catalog-qualified, it then ran unchanged against
-    ``othercat`` while the trace attributed it to the ``crm_db`` source. Any other
-    catalog, or more parts than a catalog-qualified name has, falls through to the
-    bare name. ``reference`` comes from :func:`_referenced_tables`, whose parts
+    catalog is the candidates' own (``_CANDIDATE_CATALOG``). Any other catalog, or
+    more parts than a catalog-qualified name has, falls through to the bare name.
+    ``reference`` comes from :func:`_referenced_tables`, whose parts
     are the identifiers without their quotes.
     """
     parts = reference.strip().lower().split(".")
@@ -1541,10 +1430,8 @@ def _referenced_tables(sql: str, dialect: str = "trino") -> list[str]:
 
     Built from :func:`~..table_qualifier.real_tables`, the same reading
     ``ambiguous_reference`` refuses on, so a common table expression is not a
-    table here either. ``SQLFirewall.extract_tables`` lists CTE names too: a CTE
-    named ``customers`` over ``crm_db.customers`` read as a bare reference to the
-    shared name, and a correct qualified query was refused. When the statement
-    cannot be parsed this way, the firewall's listing is used, as before.
+    table here either. When the statement cannot be parsed this way, the
+    firewall's ``SQLFirewall.extract_tables`` listing is used.
     """
     try:
         parsed = sqlglot.parse_one(sql, read=dialect)
@@ -1606,19 +1493,14 @@ def _hit_map(hits: list[VectorHit]) -> dict[str, dict[str, str]]:
 
     Keyed by class under the name, not by the name alone: in a namespace pooling
     several databases two classes can describe two different ``customers`` tables,
-    and keying by name kept only the last one seen, so the writer saw one schema
-    for a name that routing then refused as ambiguous, and sometimes answered
-    from an unrelated table. Every class reaches the prompt now. The same class
-    retrieved twice, or two classes with identical text, still render once,
-    unless the two come from two different known sources: two databases can hold
-    byte-identical schemas, and those are two tables, so both render, each with
-    its own database.
+    and every class reaches the prompt. The same class retrieved twice, or two
+    classes with identical text, render once, unless the two come from two
+    different known sources: two databases can hold byte-identical schemas, and
+    those are two tables, so both render, each with its own database.
 
     A hit with no ``data_source_id`` is no evidence of a table of its own: it
     merges with any hit of the same text, and a sourced hit of that text that
-    arrives later takes its place. The result does not depend on hit order; an
-    unsourced hit ranked first used to swallow every sourced copy after it, so
-    the writer saw one schema with no database.
+    arrives later takes its place. The result does not depend on hit order.
     """
     hit_map: dict[str, dict[str, str]] = {}
     # (name, text) -> {data_source_id ("" = none): the identity rendered for it}
@@ -1679,9 +1561,7 @@ def table_sources_need_preparation(table_sources: dict[str, str]) -> bool:
     on the common single-source path. That is only safe when preparation would be
     a no-op: it is NOT when the hits span two or more real sources (cross-source
     qualification is needed) OR mark any name ambiguous (the query must be REFUSED,
-    not run against a guessed schema). An ambiguous marker alone yields
-    fewer than two distinct real sources, so a plain ``distinct sources < 2`` check
-    skipped it and the wrong-answer path stayed open.
+    not run against a guessed schema).
     """
     values = table_sources.values()
     real = {v for v in values if v != _AMBIGUOUS_SOURCE}
@@ -1710,9 +1590,7 @@ def sql_table_routing(
     (comma-separated, as the VKG mapping's marker lists them), or the name itself
     when none are known. That is what makes ``prepare_execution_sql`` REFUSE a
     query touching it rather than run it against a guessed schema and return a
-    wrong answer as success. Dropping the name instead — as an earlier version
-    did — left it indistinguishable from a table outside the map, i.e. nothing to
-    route, so the query executed unqualified.
+    wrong answer as success.
 
     The same table referenced as ``database.table``, naming one candidate, routes
     to that candidate with its database as ``sourceSchema``. As in the VKG
@@ -1883,24 +1761,3 @@ def _extract_confidence(text: str) -> float:
     if match:
         return min(float(match.group(1)), 1.0)
     return 0.5
-
-
-def build_fk_adjacency(table_metadata: dict[str, Any]) -> dict[str, set[str]]:
-    """Build bidirectional FK adjacency graph from sources API table metadata.
-
-    Args:
-        table_metadata: {table_name: {foreignKeys: [{targetTable: ...}, ...]}}
-
-    Returns:
-        {table_name_lower: set of neighbor table names (lower)}
-    """
-    adjacency: dict[str, set[str]] = {}
-    for table_name, meta in table_metadata.items():
-        name = table_name.lower()
-        adjacency.setdefault(name, set())
-        for fk in meta.get("foreignKeys") or []:
-            target = fk.get("targetTable", "").lower()
-            if target:
-                adjacency[name].add(target)
-                adjacency.setdefault(target, set()).add(name)
-    return adjacency

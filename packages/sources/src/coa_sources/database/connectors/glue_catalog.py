@@ -8,7 +8,7 @@ paginator. No Glue Crawler provisioning needed.
 
 Supports:
   - Table filtering via Glue Expression syntax
-  - Table exclusion via client-side regex
+  - Table exclusion via shell globs
   - Partition key extraction
   - Cross-account access via STS AssumeRole
 """
@@ -180,18 +180,10 @@ class GlueCatalogConnector(MetadataConnector):
         table_filter = config.get("table_filter")
         table_exclude_filter = config.get("table_exclude_filter")
 
-        glue = self._get_glue_client(region, cross_account_role, external_id, config.get("namespace_id", ""))
-        # Reuse the shared filter compiler (same as JDBC) so a pipe/comma list
-        # like ``staging_*|temp_*`` excludes ANY matching glob. A bare
-        # ``fnmatch.translate`` treated the whole string as one glob and silently
-        # matched nothing, so multi-pattern excludes were ignored.
+        glue = self._get_glue_client(region, cross_account_role, external_id, namespace_id)
         exclude_re = compile_filter(table_exclude_filter, "table_exclude_filter")
 
-        # Pull the database-level Description once. Every Table from this
-        # discovery shares the same database, so this is the value of
-        # ``Table.database_description`` for all of them. Best-effort: if the
-        # GetDatabase call fails (e.g., transient permissions), we continue
-        # discovery with an empty database description.
+        # Database Description, fetched once for every table; best-effort.
         database_description = ""
         try:
             get_db_kwargs: dict = {"Name": database_name}
@@ -229,10 +221,6 @@ class GlueCatalogConnector(MetadataConnector):
                 )
                 tables.append(table)
 
-        # Sample distinct enum values for low-cardinality categorical columns via
-        # Athena (Glue tables have no live JDBC connection). Best-effort: any
-        # Athena/LF/permission failure leaves columns unsampled and never aborts
-        # discovery. Uses the Athena database name (Glue database) + catalog.
         self._sample_enum_values(tables, database_name, catalog_id, region)
 
         logger.info(
@@ -343,7 +331,6 @@ class GlueCatalogConnector(MetadataConnector):
                 )
             )
 
-        # Technical metadata
         fmt = params.get("classification", "") or glue_table.get("TableType", "")
         location = storage.get("Location", "")
         tech = TechnicalMetadata(
@@ -370,7 +357,6 @@ class GlueCatalogConnector(MetadataConnector):
             else BusinessMetadata()
         )
 
-        # Compute hash for re-scan change detection
         tech_hash = compute_schema_hash(columns)
 
         return Table(
@@ -378,10 +364,6 @@ class GlueCatalogConnector(MetadataConnector):
             database=database_name,
             data_source_id=data_source_id,
             namespace_id=namespace_id,
-            # Database-level description (from glue.get_database()), shared by
-            # every table in this discovery and used by the enricher as
-            # "External evidence" extra context — distinct from the table's
-            # own description above.
             database_description=database_description,
             technical_metadata=tech,
             business_metadata=table_business,

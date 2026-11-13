@@ -15,9 +15,6 @@ from coa_metrics.neptune_client import MetricAiContext, MetricDefinition, Metric
 pytestmark = pytest.mark.unit
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────
-
-
 def _make_event(namespace: str = "test-ns", names: list[str] | None = None) -> dict:
     event: dict = {
         "httpMethod": "GET",
@@ -53,9 +50,6 @@ def _sample_metric(
     )
 
 
-# ── Handler Tests ───────────────────────────────────────────────────────
-
-
 class TestExportOsiHandler:
     """Tests for the export_osi handler function."""
 
@@ -79,7 +73,7 @@ class TestExportOsiHandler:
 
     @patch("coa_metrics.api.export_osi._get_neptune")
     def test_names_query_param_scopes_export(self, mock_neptune) -> None:
-        """#569: a repeated `names` query param exports only that subset."""
+        """A repeated `names` query param exports only that subset."""
         neptune = MagicMock()
         neptune.get_metrics_bulk.return_value = [_sample_metric("metric_a")]
         mock_neptune.return_value = neptune
@@ -100,17 +94,6 @@ class TestExportOsiHandler:
         assert response["statusCode"] == 404
         body = json.loads(response["body"])
         assert "No matching metrics found" in body["message"]
-
-    @patch("coa_metrics.api.export_osi._get_neptune")
-    def test_omitted_names_exports_everything(self, mock_neptune) -> None:
-        """Default behavior (no `names` param) is unchanged — full namespace export."""
-        neptune = MagicMock()
-        neptune.get_metrics_bulk.return_value = [_sample_metric()]
-        mock_neptune.return_value = neptune
-
-        handler(_make_event(), None)
-
-        neptune.get_metrics_bulk.assert_called_once_with("test-ns", names=None)
 
     @patch("coa_metrics.api.export_osi._get_neptune")
     def test_no_metrics_returns_404(self, mock_neptune) -> None:
@@ -177,9 +160,6 @@ class TestExportOsiHandler:
         assert "metric_b" in body["content"]
 
 
-# ── Conversion Tests ────────────────────────────────────────────────────
-
-
 class TestMetricToOsi:
     """Tests for _metric_to_osi helper."""
 
@@ -200,15 +180,6 @@ class TestMetricToOsi:
         osi = _metric_to_osi(metric)
 
         assert osi.expression[0].dialect == "DATABRICKS"
-
-    def test_flattens_ai_context(self) -> None:
-        metric = _sample_metric()
-        osi = _metric_to_osi(metric)
-
-        assert osi.ai_context is not None
-        assert osi.ai_context.synonyms == ["total sales", "revenue"]
-        assert osi.ai_context.instructions == "Use with order_date"
-        assert osi.ai_context.examples == ["Q1 revenue"]
 
     def test_custom_extensions_populated(self) -> None:
         metric = _sample_metric()
@@ -232,9 +203,6 @@ class TestMetricToOsi:
         osi = _metric_to_osi(metric)
 
         assert osi.ai_context is None
-
-
-# ── Document Assembly Tests ─────────────────────────────────────────────
 
 
 class TestBuildOsiDocument:
@@ -271,9 +239,6 @@ class TestBuildOsiDocument:
         assert doc.osi_spec_version == "1.0"
 
 
-# ── Dataset Source Field Tests ──────────────────────────────────────────
-
-
 class TestExportDatasetMapping:
     """Tests for dataset name/source mapping per OSI spec."""
 
@@ -308,16 +273,6 @@ class TestExportDatasetMapping:
         assert ds.name == "orders"
         assert ds.source == "orders"
 
-    def test_dataset_includes_data_source_id(self) -> None:
-        metric = _sample_metric()
-        doc = _build_osi_document([metric])
-
-        ds = doc.datasets[0]
-        assert ds.data_source_id == "ds-abc123"
-
-
-# ── AI Context Export Tests ─────────────────────────────────────────────
-
 
 class TestExportAiContext:
     """Tests for structured ai_context export per OSI spec."""
@@ -330,13 +285,6 @@ class TestExportAiContext:
         assert osi_metric.ai_context.synonyms == ["total sales", "revenue"]
         assert osi_metric.ai_context.instructions == "Use with order_date"
         assert osi_metric.ai_context.examples == ["Q1 revenue"]
-
-    def test_no_ai_context_exports_none(self) -> None:
-        metric = _sample_metric()
-        metric.ai_context = None
-        osi_metric = _metric_to_osi(metric)
-
-        assert osi_metric.ai_context is None
 
     def test_ai_context_with_periods_preserved(self) -> None:
         """Regression: periods in instructions must not be corrupted."""

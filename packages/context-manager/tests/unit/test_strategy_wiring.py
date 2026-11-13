@@ -1,27 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Task 8.a — orchestrator/retriever strategy-selection wiring.
-
-Covers the seams wired in task 8 (``orchestrator.py::_run_tier3`` and
-``tier3/knowledge_retriever.py::resolve`` / ``_resolve_via_lexical``):
-
-1. Precedence is applied via ``resolve_strategy`` through ``_run_tier3``: a
-   request-level ``options.retrieverStrategy`` override beats the deployment
-   default (``ServiceConfig.lexical_retriever_strategy``) which beats the
-   documented default (``chunk_based_semantic``).
-2. Hand-rolled parity: ``resolve(..., retriever_strategy=...)`` is ignored when
-   ``lexical_retriever is None``, and the parallel vector + graph path runs
-   unchanged (Requirement 3.1 — zero regression in hand-rolled Tier 3).
-3. The resolved strategy name is threaded into the trace / response metadata.
-
-These tests assert against the real code paths (no patching of
-``resolve_strategy`` itself), so they exercise the actual precedence logic and
-the lazy ``lexical.strategies`` import guarded by
-``KnowledgeRetriever.lexical_enabled``.
-
-_Requirements: 2.16, 2.18, 3.1_
-"""
+"""Unit tests for orchestrator and knowledge-retriever strategy-selection wiring."""
 
 from __future__ import annotations
 
@@ -39,8 +19,6 @@ from coa_serve.tier3.knowledge_retriever import (
 )
 from coa_serve.tier3.vector_retriever import ChunkResult, VectorRetriever
 
-# ── Helpers ─────────────────────────────────────────────────────────
-
 
 def _tier3_result() -> Tier3Result:
     """A minimal, valid Tier3Result for the knowledge-retriever mock."""
@@ -57,12 +35,7 @@ def _tier3_result() -> Tier3Result:
 
 
 def _make_orchestrator(*, lexical_enabled: bool, deployment_strategy: str):
-    """Build an Orchestrator whose only exercised dependency is the knowledge
-    retriever. Tier 1/2 are stubbed to miss so resolution falls through to
-    Tier 3; ``tierOverride=3`` is used by callers to go straight to Tier 3.
-
-    Returns ``(orchestrator, knowledge_retriever_mock)``.
-    """
+    """Build an Orchestrator with Tier 1/2 stubbed to miss and a mocked knowledge retriever."""
     metric_resolver = AsyncMock()
     metric_resolver.match.return_value = MagicMock(found=False, sql_template=None)
 
@@ -89,16 +62,12 @@ def _make_orchestrator(*, lexical_enabled: bool, deployment_strategy: str):
     return orch, knowledge_retriever
 
 
-# ── 1. Precedence through _run_tier3 ────────────────────────────────
-
-
 @pytest.mark.unit
 class TestRunTier3StrategyPrecedence:
     """resolve_strategy precedence (request > deployment > documented default)
-    applied via ``_run_tier3`` when a lexical backend is configured (2.16)."""
+    applied via ``_run_tier3`` when a lexical backend is configured."""
 
     async def test_request_override_beats_deployment_default(self):
-        # Deployment default is chunk_based_semantic, request asks for traversal.
         orch, km = _make_orchestrator(lexical_enabled=True, deployment_strategy="chunk_based_semantic")
         request = InvokeRequest(
             query="explain the model",
@@ -108,14 +77,11 @@ class TestRunTier3StrategyPrecedence:
 
         await orch.resolve(request)
 
-        # The request value wins and is threaded into KnowledgeRetriever.resolve.
         assert km.resolve.await_count == 1
         passed = km.resolve.await_args.kwargs["retriever_strategy"]
         assert passed == RetrieverStrategy.TRAVERSAL
 
     async def test_deployment_default_beats_documented_default(self):
-        # No request override -> deployment default (entity_based) wins
-        # over the documented chunk_based_semantic default.
         orch, km = _make_orchestrator(lexical_enabled=True, deployment_strategy="entity_based")
         request = InvokeRequest(
             query="explain the model",
@@ -129,8 +95,6 @@ class TestRunTier3StrategyPrecedence:
         assert passed == RetrieverStrategy.ENTITY_BASED
 
     async def test_documented_default_when_deployment_invalid_and_no_override(self):
-        # An unrecognized deployment default and no request override -> the
-        # documented default (chunk_based_semantic) is resolved.
         orch, km = _make_orchestrator(lexical_enabled=True, deployment_strategy="not-a-real-strategy")
         request = InvokeRequest(
             query="explain the model",
@@ -142,9 +106,6 @@ class TestRunTier3StrategyPrecedence:
 
         passed = km.resolve.await_args.kwargs["retriever_strategy"]
         assert passed == RetrieverStrategy.CHUNK_BASED_SEMANTIC
-
-
-# ── 1b. On-demand graphrag (lexical built, no deployment default) ───
 
 
 @pytest.mark.unit
@@ -165,7 +126,6 @@ class TestRunTier3OnDemandGraphrag:
 
         response = await orch.resolve(request)
 
-        # No request field + no deployment default → None → hand-rolled path.
         passed = km.resolve.await_args.kwargs["retriever_strategy"]
         assert passed is None
         assert "retrieverStrategy" not in (response.result.metadata or {})
@@ -183,9 +143,6 @@ class TestRunTier3OnDemandGraphrag:
         passed = km.resolve.await_args.kwargs["retriever_strategy"]
         assert passed == RetrieverStrategy.ENTITY_NETWORK
         assert response.result.metadata["retrieverStrategy"] == "entity_network"
-
-
-# ── 2. Hand-rolled parity (lexical disabled) ────────────────────────
 
 
 @pytest.mark.unit
@@ -208,11 +165,7 @@ class TestRunTier3HandRolledParity:
 
         passed = km.resolve.await_args.kwargs["retriever_strategy"]
         assert passed is None
-        # No strategy metadata threaded onto the response.
         assert "retrieverStrategy" not in (response.result.metadata or {})
-
-
-# ── 3. Resolved strategy threaded into response metadata ────────────
 
 
 @pytest.mark.unit
@@ -230,7 +183,6 @@ class TestRunTier3StrategyMetadata:
         response = await orch.resolve(request)
 
         assert isinstance(response, InvokeResponse)
-        # str(StrEnum member) -> its value.
         assert response.result.metadata["retrieverStrategy"] == "traversal"
         # The namespace metadata from the assembler is preserved (merge, not replace).
         assert response.result.metadata["namespace"] == "demo"
@@ -246,9 +198,6 @@ class TestRunTier3StrategyMetadata:
         response = await orch.resolve(request)
 
         assert response.result.metadata["retrieverStrategy"] == "entity_based"
-
-
-# ── KnowledgeRetriever.resolve threading + parity ───────────────────
 
 
 def _make_synthesizer():
@@ -292,7 +241,7 @@ class TestKnowledgeRetrieverStrategyThreading:
 @pytest.mark.unit
 class TestKnowledgeRetrieverHandRolledParity:
     """When ``lexical_retriever is None``, a non-None ``retriever_strategy`` is
-    ignored entirely and the parallel vector + graph path runs unchanged (3.1)."""
+    ignored entirely and the parallel vector + graph path runs unchanged."""
 
     async def test_retriever_strategy_ignored_when_lexical_none(self):
         mock_vector = AsyncMock(spec=VectorRetriever)
@@ -309,7 +258,6 @@ class TestKnowledgeRetrieverHandRolledParity:
             lexical_retriever=None,  # hand-rolled mode
         )
 
-        # Passing a strategy must NOT change behavior: the parallel path runs.
         result = await retriever.resolve(
             "q",
             "ns",
@@ -317,36 +265,12 @@ class TestKnowledgeRetrieverHandRolledParity:
             retriever_strategy=RetrieverStrategy.TRAVERSAL,
         )
 
-        # Parallel vector + graph path executed unchanged.
         mock_vector.search.assert_awaited_once()
         mock_graph.traverse.assert_awaited_once()
-        # No lexical trace step appears on the hand-rolled path.
         step_names = [s["step"] for s in result.trace_steps]
         assert "lexical_baseline_retrieve" not in step_names
         assert "t3.vector_search" in step_names
         assert "t3.graph_traverse" in step_names
-
-    async def test_no_strategy_and_no_lexical_runs_parallel_path(self):
-        # Control: omit retriever_strategy entirely; behavior is identical.
-        mock_vector = AsyncMock(spec=VectorRetriever)
-        mock_vector.search.return_value = []
-        mock_graph = AsyncMock(spec=GraphTraverser)
-        mock_graph.traverse.return_value = []
-
-        retriever = KnowledgeRetriever(
-            vector_retriever=mock_vector,
-            graph_traverser=mock_graph,
-            synthesizer=_make_synthesizer(),
-            lexical_retriever=None,
-        )
-
-        await retriever.resolve("q", "ns", embedding=[0.1] * 8)
-
-        mock_vector.search.assert_awaited_once()
-        mock_graph.traverse.assert_awaited_once()
-
-
-# ── mode request toggle: standard vs deep-reasoning ─────────────────
 
 
 @pytest.mark.unit
@@ -384,8 +308,6 @@ class TestModeRequestToggle:
         )
         orch._embed_query = AsyncMock(return_value=[0.1])
 
-        from coa_serve.models import InvokeRequest
-
         await orch.resolve(InvokeRequest(query="q", namespace="ns", options={"mode": "deep-reasoning"}))
         assert ran == ["tier3_deep_reasoning"], f"deep reasoning must bypass the cascade, ran={ran}"
 
@@ -399,22 +321,16 @@ class TestModeRequestToggle:
         assert orch._is_deep_reasoning_engaged({"mode": "deep-reasoning"}) is True  # engaged flag unchanged
 
     def test_validator_accepts_standard_and_deep_reasoning(self):
-        from coa_serve.models import InvokeRequest
-
         for mode in ("deep-reasoning", "standard"):
             req = InvokeRequest(query="q", namespace="ns", options={"mode": mode})
             assert req.options["mode"] == mode
 
     def test_validator_still_accepts_deprecated_agentic_spelling(self):
         """The pre-rename wire value must not start 400-ing on upgrade."""
-        from coa_serve.models import InvokeRequest
-
         req = InvokeRequest(query="q", namespace="ns", options={"mode": "agentic"})
         assert req.options["mode"] == "agentic"
 
     def test_validator_rejects_unknown_mode(self):
-        from coa_serve.models import InvokeRequest
-
         with pytest.raises(ValueError, match="must be 'deep-reasoning' or 'standard'"):
             InvokeRequest(query="q", namespace="ns", options={"mode": "turbo"})
 

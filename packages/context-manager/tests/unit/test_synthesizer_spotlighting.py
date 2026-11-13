@@ -80,13 +80,10 @@ class TestPromptBuildWithSpotlighting:
         await synth.synthesize("q", chunks, [])
         prompt_arg = mock_bedrock.converse.call_args.kwargs["prompt"]
 
-        # Should contain nonce-delimited context section
         assert re.search(r"<scl_context_[0-9a-f]{16}>", prompt_arg)
         assert re.search(r"</scl_context_[0-9a-f]{16}>", prompt_arg)
 
-        # Content should be datamarked (no plain whitespace between words)
         assert "Important document content here" not in prompt_arg
-        # But individual words should still be present
         assert "Important" in prompt_arg
         assert "content" in prompt_arg
 
@@ -99,7 +96,6 @@ class TestPromptBuildWithSpotlighting:
         await synth.synthesize("q", [], entities)
         prompt_arg = mock_bedrock.converse.call_args.kwargs["prompt"]
 
-        # Graph context should have nonce tags but NOT be datamarked
         assert re.search(r"<scl_graph_[0-9a-f]{16}>", prompt_arg)
         assert "Order Entity" in prompt_arg  # Plain text, no marker between words
 
@@ -122,7 +118,6 @@ class TestPromptBuildWithSpotlighting:
         await synth.synthesize("q", chunks, [])
         system_arg = mock_bedrock.converse.call_args.kwargs["system"]
 
-        # System instruction should explain the marker token
         assert "datamarked" in system_arg
         assert "Read through" in system_arg
 
@@ -146,53 +141,38 @@ class TestPromptBuildWithSpotlighting:
         await synth.synthesize("q2", chunks, [])
         prompt2 = mock_bedrock.converse.call_args.kwargs["prompt"]
 
-        # Extract nonces from both prompts
         nonce1 = re.search(r"scl_context_([0-9a-f]{16})", prompt1).group(1)
         nonce2 = re.search(r"scl_context_([0-9a-f]{16})", prompt2).group(1)
         assert nonce1 != nonce2
 
-    async def test_marker_stripped_from_answer(self, mock_bedrock):
+    async def test_marker_stripped_from_answer(self, mock_bedrock, monkeypatch):
         """If the model accidentally reproduces datamarked text, markers are stripped."""
         synth = Synthesizer(mock_bedrock, guardrail_id="gr-1")
         chunks = [_chunk("important data")]
 
-        # Simulate the model echoing back datamarked text with the marker in the answer
-        # We need to intercept what marker was generated and include it in the mock response
-        original_generate = Synthesizer.__dict__["_generate_marker_token"]
-
+        original_generate = Synthesizer._generate_marker_token
         captured_marker = []
 
-        @staticmethod
         def _capture_marker():
-            m = original_generate.__func__()
+            m = original_generate()
             captured_marker.append(m)
             return m
 
-        Synthesizer._generate_marker_token = _capture_marker
-        try:
-            # Mock response includes a marker token (simulating LLM echoing datamarked text)
-            mock_bedrock.converse = AsyncMock(
-                side_effect=lambda **kwargs: ConverseResult(
-                    text=f"The answer is important{captured_marker[0]}data. [CONFIDENCE: 0.8]"
-                )
+        monkeypatch.setattr(Synthesizer, "_generate_marker_token", staticmethod(_capture_marker))
+        mock_bedrock.converse = AsyncMock(
+            side_effect=lambda **kwargs: ConverseResult(
+                text=f"The answer is important{captured_marker[0]}data. [CONFIDENCE: 0.8]"
             )
-            result = await synth.synthesize("q", chunks, [])
+        )
+        result = await synth.synthesize("q", chunks, [])
 
-            # Marker should be replaced with space in the final answer
-            assert captured_marker[0] not in result.answer
-            assert "important data" in result.answer or "important  data" in result.answer
-        finally:
-            Synthesizer._generate_marker_token = original_generate
+        assert captured_marker[0] not in result.answer
+        assert "important data" in result.answer or "important  data" in result.answer
 
 
 @pytest.mark.unit
 class TestOutputLanguageDirective:
-    """Work item #901: the output-language directive must be present, standalone, and LAST.
-
-    The buried 'respond in the same language' requirement was insufficient under sampling,
-    causing intermittent wrong-language answers (e.g. Russian for an English question). The
-    fix promotes it to a strong standalone directive appended last in the system instruction.
-    """
+    """The output-language directive must be present, standalone, and last in the system instruction."""
 
     async def test_system_instruction_contains_language_directive(self, mock_bedrock):
         synth = Synthesizer(mock_bedrock, guardrail_id="gr-1")

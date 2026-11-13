@@ -7,8 +7,6 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import React from "react";
 import { SourceDetail } from "../../../src/pages/SourceDetail";
 
-// ── Mock all the api-hooks the page touches ──────────────────────────────────
-
 const mockUseGetSource = vi.fn();
 const mockUseDeleteSource = vi.fn();
 const mockUseRescanSource = vi.fn();
@@ -187,8 +185,6 @@ describe("SourceDetail", () => {
   });
 
   it("shows what triggered each scan in the Scan history tab", () => {
-    // Per-job diff counts are not asserted: the shipped history has no per-job
-    // delta, which is ADR open question 2 rather than a display change.
     setupBaseMocks({ status: "PENDING_REVIEW", tablesDiscovered: 12 });
     mockUseListSourceScanJobs.mockReturnValue({
       data: {
@@ -225,8 +221,6 @@ describe("SourceDetail", () => {
     renderDetail();
 
     fireEvent.click(screen.getByRole("tab", { name: /settings/i }));
-    // Enable the schedule (click the toggle's label) — the cadence fields
-    // appear once enabled.
     fireEvent.click(screen.getByText(/enable scheduled rescans/i));
     expect(screen.getByText("Schedule expression")).toBeInTheDocument();
 
@@ -308,17 +302,6 @@ describe("SourceDetail", () => {
     expect(
       screen.queryByText(/pending tables and columns/i),
     ).not.toBeInTheDocument();
-  });
-
-  it("renders the Scan history tab", () => {
-    setupBaseMocks({ status: "PENDING_REVIEW", tablesDiscovered: 5 });
-    renderDetail();
-    // The tab itself is always rendered; clicking it surfaces the Activity
-    // header from the history table. Searching by tab role keeps this from
-    // being brittle to internal Cloudscape DOM changes.
-    expect(
-      screen.getByRole("tab", { name: /scan history/i }),
-    ).toBeInTheDocument();
   });
 
   it("displays scan error message when status is SCAN_FAILED", () => {

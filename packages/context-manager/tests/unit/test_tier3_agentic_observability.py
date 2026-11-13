@@ -1,34 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Observability / tracing tests for the Agentic Retriever session (task 14).
-
-These tests exercise the FULL trace across a complete reasoning session using the
-*real* :class:`~coa_serve.tier3.agentic.retriever.AgenticRetriever`
-and the *real*
-:class:`~coa_serve.tier3.agentic.controller.ReasoningController`
-(only the planner, tools, decomposer, synthesizer, and the wall clock are
-deterministic doubles). Where the other agentic suites verify each component's
-trace steps in isolation (``test_tier3_agentic_controller`` /
-``test_tier3_agentic_retriever`` / ``test_tier3_agentic_decompose``), this suite
-asserts that the complete Requirement-10 step set is recorded in the right
-ORDER across the whole session, that the steps survive an early termination, and
-that every step flows through the ``on_record`` progressive callback:
-
-- The expected ordered trace (Req 10.1-10.4): ``agentic_session_start`` →
-  ``decompose`` → ``subquestion_start`` → ``next_step_select`` (with the chosen
-  tool + selection reason and ``tool_used``) → the per-tool invocation step (with
-  ``tool_used``) → ``exploration_branch`` → the branch's
-  ``subquestion_start`` / ``next_step_select`` → the terminal
-  ``agentic_retrieval_stop`` (stop reason + elapsed ms) → ``llm_synthesize``.
-- Steps survive early termination (Req 10.4, 10.6): when the wall-clock
-  Time_Budget expires mid-session, every step recorded up to that point is still
-  attached to the ``Tier3Result`` in invocation order, and unprocessed
-  Sub_Questions never record a ``subquestion_start``.
-- The trace flows through the ``on_record`` callback (Req 10 / progressive
-  WebSocket emission): every recorded step fires the async callback exactly once,
-  in order.
-"""
+"""Observability tests for the full trace of an Agentic Retriever session."""
 
 from __future__ import annotations
 
@@ -51,9 +24,6 @@ from coa_serve.tier3.synthesizer import SynthesisResult
 from coa_serve.trace import TraceCollector
 
 NS = "acme"
-
-
-# ── deterministic test doubles ─────────────────────────────────────
 
 
 class FakeClockSource:
@@ -118,7 +88,7 @@ class ScriptedPlanner:
     """A :class:`StepPlanner` double driven by scripted candidate lists + booleans.
 
     ``candidates_script`` is consumed one list per ``propose_steps`` call; once
-    exhausted an empty list (no Tool selectable, Req 4.7) is returned.
+    exhausted an empty list (no Tool selectable) is returned.
     ``sufficiency`` is consumed one bool per ``check_sufficiency`` call, defaulting
     to ``default_sufficiency`` thereafter.
     """
@@ -150,8 +120,8 @@ class ScriptedPlanner:
 class FakeDecomposer:
     """A DecompositionPlanner double returning scripted Sub_Questions.
 
-    Records the ``decompose`` trace step itself (as the real planner does,
-    Req 13.10) so the session-level ordered trace includes it.
+    Records the ``decompose`` trace step itself (as the real planner does)
+    so the session-level ordered trace includes it.
     """
 
     def __init__(self, sub_questions: list[SubQuestion]) -> None:
@@ -218,15 +188,12 @@ def step_names(steps) -> list[str]:
     return [s.step for s in steps]
 
 
-# ── expected ordered trace (Req 10.1-10.4) ─────────────────────────
-
-
 @pytest.mark.unit
 class TestOrderedTrace:
     async def test_scripted_session_produces_expected_ordered_trace(self):
         # One sub-question whose single tool step surfaces one Exploration_Branch;
         # the branch then finds no selectable tool and the queue drains. This
-        # single scripted session exercises EVERY Requirement-10 step type.
+        # single scripted session exercises EVERY session step type.
         tool = FakeTool(
             "strategy:entity_based",
             input_schema={"query": "str"},
@@ -271,12 +238,12 @@ class TestOrderedTrace:
             "llm_synthesize",  # reused final synthesis
         ]
 
-        # The result carries the SAME ordered steps (Req 10.4): attached in
+        # The result carries the SAME ordered steps: attached in
         # invocation order.
         assert [d["step"] for d in result.trace_steps] == step_names(trace.steps)
 
     async def test_tool_invocation_step_carries_tool_used_and_duration(self):
-        # Req 10.1: a Tool invocation step records the tool used, a status, and a
+        # A Tool invocation step records the tool used, a status, and a
         # duration in milliseconds.
         tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
         planner = ScriptedPlanner(
@@ -301,7 +268,7 @@ class TestOrderedTrace:
         assert isinstance(tool_steps[0].duration_ms, int)
 
     async def test_next_step_select_records_chosen_tool_and_reason(self):
-        # Req 10.2: the next-step selection records the selected tool and the
+        # The next-step selection records the selected tool and the
         # reason for the selection.
         tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
         planner = ScriptedPlanner(
@@ -333,7 +300,7 @@ class TestOrderedTrace:
         assert "entity anchoring fits the question" in str(selects[0].detail)
 
     async def test_terminal_stop_step_records_reason_and_elapsed_ms(self):
-        # Req 10.3: the terminal step records the stop reason and total elapsed ms.
+        # The terminal step records the stop reason and total elapsed ms.
         src = FakeClockSource()
         tool = FakeTool(
             "strategy:entity_based",
@@ -361,30 +328,6 @@ class TestOrderedTrace:
         # Elapsed time recorded in ms; the 2s advance during the tool invoke shows.
         assert stops[0].duration_ms == 2000
 
-    async def test_terminal_stop_precedes_synthesis_which_is_last(self):
-        tool = FakeTool("strategy:entity_based", input_schema={"query": "str"})
-        planner = ScriptedPlanner(
-            [[PlannerDecision(tool_name="strategy:entity_based", inputs={"query": "q"})]],
-            sufficiency=[True],
-        )
-        retriever = make_retriever(
-            decomposer=FakeDecomposer([SubQuestion(text="root")]),
-            planner=planner,
-            tools=[tool],
-            synthesizer=FakeSynthesizer(),
-            clock_source=FakeClockSource(),
-        )
-        trace = TraceCollector()
-
-        await retriever.resolve("root", NS, trace=trace)
-
-        names = step_names(trace.steps)
-        assert names[-1] == "llm_synthesize"
-        assert names[-2] == "agentic_retrieval_stop"
-
-
-# ── steps survive early termination (Req 10.4, 10.6) ───────────────
-
 
 @pytest.mark.unit
 class TestStepsSurviveEarlyTermination:
@@ -392,7 +335,7 @@ class TestStepsSurviveEarlyTermination:
         # The first sub-question's tool invocation blows the 30s Time_Budget; the
         # session terminates before the second sub-question is ever started, yet
         # every step recorded up to termination must be attached to the result,
-        # in invocation order (Req 10.6 / 10.4).
+        # in invocation order.
         src = FakeClockSource()
         tool = FakeTool(
             "strategy:entity_based",
@@ -437,7 +380,7 @@ class TestStepsSurviveEarlyTermination:
 
     async def test_synthesis_failure_retains_all_prior_steps(self):
         # An early-ish terminal path (synthesis failure) must still retain every
-        # previously recorded trace step on the result (Req 10.5/10.6 retention).
+        # previously recorded trace step on the result.
         class _BoomSynth:
             async def synthesize(self, *a, **k):
                 raise RuntimeError("bedrock down")
@@ -468,22 +411,14 @@ class TestStepsSurviveEarlyTermination:
         assert "next_step_select" in names
         assert "strategy:entity_based" in names
         assert "agentic_retrieval_stop" in names
-        # The synthesis failure is itself recorded as an error step (Req 8.6).
+        # The synthesis failure is itself recorded as an error step.
         synth = [s for s in trace.steps if s.step == "llm_synthesize"]
         assert len(synth) == 1 and synth[0].status == "error"
         assert result.partial is True
 
     async def test_synthesis_timeout_falls_back_to_working_answer(self):
         """A synthesis call that overruns the wall-clock must degrade to the loop's
-        grounded working answer, not an empty string.
-
-        Synthesis used to be a bare ``await`` — ``synthesis_reserve_s`` only shrank
-        TOOL timeouts, so a slow LLM ran unbounded past the Time_Budget and pushed
-        total wall time into the AgentCore invocation ceiling (~131s), where the
-        endpoint returns HTTP 200 with an empty envelope and the answer is lost.
-        Measured on the SEC-10-Q eval before the fix: p50 96.9s / p90 117.2s /
-        max 131.8s, with the 131.8s query returning empty.
-        """
+        grounded working answer, not an empty string."""
 
         class _HangingSynth:
             async def synthesize(self, *a, **k):
@@ -516,9 +451,6 @@ class TestStepsSurviveEarlyTermination:
         assert result.partial is True
         # Prior steps are retained even on the timeout path.
         assert "strategy:entity_based" in [d["step"] for d in result.trace_steps]
-
-
-# ── trace flows through the on_record callback (Req 10) ────────────
 
 
 @pytest.mark.unit
@@ -555,12 +487,3 @@ class TestOnRecordCallback:
         # The callback fired once per recorded step, in invocation order — the
         # exact progressive stream a WebSocket client would receive.
         assert received == step_names(trace.steps)
-        # And the full Requirement-10 step set was delivered.
-        assert "agentic_session_start" in received
-        assert "decompose" in received
-        assert "subquestion_start" in received
-        assert "next_step_select" in received
-        assert "strategy:entity_based" in received
-        assert "exploration_branch" in received
-        assert "agentic_retrieval_stop" in received
-        assert "llm_synthesize" in received

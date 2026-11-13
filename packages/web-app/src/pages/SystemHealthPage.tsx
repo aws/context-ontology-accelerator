@@ -1,14 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * System Health page — displays backend service health status.
- *
- * Route: /system-health
- *
- * Calls GET /system-health (proxied to ontology-engine /readiness) and
- * renders the status of each backend component with visual indicators.
- */
+/** System Health page (route /system-health): renders GET /system-health per component. */
 import React, { useCallback, useEffect, useState } from "react";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";

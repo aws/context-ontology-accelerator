@@ -46,7 +46,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     path_params = event.get("pathParameters") or {}
     has_name = bool(path_params.get("name"))
 
-    # OSI import/export routes
     if resource.endswith("/import-osi/upload-url") and http_method == "POST":
         return get_osi_upload_url_handler(event, context)
     elif resource.endswith("/import-osi") and http_method == "POST":
@@ -62,7 +61,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if resource.endswith("/validate") and http_method == "POST":
         return validate_handler(event, context)
 
-    # Metric CRUD routes
     if http_method == "POST":
         return create_handler(event, context)
     elif http_method == "GET" and has_name:

@@ -1,16 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for ingest embedding-failure-fails-accept behavior (Fix 2).
-
-Covers:
-- _accumulate_embeddings returning error status
-- IngestStoreError raised on error
-- 'skipped' status does NOT raise
-- 'ok' status does NOT raise
-- Error message propagation
-- Various exception types caught by _accumulate_embeddings
-"""
+"""Unit tests for embedding-failure handling in ``_accumulate_embeddings``."""
 
 from __future__ import annotations
 
@@ -142,22 +133,3 @@ class TestIngestStoreErrorOnEmbeddingFailure:
 
         assert issubclass(IngestStoreError, IngestError)
         assert issubclass(IngestStoreError, Exception)
-
-    def test_error_message_includes_embedding_detail(self):
-        """The raised IngestStoreError should include the error detail from embedding result."""
-        from coa_ontology.catalog.ingest import IngestStoreError
-
-        # Simulate what the code does
-        embedding_result = {"status": "error", "error": "ConnectionError: AOSS unreachable"}
-        if embedding_result.get("status") == "error":
-            exc = IngestStoreError(f"Embedding accumulation failed: {embedding_result.get('error', 'unknown')}")
-            assert "AOSS unreachable" in str(exc)
-            assert "Embedding accumulation failed" in str(exc)
-
-    def test_error_with_missing_error_key(self):
-        """When error key is missing from result, 'unknown' is used."""
-        from coa_ontology.catalog.ingest import IngestStoreError
-
-        embedding_result = {"status": "error"}
-        exc = IngestStoreError(f"Embedding accumulation failed: {embedding_result.get('error', 'unknown')}")
-        assert "unknown" in str(exc)

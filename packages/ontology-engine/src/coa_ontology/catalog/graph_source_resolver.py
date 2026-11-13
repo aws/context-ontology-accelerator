@@ -14,7 +14,7 @@ table's base partition (``PK = NS#{namespace}``), which is strongly consistent: 
 source registered moments before the import is always found.
 
 Resolution checks that the source exists, is unambiguous and is a graph source. It does
-not probe the graph for data (see the LLD's known limitations).
+not probe the graph for data.
 """
 
 from __future__ import annotations

@@ -120,10 +120,8 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.name = "my-glue-db"
     req.glue_configuration = MagicMock()
     # Mirror the real GlueConfiguration.to_dict(), which carries every member the
-    # caller set — including athenaDataCatalogName. The blob is the only place a
-    # caller's declared catalog is echoed back on GetSource now that it is kept out
-    # of the system-managed top-level attribute, so a to_dict() that dropped it
-    # would hide that regression rather than catch it.
+    # caller set, including athenaDataCatalogName: the blob is the only place the
+    # caller's declared catalog is echoed back on GetSource.
     req.glue_configuration.to_dict.return_value = {
         "databaseName": "mydb",
         "region": "us-east-1",
@@ -311,8 +309,6 @@ class TestCreateDatabaseSource:
         assert "athenaDatabase" not in put_item
 
     def test_create_jdbc_source_mysql_uses_direct_jdbc(self):
-        # MySQL now has a direct-JDBC serve adapter (aiomysql), so it routes to
-        # the direct path rather than Athena federation.
         mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -324,7 +320,6 @@ class TestCreateDatabaseSource:
         assert _source_put(mock_dao)["queryEngine"] == "JDBC"
 
     def test_create_jdbc_source_sqlserver_uses_direct_jdbc(self):
-        # SQL Server now has a direct-JDBC serve adapter (python-tds).
         mock_dao = dao_double()
         with (
             patch(f"{_DR}._get_dao", return_value=mock_dao),
@@ -525,8 +520,6 @@ class TestCreateDatabaseSource:
         assert status == 400
 
     def test_create_ddb_put_fails_returns_500(self):
-        from botocore.exceptions import ClientError
-
         mock_dao = dao_double()
         mock_dao.put.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "PutItem")
         mock_scan_dao = dao_double()
@@ -540,8 +533,6 @@ class TestCreateDatabaseSource:
         assert status == 500
 
     def test_create_sqs_fails_returns_500(self):
-        from botocore.exceptions import ClientError
-
         mock_dao = dao_double()
         mock_scan_dao = dao_double()
         mock_sqs = MagicMock()
@@ -678,8 +669,6 @@ class TestCreateCustomConnectorSource:
         item = _source_put(mock_dao)
         assert reg.call_args.kwargs["catalog_name"] == item["athenaDataCatalogName"]
         assert reg.call_args.kwargs["connector_function_arn"].endswith("acme-connector")
-        # One ARN reaches the catalog registrar, because the shape models one. A
-        # `record_function_arn` kwarg would not be ignored here — it no longer exists.
         assert "record_function_arn" not in reg.call_args.kwargs
 
     # A catalog registered before the row would be orphaned: every delete path
@@ -1253,8 +1242,6 @@ class TestHandleGetScanJob:
         assert status == 404
 
     def test_get_scan_job_ddb_error_returns_500(self):
-        from botocore.exceptions import ClientError
-
         mock_dao = dao_double()
         mock_dao.get.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "GetItem")
         mock_scan_dao = dao_double()
@@ -1268,8 +1255,6 @@ class TestHandleGetScanJob:
         assert status == 500
 
     def test_get_scan_job_scan_dao_error_returns_500(self):
-        from botocore.exceptions import ClientError
-
         mock_dao = dao_double()
         mock_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
         mock_scan_dao = dao_double()
@@ -1462,7 +1447,7 @@ class TestUpdateCustomConnectorConfiguration:
 
 @pytest.mark.unit
 class TestCreateGlueSourceOwnership:
-    """F-8: catalogId/databaseName must be bound to the caller's namespace.
+    """catalogId/databaseName must be bound to the caller's namespace.
 
     ``manageSource`` authorizes against the NAMESPACE and the Smithy shape only
     checks the form of these two fields, so without this the create path is the
@@ -2016,8 +2001,6 @@ class TestHandleUpdateMetadata:
         assert status == 400
 
     def test_update_ddb_error_returns_500(self):
-        from botocore.exceptions import ClientError
-
         mock_dao = dao_double()
         mock_dao.get.return_value = self._db_item()
         mock_dao.update.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "UpdateItem")
@@ -2094,8 +2077,6 @@ class TestHandleListTables:
         assert status == 400
 
     def test_list_tables_happy_path(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2141,8 +2122,6 @@ class TestHandleListTables:
         """columnCount reflects ALL merged columns (incl. a retained
         pending-deletion column), a column slated for deletion is not counted
         approved, and the per-table pending-deletion column count is surfaced."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2198,8 +2177,6 @@ class TestHandleListTables:
         APPROVED. Bulk source approve doesn't re-enter APPROVED, so the count
         is what the tables list uses to badge the table and prompt a per-table
         or per-relationship review."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2268,8 +2245,6 @@ class TestHandleListTables:
 
     def test_list_tables_omits_pending_relationships_when_zero(self):
         """The field is absent (not zero) to keep response bodies small."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2312,8 +2287,6 @@ class TestHandleListTables:
         """When inline forms are absent and the get_asset_forms fallback raises,
         the asset is skipped with a warning log and the response includes
         a skippedAssets count."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2380,8 +2353,6 @@ class TestHandleListTables:
     def test_list_tables_malformed_form_json_logs_warning_and_marks_degraded(self):
         """When form JSON is unparseable, the asset is skipped with a warning
         and the response includes a 'degraded' indicator."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2424,8 +2395,6 @@ class TestHandleListTables:
     def test_list_tables_multiple_failures_accumulates_skipped_count(self):
         """When multiple assets fail (both API and parse errors),
         skippedAssets accurately reflects the total count."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2484,8 +2453,6 @@ class TestHandleListTables:
     def test_list_tables_malformed_columns_field_skips_gracefully(self):
         """When the columns field within a valid form payload contains malformed
         JSON, the asset is skipped and counted in skippedAssets."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2533,8 +2500,6 @@ class TestHandleListTables:
     def test_list_tables_no_failures_omits_degraded_field(self):
         """When all assets parse successfully, the response does not include
         'degraded' or 'skippedAssets' fields."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2669,8 +2634,6 @@ class TestHandleListTables:
         assert body == {"error": "Failed to search tables"}
 
     def test_list_tables_with_next_token(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2711,8 +2674,6 @@ class TestHandleListTables:
         assert body.get("nextToken") == "next-page-token"
 
     def test_list_tables_filters_by_review_status(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = dao_double()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2753,8 +2714,6 @@ class TestHandleListTables:
     def test_list_tables_inline_forms_skips_get_asset_forms(self):
         """Canary: when search returns populated forms_output, get_asset_forms
         is NOT called — this proves the N+1 is gone."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2799,18 +2758,10 @@ class TestHandleListTables:
     def test_list_tables_inline_forms_still_apply_rescan_enrichment(self):
         """Inline forms and re-scan enrichment must both hold AT ONCE.
 
-        Regression guard for the rebase of GH-133 onto the re-scan work. The two
-        features were written independently and each side's tests only exercise
-        its own path: the re-scan assertions elsewhere in this file all reach the
-        payload through the ``get_asset_forms`` fallback (their mock assets have
-        no ``forms_output``), while the inline-forms tests all use payloads with
-        no re-scan state. Removing the per-form inner loop de-indented the whole
-        ``TableSummary`` construction by one level, so a bad merge could quietly
-        drop the re-scan fields from the inline path — the common path in
-        production — while every existing test still passed.
+        The re-scan assertions elsewhere reach the payload through the
+        ``get_asset_forms`` fallback, while the inline-forms tests use payloads with
+        no re-scan state, so this pins the re-scan fields on the inline path.
         """
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2888,8 +2839,6 @@ class TestHandleListTables:
     def test_list_tables_fallback_when_forms_output_absent(self):
         """When search returns absent forms_output, the fallback calls
         get_asset_forms and the table is still listed correctly."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2934,8 +2883,6 @@ class TestHandleListTables:
 
     def test_list_tables_fallback_when_forms_output_empty_list(self):
         """When search returns an empty forms_output list, the fallback fires."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -2985,9 +2932,7 @@ class TestHandleListTables:
         Regression: the emptiness probe was at list level, so a populated
         formsOutput with an unpopulated ``content`` counted as usable and reached
         ``json.loads(form["content"])`` -> TypeError -> 500 for the WHOLE page.
-        The MR's stated contract is worst-case-today's-behaviour, i.e. fall back."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
+        The expected behaviour is to fall back."""
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -3033,8 +2978,6 @@ class TestHandleListTables:
     def test_list_tables_absent_content_key_skips_the_asset_not_the_page(self):
         """A form dict with NO ``content`` key, whose fallback is also unusable,
         degrades to a per-asset skip — never a KeyError escaping to a 500."""
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -3331,8 +3274,6 @@ class TestPendingDeletionSurfacing:
         return {"httpMethod": "GET", "queryStringParameters": qs or {}}
 
     def test_list_tables_flags_removed_tables(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -3594,8 +3535,6 @@ class TestPendingDeletionSurfacing:
             _dr._rescan_table_diff(_NAMESPACE_ID, _SOURCE_ID, "db.t", MagicMock())
 
     def test_list_tables_flags_added_tables(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -3639,8 +3578,6 @@ class TestPendingDeletionSurfacing:
         assert not flags.get("same")
 
     def test_list_tables_no_added_flag_outside_rescan_review(self):
-        from coa_common.datazone_forms import FORM_TYPE_NAME
-
         mock_ns_dao = MagicMock()
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
 
@@ -3828,12 +3765,9 @@ class TestRescanDiffSurfacing:
             return _parse(_dr._handle_get_table(_NAMESPACE_ID, _SOURCE_ID, self._TABLE_ID))
 
     def test_rescan_review_surfaces_removed_columns_from_backup(self):
-        # A re-scan dropped col_c, but the discovery merge KEEPS col_c in the live
-        # asset (tagged pendingDeletion so a steward can "Keep" it), so diff_tables
-        # sees col_c on BOTH sides and never flags it removed. The backup's
-        # removed_columns is the authoritative record — the panel must still list
-        # col_c as removed even though the diff is otherwise empty. (Regression:
-        # rescanDiff used to come back None for a dropped-columns-only re-scan.)
+        # The discovery merge KEEPS a dropped column in the live asset (tagged
+        # pendingDeletion), so diff_tables never flags it removed; the backup's
+        # removed_columns is the authoritative record the panel must still list.
         cols = [{"name": "col_a"}, {"name": "col_b"}, {"name": "col_c"}]
         form = _serialize_table(table_name="orders", database="sales", columns=cols)
         blob = self._blob_with(modified_form=form, removed_columns={self._TABLE_ID: ["col_c"]})
@@ -4168,7 +4102,6 @@ class TestReviewTable:
         assert status == 404
 
     def test_pending_to_approved_writes_revision_and_increments_counter(self, _review_env):
-        # Per-asset APPROVE now requires all columns to be terminal first.
         _mock_single_asset_load(
             _review_env["smus"],
             table_id=self._TABLE_ID,
@@ -4192,10 +4125,8 @@ class TestReviewTable:
             amount=1,
         )
 
-    # ── #116 enrichment acceptance rate (ReviewScope=Table) ──────────────
-    # The sources-structured-scan dashboard SEARCHes
-    # {COA/Sources,ReviewScope} for these exact metric names, so a
-    # rename on either side silently darkens the widget.
+    # The dashboard SEARCHes {COA/Sources,ReviewScope} for these exact metric
+    # names, so a rename on either side silently darkens the widget.
 
     def _review_and_capture_metrics(self, _review_env, *, decision, table_status):
         _mock_single_asset_load(
@@ -4356,8 +4287,6 @@ class TestReviewTable:
         # The DataZone revision is the source of truth; a failed counter
         # increment must NOT fail the request, but it MUST emit a metric so
         # ops can alarm on systematic drift.
-        from botocore.exceptions import ClientError
-
         _mock_single_asset_load(
             _review_env["smus"],
             table_id=self._TABLE_ID,
@@ -4378,8 +4307,8 @@ class TestReviewTable:
         # Request still succeeds despite the counter failure.
         assert status == 200
         assert body["reviewStatus"] == "APPROVED"
-        # Drift is made observable. (The same path also emits the #116
-        # acceptance-rate metric, so assert on the name rather than call count.)
+        # Drift is made observable (assert on the name: the same path also emits
+        # the acceptance-rate metric).
         assert "ApprovalCounterUpdateFailed" in [c.args[0] for c in mock_emit.call_args_list if c.args]
 
     def test_approve_re_approves_rejected_columns(self, _review_env):
@@ -4725,8 +4654,6 @@ class TestApproveSource:
     def test_approve_from_rejected_source_is_locked_409(self, _bulk_env):
         # REJECTED is terminal: bulk approve is not an allowed entry state
         # either — a rejected source cannot be resurrected, only re-onboarded.
-        from botocore.exceptions import ClientError
-
         _bulk_env["dao"].get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -4760,8 +4687,6 @@ class TestApproveSource:
         _bulk_env["sqs"].send_message.assert_not_called()
 
     def test_already_approving_returns_409(self, _bulk_env):
-        from botocore.exceptions import ClientError
-
         _bulk_env["dao"].get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -4808,8 +4733,6 @@ class TestApproveSource:
         assert status == 500
 
     def test_sqs_failure_rolls_back_status(self, _bulk_env):
-        from botocore.exceptions import ClientError
-
         _bulk_env["dao"].get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -4886,8 +4809,6 @@ class TestRejectSource:
         assert body["status"] == "REJECTING"
 
     def test_sqs_failure_rolls_back_to_rejection_failed(self, _bulk_env):
-        from botocore.exceptions import ClientError
-
         _bulk_env["dao"].get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -4906,8 +4827,6 @@ class TestRejectSource:
     def test_reject_from_rejected_source_is_locked_409(self, _bulk_env):
         # REJECTED is terminal: bulk reject is not an allowed entry state, so
         # the conditional transition fails and the source stays locked.
-        from botocore.exceptions import ClientError
-
         _bulk_env["dao"].get.return_value = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",
@@ -5366,8 +5285,8 @@ class TestUpdateTableKeys:
         _review_env["dao"].get.side_effect = _get
 
     def test_approve_inferred_relationship_preserves_provenance(self, _review_env):
-        # #1088: approving flips review_status to APPROVED while keeping the FK's
-        # AI_INFERRED source, cross-source target_datasource_id, and provenance.
+        # Approving flips review_status to APPROVED while keeping the FK's AI_INFERRED
+        # source, cross-source target_datasource_id, and provenance.
         _mock_single_asset_load(
             _review_env["smus"], table_id=self._TABLE_ID, form_content=self._form_with_inferred_fk()
         )
@@ -5405,8 +5324,8 @@ class TestUpdateTableKeys:
         _review_env["smus"].create_asset_revision.assert_not_called()
 
     def test_approve_cross_source_relationship_outside_namespace_returns_400(self, _review_env):
-        # #1088: approving materialises the edge, so a target datasource that is
-        # not registered in THIS namespace must be refused, not silently approved.
+        # Approving materialises the edge, so a target datasource not registered in
+        # THIS namespace must be refused, not silently approved.
         _mock_single_asset_load(
             _review_env["smus"], table_id=self._TABLE_ID, form_content=self._form_with_inferred_fk()
         )
@@ -5930,7 +5849,7 @@ class TestHandleListScanJobs:
 
 @pytest.mark.unit
 class TestHandlePutRescanSchedule:
-    """Recurring rescan schedule config (#683 R7)."""
+    """Recurring rescan schedule config."""
 
     def _enable_event(self, expr: str = "rate(1 day)", tz: str = "UTC") -> dict:
         return {"body": json.dumps({"enabled": True, "scheduleExpression": expr, "timezone": tz})}
@@ -6231,7 +6150,7 @@ class TestHandlePutRescanSchedule:
 
 @pytest.mark.unit
 class TestHandlePutEventRescan:
-    """Event-driven rescan config (#683 R8)."""
+    """Event-driven rescan config."""
 
     def _glue_item(self) -> dict:
         return {
@@ -6469,8 +6388,8 @@ class TestHandlePutEventRescan:
         mock_dao.update.assert_not_called()
 
     def test_disable_remove_targets_fails_returns_500_and_keeps_the_record(self):
-        """The rule's target is what routes events to the queue; a failure there
-        is no longer swallowed."""
+        """The rule's target routes events to the queue; a failure there returns 500
+        and keeps the record."""
         mock_dao = MagicMock()
         mock_dao.get.return_value = {**self._glue_item(), "eventRescan": {"enabled": True}}
         mock_events = MagicMock()
@@ -6724,7 +6643,7 @@ class TestCreateSparqlSource:
         mock_dao.put.assert_not_called()
 
     def test_sparql_configuration_update_is_not_supported(self):
-        """D5: a graph source's configuration is immutable in v1."""
+        """A graph source's configuration is immutable."""
         item = {
             "PK": f"NS#{_NAMESPACE_ID}",
             "SK": f"SRC#{_SOURCE_ID}",

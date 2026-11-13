@@ -63,12 +63,7 @@ class OpenSearchVectorStore(VectorStore):
     """
 
     def __init__(self, namespace: str | None = None):
-        """Bind the store to a namespace and defer AOSS client creation.
-
-        Args:
-            namespace: Default namespace (and index) for reads/writes; a
-                per-call namespace overrides it.
-        """
+        """Bind the store to a namespace and defer AOSS client creation."""
         self.dimensions = OSS_DIMENSIONS
         self._namespace = namespace
         self._client: AossVectorClient | None = None
@@ -201,17 +196,7 @@ class OpenSearchVectorStore(VectorStore):
         embedding_type=None,
         namespace=None,
     ):
-        """Return stored embeddings for one entity, optionally filtered.
-
-        Args:
-            entity_uri: URI of the entity whose embeddings to fetch.
-            entity_type: Restrict to one entity type when provided.
-            embedding_type: Restrict to one embedding variant when provided.
-            namespace: Per-call namespace override; defaults to the bound one.
-
-        Returns:
-            List of matching embedding documents.
-        """
+        """Return stored embeddings for one entity, optionally filtered."""
         idx = self._read_index(namespace)
         filters: list[dict[str, Any]] = [{"term": {"entity_uri": entity_uri}}]
         if entity_type:
@@ -228,18 +213,7 @@ class OpenSearchVectorStore(VectorStore):
         namespace=None,
         limit=None,
     ):
-        """Return all embeddings for an ontology, optionally filtered.
-
-        Args:
-            ontology_id: ID of the ontology whose embeddings to list.
-            entity_type: Restrict to one entity type when provided.
-            embedding_type: Restrict to one embedding variant when provided.
-            namespace: Per-call namespace override; defaults to the bound one.
-            limit: Maximum rows to return; the backend default applies when absent.
-
-        Returns:
-            List of matching embedding documents.
-        """
+        """Return all embeddings for an ontology, optionally filtered."""
         idx = self._read_index(namespace)
         filters: list[dict[str, Any]] = [{"term": {"ontology_id": ontology_id}}]
         if entity_type:
@@ -260,17 +234,7 @@ class OpenSearchVectorStore(VectorStore):
         Projects only ``entity_uri`` (excludes vectors/text) and pages with
         ``search_after`` so the readiness wait gets the complete URI set
         cheaply.
-
-        Args:
-            ontology_id: ID of the ontology to enumerate.
-            namespace: Per-call namespace override; defaults to the bound one.
-
-        Returns:
-            List of ``entity_uri`` strings visible in the index.
         """
-        # Project only entity_uri (exclude the knn_vector + text payload) and
-        # page with search_after — the readiness wait needs the complete URI
-        # set, never the vectors.
         idx = self._read_index(namespace)
         return self._aoss().iter_source_field(idx, [{"term": {"ontology_id": ontology_id}}], "entity_uri")
 
@@ -318,8 +282,7 @@ class OpenSearchVectorStore(VectorStore):
             # similarity in [-1, 1] here. OpenSearch's k-NN ``cosinesimil`` _score
             # is ``(1 + cos)/2`` mapped to [0, 1], so the conversion
             # ``cos = 2 * _score - 1`` is needed to conform. That conversion is
-            # deliberately NOT applied yet — see the OPTIONAL task in tasks.md
-            # (Task 10A.1). Until then, callers using the OpenSearch backend must
+            # not applied yet, so callers using the OpenSearch backend must
             # be aware that ``score`` is in [0, 1] and the class normalizer's
             # thresholds (0.95 / 0.80) DO NOT behave as documented for OpenSearch.
             hits.append(

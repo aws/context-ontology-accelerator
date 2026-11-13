@@ -22,16 +22,8 @@ pytestmark = pytest.mark.unit
 
 _PREFIX = "/coa/dev/connectors/databricks/sources"
 
-# The LIVE cross-language contract for one connector configuration parameter: without a
-# shared artifact each side pins its own key list, so either could rename a field and both
-# suites would stay green while every query failed.
-#
-# `SsmConnectionConfigProviderTest` parses a byte-identical copy at
-# `connectors/databricks/src/test/resources/databricks_connector_parameter.golden.json`
-# and asserts byte equality against THIS file. Two files rather than one shared path
-# because `connectors/` is a standalone workspace customers copy out.
-#
-# MAINTENANCE: a change here is a change to BOTH files.
+# Cross-language contract: the Java twin is
+# connectors/databricks/src/test/resources/<same name>, so change both files.
 _GOLDEN_PATH = pathlib.Path(__file__).parents[2] / "fixtures" / "databricks_connector_parameter.golden.json"
 _ARN_PARAM = "/coa/dev/connectors/databricks/deployment/function-arn"
 _CONNECTOR_ARN = "arn:aws:lambda:us-east-1:111122223333:function:coa-dev-databricks-connector"

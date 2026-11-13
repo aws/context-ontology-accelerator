@@ -3,15 +3,6 @@
 
 """Unit tests for the enriched-context loader.
 
-Tests cover:
-- Mapping sampled IDs → labels via ``label_by_id``
-- Single batched ``get_facts_for_entities`` call per class
-- Grouping facts by subject entity
-- Per-entity fact cap
-- SPO vs predicate-only fact rendering
-- Missing label ID is dropped with a warning
-- Empty inputs
-
 These tests use a mocked LexicalGraphStore with controlled fact responses.
 No live AWS calls.
 """

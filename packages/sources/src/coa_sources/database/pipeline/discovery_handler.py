@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import time
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from coa_common.constants import datasource_external_id
@@ -136,8 +136,7 @@ def _read_existing_backup(source_id: str) -> dict[str, Any] | None:
     and this blob is the approved pre-image to diff against (see
     ``rescan.reconstruct_approved_baseline``). The caller gates on that condition,
     NOT on blob presence: a blob can also be left behind on an APPROVED source
-    (re-scanned before delete-on-resolve shipped, or a paged-approve gap), and
-    such a stale blob must never drive the baseline. A missing/unreadable blob or
+    and such a stale blob must never drive the baseline. A missing/unreadable blob or
     any read error returns None. Best-effort by design: it must not fail the scan.
     """
     if not BUCKET_NAME:
@@ -179,15 +178,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # on a first scan). Drives the merge-onto-live-assets path below. The trigger
     # normalizes this to a string, so parse it as one (a bare bool works too).
     is_rescan = str(event.get("isRescan", "")).strip().lower() == "true"
-    # True ONLY when the live assets are an interim, un-approved merge and the S3
-    # backup blob holds the approved pre-image: the source was already in
-    # RESCAN_REVIEW when this re-scan was triggered (a PRIOR re-scan still open),
-    # or this retries a failed re-scan that had written its backup before failing.
-    # Gates the backup read below. Normalized as a string by the
-    # trigger (a bare bool works too); defaults to false when absent.
+    # Parsed as a string like isRescan (see the module docstring).
     had_open_rescan = str(event.get("hadOpenRescan", "")).strip().lower() == "true"
 
-    # Strip "DS#" prefix to get the bare source UUID
     source_id = datasource_id.removeprefix("DS#")
 
     logger.info(
@@ -197,13 +190,12 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         scan_type,
     )
 
-    # New sources-table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}
+    # sources-table key schema: PK=NS#{namespaceId}, SK=SRC#{sourceId}
     source_key = {"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"}
     # source-scan-jobs key schema: PK=SRC#{sourceId}, SK=<ISO timestamp>
     scan_job_key = {"PK": f"SRC#{source_id}", "SK": scan_job_sk}
 
     try:
-        # Fetch source configuration from sources-table
         item = _get_ds_dao().get(source_key)
         if not item:
             raise ValueError(f"Data source not found: {datasource_id}")
@@ -227,37 +219,17 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             condition="attribute_exists(PK)",
         )
 
-        source_type = item["sourceSubType"]  # GLUE_DATABASE or JDBC_DATABASE
+        source_type = item["sourceSubType"]
         raw_config = item.get("configuration", "{}")
         config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
 
-        # Re-verify the credential secret still lists this namespace BEFORE
-        # anything reads it. Registration checks the ARN the caller supplies, but
-        # this handler takes the ARN from the stored row — so registration alone
-        # does not cover a row written before the binding rule existed, or a secret
-        # whose tag list changed after the source was registered. Without this
-        # re-check the discovery connector would fetch the secret and open a
-        # connection to the host in the same row, which is where the credentials
-        # leave the account.
-        #
-        # The IAM conditions on this role can only assert the tag EXISTS — a shared
-        # execution role has no per-request namespace identity — so the membership
-        # test has to happen here.
-        #
-        # Raises on refusal: the scan fails and the source goes SCAN_FAILED, which
-        # is the signal the operator needs (add this namespace to the secret's tag,
-        # then re-scan). Cross-account secrets are skipped — see secret_binding.
-        #
-        # Skipped for DATABRICKS_SQL_WAREHOUSE: this role never reads that secret.
-        # Discovery reaches the warehouse through Athena and the connector, which assumes
-        # the customer's role and reads the credential as that session, so the role's own
-        # permission policy is what binds the secret.
+        # Re-verify the secret still lists this namespace before anything reads it:
+        # registration checks the caller's ARN, not the stored one, and the shared
+        # role's IAM conditions can only assert the tag exists. A refusal raises and
+        # the scan fails. Skipped for DATABRICKS_SQL_WAREHOUSE, whose secret is read
+        # by the connector as the customer's role, never by this role.
         if source_type != SourceSubType.DATABRICKS_SQL_WAREHOUSE:
             require_secret_namespace_binding(config.get("credentialSecretArn"), namespace_id, datasource_id)
-
-        # Athena federation for JDBC sources is provisioned by a separate,
-        # dedicated Step Functions step (FederationProvisionerFn) — kept out of
-        # discovery so its Lake Formation admin privilege stays isolated.
 
         # Dispatch to the appropriate connector. All JDBC engines (incl. Snowflake)
         # are discovered directly via their driver dialect (see connectors/dialects.py).
@@ -265,11 +237,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         scan_start = time.monotonic()
         metadata = _discover(connector, config, datasource_id, namespace_id, source_type, item)
 
-        # Guardrail: fail fast on sources too large to register within the
-        # Lambda timeout. Discovery is cheap; the per-table DataZone asset write
-        # is the bottleneck. Surface an actionable message (scope with
-        # schema/table filters) rather than letting the pipeline time out and
-        # retry fruitlessly.
         if MAX_TABLES_PER_SOURCE and len(metadata.tables) > MAX_TABLES_PER_SOURCE:
             raise ValueError(
                 f"Source has {len(metadata.tables)} tables, exceeding the limit of "
@@ -308,16 +275,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             # and read the backup BEFORE the merge below overwrites it. Interim
             # un-approved edits made during an open review are intentionally NOT
             # preserved across a fresh re-scan.
-            #
-            # We read the backup ONLY when had_open_rescan is true. Blob PRESENCE
-            # is NOT proof of an open review: a source re-scanned before the
-            # delete-on-approve/reject change shipped (or hit by the paged-approve
-            # gap) is APPROVED yet still has a leftover backup. Reconstructing from
-            # that stale blob would build a WRONG baseline — dropping tables it
-            # lists as added, restoring stale pre-images — and manufacture drift on
-            # a clean re-scan. When re-scanning from APPROVED the live assets ARE
-            # the approved baseline, so we pass None and any stale backup is ignored
-            # (reconstruct_approved_baseline then returns live unchanged).
             existing_backup = _read_existing_backup(source_id) if had_open_rescan else None
             live = read_assets_for_datasource(SMUS_DOMAIN_ID, project_id, datasource_id)
             accepted = reconstruct_approved_baseline(live, existing_backup, source_id=source_id)
@@ -482,8 +439,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # comments, and no keys while enrichment backfills AI descriptions over
         # the gap. Recording it on the scan job makes the degradation visible to
         # the steward reviewing the result rather than only to whoever reads the
-        # logs. The names are capped because this is a signal, not an inventory —
-        # the count is the part that must always be right.
+        # logs.
         if metadata.failed_tables:
             scan_job_update["tablesFailed"] = len(metadata.failed_tables)
             scan_job_update["failedTables"] = metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES]
@@ -514,8 +470,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # is in RESCAN_REVIEW (out of the APPROVED gate), so consumers ignore it
         # meanwhile; a reject restores these pre-rescan counts from the S3 backup
         # (captured above), and an approve keeps them.
-        from datetime import datetime
-
         discovered_schemas = sorted({t.database for t in metadata.tables if t.database})
         source_update: dict[str, Any] = {
             "tablesDiscovered": len(metadata.tables),
@@ -576,8 +530,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # Failure-path updates use raise_on_error=False: if the underlying
         # row has been deleted we still want to surface the original
         # exception, not a ConditionalCheckFailedException from cleanup.
-        from datetime import datetime
-
         _get_ds_dao().update(
             key=source_key,
             update_fields={
@@ -705,7 +657,7 @@ def _discover(
     # self-grant assumes a Lake Formation admin role, so it must be positively
     # authorized rather than merely not-forbidden. See
     # ``coa_sources.database.glue_ownership``.
-    if (source_item or {}).get("sourceSubType") == SourceSubType.GLUE_DATABASE:
+    if item.get("sourceSubType") == SourceSubType.GLUE_DATABASE:
         # A refusal raises GlueOwnershipError, a ClientSafeError: it propagates
         # as-is so the scan job stores the steward-facing message (and the tag
         # command it carries) without rewording.
@@ -719,7 +671,6 @@ def _discover(
         )
         connector_config["lf_self_grant_allowed"] = True
 
-    # Test connection first
     validate_start = time.monotonic()
     test_result = connector.test_connection(connector_config)
     emit_metric("ValidationLatency", (time.monotonic() - validate_start) * 1000, "Milliseconds", SourceType=source_type)

@@ -49,6 +49,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Graph sources (RDF_SPARQL: Neptune graphs queried directly). Off by default;
 # on/true/1/yes turns them on. Set it on EVERY deploy: an unset value turns them off.
 #   SCL_GRAPH_SOURCES=on make deploy-dev
+# Prefer IPv4 in the Python service images (on by default; false keeps
+# glibc's IPv6-first order):
+#   SCL_PREFER_IPV4=false make deploy-dev
 # SMUS admin principal(s) — required, comma-separated IAM role/user ARN(s)
 # that human admins federate into (e.g. your IAM Identity Center
 # permission-set role): SCL_SMUS_ADMIN_ARNS=arn:aws:iam::123456789012:role/... make deploy-dev

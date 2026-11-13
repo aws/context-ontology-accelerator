@@ -3,7 +3,7 @@
 
 """The induction entry points resolve the namespace language once, server-side.
 
-Pins LLD section 2.2.8 (ontology induction row): the language comes from the
+The language comes from the
 namespace item, never from the request; it reaches the structured strategy, the
 unstructured worker and the rebuild path; default proposal titles follow it; and
 a non-English ``rigor_ontology`` request is rejected before any job state exists.
@@ -53,9 +53,6 @@ def _request(config: dict | None = None) -> MagicMock:
 
 def _body(strategy: str = "table_to_ontology", **extra) -> WorkbenchInductionRequest:
     return WorkbenchInductionRequest(datasource_ids=["ds-1"], ontology_uri_prefix=_PREFIX, strategy=strategy, **extra)
-
-
-# ── resolve_namespace_language ──────────────────────────────────────────
 
 
 class _FakeTable:
@@ -128,9 +125,6 @@ class TestResolveNamespaceLanguage:
             start_induction(body=_body(), request=_request({"catalog_source": "smus"}), namespace="ns-1")
         assert err.value.status_code == 500
         assert dynamo.mock_calls == []
-
-
-# ── structured route ────────────────────────────────────────────────────
 
 
 class TestStructuredRoute:
@@ -287,9 +281,6 @@ def test_run_induction_passes_language_to_strategy_and_records_it(tmp_path, monk
     assert metadata["namespaceLanguage"] == "ja"
 
 
-# ── unstructured route ──────────────────────────────────────────────────
-
-
 def test_unstructured_route_resolves_language_for_the_worker() -> None:
     from coa_ontology.inducer.routers import induce_unstructured
     from coa_ontology.inducer.unstructured.schemas import UnstructuredInductionRequest
@@ -318,9 +309,6 @@ def test_unstructured_request_cannot_carry_a_language() -> None:
     assert "language" not in UnstructuredInductionRequest.model_fields
     assert "language" not in WorkbenchInductionRequest.model_fields
     assert "namespace_language" not in WorkbenchInductionRequest.model_fields
-
-
-# ── grounding-override rebuild ──────────────────────────────────────────
 
 
 def test_grounding_override_rebuild_keeps_the_namespace_language(monkeypatch) -> None:
@@ -378,9 +366,6 @@ def test_grounding_override_rebuild_keeps_the_namespace_language(monkeypatch) ->
     resolve.assert_called_once()
     assert spy.call_args.kwargs["namespace_language"] == "ja"
     assert '"購入注文"@ja' in turtles["ontology"]
-
-
-# ── accept-time fallback title ──────────────────────────────────────────
 
 
 @pytest.mark.parametrize(

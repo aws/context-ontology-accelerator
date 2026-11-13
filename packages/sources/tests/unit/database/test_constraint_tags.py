@@ -94,9 +94,7 @@ class TestParseComment:
 
     def test_sentence_period_after_the_closing_bracket_is_prose(self):
         # The bracket ends the tag, so a trailing sentence period needs no special
-        # tolerance inside the reference — it is simply text after the tag. (The
-        # pre-bracket grammar had to rstrip(".") to survive this, which is exactly
-        # what made "@fk(orders.)" indistinguishable from a usable reference.)
+        # tolerance inside the reference — it is simply text after the tag.
         parsed = parse_comment("Parent order @fk(orders.order_id).")
         assert parsed.description == "Parent order."
         assert parsed.foreign_keys == (ParsedFk(target_table="orders", target_column="order_id"),)
@@ -142,7 +140,7 @@ class TestMalformedTags:
             assert parsed.is_pk_member is False, tag
             # Strip-iff-understood: a tag the parser could not act on stays in the
             # text verbatim — the author's only visible signal, since the warning
-            # lands in Orion's logs rather than theirs — and is reported once.
+            # lands in this deployment's logs rather than theirs — and is reported once.
             assert parsed.description == f"Parent order {tag}", tag
             assert [record.message for record in caplog.records] == ["constraint_tag_malformed"], tag
 
@@ -204,9 +202,7 @@ class TestMalformedTags:
         assert "constraint_tag_unrecognised" in caplog.text
 
     def test_retired_equals_spelling_is_a_near_miss(self, caplog):
-        # "@fk=orders.order_id" was the earlier spelling and is now no tag at all.
-        # It is a plausible thing to write from memory, so it is diagnosed rather
-        # than read as prose — and, being unrecognised, it is left in the text.
+        # "@fk=" is not a tag: it is reported as a near miss and left in the text.
         for tag in ("@fk=orders.order_id", '@fk="orders"."order_id"'):
             with caplog.at_level(logging.WARNING):
                 caplog.clear()
@@ -252,9 +248,9 @@ class TestTagBoundaries:
         assert parsed.description == "Owner bob@pk.example.com"
         assert caplog.records == []
 
-        parsed = parse_comment("Contact team-data@pk.amazon.com for access")
+        parsed = parse_comment("Contact team-data@pk.example.com for access")
         assert parsed.is_pk_member is False
-        assert parsed.description == "Contact team-data@pk.amazon.com for access"
+        assert parsed.description == "Contact team-data@pk.example.com for access"
 
     def test_address_in_prose_is_not_an_fk_tag(self, caplog):
         # The left-boundary rule holds for the bracketed form and for the retired
@@ -277,11 +273,7 @@ class TestTagBoundaries:
         assert parsed.foreign_keys == (ParsedFk(target_table="sales-eu", target_column="order_id"),)
 
     def test_period_bound_to_following_prose_is_resolved_by_the_bracket(self):
-        # This was the pre-bracket grammar's documented limitation:
-        # "@fk=orders.order_id.See notes" resolved to order_id.See, and could not
-        # be told apart from the legitimate qualification in
-        # "@fk=public.orders.order_id". The closing bracket ends the tag, so the
-        # period and the word after it are prose by construction.
+        # The closing bracket ends the tag, so ".See notes" after it is prose.
         parsed = parse_comment("Parent order @fk(orders.order_id).See notes")
         assert parsed.foreign_keys == (ParsedFk(target_table="orders", target_column="order_id"),)
         assert parsed.description == "Parent order.See notes"
@@ -368,10 +360,7 @@ class TestBracketedReferences:
         parsed = parse_comment('Parent @fk("he said ""hi"""."x")')
         assert parsed.foreign_keys == (ParsedFk(target_table='he said "hi"', target_column="x"),)
 
-        # The same name ending in a quote, mixed with a bare column. (This shape
-        # cannot be written in a module docstring — the closing quote would run
-        # into the docstring's own delimiter — so the grammar's support for it is
-        # pinned here.)
+        # The same name ending in a quote, mixed with a bare column.
         parsed = parse_comment('Parent @fk("he said ""hi""".x)')
         assert parsed.foreign_keys == (ParsedFk(target_table='he said "hi"', target_column="x"),)
 
@@ -379,16 +368,14 @@ class TestBracketedReferences:
         assert parsed.foreign_keys == (ParsedFk(target_table='say "hi" now', target_column="x"),)
 
     def test_quoting_is_per_segment_and_independent(self):
-        # The all-or-nothing rule is gone: quote what needs it, leave the rest.
+        # Quote what needs it, leave the rest.
         for reference in ('"orders"."order_id"', '"orders".order_id', 'orders."order_id"', "orders.order_id"):
             parsed = parse_comment(f"Parent order @fk({reference})")
             assert parsed.foreign_keys == (ParsedFk(target_table="orders", target_column="order_id"),), reference
             assert parsed.description == "Parent order", reference
 
     def test_mixed_quoting_with_three_segments_resolves_to_the_last_two(self):
-        # The case the all-or-nothing rule mis-targeted: the reference used to end
-        # at the last closing quote, yielding a usable-looking key to db.orders
-        # with ".order_id" left as prose. Inside a bracket it is unambiguous.
+        # Inside a bracket a mixed-quoted three-segment reference is unambiguous.
         parsed = parse_comment('Parent order @fk("db"."orders".order_id)')
         assert parsed.description == "Parent order"
         assert parsed.foreign_keys == (ParsedFk(target_table="orders", target_column="order_id"),)
@@ -489,7 +476,7 @@ class TestAssembleConstraints:
         assert fk.confidence == 1.0
 
     def test_composite_fk_is_stored_as_one_row_per_child_column(self):
-        # LLD Appendix A1: region_country + region_zone form a composite FK to
+        # region_country + region_zone form a composite FK to
         # regions(country, zone), expressed as one @fk(...) per child column and
         # stored ungrouped — exactly as the JDBC path flattens composites.
         columns = [
@@ -503,7 +490,7 @@ class TestAssembleConstraints:
             ("region_zone", "regions", "zone"),
         ]
 
-    def test_appendix_a1_worked_example(self):
+    def test_worked_example_pk_and_composite_fk(self):
         raw = {
             "customer_id": "Customer identifier @pk",
             "order_ref": "Parent order @fk(orders.order_id)",

@@ -52,6 +52,12 @@ RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
     pip uninstall -y msgpack && \
     python -c "import os, shutil, spacy; shutil.rmtree(os.path.join(os.path.dirname(spacy.__file__), 'tests'), ignore_errors=True)"
 
+# Prefer IPv4 unless built with PREFER_IPV4=false. In a dual-stack subnet
+# without IPv6 egress to AWS, IPv6-first connects stall for minutes, long
+# enough to expire a request's SigV4 signature. Kept before USER (needs root).
+ARG PREFER_IPV4=true
+RUN if [ "$PREFER_IPV4" = "true" ]; then echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf; fi
+
 USER appuser
 
 # Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).

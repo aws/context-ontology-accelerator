@@ -10,18 +10,9 @@
  * `TokenGroup`. Values are trimmed and de-duplicated.
  *
  * Committed text is split on commas and tabs, so a list can be pasted in one
- * go. Without that, pasting `"Dress, Coat, Shirt"` produced a single token
- * spelled `"Dress, Coat, Shirt"` — it passes length and duplicate checks, so
- * nothing flagged it and the caller silently received one nonsense entry. Every
- * consumer holds identifier-like values (column, table and metric names, entity
- * classes, topic names), none of which can legitimately contain those
- * characters, so treating them as separators is always the right reading.
- *
- * A newline-separated list cannot be handled here: a single-line `<input>`
- * applies the HTML value sanitization algorithm, which strips CR and LF, so such
- * a paste arrives already concatenated and the entry boundaries are gone before
- * any of this code runs. Accepting one needs a `<textarea>`, which is a
- * different control, not a change to this one.
+ * go; every consumer holds identifier-like values that cannot contain them.
+ * A single-line `<input>` strips CR and LF (HTML value sanitization), so a
+ * newline-separated paste arrives already concatenated.
  */
 import React, { useState } from "react";
 import Box from "@cloudscape-design/components/box";
@@ -48,9 +39,7 @@ export interface TokenInputProps {
   value: string[];
   /** Called with the next value list whenever a chip is added or removed. */
   onChange: (value: string[]) => void;
-  /** Placeholder shown in the text input. */
   placeholder?: string;
-  /** Accessible label for the text input. */
   ariaLabel?: string;
   /** Disables the input and the add button. */
   disabled?: boolean;
@@ -92,8 +81,8 @@ export const TokenInput: React.FC<TokenInputProps> = ({
   /**
    * Commit the input, which may hold one entry or a pasted list.
    *
-   * A single entry keeps the original behaviour exactly: on rejection the text
-   * is left in place so it can be corrected. A multi-entry commit instead adds
+   * A rejected single entry is left in place so it can be corrected. A
+   * multi-entry commit instead adds
    * everything that passes and clears the field, because leaving text that was
    * partly consumed would be worse than reporting what was skipped.
    */
@@ -110,8 +99,6 @@ export const TokenInput: React.FC<TokenInputProps> = ({
 
     const accepted: string[] = [];
     const rejections: string[] = [];
-    // Membership set over already-present values, so the per-entry duplicate check
-    // is O(1) rather than rebuilding and scanning an array each iteration.
     const seen = new Set(value);
     for (const entry of entries) {
       // Silently ignore exact duplicates — the value is already a chip.

@@ -6,18 +6,18 @@
 A single :class:`AccumulatedContext` is created per request and shared across
 every Sub_Question and Exploration_Branch. It is the agent's working memory: it
 holds the native ``ChunkResult`` / ``GraphEntity`` objects gathered so far (fed
-verbatim to the final ``Synthesizer``), the per-request cached ontology
-(Req 3.8), the set of de-duplication keys that powers the "no new information"
-stop (Req 6.3), and the running list of degraded sources (Req 9).
+verbatim to the final ``Synthesizer``), the per-request cached ontology,
+the set of de-duplication keys that powers the "no new information"
+stop, and the running list of degraded sources.
 
 Each :class:`~coa_serve.tier3.agentic.tools.base.ToolResult` is
 incorporated via :meth:`AccumulatedContext.add` *before* the controller selects
-the next Reasoning_Step (Req 4.2). ``add`` de-duplicates by a stable per-item key
+the next Reasoning_Step. ``add`` de-duplicates by a stable per-item key
 and returns the count of genuinely NEW retrieval results, so a step that adds
 nothing already-unseen returns ``0`` and lets the controller stop with
-``no_new_information`` (Req 6.3).
+``no_new_information``.
 
-Import discipline (Requirement 12.3): this module is dependency-free at load
+Import discipline: this module is dependency-free at load
 time. ``ChunkResult``, ``GraphEntity``, and ``Ontology`` are referenced only as
 string / ``TYPE_CHECKING`` annotations and handled structurally (via ``getattr``)
 at runtime, so importing this module never pulls ``graphrag_toolkit`` — nor even
@@ -50,7 +50,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
 
 
 def _chunk_key(chunk: Any) -> str:
-    """Derive a stable de-dupe key for a retrieved chunk (Req 6.3).
+    """Derive a stable de-dupe key for a retrieved chunk.
 
     Prefers the chunk's own identifier, then its source URI, and finally a hash
     of its text so that two chunks carrying the same content de-duplicate even
@@ -68,7 +68,7 @@ def _chunk_key(chunk: Any) -> str:
 
 
 def _entity_key(entity: Any) -> str:
-    """Derive a stable de-dupe key for a retrieved entity (Req 6.3).
+    """Derive a stable de-dupe key for a retrieved entity.
 
     Prefers the entity URI (the graph's stable identifier), falling back to a
     ``label|type`` composite when no URI is present.
@@ -101,11 +101,6 @@ _RELATIONSHIP_ALIASES = {
 }
 
 
-def _statement_values(value: Any) -> list[str]:
-    """Decode one bounded, ordered ``supportingStatements`` property value."""
-    return bound_supporting_statements(value)
-
-
 def _merge_entity_properties(existing: dict, incoming: dict) -> dict:
     """Merge graph properties in stable fork order without losing statement evidence.
 
@@ -124,8 +119,12 @@ def _merge_entity_properties(existing: dict, incoming: dict) -> dict:
 
     statements = bound_supporting_statements(
         [
-            *_statement_values(existing.get(SUPPORTING_STATEMENTS_KEY, existing.get(LEGACY_SUPPORTING_STATEMENTS_KEY))),
-            *_statement_values(incoming.get(SUPPORTING_STATEMENTS_KEY, incoming.get(LEGACY_SUPPORTING_STATEMENTS_KEY))),
+            *bound_supporting_statements(
+                existing.get(SUPPORTING_STATEMENTS_KEY, existing.get(LEGACY_SUPPORTING_STATEMENTS_KEY))
+            ),
+            *bound_supporting_statements(
+                incoming.get(SUPPORTING_STATEMENTS_KEY, incoming.get(LEGACY_SUPPORTING_STATEMENTS_KEY))
+            ),
         ]
     )
     if statements:
@@ -242,7 +241,7 @@ def _normalize_entity(entity: Any) -> tuple[Any, int]:
 
 
 def _row_key(row: dict) -> str:
-    """Derive a stable de-dupe key for a structured result row (Req 6.3).
+    """Derive a stable de-dupe key for a structured result row.
 
     A structured row is a plain ``dict`` (one NL→SQL / metric result record) with
     no natural id, so the key is a hash of its canonical (sorted-key) serialization
@@ -284,13 +283,13 @@ class AccumulatedContext:
         entities: Native graph-entity objects gathered so far, in arrival order,
             passed through to the final Synthesizer. De-duplicated by :meth:`add`.
         ontology: The ontology resolved once per request and reused on subsequent
-            lookups (Req 3.8); ``None`` until the Ontology_Lookup_Tool populates
+            lookups; ``None`` until the Ontology_Lookup_Tool populates
             it.
         seen_keys: Stable de-dupe keys for every chunk/entity already
             incorporated, so a repeated retrieval result is not double-counted
-            and drives the ``no_new_information`` stop (Req 6.3).
+            and drives the ``no_new_information`` stop.
         degraded_sources: Running list of ``{"source", "reason"}`` records for
-            Tools that failed or timed out, surfaced in the Tier3_Result (Req 9).
+            Tools that failed or timed out, surfaced in the Tier3_Result.
     """
 
     chunks: list[ChunkResult] = field(default_factory=list)
@@ -304,26 +303,25 @@ class AccumulatedContext:
     # Query artifacts (SQL/SPARQL) that structured tools built and executed this
     # session, in arrival order — one entry per generated statement. Surfaced
     # (gated by includeDebugInfo) on the final QueryResult so Deep Reasoning
-    # returns the queries it ran, mirroring Standard mode (#1166). Each item is
+    # returns the queries it ran, mirroring Standard mode. Each item is
     # an ``ExecutedQuery`` (kind + query). Never de-duplicated: two distinct
     # sub-questions legitimately run distinct SQL, and even an identical repeat
     # is a real second execution worth showing.
     executed_queries: list[ExecutedQuery] = field(default_factory=list)
-    # ── Carried reasoning state (improvement ideas 2 & 3) ──────────────
     # The planner is stateless across steps (a fresh Converse call each step), so
     # cross-step continuity lives here and is echoed back into the planner prompt.
     #
     # attempt_history: one record per Reasoning_Step the controller ran —
     #   {"tool", "inputs", "new_count", "status"} — so the planner can SEE what it
     #   already tried (and that an attempt added nothing) and deliberately escalate
-    #   to a different tool / reframing instead of repeating it (idea 4).
+    #   to a different tool / reframing instead of repeating it.
     # working_answers: the decision agent's running, context-grounded best-guess
     #   answer per sub-question — {"question", "answer"} — updated as evidence
-    #   arrives and handed to the synthesizer alongside the chunks (idea 2).
+    #   arrives and handed to the synthesizer alongside the chunks.
     attempt_history: list[dict] = field(default_factory=list)
     working_answers: list[dict] = field(default_factory=list)
     # Edge-type predicates discovered present on anchored entities via the graph
-    # tool's ``edge_types`` mode (idea 5 soft-prior): raw ``r.value`` labels the
+    # tool's ``edge_types`` mode (soft-prior): raw ``r.value`` labels the
     # planner can propose for an ``edge_typed`` traversal even when the pruned
     # ontology omits them. Insertion order preserved (discovery is frequency-ranked).
     present_edge_types: list[str] = field(default_factory=list)
@@ -473,7 +471,7 @@ class AccumulatedContext:
         against :attr:`seen_keys` using a stable per-item key. Only items whose
         key has not been seen before are appended to :attr:`chunks` /
         :attr:`entities` / :attr:`rows` and counted; previously seen items are
-        skipped so they are never double-counted (Req 6.3). Arrival order is
+        skipped so they are never double-counted. Arrival order is
         preserved.
 
         Rows are counted toward progress exactly like chunks/entities — this is
@@ -481,12 +479,12 @@ class AccumulatedContext:
         no-progress: its output arrives on ``result.rows``, not ``result.chunks``.
 
         Args:
-            result: The Tool invocation output to incorporate (Req 4.2).
+            result: The Tool invocation output to incorporate.
 
         Returns:
             The number of genuinely new (not-already-present) retrieval results
             added by this call. ``0`` means the step surfaced no new information
-            and the controller may stop with ``no_new_information`` (Req 6.3).
+            and the controller may stop with ``no_new_information``.
         """
         new_count = 0
 
@@ -510,7 +508,7 @@ class AccumulatedContext:
             self.rows.append(row)
             new_count += 1
 
-        # Collect any query artifacts the tool executed (#1166). Not counted as
+        # Collect any query artifacts the tool executed. Not counted as
         # progress (that is what rows/chunks/entities are for) and not
         # de-duplicated — this is an observability record of what ran.
         self.executed_queries.extend(result.executed_queries)
@@ -520,12 +518,12 @@ class AccumulatedContext:
         return new_count
 
     def fork(self) -> AccumulatedContext:
-        """Return a private sub-context for one parallel sub-question (P2).
+        """Return a private sub-context for one parallel sub-question.
 
         The fork starts EMPTY (own ``chunks`` / ``entities`` / ``seen_keys`` /
         ``attempt_history`` / ``working_answers`` / ``degraded_sources``) but shares
         the already-resolved :attr:`ontology` by reference (read-only during the
-        loop; pre-resolved once before fan-out — P3). Private ``seen_keys`` is the
+        loop; pre-resolved once before fan-out). Private ``seen_keys`` is the
         whole point: it prevents the false ``no_new_information`` cross-poisoning
         that a shared dedup set would cause when two sibling sub-questions retrieve
         an overlapping chunk (each must judge progress against *its own* prior
@@ -550,7 +548,7 @@ class AccumulatedContext:
         )
 
     def merge(self, other: AccumulatedContext) -> int:
-        """Fold a forked sub-context back into this one, returning the NEW count (P2).
+        """Fold a forked sub-context back into this one, returning the NEW count.
 
         Re-runs the same stable per-item dedup (:func:`_chunk_key` /
         :func:`_entity_key` / :func:`_row_key`) so a chunk/entity/row already
@@ -583,7 +581,7 @@ class AccumulatedContext:
             new_count += 1
         self.attempt_history.extend(other.attempt_history)
         self.degraded_sources.extend(other.degraded_sources)
-        # Fold in the sibling's executed query artifacts (#1166), in order,
+        # Fold in the sibling's executed query artifacts, in order,
         # exactly as sequential accumulation would have — same append-only,
         # non-deduplicated treatment as degraded_sources.
         self.executed_queries.extend(other.executed_queries)
@@ -607,13 +605,11 @@ class AccumulatedContext:
         """Record a degraded Tool source so it surfaces in the Tier3_Result.
 
         Appends a ``{"source", "reason"}`` record to :attr:`degraded_sources`
-        (reason is typically ``"error"`` or ``"timeout"``, Req 9.1-9.2). Records
+        (reason is typically ``"error"`` or ``"timeout"``). Records
         accumulate — one per failure — and are never de-duplicated, so repeated
         failures of the same Tool are each represented.
         """
         self.degraded_sources.append({"source": source, "reason": reason})
-
-    # ── carried reasoning state (improvement ideas 2 & 3) ──────────────
 
     def record_attempt(
         self, tool_name: str, inputs: dict | None, new_count: int, status: str, reasoning: str = ""
@@ -623,9 +619,9 @@ class AccumulatedContext:
         Captures the tool, a summarized view of its inputs, how many genuinely new
         results it produced, its status (``"succeeded"``, ``"timeout"``, ``"error"``,
         ``"invalid_input"``, ``"unknown_tool"``), and the planner's own short
-        ``reasoning`` for the step (E-cheap): carrying the *why* — not just the
+        ``reasoning`` for the step: carrying the *why* — not just the
         what+count — lets the next planner step build on its prior intent rather
-        than re-deriving it from a lossy summary (idea 3/4). Empty reasoning is
+        than re-deriving it from a lossy summary. Empty reasoning is
         omitted so the record stays compact.
         """
         record: dict = {
@@ -639,7 +635,7 @@ class AccumulatedContext:
         self.attempt_history.append(record)
 
     def set_working_answer(self, question: str, answer: str) -> None:
-        """Store/refresh the decision agent's grounded best-guess for ``question`` (idea 2).
+        """Store/refresh the decision agent's grounded best-guess for ``question``.
 
         Updates the existing entry for the sub-question when present, otherwise
         appends a new one. Empty/whitespace answers are ignored so a failed update
@@ -658,7 +654,7 @@ class AccumulatedContext:
 
     @property
     def working_answer(self) -> str:
-        """The combined grounded best-guess answer(s) for the synthesizer (idea 2).
+        """The combined grounded best-guess answer(s) for the synthesizer.
 
         Empty when the agent produced no grounded guess. A single sub-question
         returns its answer directly; multiple sub-questions are labelled so the
@@ -689,8 +685,8 @@ class AccumulatedContext:
         """Return ``(chunk_id, snippet)`` pairs for the most-recently gathered chunks.
 
         Surfaces the chunk identifiers (not just text) so the planner can pass them
-        to the chunk-window expansion tool to pull the physically adjacent chunks
-        (improvement idea 6). Only chunks carrying a non-empty id are included.
+        to the chunk-window expansion tool to pull the physically adjacent chunks.
+        Only chunks carrying a non-empty id are included.
         """
         out: list[tuple[str, str]] = []
         for chunk in self.chunks[-limit:]:
@@ -702,14 +698,7 @@ class AccumulatedContext:
         return out
 
     def recent_row_snippets(self, limit: int = 5, width: int = 200) -> list[str]:
-        """Return compact renderings of gathered structured rows (evenly sampled).
-
-        Structured rows (NL->SQL / metric tools) were invisible to the planner's
-        content view: the sufficiency/working-answer assessment saw only document
-        chunks, so a sub-question fully answered by rows was assessed as "no data
-        gathered" and the loop wandered or reported nothing. Surfacing a bounded
-        row sample (same shape the synthesizer receives) closes that blind spot.
-        """
+        """Return compact renderings of gathered structured rows (evenly sampled, bounded)."""
         rows = self.rows
         if len(rows) > limit:
             # Evenly-spaced sample (first and last rows always included). A
@@ -728,16 +717,12 @@ class AccumulatedContext:
         return out
 
     def _by_relevance(self, limit: int) -> list:
-        """Return up to ``limit`` gathered chunks ranked by relevance (idea 8).
+        """Return up to ``limit`` gathered chunks ranked by relevance.
 
         Ranks all gathered chunks by ``relevance_score`` descending (stable, so
         ties keep arrival order), but GUARANTEES the single newest chunk is
         included — so the planner still sees the effect of its most recent action
-        even when that chunk did not score highest. This replaces the pure-recency
-        ``self.chunks[-limit:]`` view used by the recency helpers, so the capped
-        context the planner/assessor sees is the most ON-TOPIC chunks rather than
-        merely the most recent ones (the rest of the chunks remain in the context
-        and still reach final synthesis — this only changes what is SURFACED).
+        even when that chunk did not score highest.
         """
         chunks = list(self.chunks)
         if not chunks:
@@ -757,7 +742,7 @@ class AccumulatedContext:
         return chosen
 
     def relevant_chunk_refs(self, limit: int = 5, width: int = 200) -> list[tuple[str, str]]:
-        """``(chunk_id, snippet)`` pairs for the most-RELEVANT gathered chunks (idea 8).
+        """``(chunk_id, snippet)`` pairs for the most-RELEVANT gathered chunks.
 
         Same shape as :meth:`recent_chunk_refs` but ranked by relevance score
         (with a guaranteed slot for the newest chunk) instead of recency.
@@ -771,7 +756,7 @@ class AccumulatedContext:
         return out
 
     def relevant_chunk_snippets(self, limit: int = 5, width: int = 280) -> list[str]:
-        """Text snippets of the most-RELEVANT gathered chunks (idea 8).
+        """Text snippets of the most-RELEVANT gathered chunks.
 
         Relevance-ranked counterpart of :meth:`recent_chunk_snippets`.
         """

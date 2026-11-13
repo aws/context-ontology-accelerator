@@ -134,12 +134,7 @@ def build_rescan_backup(
     removed_columns: dict[str, list[str]] = {}
     modified_backup: dict[str, dict[str, Any]] = {}
     for change in diff.modified:
-        accepted_table = accepted_by_id.get(change.table_id)
-        if accepted_table is None:
-            # diff_tables only marks a table modified when it is in BOTH scans,
-            # so the accepted table is always present; skip defensively rather
-            # than fabricate a backup we cannot restore.
-            continue
+        accepted_table = accepted_by_id[change.table_id]
         modified_backup[change.table_id] = serialize_form(accepted_table)
         removed = [col.name for col in change.columns if col.status == RescanColumnChangeStatus.REMOVED]
         if removed:

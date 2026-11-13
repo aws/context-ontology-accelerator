@@ -5,11 +5,8 @@ import { mergeOpenApiPaths } from "../../lib/utils/api-utils";
 
 describe("mergeOpenApiPaths", () => {
   it("throws when both specs define the same path and method", () => {
-    // The regression this guards: ControlPlaneService#ListMetrics and
-    // DataLayerService#ServeListMetrics were both GET on
-    // /namespaces/{namespaceId}/metrics. A plain spread let the overlay win, so
-    // API Gateway published the overlay's parameters and response schema in
-    // front of the base operation's integration, with a green build.
+    // A plain spread would let the overlay win, publishing the overlay's
+    // parameters and response schema in front of the base operation's integration.
     const base = {
       paths: {
         "/namespaces/{namespaceId}/metrics": {

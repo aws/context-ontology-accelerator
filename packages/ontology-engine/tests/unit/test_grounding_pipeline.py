@@ -47,9 +47,6 @@ def _bedrock_returning(text: str) -> MagicMock:
     return client
 
 
-# ── STANDARD mode: real recall + exact-name match ───────────────────────
-
-
 class TestStandardExactMatch:
     def test_single_exact_name_match_auto_grounds_with_confidence_one(self):
         hits = [
@@ -113,9 +110,6 @@ class TestStandardExactMatch:
         assert result.match_type == "ambiguous"
         assert result.relationship == "relatedMatch"
         assert result.mode == "STANDARD"
-
-
-# ── Recall internals: dedup, cosine fallback, definition extraction ─────
 
 
 class TestRecall:
@@ -237,13 +231,7 @@ class TestRecall:
         assert cand.definition == "a negotiated understanding between parties"
 
     def test_recall_propagates_per_ontology_search_failure(self):
-        """Corrected contract: a per-ontology recall failure must RE-RAISE,
-        not be logged-and-skipped into a partial candidate set. Continuing with
-        partial recall silently drops the broken ontology's classes → the subject
-        is misclassified 'novel' (reason "No candidates returned from embedding
-        search") with no signal. A loud, re-runnable failure beats a silently
-        incomplete all-novel grounding. Previously this swallowed the raise and
-        returned only the surviving ontology's hit."""
+        """A per-ontology recall failure re-raises instead of returning partial candidates."""
         catalog = MagicMock()
         catalog.search_embeddings.side_effect = [
             RuntimeError("AOSS down"),
@@ -280,9 +268,6 @@ class TestRecall:
         uris = [c.entity_uri for c in result.candidates]
         assert "http://ns/Foo" not in uris
         assert "http://ns/Bar" in uris
-
-
-# ── ENHANCED mode: real _llm_rerank via mocked Bedrock converse ─────────
 
 
 class TestEnhancedRerank:
@@ -403,7 +388,7 @@ class TestEnhancedRerank:
         # The call succeeded but the model returned prose instead of JSON — a
         # model-contract failure, not an abstention (a real abstention is the
         # parseable {"choice": "NONE"}). It must fail loud, never silently
-        # ground novel — the enhanced-grounding defect (#59).
+        # ground novel.
         hits = [
             {"entity_uri": "http://fibo/Agreement", "ontology_id": "fibo", "score": 0.6, "text": "Agreement"},
         ]
@@ -423,7 +408,7 @@ class TestEnhancedRerank:
     def test_rerank_converse_error_fails_loud_not_novel(self):
         # A Bedrock error surfacing past botocore's retries is an INFRASTRUCTURE
         # failure, not an abstention. It must raise (so the job fails loud),
-        # never silently ground novel — the enhanced-grounding defect (#59).
+        # never silently ground novel.
         hits = [
             {"entity_uri": "http://fibo/Agreement", "ontology_id": "fibo", "score": 0.6, "text": "Agreement"},
         ]
@@ -526,11 +511,7 @@ class TestEnhancedRerank:
             )
 
     def test_rerank_omits_temperature_from_inference_config(self):
-        # Defect 1 of issue #59: sending inferenceConfig.temperature made newer
-        # models (Opus 5 / Sonnet 5) reject the call with a ValidationException,
-        # which the old code swallowed to a silent novel. We only ever wanted 0
-        # (the model default), so the key must NOT be sent at all. Capture the
-        # converse kwargs and assert temperature is absent.
+        # inferenceConfig.temperature must not be sent: newer models reject it.
         hits = [
             {"entity_uri": "http://fibo/Agreement", "ontology_id": "fibo", "score": 0.6, "text": "Agreement"},
         ]

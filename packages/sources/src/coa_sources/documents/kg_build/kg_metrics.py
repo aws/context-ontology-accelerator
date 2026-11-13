@@ -10,11 +10,8 @@ thread/process fan-out reaches the monitor). We implement it to write the
 running counts straight into the shared per-source DynamoDB record so the
 Source Detail UI can poll live progress.
 
-This replaces the previous monkey-patching approach, which wrapped botocore /
-graphrag internals to derive the same counts and had to reconcile them across
-the ``ProcessPoolExecutor`` build workers via DynamoDB String-Set unions. Since
-``ProgressMonitor`` is invoked only from the main process, the counts are plain
-additive Numbers (atomic ``ADD``) — no cross-process distinct-set machinery.
+``ProgressMonitor`` is invoked only from the main process, so the counts are
+plain additive Numbers (atomic ``ADD``).
 
 Metrics written (Numbers, keyed under PK=METRICS#{ns}, SK=KGBUILD#{ds}):
 
@@ -107,13 +104,9 @@ def _rss_mb() -> float | None:
 def start_heartbeat(*, namespace_id: str, doc_source_id: str) -> threading.Event:
     """Start a daemon thread logging periodic liveness until the returned Event is set.
 
-    The toolkit only reports progress at document-batch boundaries, which in
-    practice can be 15-25 minutes apart. Between boundaries the task emits
-    nothing, so a stall and normal operation look identical in CloudWatch — a
-    task that dies mid-batch leaves no evidence of where it stopped or whether
-    memory was climbing. Each beat logs elapsed time, RSS, and the counter deltas
-    since the previous beat, which distinguishes "stalled" from "slow" and gives
-    memory-growth evidence without Container Insights.
+    The toolkit reports progress only at document-batch boundaries, which can be
+    15-25 minutes apart. Each beat logs elapsed time, RSS, and the counter deltas
+    since the previous beat, so "stalled" can be told from "slow".
 
     Returns the stop Event. Setting it ends the thread; since the thread is a
     daemon, forgetting to stop it will not block process exit.

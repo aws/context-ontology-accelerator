@@ -1,14 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for #784 item 5: per-channel embedding-text dedup.
+"""Unit tests for per-channel embedding-text dedup.
 
-``BedrockEmbeddingClient.generate_lexical`` collapses identical channel texts so
-each unique string is embedded once, then scatters the resulting vector back to
-every original position. These tests assert the scatter is order- and
-length-preserving (HLD R2), that ``embed_documents`` is dispatched only the
-distinct texts (the core request-count win), and that the deduped path is
-quality-neutral end to end through the fusion loop (HLD R3/R4/R5).
+``BedrockEmbeddingClient.generate_lexical`` embeds each unique channel text once
+and scatters the vector back to every original position.
 """
 
 from __future__ import annotations
@@ -62,9 +58,6 @@ def _client_with(embedder: _RecordingEmbedder) -> BedrockEmbeddingClient:
     return client
 
 
-# ── dedup correctness / dispatch ─────────────────────────────────────────
-
-
 def test_generate_lexical_duplicate_texts_returns_results_in_input_order():
     """Duplicate inputs → one result per class, each vector equal to the single
     embed of its own text, in original order (scatter must not misalign)."""
@@ -96,7 +89,7 @@ def test_generate_lexical_dispatches_only_distinct_texts():
 
 def test_generate_lexical_all_identical_texts_embeds_once():
     """The real dtype-channel case: every column shares one text → embed_documents
-    dispatched exactly one text, all results present and equal (R3 collapse)."""
+    dispatched exactly one text, all results present and equal."""
     embedder = _RecordingEmbedder()
     client = _client_with(embedder)
     labels = ["unknown"] * 500
@@ -145,9 +138,6 @@ def test_generate_lexical_propagates_embedder_failure():
         client.generate_lexical("", _classes(["alpha", "beta"]))
 
 
-# ── quality-neutral: fused vector matches a hand-computed reference ───────
-
-
 def _reference_fused(name_vec: list[float], desc_vec: list[float], dtype_vec: list[float]) -> list[float]:
     """Historical name→desc→dtype weighted sum (float add is not associative)."""
     fused = [0.0] * len(name_vec)
@@ -158,10 +148,9 @@ def _reference_fused(name_vec: list[float], desc_vec: list[float], dtype_vec: li
 
 
 def test_embed_concepts_with_dedup_matches_hand_computed_fused_reference():
-    """Quality-neutral (HLD §7): run the real dedup generate_lexical through the
-    fusion loop on columns whose dtype channel is all-identical, and assert each
-    fused concept.vector equals the hand-computed weighted sum. Proves dedup +
-    aliasing feed correct per-column vectors into 661's fold."""
+    """Run the real dedup generate_lexical through the fusion loop on columns whose
+    dtype channel is all-identical, and assert each fused concept.vector equals the
+    hand-computed weighted sum."""
     embedder = _RecordingEmbedder()
     client = _client_with(embedder)
     pipeline = InductionPipeline(None, client, None)

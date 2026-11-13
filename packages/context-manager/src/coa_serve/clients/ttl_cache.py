@@ -8,10 +8,6 @@ A tiny self-contained cache that owns BOTH its expiry (TTL) and its size bound
 ``get`` returns ``None`` for an absent or expired entry, ``set`` inserts and
 evicts the least-recently-used entry past ``max_size``.
 
-This exists to replace the hand-rolled ``OrderedDict`` + inline
-``time.monotonic() - ts < TTL`` pattern duplicated across the serve clients, so
-the expiry policy lives inside the cache instead of at every call site.
-
 Not thread-safe on its own — the serve runtime is single-threaded asyncio and
 each ``get``/``set`` is synchronous (no ``await`` between the OrderedDict ops),
 so accesses are atomic with respect to other coroutines. Guard with a lock only
@@ -47,12 +43,6 @@ class TtlLruCache[K, V]:
         on_evict: Callable[[V], None] | None = None,
     ) -> None:
         """Initialize the cache with a freshness window, size bound, and clock.
-
-        Args:
-            ttl_s: Seconds an entry stays fresh; must be positive.
-            max_size: Maximum entries retained; must be positive.
-            time_fn: Monotonic clock, injectable for tests.
-            on_evict: Optional callback receiving every dropped value.
 
         Raises:
             ValueError: If ``ttl_s`` or ``max_size`` is not positive.
@@ -106,5 +96,5 @@ class TtlLruCache[K, V]:
         return values
 
     def __len__(self) -> int:
-        """Return the number of entries currently held (including any not yet expired)."""
+        """Return the number of entries currently held (expired ones included until purged)."""
         return len(self._store)

@@ -32,10 +32,10 @@ MAX_SESSION_NAME_LEN = 64
 class DatasourceAssumeError(ValueError):
     """``sts:AssumeRole`` on a customer-supplied datasource role was refused.
 
-    A ``ValueError`` subclass because that is what this module raised before, and callers
-    catch it. ``code`` carries STS's own error code as an attribute so a caller can branch
-    on it: the message deliberately omits the role ARN, and recovering the code by splitting
-    that message makes the branch depend on the wording.
+    A ``ValueError`` subclass because callers catch ``ValueError``. ``code`` carries
+    STS's own error code as an attribute so a caller can branch on it: the message
+    deliberately omits the role ARN, and recovering the code by splitting that
+    message makes the branch depend on the wording.
     """
 
     def __init__(self, code: str) -> None:

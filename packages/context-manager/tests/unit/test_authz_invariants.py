@@ -4,17 +4,9 @@
 """End-to-end security invariants: grant rows → resolved profile → firewall decision.
 
 The per-unit suites (``test_role_resolver.py``, ``test_sql_firewall.py``) each cover
-their own half. These tests exist because the halves can agree individually and
-still compose into a bypass: the resolver can emit a restriction the firewall then
-declines to enforce.
-
-That is not hypothetical — it is how the empty-``tableAllowlist`` fail-open was
-found. ``test_explicitly_empty_allowlist_denies_all_tables`` asserted the resolver
-produced ``[]`` and passed, while the firewall treated the empty list as falsy,
-dropped the restriction, and allowed every table. A profile-level assertion cannot
-catch that; only running the query through can.
-
-Each test therefore asserts on the DECISION (denied / allowed), never on an
+their own half, but the halves can agree individually and still compose into a
+bypass: the resolver can emit a restriction the firewall then declines to enforce.
+Each test therefore asserts on the decision (denied / allowed), never on an
 intermediate field.
 """
 
@@ -96,7 +88,7 @@ class TestColumnDenylistIsEnforced:
         assert denied, "platform-viewer must not bypass the data layer"
 
     def test_an_unrestricted_grant_on_the_same_namespace_cannot_lift_it(self):
-        """The sharpest edge of the old permissive merge, asserted on behaviour."""
+        """A second unrestricted grant must not lift a denylist."""
         denied, _ = _decide(
             [_grant(role="data-analyst", **self.DENY_SSN), _grant(role="namespace-owner")],
             "SELECT ssn FROM customers",
@@ -213,21 +205,21 @@ class TestFailClosed:
         A restricted grant on a later page while an unrestricted one survives would
         otherwise make the merge see no restrictions at all.
         """
-        dao = MagicMock()
-        dao.query_all.side_effect = lambda params: [
-            _grant(role="namespace-owner"),
-            _grant(role="data-analyst", columnDenylist={"customers": ["ssn"]}),
-        ]
+        first_page = {"Items": [_grant(role="namespace-owner")], "LastEvaluatedKey": {"principalKey": "p"}}
+        second_page = {"Items": [_grant(role="data-analyst", columnDenylist={"customers": ["ssn"]})]}
+        table = MagicMock()
+        table.query.side_effect = lambda **kwargs: second_page if "ExclusiveStartKey" in kwargs else first_page
         with (
             patch.object(role_resolver, "_RRM_TABLE", "rrm"),
-            patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+            patch("coa_common.dao.dynamodb.boto3.resource") as resource,
         ):
+            resource.return_value.Table.return_value = table
             resolved = role_resolver.resolve_profile(_USER, [], namespace=_NS)
 
-        # query_all (not query) is what guarantees this; assert the DAO contract too.
-        assert dao.query_all.called
-        assert not dao.query.called, "authorization reads must not use the single-page query()"
-        assert resolved.column_denylist == {"customers": ["ssn"]}
+        profile: dict = {}
+        resolved.inject_into(profile)
+        result = SQLFirewall().evaluate("SELECT ssn FROM customers", profile=profile, namespace=_NS)
+        assert result.denied, "a restricted grant on a later page must still be enforced"
 
 
 def _admit(grants: list[dict], *, namespace: str = _NS) -> tuple[bool, str | None]:
@@ -254,7 +246,7 @@ def _admit(grants: list[dict], *, namespace: str = _NS) -> tuple[bool, str | Non
 
 @pytest.mark.unit
 class TestNamespaceAdmissionGate:
-    """F-2 (CWE-862): the SQL-free retrieval surfaces must be namespace-gated too.
+    """CWE-862: the SQL-free retrieval surfaces must be namespace-gated too.
 
     ``authorize_namespace`` is the single admission point for the isolated
     kbSearch/graphTraverse/translate actions and the Tier-3 path, none of which
@@ -268,17 +260,13 @@ class TestNamespaceAdmissionGate:
         assert not denied, "a principal holding a query role on the namespace must be admitted"
 
     def test_no_grant_anywhere_is_denied(self):
-        """No resolved roles → Cedar fails closed. This is the core F-2 fix."""
+        """No resolved roles → Cedar fails closed."""
         denied, _ = _admit([])
 
         assert denied, "an authenticated caller with no grant must not read the namespace"
 
     def test_grant_on_another_namespace_does_not_admit_this_one(self):
-        """The F-2 cross-tenant read: a role on ns-OTHER must not admit ns-Z.
-
-        This is exactly the precondition in the finding — the attacker holds a
-        grant on some namespace and targets another they were never granted.
-        """
+        """Cross-namespace read: a role on ns-OTHER must not admit this namespace."""
         denied, _ = _admit([{"role": _CEDAR_OK_ROLE, "resourceId": "ns-OTHER"}], namespace=_NS)
 
         assert denied, "a grant on another namespace must not admit this one"
@@ -290,8 +278,7 @@ class TestNamespaceAdmissionGate:
         result = SQLFirewall(cedar_authorizer=boom).authorize_namespace(_NS, {"userId": "u", "globalRoles": ["x"]})
 
         assert result.denied, "an evaluator error must deny (fail closed)"
-        # The reason survives the shared _cedar_gate refactor (and stays generic —
-        # the evaluator's own exception text is logged, not returned).
+        # The evaluator's own exception text is logged, not returned.
         assert result.reason == "Authorization policy evaluation failed"
         assert "cedar exploded" not in (result.reason or "")
 

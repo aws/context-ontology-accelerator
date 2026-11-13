@@ -44,9 +44,6 @@ _OPENAPI = (
 client = TestClient(app)
 
 
-# ── Minimal Smithy reader ────────────────────────────────────────────────────
-
-
 def _model(name: str) -> str:
     path = _SMITHY_DIR / name
     assert path.is_file(), f"{name} not found at {path}"
@@ -90,9 +87,6 @@ def _enum_values(text: str, shape: str) -> set[str]:
 
 _INDUCTION = _model("ontology-induction.smithy")
 _GRAPH = _model("ontology-graph.smithy")
-
-
-# ── Parity ───────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -217,9 +211,6 @@ def test_ingest_ontology_type_enum_covers_what_the_web_app_sends():
     assert {"foundational", "induced", "user_created", "user_uploaded"} <= _enum_values(_GRAPH, "OntologyType")
 
 
-# ── Enforcement ──────────────────────────────────────────────────────────────
-
-
 @pytest.fixture()
 def _graph_store():
     store = MagicMock()
@@ -255,9 +246,6 @@ def test_constraint_config_within_the_bound_reaches_the_proposal_lookup():
         resp = client.post("/ontology/proposals/p-1/compile-constraints?namespace=ns", json={"constraint_config": {}})
     assert resp.status_code == 404
     get.assert_called_once()
-
-
-# ── New @pattern constraints vs. today's callers and the runtime ─────────────
 
 
 def _openapi_pattern(operation: str, member: str) -> re.Pattern[str]:

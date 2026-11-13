@@ -47,7 +47,6 @@ _CLIENT_TIMEOUT_GRACE_S = 5
 _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
 
-# ---------------------------------------------------------------------------
 # Redshift-aware asyncpg dialect.
 #
 # SQLAlchemy's PGDialect.initialize() runs ``show standard_conforming_strings``
@@ -57,7 +56,6 @@ _SCHEMA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 # Redshift query fails. Override the hook to skip the probe and hardcode the
 # modern-Redshift default (standard_conforming_strings=on -> _backslash_escapes
 # =False). PostgreSQL sources keep the stock dialect and its probe.
-# ---------------------------------------------------------------------------
 _REDSHIFT_ASYNCPG_DRIVER = "postgresql+asyncpg_redshift"
 
 
@@ -121,12 +119,10 @@ class PostgresAdapter(EngineAdapter):
             connect_args={
                 # TLS is REQUIRED by Redshift and expected by managed PostgreSQL
                 # (RDS/Aurora); without it a require_ssl source refuses the
-                # plaintext connection and the query hangs/errors. _SSL_CONTEXT is
+                # plaintext connection and the query hangs/errors. SSL_CONTEXT is
                 # permissive (no peer-identity pinning) — see base.build_ssl_context.
                 "ssl": SSL_CONTEXT,
-                # Bound the TCP+handshake (asyncpg `timeout`) so an unreachable host
-                # can't hang the connect; pool_timeout only bounds waiting for a
-                # free pooled slot, not the underlying connect.
+                # pool_timeout only bounds waiting for a pooled slot, not the connect.
                 "timeout": _CONNECT_TIMEOUT_S,
                 "server_settings": server_settings,
             },
@@ -177,8 +173,7 @@ class PostgresAdapter(EngineAdapter):
             await db.execute(text(f"SET LOCAL statement_timeout = {timeout_ms}"))
             # Redshift Serverless ignores search_path set via asyncpg server_settings
             # on connection startup, so set it per-transaction here. SET search_path
-            # cannot be parameterized, so validate each identifier before interpolation
-            # (schema comes from source config, but we never trust it blindly).
+            # cannot be parameterized (identifiers were validated above).
             if search_path:
                 try:
                     await db.execute(text(f"SET search_path TO {search_path}"))

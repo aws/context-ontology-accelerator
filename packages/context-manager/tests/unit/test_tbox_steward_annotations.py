@@ -1,13 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The NL→SPARQL (Ontop) context carries the steward-reviewed metadata (#1167).
-
-The NL→SQL writer already received each table's description and synonyms through
-the indexed class text; the Ontop writer received only labels and the class
-hierarchy. These tests pin that the T-Box context now fetches and renders the same
-approved fields — description, synonyms, glossary terms and tags — for classes,
-their columns and their join paths, bounded, stable and best-effort.
-"""
+"""The T-Box context fetches and renders steward-approved description, synonyms, glossary terms and tags."""
 
 from __future__ import annotations
 

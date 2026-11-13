@@ -12,10 +12,10 @@ describe("deriveRuntimeSessionId", () => {
   });
 
   it("pads a short sub (e.g. enterprise SSO username) to the 33-char minimum", () => {
-    const result = deriveRuntimeSessionId("noahpaig");
+    const result = deriveRuntimeSessionId("jdoe1234");
     expect(result).toBeDefined();
     expect(result!.length).toBeGreaterThanOrEqual(MIN_LENGTH);
-    expect(result).toContain("noahpaig");
+    expect(result).toContain("jdoe1234");
   });
 
   it("keeps a Cognito-style UUID sub intact and above the minimum", () => {
@@ -26,21 +26,21 @@ describe("deriveRuntimeSessionId", () => {
   });
 
   it("is deterministic — same sub always maps to the same session id", () => {
-    expect(deriveRuntimeSessionId("noahpaig")).toBe(
-      deriveRuntimeSessionId("noahpaig"),
+    expect(deriveRuntimeSessionId("jdoe1234")).toBe(
+      deriveRuntimeSessionId("jdoe1234"),
     );
   });
 
   it("does not collide for subs differing only by trailing zeros", () => {
-    // Padding alone maps both of these to "noah0000…" — one AgentCore session
+    // Padding alone maps both of these to "jdoe0000…" — one AgentCore session
     // shared by two distinct users.
-    expect(deriveRuntimeSessionId("noah")).not.toBe(
-      deriveRuntimeSessionId("noah0"),
+    expect(deriveRuntimeSessionId("jdoe")).not.toBe(
+      deriveRuntimeSessionId("jdoe0"),
     );
   });
 
   it("is injective across subs that pad to the same string", () => {
-    const subs = ["a", "a0", "a00", "noah", "noah0", "noah00000000000000"];
+    const subs = ["a", "a0", "a00", "jdoe", "jdoe0", "jdoe00000000000000"];
     const derived = subs.map((s) => deriveRuntimeSessionId(s));
     expect(new Set(derived).size).toBe(subs.length);
     for (const id of derived) {
@@ -49,7 +49,7 @@ describe("deriveRuntimeSessionId", () => {
   });
 
   it("does not collide between a short sub and a long sub equal to its padded form", () => {
-    const short = "noah";
+    const short = "jdoe";
     const padded = short.padEnd(MIN_LENGTH, "0"); // what a naive impl would return
     expect(deriveRuntimeSessionId(short)).not.toBe(
       deriveRuntimeSessionId(padded),
