@@ -39,7 +39,7 @@ class CatalogConstraint(BaseModel):
     columns: list[str]
     referredColumns: list[str] | None = None
     relationshipType: str | None = None
-    # Governance (#1088). Optional/defaulted so any catalog source that does not
+    # Governance. Optional/defaulted so any catalog source that does not
     # populate them (HTTP data-catalog, fixtures, pre-existing payloads) parses
     # unchanged and is treated as authoritative/grandfathered by the gate.
     reviewStatus: str | None = None
@@ -86,18 +86,9 @@ def parse_referred_column(ref: str) -> tuple[str, str | None]:
     former yields the SCHEMA name, so the mapping pointed ``rr:parentTriplesMap``
     at a TriplesMap that does not exist while the ontology and shapes correctly
     referenced the table — the artifacts described different graphs.
-
-    Args:
-        ref: A ``referredColumns`` entry.
-
-    Returns:
-        ``(target_table, target_column)``; ``target_column`` is ``None`` when
-        ``ref`` has no dot.
     """
     if "." not in ref:
         return ref, None
-    # Only the trailing TABLE.COLUMN pair carries meaning; the leading
-    # qualification segments (database/schema/catalog) are discarded.
     *_qualification, target_table, target_column = ref.split(".")
     return target_table, target_column
 
@@ -145,14 +136,3 @@ class DataCatalogClient:
             resp = client.get(f"{self.base_url}/api/v1/tables/{table_id}")
             resp.raise_for_status()
             return CatalogTable(**resp.json())
-
-    def list_tables(self) -> list[CatalogTable]:
-        """Fetch metadata for all tables in the catalog.
-
-        Returns:
-            A list of :class:`CatalogTable` for every table the catalog exposes.
-        """
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(f"{self.base_url}/api/v1/tables")
-            resp.raise_for_status()
-            return [CatalogTable(**t) for t in resp.json()]

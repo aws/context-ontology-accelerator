@@ -29,9 +29,7 @@ different parsers and they disagree on quoting: ``SHOW``/``DESCRIBE`` accept
 backticks and reject double quotes, while ``SELECT`` accepts double quotes and
 rejects backticks. Every statement here is ``SHOW`` or ``DESCRIBE``, so all three
 use backticks via :func:`_quote_ident`, which makes a name needing quoting
-addressable rather than fatal. Serve needs no matching change, because it renders
-table references through sqlglot, which double-quotes an identifier that requires
-it.
+addressable rather than fatal.
 """
 
 from __future__ import annotations
@@ -61,11 +59,6 @@ from .base import ConnectionCheck, ConnectionTestResult, MetadataConnector
 from .constraint_tags import ParsedComment, assemble_constraints, parse_comment
 from .filters import compile_filter, unmatched_regex_warning
 
-# structlog, not stdlib logging: these run in the sources-api and discovery
-# Lambdas, whose setup_logging() pins the stdlib root logger to WARNING and
-# builds a formatter without ExtraAdder — so stdlib logger.info(..., extra={...})
-# emits nothing at all, dropping exactly the per-table accounting this module
-# exists to produce. Matches athena_catalog.py, which switched for the same reason.
 logger = structlog.get_logger(__name__)
 
 
@@ -113,13 +106,7 @@ _UNQUOTED_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def _quote_ident(identifier: str) -> str:
     """Backtick-quote one identifier for Athena's ``SHOW``/``DESCRIBE`` parser.
 
-    Hive-style: wrap in backticks and double any the name contains, which is the
-    only escape that parser recognises. Double quotes are not usable here, since
-    that parser rejects them, which is why discovery and serve spell quoting
-    differently.
-
-    Args:
-        identifier: a catalog, database, or table name.
+    Doubling a backtick is the only escape that parser recognises.
     """
     return "`" + identifier.replace("`", "``") + "`"
 
@@ -172,8 +159,6 @@ class CustomConnector(MetadataConnector):
                 supported way to share a client across threads.
         """
         self._runner = runner or AthenaStatementRunner()
-
-    # ── Connection test ──────────────────────────────────────────────────
 
     def test_connection(self, config: dict) -> ConnectionTestResult:
         """Verify the catalog resolves and the connector answers a metadata call.
@@ -274,8 +259,6 @@ class CustomConnector(MetadataConnector):
         )
         return ConnectionTestResult(success=True, message="Custom connector reachable.", checks=checks)
 
-    # ── Discovery ────────────────────────────────────────────────────────
-
     def discover_metadata(self, config: dict) -> DiscoveredMetadata:
         """Discover the configured database's tables, columns, and constraints.
 
@@ -335,14 +318,8 @@ class CustomConnector(MetadataConnector):
             # is a configuration outcome the steward can see and correct.
             return DiscoveredMetadata(tables=[], filter_warnings=filter_warnings)
 
-        # Enforced HERE, before the fan-out, not only in discovery_handler. That
-        # check runs on `metadata.tables` — i.e. after this method has already
-        # returned — so a connector exposing thousands of tables would fan out
-        # first and be counted afterwards. A Lambda hard-timeout mid-fan-out skips
-        # the handler's `except` entirely, so nothing writes SCAN_FAILED or an
-        # errorMessage: the source stays in SCANNING, where DELETE and re-scan both
-        # 409, until the reaper fires. Raising up front keeps the failure a
-        # readable configuration error instead of a stuck source.
+        # Enforced before the fan-out: a Lambda timeout mid-fan-out skips the
+        # handler's except and leaves the source stuck in SCANNING.
         if MAX_TABLES_PER_SOURCE and len(kept) > MAX_TABLES_PER_SOURCE:
             raise ValueError(
                 f"{catalog}.{database} exposes {len(kept)} tables after filters, exceeding the limit of "
@@ -371,8 +348,6 @@ class CustomConnector(MetadataConnector):
         return DiscoveredMetadata(
             tables=tables, failed_tables=[f"{database}.{t}" for t in failed], filter_warnings=filter_warnings
         )
-
-    # ── Statement helpers ────────────────────────────────────────────────
 
     def _list_databases(self, catalog: str) -> set[str]:
         """Databases the connector exposes, from ``SHOW DATABASES IN <catalog>``."""

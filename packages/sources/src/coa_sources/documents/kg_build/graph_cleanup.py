@@ -11,29 +11,15 @@ Uses DeleteSources directly with a small batch_size to avoid Neptune's
 per-query memory limit. The default batch_size=1000 causes MemoryLimitExceeded
 on large documents because delete_statements() passes all 1000 IDs in one query.
 
-Opens the vector store over the SAME ``EMBEDDING_INDEXES`` the build task writes,
-which is why that constant is imported rather than re-derived here. Omitting
-``index_names`` falls back to the toolkit's default set, which includes
-``statement`` — an index the build path deliberately does not create (see the
-constant's rationale in graph_build). Deletion then waits out a 70-second
-"Unable to find documents for all ids in index" timeout per batch for documents
-that were never indexed. A 36-source deletion burned 10 hours that way before the
-Step Functions task timed out and left the source DELETE_FAILED. The two paths
-must agree on the index set: any change to what is embedded has to reach this
-task, or deletion hangs on whatever the build stopped writing.
+Opens the vector store over the SAME ``EMBEDDING_INDEXES`` the build task writes
+(imported rather than re-derived). The toolkit's default index set includes
+``statement``, which the build path does not create, and deletion would wait out
+a 70-second timeout per batch for documents that were never indexed.
 
-Applies the same graphrag-toolkit monkey-patches as the build task. Deletion
-reads the vector indexes (``delete_embeddings`` →
-``_get_existing_doc_ids_for_ids`` → ``paginated_search``), so it hits the exact
-AOSS failure modes the build path already patches around. Unpatched, a
-``429 circuit_breaking_exception`` from the NEXTGEN heap breaker was neither
-retried nor reported: the toolkit's own handler does ``except Exception as ee:
-... raise e`` with ``e`` unbound, so it raised ``UnboundLocalError``, masked the
-real 429, failed the ECS task, and left the Step Functions execution FAILED with
-the namespace's embeddings orphaned half-deleted in AOSS (observed 2026-07-27 on
-both SEC-10-Q namespaces). The patches must run BEFORE graphrag is imported —
-``LexicalGraphIndex``/``VectorStoreFactory`` bind their own references to the
-patched functions at import time — so the graphrag imports live inside main().
+Applies the same graphrag-toolkit monkey-patches as the build task, because
+deletion reads the vector indexes and hits the same AOSS failure modes. They must
+run BEFORE graphrag is imported (``LexicalGraphIndex``/``VectorStoreFactory`` bind
+their own references at import time), so the graphrag imports live inside main().
 """
 
 from __future__ import annotations
@@ -61,34 +47,19 @@ TENANT_ID: str = os.environ.get("TENANT_ID", "")
 NEPTUNE_ENDPOINT: str = os.environ.get("NEPTUNE_ENDPOINT", "")
 OPENSEARCH_ENDPOINT: str = os.environ.get("OPENSEARCH_ENDPOINT", "")
 
-# Small batch size to avoid Neptune's per-query memory limit.
-# The default is 1000 which causes MemoryLimitExceededException on large docs.
 _BATCH_SIZE = 200
 
 
 def _existing_embedding_indexes(prefixes: list[str], tenant_id: str) -> list[str]:
     """Return only the ``prefixes`` whose AOSS index actually exists.
 
-    Deletion MUST NOT be handed an index name that isn't there. graphrag's
-    ``delete_embeddings`` treats "no documents found for these ids" as
-    replication lag and sleeps in a **70-second retry loop per batch** before
-    giving up (``_insufficient_ids`` → ``time.sleep(10)`` until 70s elapse).
-    With a missing index every batch takes that full 70s: the vector client is
-    graphrag's dummy (``_os_client is None``), so ``paginated_search`` returns
-    nothing and the id map is always empty. At ``_BATCH_SIZE`` 200 per index
-    that is where the module docstring's "36-source deletion burned 10 hours
-    ... left the source DELETE_FAILED" comes from.
+    Deletion must not be handed a missing index name: graphrag's
+    ``delete_embeddings`` sleeps in a 70-second retry loop per batch when it finds
+    no documents. A missing index is a normal condition, since namespace teardown
+    drops ``chunk_*``/``topic_*`` once the last source is deleted.
 
-    A missing index is now a NORMAL condition rather than a bug: namespace
-    teardown drops ``chunk_*``/``topic_*`` once the last source is deleted
-    (control-plane ``cleanup.delete_graphrag_indexes``), and these ECS cleanup
-    tasks can still be running when it does. Passing only the indexes that
-    exist means graphrag skips vector deletion entirely instead of stalling,
-    while the Neptune subgraph deletes — the part that still matters — proceed.
-
-    Best-effort: if the existence probe itself fails we keep the prefix, so a
-    transient AOSS fault degrades to the old (slow) behaviour rather than
-    silently skipping a delete that was actually needed.
+    Best-effort: if the existence probe itself fails the prefix is kept, so a
+    transient AOSS fault does not skip a delete that was needed.
     """
     if not prefixes:
         return []
@@ -133,18 +104,8 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-    # Patch BEFORE importing graphrag (see module docstring): the AOSS NEXTGEN
-    # mapping fix must replace index_exists in the module namespace before
-    # LexicalGraphIndex/VectorStoreFactory bind their own references, and the
-    # paginated_search retry is what keeps a transient AOSS 429/5xx during deletion
-    # from aborting the task with a masked UnboundLocalError.
-    #
-    # allow_create=False: this is the DELETION path, and it must never create an
-    # index. graphrag's VectorIndex.writeable defaults to True and its
-    # index_exists creates when writeable, so cleaning a tenant whose indexes
-    # are already gone would recreate chunk_*/topic_* as empty shells for a
-    # namespace on its way out — unreclaimable, and AOSS caps a collection at
-    # 1000 indexes. A missing index means there is nothing to delete anyway.
+    # Patch BEFORE importing graphrag (see module docstring). allow_create=False
+    # because this is the deletion path and must never create an index.
     _patch_graphrag_toolkit_for_aoss_nextgen(allow_create=False)
     _patch_graphrag_paginated_search_retry()
     _patch_graphrag_bulk_ingest_retry()
@@ -173,24 +134,11 @@ def main() -> None:
     if existing_indexes:
         vector_index_names = existing_indexes
     else:
-        # No AOSS indexes remain (namespace teardown drops chunk_*/topic_* once the
-        # last source is deleted, and this task can still be running when it does).
-        # There are no embeddings to delete — but graphrag's
+        # No AOSS indexes remain, so there are no embeddings to delete. But
         # VectorStoreFactory.for_vector_store raises "Unrecognized vector store info"
-        # when handed an EMPTY index list: the aoss:// factory's try_create iterates
-        # zero names and returns [], every factory is then treated as a non-match, and
-        # it falls through to that ValueError (proven against graphrag-toolkit 3.18.x).
-        # Point at the dummy vector store with a NON-EMPTY set of names instead so it
-        # builds a no-op VectorStore; DeleteSources' get_index(...).delete_embeddings(...)
-        # then no-ops while the Neptune subgraph deletion — the part that still matters —
-        # proceeds. Without this, the cleanup task crashes on exactly the namespaces
-        # whose vector indexes were already reclaimed, leaving the source DELETE_FAILED.
-        #
-        # The name list MUST stay non-empty: for_vector_store raises the same
-        # ValueError for ANY scheme (dummy:// included) when index_names is empty, so
-        # falling back to EMBEDDING_INDEXES alone would reintroduce the crash if it is
-        # misconfigured empty (``EMBEDDING_INDEXES=""`` parses to []). The names are
-        # irrelevant to a dummy store, so default to the standard doc-KG set.
+        # for an EMPTY index list under any scheme, so point at the dummy store with
+        # a NON-EMPTY set of names (irrelevant to a dummy store; default to the
+        # standard doc-KG set). The Neptune subgraph deletion still proceeds.
         logger.info(
             "no_embedding_indexes_present_skipping_vector_deletes",
             tenant_id=TENANT_ID,
@@ -213,7 +161,6 @@ def main() -> None:
             source_ids = [s["sourceId"] for s in sources]
             logger.info("sources_found", count=len(source_ids), doc_source_id=DOC_SOURCE_ID)
 
-            # Pass a small batch_size to avoid Neptune's per-query memory limit.
             # Use num_workers=1 to serialize deletions — parallel workers cause
             # ConcurrentModificationException in Neptune when multiple transactions
             # modify the same nodes simultaneously.

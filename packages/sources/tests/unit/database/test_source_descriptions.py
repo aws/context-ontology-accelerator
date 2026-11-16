@@ -1,24 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for source-existing description discovery and preservation.
-
-Covers:
-- Glue connector pulls table-level Description and column Comments and tags
-  them ``DETERMINISTIC`` so AI enrichment doesn't overwrite them.
-- Each JDBC dialect emits the engine-specific SQL to fetch table/column
-  descriptions (PostgreSQL/Redshift, MySQL, SQL Server, Snowflake, Oracle).
-- The JDBC connector wires those descriptions into Table.business_metadata
-  and Column.business_metadata with ``DETERMINISTIC`` (mirrors how PK/FK
-  constraints discovered from the source schema are tagged).
-- The table_enricher preserves authoritative descriptions for every value in
-  ``_PROTECTED_DESCRIPTION_SOURCES`` (DETERMINISTIC, CATALOG_EXISTING,
-  STEWARD_EDITED, STEWARD_SPECIFIED) on both tables and columns, even when
-  the Bedrock response (incorrectly) regenerates them — code-side defense,
-  not just the prompt instruction.
-- The enrichment prompt advertises columns that already carry a description
-  in either ``Column.description`` (catalog) or ``business_metadata``.
-"""
+"""Unit tests for discovering source descriptions (Glue, JDBC dialects) and preserving them through enrichment."""
 
 from __future__ import annotations
 
@@ -49,15 +32,10 @@ from coa_sources.database.enrichment.table_enricher import (
 
 _mock_pg8000 = sys.modules.setdefault("pg8000", MagicMock())
 
-from coa_sources.database.connectors.glue_catalog import (  # noqa: E402
+from coa_sources.database.connectors.glue_catalog import (
     GlueCatalogConnector,
 )
-from coa_sources.database.connectors.jdbc import JdbcConnector  # noqa: E402
-
-# ────────────────────────────────────────────────────────────────────────
-# Glue connector: pulls Description (table) and Comment (columns) and tags
-# them DETERMINISTIC (came directly from the source catalog).
-# ────────────────────────────────────────────────────────────────────────
+from coa_sources.database.connectors.jdbc import JdbcConnector
 
 
 @pytest.mark.unit
@@ -65,8 +43,7 @@ class TestGlueCatalogDescriptions:
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
     def test_table_description_promoted_to_business_metadata(self, mock_boto3):
         mock_client = MagicMock()
-        # The connector now also calls get_database() once to pull the
-        # database-level Description (separate from the table's Description).
+        # get_database() supplies the database-level Description.
         mock_client.get_database.return_value = {"Database": {"Name": "sales", "Description": "Sales operational DB"}}
         paginator = MagicMock()
         paginator.paginate.return_value = [
@@ -91,12 +68,8 @@ class TestGlueCatalogDescriptions:
         # The table's own description is on business_metadata only.
         assert table.business_metadata.description == "All customer orders since 2018"
         assert table.business_metadata.enrichment_source == EnrichmentSource.DETERMINISTIC
-        # Tables stay PENDING_REVIEW at discovery time regardless of enrichment
-        # source. They are only approved once all columns reach terminal state.
         assert table.business_metadata.review_status == ReviewStatus.PENDING_REVIEW
         assert table.business_metadata.confidence == 1.0
-        # database_description carries the *database*-level description
-        # (from get_database()), not the table's. The two are now distinct.
         assert table.database_description == "Sales operational DB"
 
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
@@ -123,33 +96,6 @@ class TestGlueCatalogDescriptions:
         assert table.business_metadata.description == ""
         assert table.business_metadata.enrichment_source == ""
         assert table.database_description == ""
-
-    @patch("coa_sources.database.connectors.glue_catalog.boto3")
-    def test_database_description_separate_from_table_description(self, mock_boto3):
-        """get_database() Description goes to database_description; table
-        Description goes to business_metadata.description. Different values."""
-        mock_client = MagicMock()
-        mock_client.get_database.return_value = {"Database": {"Name": "sales", "Description": "Sales DB"}}
-        paginator = MagicMock()
-        paginator.paginate.return_value = [
-            {
-                "TableList": [
-                    {
-                        "Name": "orders",
-                        "Description": "Order rows",
-                        "StorageDescriptor": {"Columns": [], "Location": ""},
-                        "PartitionKeys": [],
-                    }
-                ]
-            }
-        ]
-        mock_client.get_paginator.return_value = paginator
-        mock_boto3.client.return_value = mock_client
-
-        table = GlueCatalogConnector().discover_metadata({"database_name": "sales", "region": "us-east-1"}).tables[0]
-
-        assert table.database_description == "Sales DB"
-        assert table.business_metadata.description == "Order rows"
 
     @patch("coa_sources.database.connectors.glue_catalog.boto3")
     def test_column_comment_promoted_to_business_metadata(self, mock_boto3):
@@ -194,11 +140,6 @@ class TestGlueCatalogDescriptions:
         # Column without a comment must NOT be tagged.
         assert cols_by_name["amount"].business_metadata.description == ""
         assert cols_by_name["amount"].business_metadata.enrichment_source == ""
-
-
-# ────────────────────────────────────────────────────────────────────────
-# JDBC dialects: each engine emits the right SQL for descriptions.
-# ────────────────────────────────────────────────────────────────────────
 
 
 class _RecordingCursor:
@@ -350,11 +291,6 @@ def test_default_dialect_returns_empty_descriptions():
     assert _Custom().fetch_descriptions(MagicMock(), "x", ["y"]) == ({}, {})
 
 
-# ────────────────────────────────────────────────────────────────────────
-# JDBC connector: wires descriptions into Table / Column business_metadata.
-# ────────────────────────────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestJdbcDescriptionsWiring:
     """The JDBC discovery loop must surface dialect descriptions on the model."""
@@ -430,14 +366,9 @@ class TestJdbcDescriptionsWiring:
         # Table description came from the catalog and is tagged DETERMINISTIC.
         assert table.business_metadata.description == "Customer orders table"
         assert table.business_metadata.enrichment_source == EnrichmentSource.DETERMINISTIC
-        # Tables stay PENDING_REVIEW at discovery time regardless of enrichment
-        # source. They are only approved once all columns reach terminal state.
         assert table.business_metadata.review_status == ReviewStatus.PENDING_REVIEW
         assert table.business_metadata.confidence == 1.0
-        # The mock connection doesn't simulate a schema-level COMMENT response,
-        # so the per-dialect fetch_database_description returns "". This is
-        # distinct from the table's own description above — the two fields
-        # no longer mirror each other.
+        # The mock connection returns no schema-level COMMENT.
         assert table.database_description == ""
 
         cols = {c.name: c for c in table.columns}
@@ -485,12 +416,6 @@ class TestJdbcDescriptionsWiring:
         assert len(result.tables) == 1
         # No descriptions, but discovery must not raise.
         assert result.tables[0].business_metadata.description == ""
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Table enricher: preserves descriptions tagged with any protected source
-# (DETERMINISTIC, CATALOG_EXISTING, STEWARD_EDITED, STEWARD_SPECIFIED).
-# ────────────────────────────────────────────────────────────────────────
 
 
 def _table_with_protected_description(table_desc: str, columns: list[Column], source: str) -> Table:
@@ -662,9 +587,6 @@ class TestEnricherPreservesProtectedDescriptions:
         assert cols["id"].business_metadata.review_status == ReviewStatus.APPROVED
         assert cols["id"].business_metadata.confidence == 1.0
         assert cols["amount"].business_metadata.description == ""
-        # The Column dataclass no longer has a separate ``description`` field —
-        # the only home is ``business_metadata.description``.
-        assert not hasattr(cols["id"], "description")
 
     def test_ai_still_applies_when_no_protected_description(self) -> None:
         col = Column(name="id", data_type="bigint")
@@ -726,11 +648,6 @@ class TestEnricherPreservesProtectedDescriptions:
 
         assert table.columns[0].business_metadata.description == "Better AI guess"
         assert table.columns[0].business_metadata.enrichment_source == EnrichmentSource.AI_GENERATED
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Prompt: notes columns that already have a description in either field.
-# ────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.unit

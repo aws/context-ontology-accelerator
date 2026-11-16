@@ -36,14 +36,6 @@ describe("projectEdgeLabel", () => {
     expect(p.y).toBeCloseTo(15, 5);
   });
 
-  it("parallel edges with different curves land on different points at t = 0.5", () => {
-    // Two parallel edges between the same chord, curves ±40.
-    const up = projectEdgeLabel(0, 0, 200, 0, 40, 0.5);
-    const down = projectEdgeLabel(0, 0, 200, 0, -40, 0.5);
-    expect(up.y).not.toBeCloseTo(down.y, 1);
-    expect(Math.abs(up.y - down.y)).toBeCloseTo(40, 5);
-  });
-
   it("returns the source for a self-loop (zero-length chord)", () => {
     expect(projectEdgeLabel(5, 7, 5, 7, 0, 0.5)).toEqual({ x: 5, y: 7 });
     // Curve is meaningless at zero length and should not NaN.

@@ -114,10 +114,6 @@ from coa_control_plane_server.models.source_status import SourceStatus
 from coa_sources.documents.kg_build import batch_patches
 from coa_sources.namespace_language import NAMESPACE_LANGUAGE_ENV, require_language_snapshot
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 # graphrag-toolkit logs via stdlib ``logging``, so its records only reach
 # CloudWatch because setup_logging() bridges stdlib into structlog. Without the
 # bridge they fall to ``logging.lastResort`` (stderr, WARNING-only), which drops
@@ -130,9 +126,6 @@ setup_logging(
 )
 logger = structlog.get_logger()
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 AWS_REGION = resolve_region()
 EXTRACTION_MODE = ExtractionMode(os.environ.get("EXTRACTION_MODE", DEFAULT_EXTRACTION_MODE).lower())
@@ -153,30 +146,12 @@ INFER_ENTITY_CLASSIFICATIONS = (
 )
 
 
-# Explicit vocabulary supplied by the user (or, in a future change, resolved
-# from the namespace's accepted ontology). Arrives as a JSON-encoded list from
-# the trigger Lambda — an object/array can't be inlined into a Step Functions
-# container-override JsonPath, so it must be pre-stringified. When non-empty
-# this WINS over INFER_ENTITY_CLASSIFICATIONS: the user asked for these exact
-# labels, so don't second-guess them with an inference pass.
 def _env_str_list(name: str, default_json: str) -> list[str]:
     """Decode a JSON-array-of-strings env var into a cleaned ``list[str]``.
 
-    Values arrive pre-stringified because a Step Functions container-override
-    JsonPath cannot inline an array. Entries are stripped and empties dropped.
-
-    **Raises** on malformed / wrong-typed JSON rather than degrading to ``[]``.
-    The API validates this vocabulary and 400s before ingestion starts, so a real
-    caller's bad input never reaches here; a malformed value at container start
-    therefore means a *pipeline* bug, not user input. Failing loudly surfaces it as
-    SCAN_FAILED, where silently extracting with no vocabulary would hide it — the
-    user would just get a graph that ignores what they configured (raised in review).
-
-    Over-cap is the one case that still degrades: it clamps to
-    ``MAX_VOCABULARY_ENTRIES`` with a warning, because the first N entries are a
-    valid steer. The API already enforces the cap, so this is defence in depth for
-    an execution started outside it; every entry is injected into every chunk's
-    prompt, so an unbounded list is a cost and adherence problem.
+    Entries are stripped and empties dropped. Raises on malformed or wrong-typed
+    JSON, so a pipeline bug surfaces as SCAN_FAILED instead of extracting with no
+    vocabulary. Over-cap input clamps to ``MAX_VOCABULARY_ENTRIES`` with a warning.
     """
     raw = os.environ.get(name, default_json)
     try:
@@ -184,9 +159,6 @@ def _env_str_list(name: str, default_json: str) -> list[str]:
         if not isinstance(decoded, list) or not all(isinstance(x, str) for x in decoded):
             raise ValueError("must be a JSON array of strings")
     except (ValueError, json.JSONDecodeError) as exc:
-        # Fail loud: an API-validated field arriving malformed here is a pipeline
-        # defect. Crashing the task (→ SCAN_FAILED) is more honest than proceeding
-        # with no vocabulary and a warning the user never reads.
         raise ValueError(f"{name} is not a JSON array of strings: {raw[:256]!r}") from exc
     cleaned = [x.strip() for x in decoded if x.strip()]
     if len(cleaned) > MAX_VOCABULARY_ENTRIES:
@@ -212,13 +184,8 @@ PREFERRED_ENTITY_CLASSIFICATIONS: list[str] = _env_str_list(
 PREFERRED_TOPICS: list[str] = _env_str_list("PREFERRED_TOPICS", DEFAULT_PREFERRED_TOPICS_JSON)
 
 # Optional chunk-size / chunk-overlap override. 0 (default) means "use the
-# graphrag-toolkit default" — SentenceSplitter(chunk_size=256, chunk_overlap=25).
-# The benchmark harness pins 1024 for dense/tabular corpora; use that as the
-# starting point when tables dominate the corpus.
-# These arrive as stringified integers from the trigger Lambda via the SFN ->
-# ECS env pipe. Guard the parse: a malformed value must degrade to the toolkit
-# default with a logged warning, never crash the container at import time
-# (which would fail the whole KG build before any diagnostic is emitted).
+# graphrag-toolkit default" (SentenceSplitter 256/25). A malformed value degrades
+# to that default with a logged warning instead of crashing at import.
 try:
     CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
     CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP)))
@@ -274,18 +241,9 @@ def _bounded_float_env(name: str, default: float, *, minimum: float, maximum: fl
 # graphrag-toolkit benchmark harness. Env-overridable without a deploy.
 EXTRACTION_MAX_TOKENS = int(os.environ.get("EXTRACTION_MAX_TOKENS", "16384"))
 
-# Read timeout for a single extraction call, in seconds. BedrockConverse defaults
-# to 60, which was enough for Haiku 4.5 but not for Sonnet 5: a chunk that emits
-# anything near EXTRACTION_MAX_TOKENS takes longer than that to come back, and the
-# call dies with "Read timeout on endpoint URL". Because the toolkit retries 50
-# times and every attempt times out for the same reason, one slow chunk does not
-# degrade the run — it ends it. A whole 14-document run failed this way after 33
-# minutes of retrying, extracting nothing.
-#
-# 300 is ~20x the measured p50: Sonnet 5 returns a chunk-sized extraction in ~15s
-# on its own, and 64 concurrently (the fan-out this task runs) still peaked at ~27s
-# with no errors. So this is headroom for an outlier, not an estimate of normal
-# latency — it costs nothing when calls return promptly, and bounds a hung one.
+# Read timeout for a single extraction call, in seconds. BedrockConverse
+# defaults to 60, too short for large Sonnet extractions. 300 is headroom for an
+# outlier and costs nothing when calls return promptly.
 EXTRACTION_TIMEOUT_SECONDS = _bounded_float_env(
     "EXTRACTION_TIMEOUT_SECONDS",
     300,
@@ -293,11 +251,8 @@ EXTRACTION_TIMEOUT_SECONDS = _bounded_float_env(
     maximum=3600,
 )
 
-# Attempts per extraction call, including the first. The toolkit's own value is 2,
-# which is too few for the Bedrock throttling a long run does meet, but retrying is
-# only worth it for faults that clear: a read timeout under a 300s budget does not,
-# and retrying it 50x is how a single slow chunk burned 45 minutes before failing.
-# 5 covers a throttle window without turning one bad chunk into a long stall.
+# Attempts per extraction call, including the first. 5 covers a throttle window
+# without turning one slow chunk into a long stall.
 EXTRACTION_MAX_ATTEMPTS = _bounded_int_env(
     "EXTRACTION_MAX_ATTEMPTS",
     5,
@@ -305,11 +260,8 @@ EXTRACTION_MAX_ATTEMPTS = _bounded_int_env(
     maximum=20,
 )
 
-# Connect timeout, kept separate from the read timeout on purpose. BedrockConverse
-# and llm_cache both set connect and read to one value, so a 300s read budget also
-# means waiting 300s to discover an endpoint is simply unreachable — a security group,
-# NAT or VPC endpoint fault then looks exactly like the slow model we just spent a run
-# chasing. TCP+TLS to Bedrock completes well under a second or not at all.
+# Connect timeout, separate from the read timeout: BedrockConverse sets both to
+# one value, so a long read budget would also delay detecting an unreachable endpoint.
 EXTRACTION_CONNECT_TIMEOUT_SECONDS = _bounded_float_env(
     "EXTRACTION_CONNECT_TIMEOUT_SECONDS",
     10,
@@ -317,11 +269,8 @@ EXTRACTION_CONNECT_TIMEOUT_SECONDS = _bounded_float_env(
     maximum=300,
 )
 
-# Mirrors the env var the toolkit itself reads (its own default is 4). Read here only
-# to size the connection pool to the fan-out; the toolkit still owns the concurrency.
-# This is the PER-PROCESS figure: extraction is ProcessPoolExecutor(NUM_WORKERS) and
-# inside each process an asyncio run_jobs(workers=THREADS_PER_WORKER), so the task runs
-# 4x16 calls at once but each process has its own client, and 16 is what one pool holds.
+# Per-process fan-out (the toolkit's own default is 4), read only to size the
+# connection pool; the toolkit still owns the concurrency.
 EXTRACTION_NUM_THREADS_PER_WORKER = _bounded_int_env(
     "EXTRACTION_NUM_THREADS_PER_WORKER",
     4,
@@ -329,25 +278,11 @@ EXTRACTION_NUM_THREADS_PER_WORKER = _bounded_int_env(
     maximum=256,
 )
 
-# Vector indexes to build: ``chunk`` + ``topic``, matching the graphrag-toolkit
-# benchmark harness (benchmarks/ingest_v5.py, INDEX_NAMES = ['chunk', 'topic']).
-#
-# Two deliberate deviations from the toolkit's ``DEFAULT_EMBEDDING_INDEXES``
-# (``['chunk', 'statement']``, graphrag storage/constants.py):
-#
-#   + topic: ``TopicBeamSearch`` (new in graphrag-lexical-graph 3.18.7) seeds from
-#     ``get_index('topic')`` and silently skips any topic with no stored vector, so
-#     without this index it degenerates to an empty seed set.
-#   - statement: statements are still BUILT into the graph, just not embedded.
-#     Nothing reads the statement *vector* index — serve never calls
-#     ``get_index('statement')``, and the traversal retrievers reach statements
-#     through the graph (``__SUPPORTS__``/``__MENTIONED_IN__``), not by vector
-#     search. Dropping it removes an embedding cost per statement (49,548 of them
-#     on SEC-10-Q vs 3,125 chunks) with no retrieval loss.
-#
-# Embeddings are only written during indexing, so this takes effect on a fresh
-# ingest — an existing graph needs a re-ingest to gain/lose an index.
-# Env-overridable (e.g. EMBEDDING_INDEXES=chunk,statement,topic) without a deploy.
+# Vector indexes to build. ``topic`` is embedded because ``TopicBeamSearch``
+# seeds from ``get_index('topic')`` and skips topics with no stored vector.
+# ``statement`` is not, because nothing reads the statement vector index
+# (retrievers reach statements through the graph). Takes effect on a fresh
+# ingest only. Env-overridable, e.g. EMBEDDING_INDEXES=chunk,statement,topic.
 EMBEDDING_INDEXES = [
     name.strip() for name in os.environ.get("EMBEDDING_INDEXES", "chunk,topic").split(",") if name.strip()
 ]
@@ -401,39 +336,12 @@ except ImportError:  # pragma: no cover - unit tests stub this module out
 def _picklable_bedrock_converse_cls() -> type:
     """A BedrockConverse subclass that keeps its boto3 client across a ProcessPool hop.
 
-    Upstream loses it. ``llama_index.core.schema.__getstate__`` drops the unpicklable
-    ``_client``, then ``__setstate__`` tries to rebuild by re-running ``__init__`` with
-    the whole pickled ``__dict__`` — which carries inherited LLM fields
-    (``rate_limiter``, ``query_wrapper_prompt``) that ``BedrockConverse.__init__`` does
-    not accept. It raises TypeError, falls back to a plain attribute restore, and the
-    worker ends up with an LLM that has no client at all.
-
-    Filtering the state to the parameters ``__init__`` accepts makes the re-init
-    succeed, so the worker rebuilds the client from OUR botocore_config. Measured
-    across a real ProcessPoolExecutor: upstream arrives with no client, this arrives
-    with pool=16 and read_timeout=300.
-
-    That matters because of what fills the gap otherwise: ``LLMCache.predict`` checks
-    ``if not hasattr(self.llm, '_client')`` and builds its own from llm_cache's module
-    constants (60s, 2 attempts, default pool). Keeping the client makes that fallback
-    dead code instead of the live path.
-
-    A subclass rather than a monkey-patch on ``__setstate__``: a module-level rebind
-    only reaches workers under ``fork``, and is silently lost under ``spawn`` /
-    ``forkserver`` because the child re-imports from source. Linux/CPython 3.12
-    defaults to fork today — but pickling runs under every start method, so this does
-    not depend on that staying true.
-
-    Pickle stores a class by module and qualified name and looks it up again on load, so
-    the class has to be reachable as a plain module attribute — and under ``spawn`` the
-    worker re-imports this module from source, so it has to exist by the end of import,
-    not on first call. That rules out both a function-local class ("Can't get local
-    object") and one cached lazily onto the module ("Can't get attribute ... on module").
-    Hence the module-level definition above, guarded so that stubbing
-    ``llama_index.llms.bedrock_converse`` in unit tests leaves it as None rather than
-    failing the import.
-
-    This function just hands back that class, or explains why it is missing.
+    Upstream drops the unpicklable ``_client`` on pickle and cannot rebuild it,
+    because ``__init__`` rejects inherited LLM fields, so the worker would get an
+    LLM with no client. Filtering the state to the parameters ``__init__`` accepts
+    lets it rebuild the client from our botocore_config. Defined at module level
+    so pickle can find it under every start method; ``None`` when llama_index is
+    stubbed (unit tests).
     """
     if _picklable_bedrock_converse_class is None:  # pragma: no cover - import guard
         raise RuntimeError(
@@ -443,23 +351,12 @@ def _picklable_bedrock_converse_cls() -> type:
     return _picklable_bedrock_converse_class
 
 
-# ---------------------------------------------------------------------------
-# S3 staging file loading → LlamaIndex Documents (with sidecar metadata)
-# ---------------------------------------------------------------------------
-
-
 def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]:
     """Download staged text files + metadata sidecars from S3.
 
     Returns ``(documents, unloaded_count)`` where ``unloaded_count`` is the number
     of staged text files that were listed but produced no document — either they
     could not be downloaded / decoded, or they held no text at all.
-
-    An empty staged file used to be skipped with a bare ``continue`` that left
-    every counter untouched, so a source whose files all extracted to zero bytes
-    reported a clean success having contributed nothing to the graph. Both
-    outcomes mean "a file we staged is not in the graph", which is what the
-    caller's failure accounting is for, so both are counted here.
 
     Raises on a LISTING failure (transient S3 error, wrong prefix, IAM hiccup):
     an empty listing must NOT be silently indistinguishable from a real failure,
@@ -505,11 +402,6 @@ def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]
             text = content_bytes.decode("utf-8", errors="replace")
 
             if not text.strip():
-                # Preprocessing now refuses to stage an empty extraction, so this
-                # only fires for a prefix staged before that guard existed. Count
-                # it: a staged file missing from the graph is the same outcome as
-                # one that failed to download, and a bare `continue` on data that
-                # was expected to exist is how a 50% corpus loss reported clean.
                 logger.warning("Empty staged file, skipping", s3_key=key)
                 empty_count += 1
                 continue
@@ -538,11 +430,6 @@ def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]
                             collides_with=origin_of[safe_key],
                             sanitized_key=safe_key,
                         )
-                        # Probe origin_of (the sanitized-key namespace this loop
-                        # owns) rather than metadata: metadata also carries
-                        # pre-seeded keys (filename, later versioning fields) that
-                        # are unrelated to sanitized-key disambiguation, so scoping
-                        # the free-slot search to origin_of keeps this self-contained.
                         suffix = 2
                         while f"{safe_key}_{suffix}" in origin_of:
                             suffix += 1
@@ -578,57 +465,18 @@ def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]
     return documents, failed_count + empty_count
 
 
-# ---------------------------------------------------------------------------
-# GraphRAG setup
-# ---------------------------------------------------------------------------
-
-
 _graphrag_llm_client_patched = False
 
 
 def _patch_graphrag_llm_cache_client_config() -> None:
     """Bound the toolkit's own fallback client, for when ours does not reach the worker.
 
-    Defence in depth behind ``_picklable_bedrock_converse_cls``, which is the primary
-    fix: with the client surviving the pickle hop, the branch patched here is dead
-    code. It stays because it is the branch that runs whenever the client does NOT
-    survive — a future toolkit version that rebuilds the LLM rather than reusing ours
-    would land straight back here, and the failure it produces is a 45-minute run that
-    extracts nothing rather than an error anyone can read.
-
-    Why that branch is so costly unpatched:
-
-    1. The build pipeline pickles the LLM out to ProcessPool workers. llama_index's
-       ``__getstate__`` drops the unpicklable ``_client`` private attribute (the
-       "Removing unpickleable private attribute _client" line in every run log),
-       and its ``__setstate__`` tries to rebuild by re-running ``__init__``, which
-       raises TypeError on ``rate_limiter`` and falls back to a plain restore. So
-       the worker holds an LLM with no client at all.
-    2. ``LLMCache.predict`` notices that (``if not hasattr(self.llm, '_client')``)
-       and builds one itself, from module constants in llm_cache.py:
-       ``TIMEOUT = 60.0`` and ``MAX_ATTEMPTS = 2``.
-
-    A 14-document run therefore died after 45 minutes on ReadTimeoutError with
-    ``timeout=300`` configured: the 300 was never used, and neither was
-    ``max_retries=50`` — the effective values were 60s and 2 attempts. Raising the
-    number on our own object again would change nothing, which is why this patches
-    the constants the worker actually reads.
-
-    60s was too short for headroom, not because the model is slow: Sonnet 5 answers
-    a chunk-sized extraction in ~15s p50, and 64 of those concurrently still peak at
-    ~27s with zero errors. Sizing from the measured p50 rather than from the old
-    value is the point of EXTRACTION_TIMEOUT_SECONDS.
-
-    Two limits worth knowing, neither of which applies to the primary fix. llm_cache
-    passes one TIMEOUT to both connect_timeout and read_timeout at all three of its
-    build sites, so on this path a raised read budget also raises the connect budget —
-    the client built in ``_setup_graphrag`` splits them via
-    EXTRACTION_CONNECT_TIMEOUT_SECONDS, this one cannot. And a module-level rebind only
-    reaches workers under ``fork``; under ``spawn``/``forkserver`` the child re-imports
-    and gets 60.0/2 back. Verified: fork gives the worker the patched values, spawn does
-    not. Linux/CPython 3.12 forks today, so this holds in the container and not on a
-    macOS dev box — another reason the subclass, which pickling carries under every
-    start method, is the mechanism to rely on.
+    Defence in depth behind ``_picklable_bedrock_converse_cls``. When the LLM
+    arrives without a client, ``LLMCache.predict`` builds one from llm_cache's
+    module constants (``TIMEOUT = 60.0``, ``MAX_ATTEMPTS = 2``), so the configured
+    timeout and retries would never apply. This rebinds those constants. The
+    rebind reaches workers under ``fork`` only, and llm_cache uses one value for
+    both connect and read timeouts.
 
     Separate flag + narrow import so an ImportError here cannot disable the other
     patches. Must run BEFORE graphrag is imported elsewhere, like its siblings.
@@ -762,22 +610,13 @@ _graphrag_aoss_patched = False
 def _patch_graphrag_toolkit_for_aoss_nextgen(*, allow_create: bool = True) -> None:
     """Patch graphrag_toolkit's index_exists to drop the unsupported 'engine' field.
 
-    AOSS NEXTGEN rejects knn_vector mappings with a 'method.engine' key.
-    Same fix as opensearch_vector.py commit 2261418. No-op in unit tests
-    (stubs don't expose the full module path).
+    AOSS NEXTGEN rejects knn_vector mappings with a 'method.engine' key. No-op in
+    unit tests (stubs don't expose the full module path).
 
-    ``allow_create=False`` makes the patch never create a missing index, only
-    report whether it exists. The DELETION task passes this: graphrag's
-    ``VectorIndex.writeable`` defaults to True and its ``index_exists`` creates
-    when writeable, so a cleanup run against an already-empty tenant would
-    RECREATE ``chunk_*``/``topic_*`` as empty shells. Nothing ever reclaims
-    those (the namespace they belong to is being deleted), and AOSS caps a
-    collection at 1000 indexes, so they accumulate until every embedding write
-    in the deployment fails with ``index_limit_breached``. Same
-    reads-must-not-create rule the ontology vector store follows — see
-    ``OpenSearchVectorStore._read_index``. With no index there are no
-    embeddings to delete, so graphrag falls back to its
-    ``DummyOpensearchVectorClient`` and the delete is correctly a no-op.
+    ``allow_create=False`` never creates a missing index, only reports whether it
+    exists. The DELETION task passes it: graphrag would otherwise recreate empty
+    ``chunk_*``/``topic_*`` indexes for an already-empty tenant, and AOSS caps a
+    collection at 1000 indexes.
     """
     global _graphrag_aoss_patched
     if _graphrag_aoss_patched:
@@ -1047,10 +886,7 @@ def _patch_graphrag_bulk_ingest_retry() -> None:
             client.indices.refresh(index=index_name)
         return []  # graphrag contract: empty == no unresolved errors
 
-    # mypy: OpensearchVectorClient is typed (llama_index ships stubs in CI), so
-    # reassigning its method trips [method-assign]. The reassignment is the whole
-    # point of the monkey-patch; ignore it (same pattern as main.py's patched
-    # module-level rebinds).
+    # Reassigning the typed method is the point of the patch ([method-assign]).
     _osvs.OpensearchVectorClient._bulk_ingest_embeddings = _retrying_bulk_ingest_embeddings  # type: ignore[method-assign]
     _graphrag_bulk_ingest_patched = True
 
@@ -1062,9 +898,6 @@ def _setup_graphrag(tenant_id: str):
     # bind their own references to it. Importing GraphRAGConfig triggers those loads.
     _patch_graphrag_toolkit_for_aoss_nextgen()
     _patch_graphrag_paginated_search_retry()
-    # Rebinds module constants that llm_cache reads at call time, so this one is not
-    # order-sensitive the way the others are — kept here so all the patches are in
-    # one place rather than split across the import.
     _patch_graphrag_llm_cache_client_config()
 
     from graphrag_toolkit.lexical_graph import GraphRAGConfig
@@ -1098,60 +931,27 @@ def _setup_graphrag(tenant_id: str):
     )
     GraphRAGConfig.embed_dimensions = BEDROCK_EMBED_DIMENSIONS
     if BEDROCK_MODEL_ARN:
-        # Pass the extraction LLM as an INSTANCE, not a model string and not a JSON
-        # config. All three reach BedrockConverse, but only the instance carries a
-        # timeout: to_llm() (config.py) reads just model/temperature/max_tokens/
-        # region_name/profile_name out of the JSON form and drops everything else,
-        # leaving BedrockConverse's 60s default in place. That default is what ended
-        # a whole run under Sonnet 5 — see EXTRACTION_TIMEOUT_SECONDS. An instance is
-        # returned unchanged (``isinstance(llm, LLM)`` short-circuit), so every field
-        # here is the one that gets used.
+        # Pass the extraction LLM as an INSTANCE: to_llm() reads only
+        # model/temperature/max_tokens/region_name/profile_name from the JSON form
+        # and drops the timeout, leaving BedrockConverse's 60s default.
         #
         # max_tokens: the toolkit hardcodes 4096 for a bare model string, which
-        # truncates extraction mid-response on dense chunks and silently drops that
-        # chunk's trailing entities/statements. 16384 matches the graphrag-toolkit
-        # benchmark harness (benchmarks/ingest_v5.py).
+        # truncates extraction mid-response on dense chunks.
         #
-        # max_retries bounds llama_index's own retry layer, which sits on top of
-        # botocore's. BedrockConverse wraps each converse call in a tenacity retry on
-        # ThrottlingException, InternalServerException, ServiceUnavailableException and
-        # ModelTimeoutException, up to max_retries calls, and each call is a botocore
-        # request with its own standard-mode retries (botocore_config below, which
-        # counts max_attempts as retries, so EXTRACTION_MAX_ATTEMPTS + 1 attempts). The
-        # two layers multiply for throttling and 5xx. A read timeout is retried by
-        # botocore only, because the tenacity layer does not catch ReadTimeoutError, so a
-        # persistently slow chunk costs at most (EXTRACTION_MAX_ATTEMPTS + 1) *
-        # EXTRACTION_TIMEOUT_SECONDS. Both layers take the same bound so it reads in one
-        # place.
+        # max_retries bounds llama_index's retry layer, which sits on top of
+        # botocore's. The layers multiply for throttling and 5xx; a read timeout is
+        # retried by botocore only, so a slow chunk costs at most
+        # (EXTRACTION_MAX_ATTEMPTS + 1) * EXTRACTION_TIMEOUT_SECONDS.
         #
-        # MUST stay picklable: the build pipeline fans out over a ProcessPoolExecutor
-        # and pickles this, same constraint as embed_model above. Pickling drops the
-        # private _client, and upstream does NOT get it back — which is what
-        # _picklable_bedrock_converse_cls fixes, so the worker rebuilds the client
-        # from the botocore_config below. _patch_graphrag_llm_cache_client_config
-        # bounds the fallback path for the case where it still does not survive;
-        # both are set to the same values so the two paths cannot drift.
+        # Must stay picklable (ProcessPoolExecutor); see
+        # _picklable_bedrock_converse_cls. region_name is explicit because a worker
+        # has no session to inherit it from. temperature is discarded by llama_index
+        # for models in BEDROCK_NO_TEMP_MODELS, which Bedrock rejects it for.
         #
-        # region_name must be explicit for the same reason: there is no surviving
-        # session for a worker to inherit it from.
-        #
-        # temperature is accepted and then discarded — llama_index strips it for the
-        # models in BEDROCK_NO_TEMP_MODELS, which includes claude-sonnet-5, and
-        # Bedrock rejects the field outright for those models. Left in place because
-        # it is correct for a model that does take it; if extraction moves to one,
-        # this is already right.
-        # Size the pool to the per-process fan-out, the same rule coa_common.embeddings
-        # and preprocessing/handler.py already follow. botocore defaults to 10 and
-        # urllib3 uses block=False, so with 16 threads the 6 excess calls neither queue
-        # nor warn — they open a throwaway connection that is closed on release.
-        # Measured at 64 concurrent: 26.6s wall on pool=10 vs 22.5s on pool=64, zero
-        # errors either way. Real, but ~18% throughput, not the timeout.
-        #
-        # retries mode is explicit because supplying botocore_config means an omitted
-        # `retries` reverts to botocore's legacy default. standard, not adaptive: an
-        # adaptive rate limiter is per-client and there are 4 clients in 4 processes
-        # that cannot see each other's throttle signal, and 64 concurrent measured zero
-        # throttles, so there is nothing to adapt to.
+        # The pool is sized to the per-process fan-out: botocore defaults to 10 and
+        # excess calls open throwaway connections. Retries mode is explicit because
+        # supplying botocore_config reverts an omitted `retries` to the legacy
+        # default; standard, not adaptive, because each process has its own client.
         from botocore.config import Config
 
         extraction_pool_size = max(EXTRACTION_NUM_THREADS_PER_WORKER, 10)
@@ -1185,14 +985,6 @@ def _setup_graphrag(tenant_id: str):
     graph_store_uri = f"neptune-db://{neptune_host}:8182"
     vector_store_uri = f"aoss://{opensearch_host}:443"
 
-    # NOTE: chunking is intentionally NOT overridden here. With no SentenceSplitter
-    # in the IndexingConfig, the toolkit falls back to its default
-    # SentenceSplitter(chunk_size=256, chunk_overlap=25) (graphrag
-    # lexical_graph_index.py). The graphrag-toolkit benchmark harness pins this
-    # explicitly (--chunk-size, e.g. 1024 for dense corpora); we keep the default so
-    # the r8g / worker / 3.18.7 / max_tokens deltas are measured against the existing
-    # SEC-10-Q baseline without chunking as a confound. Revisit chunk_size as a
-    # separate, isolated experiment.
     logger.info(
         "GraphRAG config",
         tenant_id=tenant_id,
@@ -1215,50 +1007,16 @@ def _setup_graphrag(tenant_id: str):
 def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str, *, namespace_language: str):
     """Build the IndexingConfig handed to LexicalGraphIndex.
 
-    ALWAYS returns an IndexingConfig with a fully-specified ExtractionConfig —
-    never None, and never a bare ``ExtractionConfig()``. Without this, when
-    the default flags applied, ``_build_indexing_config``
-    returned None, the toolkit built its own ``ExtractionConfig()``, and
-    ``preferred_entity_classifications`` silently defaulted to
-    ``DEFAULT_ENTITY_CLASSIFICATIONS`` (``['Company', 'Location', 'Event',
-    'Sports Team', 'Person', 'Role', 'Product', 'Service', 'Creative Work',
-    'Software', 'Financial Instrument']``, ``graphrag/indexing/constants.py``).
-    That is a news/finance list — inheriting it steers the extraction LLM
-    away from any non-news domain (insurance, healthcare, manufacturing, …).
+    Always returns an IndexingConfig with a fully-specified ExtractionConfig,
+    never None, so the toolkit's news/finance default classifications are not
+    inherited.
 
-    Vocabulary source (checked in this order):
-    1. ``PREFERRED_ENTITY_CLASSIFICATIONS`` (JSON list) — an explicit list from
-       the user is authoritative; no inference runs.
-    2. ``INFER_ENTITY_CLASSIFICATIONS=true`` (default) — the toolkit runs a
-       short LLM sweep at ingest start (``InferClassifications`` in
-       ``graphrag/indexing/extract/infer_classifications.py``, default 5
-       samples × 1 iteration → 15 labels) and uses the labels it discovered
-       in this corpus. ``preferred_entity_classifications=[]`` +
-       ``replace_default_classifications=True`` together mean "start from
-       nothing, keep only what the corpus proves".
-    3. Both off — the extractor runs unguided (empty list). Do not enable
-       both off unless the toolkit-default vocabulary has been checked to be
-       inappropriate for this corpus.
-
-    Topic vocabulary: ``PREFERRED_TOPICS`` (JSON list) steers which thematic
-    groupings the extractor assigns chunks to. Unlike the classifications above
-    there is no inference option — graphrag-toolkit has no topic analogue of
-    ``InferClassificationsConfig`` — so an empty list already means "let the model
-    name topics freely", which is the behaviour of every ingest before this field
-    existed. Topics land as ``__Topic__`` nodes and are later induced as
-    ``skos:Concept``, so an unsteered vocabulary drifts across chunks.
-
-    Chunking: ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` are ``0`` by default, in
-    which case the toolkit's ``SentenceSplitter(chunk_size=256,
-    chunk_overlap=25)`` is used. Setting a positive integer switches the
-    IndexingConfig to that splitter — 1024 is the graphrag benchmark
-    harness value for dense/tabular corpora.
-
-    Future enhancement: when ``PREFERRED_ENTITY_CLASSIFICATIONS`` is
-    empty AND the namespace has an accepted ontology, resolve its class
-    labels here. Deferred because it requires a cross-service HTTP call to
-    ontology-engine (or a direct SPARQL client), neither of which
-    ``packages/sources`` has today.
+    Vocabulary: an explicit ``PREFERRED_ENTITY_CLASSIFICATIONS`` wins and no
+    inference runs; otherwise ``INFER_ENTITY_CLASSIFICATIONS`` (default) infers
+    labels from the corpus; with both off the extractor runs unguided.
+    ``PREFERRED_TOPICS`` steers topic grouping (empty lets the model name topics).
+    ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` of 0 use the toolkit's default splitter
+    (256/25); positive values switch to that splitter.
     """
     from graphrag_toolkit.lexical_graph import ExtractionConfig, IndexingConfig
     from graphrag_toolkit.lexical_graph.indexing.extract import InferClassificationsConfig
@@ -1272,15 +1030,10 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         preferred = list(PREFERRED_ENTITY_CLASSIFICATIONS)
         infer_config = False
     elif INFER_ENTITY_CLASSIFICATIONS:
-        # Corpus-inferred vocabulary. ``preferred_entity_classifications=[]``
-        # is NOT the same as "unset": the toolkit reads an empty list as the
-        # seed vocabulary (see ``lexical_graph_index.py`` ~line 377); with
-        # ``replace_default_classifications=True`` the inferer replaces that
-        # seed with what it derives from THIS corpus, so the final vocabulary
-        # is entirely corpus-driven. Leaving the argument unset would have
-        # fallen back to the news/finance list — the exact bug this fixes.
-        # A non-English namespace also passes the inference prompt with the
-        # language instruction; an English one passes no template, as before.
+        # Corpus-inferred vocabulary: an empty ``preferred_entity_classifications``
+        # is read as the seed vocabulary, and ``replace_default_classifications=True``
+        # replaces it with labels inferred from this corpus. A non-English namespace
+        # also passes the inference prompt with the language instruction.
         preferred = []
         infer_config = InferClassificationsConfig(
             replace_default_classifications=True,
@@ -1296,15 +1049,6 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
         preferred = []
         infer_config = False
 
-    # ``preferred_topics`` is a separate axis from the classifications above:
-    # it steers the THEMATIC grouping (``__Topic__`` nodes) rather than what an
-    # entity IS. An empty list is passed through unchanged — the toolkit reads it
-    # as "no preferred topics", the extractor names them from the chunk text, and
-    # behaviour matches every ingest before this field existed.
-    #
-    # A non-English namespace also overrides the proposition and topic prompt
-    # templates with the fixed language instruction; an English one passes no
-    # template arguments, exactly as before.
     extraction_config = ExtractionConfig(
         enable_proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
         preferred_entity_classifications=preferred,
@@ -1401,11 +1145,6 @@ def _warn_if_no_topics(graph_store_uri: str, tenant_id: str, doc_source_id: str,
         logger.debug("kg_build_zero_topics_check_failed", error=type(e).__name__)
 
 
-# ---------------------------------------------------------------------------
-# Mode: continuous — extract_and_build() in a single pass
-# ---------------------------------------------------------------------------
-
-
 def _run_continuous(
     documents: list,
     graph_store_uri: str,
@@ -1477,11 +1216,6 @@ def _stage_failure_message(code: str) -> str:
     return f"{code}: {_STAGE_FAILURE_TEXT.get(code, 'processing failed')}; see the service logs for details."
 
 
-# ---------------------------------------------------------------------------
-# Backend health checks
-# ---------------------------------------------------------------------------
-
-
 def _check_backend_health(
     graph_store_uri: str,
     vector_store_uri: str,
@@ -1538,11 +1272,6 @@ def _check_backend_health(
         return False
 
     return True
-
-
-# ---------------------------------------------------------------------------
-# Mode: separated — extract() → S3 → build()
-# ---------------------------------------------------------------------------
 
 
 def _run_separated(
@@ -1638,21 +1367,12 @@ def _run_separated(
     return total_docs, 0
 
 
-# ---------------------------------------------------------------------------
-# Content screening windows
-# ---------------------------------------------------------------------------
-
 # main() screens each document with one ApplyGuardrail call per window of its
-# text. A window is 10,000 chars, i.e. 10 guardrail text units (1 unit = 1,000
-# chars), unchanged from the original non-overlapping scheme.
+# text (10 guardrail text units per window).
 _SCREEN_WINDOW_SIZE = 10_000
 # Neighbouring windows share this many chars, so any span up to this length lies
-# wholly inside at least one window. Without the overlap an injected sentence
-# that straddled a window boundary was split in two and each half passed the
-# guardrail on its own. 1,000 chars holds a multi-sentence payload (a
-# reproduction used a sentence of about 100 chars). A document of N > 1,000 chars takes
-# ceil((N - 1,000) / 9,000) calls instead of ceil(N / 10,000): the same up to
-# 19,000 chars, one more at 20,000 or 100,000, and about 11% more when long.
+# wholly inside at least one window and cannot be split across two windows that
+# each pass the guardrail.
 _SCREEN_WINDOW_OVERLAP = 1_000
 _SCREEN_WINDOW_STEP = _SCREEN_WINDOW_SIZE - _SCREEN_WINDOW_OVERLAP
 
@@ -1669,11 +1389,6 @@ def _screening_windows(length: int) -> list[tuple[int, int]]:
     """
     starts = range(0, max(1, length - _SCREEN_WINDOW_OVERLAP), _SCREEN_WINDOW_STEP)
     return [(start, min(start + _SCREEN_WINDOW_SIZE, length)) for start in starts]
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -1769,11 +1484,6 @@ def main() -> None:
         bucket_name, namespace_id, doc_source_id, namespace_language=namespace_language
     )
 
-    # Build the progress monitor. The toolkit invokes its increment_* methods at
-    # document boundaries (single-threaded, main process), and each call atomic-
-    # ADDs the count to PK=METRICS#{ns}, SK=KGBUILD#{ds} for live UI progress.
-    # No-op monitor when metrics are disabled / toolkit unavailable, so callers
-    # pass it unconditionally. Best-effort; never fails the build.
     from coa_sources.documents.kg_build import kg_metrics
 
     # Clear any leftover metrics record from a prior build first — the per-stage
@@ -1806,7 +1516,7 @@ def main() -> None:
 
     # 2c. Content screening — evaluate document text against retrieval guardrail
     # (MEDIUM PROMPT_ATTACK sensitivity) to quarantine poisoned content before
-    # it enters the graph/vector store. Per SDO-188.
+    # it enters the graph/vector store.
     retrieval_guardrail_id = os.environ.get("RETRIEVAL_GUARDRAIL_ID", "")
     retrieval_guardrail_version = os.environ.get("RETRIEVAL_GUARDRAIL_VERSION", "DRAFT")
     docs_quarantined = 0
@@ -1822,8 +1532,6 @@ def main() -> None:
         # Screen each document individually. ApplyGuardrail evaluates the entire
         # content list as a single input (not per-block), so batching multiple
         # docs in one call doesn't give per-doc results.
-        # Screen in overlapping 10k-char windows to catch payloads placed past the
-        # API char limit, including ones that straddle a window boundary.
         for doc in documents:
             text = doc.text
             try:
@@ -1920,10 +1628,6 @@ def main() -> None:
 
     elapsed = round(time.time() - start_ts, 2)
 
-    # Stamp the metrics record header + total run time. The per-stage counts were
-    # written live by the ProgressMonitor via atomic ADD as extraction/build
-    # progressed; this just records identifying metadata + the run duration.
-    # Best-effort, never fatal.
     kg_metrics.write_record_metadata(
         table=ddb_table,
         region=AWS_REGION,

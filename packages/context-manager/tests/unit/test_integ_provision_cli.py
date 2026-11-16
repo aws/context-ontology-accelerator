@@ -3,15 +3,9 @@
 
 """Unit tests for the integ provisioning CLI (no AWS, no deployment).
 
-The CLI is what lets CI provision the cross-tier data once per pipeline instead of
-once per pytest process, which is what makes `pytest -n` safe for that suite. Two
-things can break silently and are pinned here:
-
-1. **A key provisioning sets but the CLI does not export.** The consumer job would
-   then re-provision that slice in-process — correct, but silently slow, and it
-   defeats the whole point of the hoist. Nothing at runtime notices.
-2. **A dotenv artifact GitLab cannot parse.** A value containing a newline corrupts
-   every variable after it in the file.
+The CLI provisions the cross-tier data once per CI pipeline. A key that provisioning
+sets but the CLI does not export makes the consumer job silently re-provision it, and a
+value containing a newline corrupts every variable after it in the dotenv artifact.
 """
 
 from __future__ import annotations

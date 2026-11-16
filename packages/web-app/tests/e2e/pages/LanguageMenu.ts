@@ -9,9 +9,8 @@ import { expect, type Page } from "@playwright/test";
  * The switcher only changes what the browser shows: the locale is kept in
  * localStorage and the Cloudscape message bundle is a same-origin static chunk,
  * so these steps mutate no backend state. Assertions target a Cloudscape
- * built-in string (the pagination "next page" control on the Namespaces list),
- * which is exactly the layer Phase 1 of #1024 localizes. Since Phase 2 the
- * app-authored copy is localized too, so steps that run while the UI is
+ * built-in string (the pagination "next page" control on the Namespaces list).
+ * App-authored copy is localized too, so steps that run while the UI is
  * Japanese must not match English app copy.
  */
 export class LanguageMenu {

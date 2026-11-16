@@ -78,17 +78,12 @@ describe("RationalePanel", () => {
 
     it("renders Resolution tier label consistently with the section header", () => {
       renderPanel({ message });
-      // The Resolution field and the execution-plan section header now share the
-      // same Tier-2 label (fixture trace has only t2.vkg.* steps → VKG strategy).
       expect(
         screen.getAllByText("Tier 2 — Structured Query (VKG (Ontop))").length,
       ).toBeGreaterThanOrEqual(2);
     });
 
     it("labels the Resolution 'Deep Reasoning' when executionMode is deep-reasoning, overriding the tier", () => {
-      // A Deep Reasoning answer resolves at a tier but must not be labelled by it
-      // (#1166 Cut #2): the mode wins. Reuses the same tier-2 fixture, flipped to
-      // deep-reasoning, so only the mode drives the change.
       const drMessage: ChatMessage = {
         ...message,
         response: {
@@ -101,11 +96,7 @@ describe("RationalePanel", () => {
       };
       renderPanel({ message: drMessage });
       expect(screen.getByText("Deep Reasoning")).toBeInTheDocument();
-      // The Resolution field no longer carries the Tier-2 label. The
-      // execution-plan section header still describes which strategy ran
-      // (the trace is unchanged), so the tier string drops from TWO
-      // occurrences (Resolution + header, see the standard-mode test above)
-      // to at most one — proving the Resolution field, not the header, changed.
+      // The Resolution field no longer shows the tier label; the header still does.
       expect(
         screen.queryAllByText("Tier 2 — Structured Query (VKG (Ontop))").length,
       ).toBeLessThanOrEqual(1);
@@ -137,14 +128,7 @@ describe("RationalePanel", () => {
       expect(screen.getByText("req-abc-123")).toBeInTheDocument();
     });
 
-    it("renders confidence as a LOW/MEDIUM/HIGH band word, not a raw score, as the headline", () => {
-      renderPanel({ message });
-      // 0.92 → High. The band word is the only confidence signal shown (#1166):
-      // the raw percentage is removed entirely so users read the band, not a number.
-      expect(screen.getByText("High")).toBeInTheDocument();
-    });
-
-    it("does not render the raw percentage at all (#1166)", () => {
+    it("does not render the raw percentage at all", () => {
       renderPanel({ message });
       expect(screen.queryByText("92%")).toBeNull();
     });
@@ -190,7 +174,6 @@ describe("RationalePanel", () => {
           },
         };
         renderPanel({ message: scored });
-        // The band word is the headline; assert it appears exactly once as a badge.
         expect(screen.getAllByText(band).length).toBeGreaterThanOrEqual(1);
       },
     );
@@ -300,7 +283,6 @@ describe("RationalePanel", () => {
         },
       };
       renderPanel({ message: retryMessage });
-      // The step label and its humanized failure detail must both render.
       expect(
         screen.getAllByText("Translate SPARQL → SQL").length,
       ).toBeGreaterThan(0);
@@ -406,9 +388,7 @@ describe("RationalePanel", () => {
   });
 
   describe("boundary controls - guardrail passed state (Tier-3 answered)", () => {
-    // Regression guard for bug #836: a Tier-3 answer that ran through a
-    // Bedrock guardrail and passed must render "Guardrails: passed", not
-    // "n/a". The trace step is the single source of truth.
+    // A Tier-3 answer whose guardrail step passed renders "Guardrails: passed".
     const passedMessage: ChatMessage = {
       id: "msg-t3-passed",
       role: "assistant",

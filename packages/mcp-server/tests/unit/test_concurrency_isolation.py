@@ -21,7 +21,7 @@ class TestConcurrencyIsolation:
         """Two concurrent CM invocations with different tokens must not cross-contaminate."""
         captured_calls: list = []
 
-        async def capture_invoke(payload, bearer_token):
+        async def capture_invoke(payload, bearer_token, **kwargs):
             captured_calls.append({"payload": payload, "bearer_token": bearer_token})
             await asyncio.sleep(0.01)
             return {"result": {"tier": 2, "confidence": {"score": 0.9, "rationale": "test"}, "resultRows": []}}

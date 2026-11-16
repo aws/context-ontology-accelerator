@@ -2,33 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * MCP page — everything an agent developer needs to connect an MCP client to
- * this deployment's Model Context Protocol server (#1166 Cut #1).
- *
- * Route: /mcp
- *
- * Built around the PKCE browser-login flow that packages/mcp-proxy already
- * implements: the proxy opens a browser on first run (no stored password),
- * caches a 30-day refresh token in ~/.scl/tokens.json, and auto-discovers the
- * runtime ARN / MCP client id / issuer from SSM under the deployment's prefix.
- * This gives each user their OWN Cognito identity — the server keys Cedar
- * grants and the audit log off the token's `sub`
- * (mcp-server/src/coa_mcp/auth/claims.py) — instead of the shared
- * integration-test secret the old get-token.sh path produced.
- *
- * Laid out actionable-first, in the order a reader actually does them:
- *   1. Before you start  — one line of prerequisites.
- *   2. Add the server    — per-client tabs, each a copy-paste config.
- *   3. Verify            — ask a question inside the agent, with the namespace
- *                          id this deployment needs, and the expected shape of
- *                          a good answer.
- * Reference sections (connection details, tool list, troubleshooting) are
- * collapsed below. All deployment-specific values come from
- * runtime-config.json + the namespace switcher, so nothing is rebuilt per env.
- *
- * When mcpRuntimeArn is absent (MCP stack not deployed, or an older
- * runtime-config.json), the page shows the same "not configured" guidance the
- * Playground uses for a missing serveRuntimeArn rather than a broken endpoint.
+ * MCP page (route /mcp): how to connect an MCP client to this deployment's MCP
+ * server through packages/mcp-proxy, which signs in with a browser PKCE login and
+ * discovers the runtime ARN, client id and issuer from SSM. When mcpRuntimeArn is
+ * absent the page shows the same "not configured" guidance as the Playground.
  */
 import React, { useContext, useState } from "react";
 import Box from "@cloudscape-design/components/box";
@@ -50,9 +27,8 @@ import {
 } from "./mcp-proxy-build";
 
 /**
- * Tools exposed by the MCP server. Mirrors the @mcp.tool() functions in
- * packages/mcp-server/src/coa_mcp/server.py — names and one-line summaries are
- * copied from their docstrings so the console and the server never drift.
+ * Tools exposed by the MCP server: a manual copy of the @mcp.tool() functions in
+ * packages/mcp-server/src/coa_mcp/server.py, to be updated with them.
  */
 const MCP_TOOLS: readonly { name: string; description: string }[] = [
   {
@@ -127,32 +103,19 @@ function CopyableCode({
 }
 
 /**
- * The proxy command every client runs. packages/mcp-proxy is an in-repo package
- * (coa-mcp-proxy, not published), so the reader runs the built entrypoint from
- * a checkout. RESOURCE_PREFIX and AWS_REGION are the only env vars worth
- * setting; the proxy auto-discovers everything else (client id, issuer, runtime
- * ARN) from SSM and authenticates via a browser PKCE login on first run. We do
- * NOT set AWS_PROFILE — the proxy uses the default credential chain, and a
- * literal "your-profile" placeholder breaks anyone on default credentials.
+ * The proxy command every client runs. The proxy is not published, so it runs
+ * from a checkout. AWS_PROFILE is deliberately unset: the proxy uses the default
+ * credential chain, and a placeholder profile breaks default credentials.
  */
 const PROXY_COMMAND = "node";
 const PROXY_ARGS = ["/absolute/path/to/mcp-proxy/dist/index.js"];
 
 /**
- * The raw-source download bundle, generated at build time by
- * `web-app/scripts/pack-mcp-proxy.mjs` (wired as the `prebuild` step) and
- * served as a static file of the console's CloudFront distribution. The
- * console's sign-in runs in the browser and does not gate static files, so the
- * zip and its `.sha256` download without signing in (unless the deployment
- * adds the optional Lambda@Edge authorizer). That is fine: the bundle is
- * source code only, with no secrets and no deployment-specific values. It
- * contains the proxy's TypeScript SOURCE (not a compiled blob) so a user
- * without repo access can read exactly what runs with their AWS credentials
- * before trusting it, then build it with PROXY_BUILD_COMMAND. The `.sha256`
- * sidecar lets the user check the download is complete and intact. It is
- * served from the same origin as the zip, so it is not proof of who published
- * it, and it covers the pinned direct dependency versions, not the packages
- * `npm install` resolves for them (PROXY_CHECKSUM_SCOPE says so on the page).
+ * The proxy source bundle, built by `web-app/scripts/pack-mcp-proxy.mjs` at
+ * prebuild and served as a static file. Static files are not gated by the
+ * console sign-in, which is fine: the bundle is source only, with no secrets.
+ * The `.sha256` sidecar comes from the same origin, so it proves integrity, not
+ * who published it.
  */
 const PROXY_SRC_ZIP = "/downloads/coa-mcp-proxy-src.zip";
 const PROXY_SRC_SHA = "/downloads/coa-mcp-proxy-src.zip.sha256";
@@ -200,11 +163,11 @@ function BundleChecksum() {
 }
 
 /** Build the mcp.json-style block Kiro / Claude Desktop / Cursor all share. */
-function buildJsonConfig(region: string, serverKey: string): string {
+function buildJsonConfig(region: string): string {
   return JSON.stringify(
     {
       mcpServers: {
-        [serverKey]: {
+        coa: {
           command: PROXY_COMMAND,
           args: PROXY_ARGS,
           env: {
@@ -232,9 +195,6 @@ export const McpPage: React.FC = () => {
   const { namespaceId, current } = useCurrentNamespace();
   const endpoint = buildMcpEndpoint(runtimeContext);
 
-  // Mirror the Playground's guidance for a missing serveRuntimeArn: the MCP
-  // stack publishes mcpRuntimeArn into runtime-config.json, so an absent value
-  // means MCP is not deployed (or the config predates it) rather than an error.
   if (!endpoint) {
     return (
       <ContentLayout header={<Header variant="h1">MCP Server</Header>}>
@@ -249,9 +209,7 @@ export const McpPage: React.FC = () => {
   }
 
   const region = runtimeContext!.region;
-  const kiroConfig = buildJsonConfig(region, "coa");
-  const claudeDesktopConfig = buildJsonConfig(region, "coa");
-  const cursorConfig = buildJsonConfig(region, "coa");
+  const jsonConfig = buildJsonConfig(region);
   const claudeCodeCmd = buildClaudeCodeCommand(region);
 
   // The id the agent needs to scope every tool call. The header shows the name;
@@ -277,7 +235,6 @@ export const McpPage: React.FC = () => {
       }
     >
       <SpaceBetween size="l">
-        {/* One-line auth summary — the whole "how this authenticates" story. */}
         <Box variant="p">
           Each request is signed in with your own browser login (Cognito PKCE).
           The bundled proxy opens a browser the first time, then keeps you
@@ -285,7 +242,6 @@ export const McpPage: React.FC = () => {
           audit log reflect you, not a shared account.
         </Box>
 
-        {/* ---- STEP 1: before you start ---- */}
         <ExpandableSection
           variant="container"
           headerText="1. Before you start"
@@ -341,7 +297,6 @@ export const McpPage: React.FC = () => {
           </ul>
         </ExpandableSection>
 
-        {/* ---- STEP 2: add the server (the hero) ---- */}
         <ExpandableSection
           variant="container"
           defaultExpanded
@@ -359,7 +314,7 @@ export const McpPage: React.FC = () => {
                       Add to <Box variant="code">.kiro/settings/mcp.json</Box>.
                     </Box>
                     <CopyableCode
-                      code={kiroConfig}
+                      code={jsonConfig}
                       ariaLabel="Copy Kiro MCP configuration"
                     />
                   </SpaceBetween>
@@ -391,7 +346,7 @@ export const McpPage: React.FC = () => {
                       (Settings → Developer → Edit Config).
                     </Box>
                     <CopyableCode
-                      code={claudeDesktopConfig}
+                      code={jsonConfig}
                       ariaLabel="Copy Claude Desktop MCP configuration"
                     />
                   </SpaceBetween>
@@ -407,7 +362,7 @@ export const McpPage: React.FC = () => {
                       project-level <Box variant="code">.cursor/mcp.json</Box>).
                     </Box>
                     <CopyableCode
-                      code={cursorConfig}
+                      code={jsonConfig}
                       ariaLabel="Copy Cursor MCP configuration"
                     />
                   </SpaceBetween>
@@ -417,7 +372,6 @@ export const McpPage: React.FC = () => {
           />
         </ExpandableSection>
 
-        {/* ---- STEP 3: verify inside the agent ---- */}
         <ExpandableSection
           variant="container"
           defaultExpanded
@@ -453,8 +407,6 @@ export const McpPage: React.FC = () => {
             </Box>
           </SpaceBetween>
         </ExpandableSection>
-
-        {/* ---- INFORMATIONAL (reference only) ---- */}
 
         <ExpandableSection
           variant="container"

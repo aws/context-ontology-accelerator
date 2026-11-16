@@ -4,8 +4,8 @@
 """Neptune ``MemoryLimitExceededException`` handling and the kind-scoped search scan.
 
 Under concurrent integ load the shared Neptune cluster answered
-``/graph/search`` with HTTP 500 ``MemoryLimitExceededException`` (pipelines
-2861430, 2861563, 2871155, 2871465). These tests pin the three parts of the fix:
+``/graph/search`` with HTTP 500 ``MemoryLimitExceededException``.
+These tests pin the three parts of the fix:
 
 * the transport retries an OOM (and only an OOM), then raises
   :class:`NeptuneMemoryLimitError` on exhaustion;

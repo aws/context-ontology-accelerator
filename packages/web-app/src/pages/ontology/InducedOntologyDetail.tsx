@@ -43,7 +43,6 @@ import { useAppI18n } from "../../i18n/LocaleProvider";
 /** Strip an IRI down to its local name (after the last ``#`` or ``/``). */
 export function localName(uri: string | undefined | null): string {
   if (!uri) return "—";
-  // Strip trailing # or / before extracting
   const trimmed = uri.replace(/[#/]+$/, "");
   const hash = trimmed.lastIndexOf("#");
   const slash = trimmed.lastIndexOf("/");
@@ -125,9 +124,9 @@ export function InducedOntologyDetailPage() {
   const classes = useMemo(() => overview?.classes ?? [], [overview?.classes]);
   const relationships = overview?.objectProperties ?? [];
   const attributes = overview?.datatypeProperties ?? [];
-  // The overview response is a bounded page (#143); the counts come from the
-  // un-paged totals so the UI shows the real scale even when the tables render
-  // only the first page. Fall back to the loaded length when totals are absent.
+  // The overview response is a bounded page; the counts come from the un-paged
+  // totals so the UI shows the real scale. Fall back to the loaded length when
+  // totals are absent.
   const totalClasses = overview?.totalClasses ?? classes.length;
   const totalRelationships =
     overview?.totalObjectProperties ?? relationships.length;

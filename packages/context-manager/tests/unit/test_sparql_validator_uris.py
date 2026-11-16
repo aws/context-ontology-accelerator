@@ -49,13 +49,11 @@ class TestURIExtraction:
         uris = validator._extract_uris(sparql)
         assert "http://example.org/insurance#Claim" in uris
         assert "http://example.org/insurance#claimId" in uris
-        # W3C URIs should be excluded
         assert all("www.w3.org" not in u for u in uris)
 
     def test_excludes_bare_namespace_uris(self, validator):
         sparql = "PREFIX : <http://example.org/insurance#> SELECT ?x WHERE { ?x a :Claim }"
         uris = validator._extract_uris(sparql)
-        # The bare namespace URI (ending with #) should be excluded
         assert "http://example.org/insurance#" not in uris
 
     def test_excludes_slash_ending_namespaces(self, validator):

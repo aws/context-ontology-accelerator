@@ -26,7 +26,6 @@ const MemoizedMarkdownBlock = memo(
       </TextContent>
     );
   },
-  (prevProps, nextProps) => prevProps.content === nextProps.content,
 );
 
 MemoizedMarkdownBlock.displayName = "MemoizedMarkdownBlock";

@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Induction and the structured proposal update resolve a datasource the same way.
 
-Regression for the deployed ``test_mark_novel_round_trips_through_public_update_api``:
-a proposal induced from the ``ds-pc-insurance-mock`` datasource (read from the bundled
-fixture) could not be edited, because the update's rebuild asked SMUS for the mock ID,
-got no tables, and answered ``409 Could not fetch catalog tables``.
+Mock datasource ids are read from the bundled fixture on both paths.
 """
 
 from __future__ import annotations

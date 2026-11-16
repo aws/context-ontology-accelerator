@@ -9,15 +9,9 @@ import { useAppI18n } from "../../../i18n/LocaleProvider";
 import type { AppMessage } from "../../../i18n/appMessages";
 
 /**
- * Induction job stages — mirrors the Smithy ``InductionJobStatus`` enum
- * order:
- *   PENDING → FETCHING_METADATA → GENERATING_EMBEDDINGS → MATCHING →
- *   BUILDING_ONTOLOGY → STORING → COMPLETED
- *
- * Renders a horizontal step strip with the current stage highlighted.
- * On ``failed`` status the stage at which we stopped is rendered with
- * an error icon. Uses Cloudscape's ``StatusIndicator`` for the per-step
- * icon to match the rest of the app's visual language.
+ * Induction job stages, in ``InductionJobStatus`` enum order. Renders a
+ * horizontal step strip with the current stage highlighted; on ``failed`` the
+ * stage where we stopped shows an error icon.
  */
 
 interface Stage {
@@ -71,9 +65,6 @@ interface Props {
 
 export function InductionStages({ status, error }: Props) {
   const { t } = useAppI18n();
-  // Map the status string to its index in STAGES. ``pending`` comes
-  // before any stage runs (index -1). ``completed`` is after the last
-  // stage (length).
   const lower = status.toLowerCase();
   let activeIdx = STAGES.findIndex((s) => s.id === lower);
   if (lower === "pending") activeIdx = -1;

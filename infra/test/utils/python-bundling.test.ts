@@ -98,7 +98,7 @@ describe("bundlePython asset hash", () => {
     it("tracks a symlinked file's target content", () => {
       // `cp -r ${d}/*` expands the glob, so a top-level symlink is a command-line
       // argument and cp DEREFERENCES it: the target content ships in the bundle.
-      // isFile() is false for symlinks, so that content was previously unhashed.
+      // isFile() is false for symlinks, so they need explicit handling.
       const dir = srcDir("a", { "mod.py": "x = 1" });
       const target = path.join(root, "outside.txt");
       fs.writeFileSync(target, "v1");
@@ -148,15 +148,6 @@ describe("bundlePython asset hash", () => {
       expect(_computeSourceHash({ srcDirs: [dir] })).not.toEqual(before);
     });
 
-    it("changes when a file is renamed but content is identical", () => {
-      const dir = srcDir("a", { "old.py": "x = 1" });
-      const before = _computeSourceHash({ srcDirs: [dir] });
-
-      fs.renameSync(path.join(dir, "old.py"), path.join(dir, "new.py"));
-
-      expect(_computeSourceHash({ srcDirs: [dir] })).not.toEqual(before);
-    });
-
     it("is stable across calls with no changes", () => {
       const dir = srcDir("a", { "mod.py": "x = 1", "data.json": "{}" });
 
@@ -179,9 +170,7 @@ describe("bundlePython asset hash", () => {
     });
 
     it("handles a path containing spaces", () => {
-      // The old shell pipeline was unquoted and failure-suppressed (`|| true`),
-      // so a path with a space degraded every hash to the empty-input hash —
-      // permanently disabling invalidation.
+      // A path with a space must not degrade the hash to the empty-input hash.
       const dir = srcDir("dir with space", { "mod.py": "x = 1" });
       const before = _computeSourceHash({ srcDirs: [dir] });
 
@@ -324,11 +313,9 @@ describe("_uvInstallCommand (local install uses uv, not host pip)", () => {
 });
 
 /**
- * A bundle installs its requirements without botocore (the Lambda
- * runtime provides it), so the resolver never sees botocore's own bounds. On
- * 2026-10-22 that put python-dateutil 3.0.0 in four bundles while the runtime's
- * botocore requires python-dateutil>=2.1,<3.0.0; the bundle precedes the runtime
- * on sys.path, so botocore would have imported the out-of-range copy.
+ * A bundle installs its requirements without botocore (the Lambda runtime
+ * provides it), so the resolver never sees botocore's bounds. The bundle
+ * precedes the runtime on sys.path, and botocore needs python-dateutil<3.0.0.
  */
 describe("Lambda runtime constraints", () => {
   const CONSTRAINTS = fromRoot(

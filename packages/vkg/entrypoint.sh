@@ -73,15 +73,22 @@ fi
 echo "[VKG] Ontology: ${ONTOLOGY_FILE}"
 echo "[VKG] Mappings: ${MAPPINGS_FILE}"
 
-# Detect schema file by extension (optional - for Ontop metadata extraction)
+# Load the Ontop validation schema (optional - for Ontop metadata extraction).
+#
+# Fixed filename: the ontology engine writes exactly one artifact under this key.
+# Globbing for "*.sql" would also pick up any other .sql object someone can land
+# in the namespace prefix, and "head -1" would pick it non-deterministically.
 H2_DB_PATH="/app/ontology/vkgdb"
 H2_URL="jdbc:h2:${H2_DB_PATH};DB_CLOSE_DELAY=-1"
-SCHEMA_FILE=$(find "${ARTIFACT_DIR}" -maxdepth 1 -name "*.sql" | head -1)
-if [ -n "${SCHEMA_FILE}" ]; then
+H2_CLASSPATH="/opt/ontop/lib/*:/opt/ontop/jdbc/*"
+SCHEMA_FILE="${ARTIFACT_DIR}/schema.sql"
+
+if [ -f "${SCHEMA_FILE}" ]; then
   echo "[VKG] Loading schema: ${SCHEMA_FILE}"
-  if ! java -cp "/opt/ontop/lib/*:/opt/ontop/jdbc/*" org.h2.tools.RunScript \
-    -url "${H2_URL}" -user sa -password "" -script "${SCHEMA_FILE}" 2>/tmp/schema_error.log; then
-    echo "[VKG] WARN: Cannot parse schema file ${SCHEMA_FILE} — starting in degraded mode"
+  # load-schema.sh runs the untrusted half of the script as a non-admin H2 user;
+  # see the header there for why that split is a security boundary.
+  if ! /app/load-schema.sh "${SCHEMA_FILE}" "${H2_DB_PATH}" "${H2_CLASSPATH}" 2>/tmp/schema_error.log; then
+    echo "[VKG] WARN: Cannot load schema file ${SCHEMA_FILE} — starting in degraded mode"
     echo "[VKG] Schema error details:"
     cat /tmp/schema_error.log 2>/dev/null
     echo "[VKG] Fix the file in s3://${ONTOLOGY_BUCKET}/${ONTOLOGY_PREFIX}${NAMESPACE}/${VERSION}/ and restart the task"
@@ -89,7 +96,12 @@ if [ -n "${SCHEMA_FILE}" ]; then
   fi
 fi
 
-# Generate Ontop properties
+# Generate Ontop properties.
+# This connection stays admin, which is safe only because no mapping can carry
+# its own SQL: an rr:sqlQuery view is refused on edit, on accept and when the
+# mapping is published, so Ontop runs only SQL it generates from rr:tableName
+# mappings, never a script from the artifact bucket. Admitting views would turn
+# this into admin SQL. It also needs DB_CLOSE_DELAY, which a non-admin user cannot set.
 cat > "${ARTIFACT_DIR}/ontop.properties" <<EOF
 jdbc.url=${H2_URL}
 jdbc.driver=org.h2.Driver

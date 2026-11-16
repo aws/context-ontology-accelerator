@@ -73,16 +73,8 @@ _GLUE_SUB_TYPE = DatabaseSubType.GLUE_DATABASE.value
 # Sub-types whose recorded database is a real database inside their own catalog, so the
 # configured value is the right thing to send as Athena's `Database`. The one exclusion is
 # federated JDBC, whose `databaseName` is its database while its federated catalog is keyed
-# by SCHEMA — `postgres` would be sent where `public` belongs.
-#
-# Written as a positive membership rather than as an exclusion of JDBC, and the membership
-# is the full set of values that can reach here, NOT just the connector-backed ones:
-# narrowing it would change behaviour for a legacy Glue row whose scan found zero tables,
-# which resolved its configured Glue database and would start resolving `public`. A row
-# with no `sourceSubType` is also a legacy row and keeps the same treatment.
-#
-# So the only value this refuses that the old JDBC exclusion admitted is a sub-type that
-# does not exist yet, which is the hardening.
+# by SCHEMA — `postgres` would be sent where `public` belongs. A row with no
+# `sourceSubType` is a legacy row and keeps the same treatment.
 _OWN_DATABASE_SUB_TYPES = CONNECTOR_BACKED_SUB_TYPES | {_GLUE_SUB_TYPE}
 
 # Log label per sub-type for the ``catalog_resolution`` event. A sub-type absent here
@@ -232,15 +224,10 @@ class AthenaQueryExecutor:
         validate_namespace(namespace)
         _firewall.validate(sql)
 
-        # inject a dialect-aware LIMIT into the SQL itself (not just the
+        # Inject a dialect-aware LIMIT into the SQL itself (not just the
         # result-fetch cap) so large scans don't execute fully on the Athena side.
-        # Mirrors the JDBC path's sqlglot LIMIT injection (source_db._inject_limit).
-        #
-        # Parsed once and shared with the qualification check below: both need the
-        # AST, and injecting a LIMIT cannot change the qualification answer (a
-        # LIMIT clause adds no table references), so the pre-injection AST is the
-        # right input for both. Re-parsing the same statement costs ~1.7 ms per KB,
-        # synchronously, on every Tier-2 query.
+        # Parsed once and shared with the qualification check below (a LIMIT adds
+        # no table references).
         parsed = self._try_parse(sql)
         sql = self._inject_limit(sql, max_rows, parsed)
 
@@ -251,12 +238,9 @@ class AthenaQueryExecutor:
 
         # SQL whose every table reference already carries a catalog is
         # self-describing: Athena resolves each name against its own qualifier and
-        # ignores the QueryExecutionContext entirely (verified — a qualified query
-        # succeeds with a context Database that does not exist, and with no
-        # context at all). Resolving a single catalog for it would be meaningless,
-        # and _rewrite_table_names_for_federation — which strips ONE source's
-        # schema prefix — would corrupt the names it did not expect. So skip both.
-        # Unparseable SQL is treated as unqualified, as before.
+        # ignores the QueryExecutionContext entirely, and
+        # _rewrite_table_names_for_federation would corrupt names it did not
+        # expect. So skip both. Unparseable SQL is treated as unqualified.
         if parsed is not None and is_fully_catalog_qualified_ast(parsed):
             logger.info("athena_qualified_sql_neutral_context", namespace=namespace)
             resolved_catalog, resolved_db = "", self._default_database
@@ -404,10 +388,7 @@ class AthenaQueryExecutor:
         """Fetch up to ``max_rows`` result rows, following NextToken across pages.
 
         Athena caps GetQueryResults at 1000 rows per call and returns a
-        ``NextToken`` for the remainder. The previous implementation issued a
-        single call and discarded the token, so every result set was silently
-        truncated to 999 rows (1000 minus the header) no matter how large
-        ``max_rows`` was — ``has_more`` was computed and then ignored by callers.
+        ``NextToken`` for the remainder.
 
         Note the Athena quirk this loop depends on: the header row is present
         ONLY on the first page. Stripping ``rows[1:]`` unconditionally would eat
@@ -428,8 +409,6 @@ class AthenaQueryExecutor:
             if next_token:
                 kwargs["NextToken"] = next_token
 
-            # Bind kwargs as a default arg: a bare closure would late-bind and
-            # every iteration would re-request the same page.
             response = await loop.run_in_executor(
                 _EXECUTOR,
                 lambda kw=kwargs: self._athena.get_query_results(**kw),
@@ -473,9 +452,7 @@ class AthenaQueryExecutor:
     def _inject_limit(sql: str, max_rows: int, parsed: sqlglot.exp.Expression | None = None) -> str:
         """Inject/cap the OUTER-query LIMIT for the Trino/Athena dialect.
 
-        the JDBC path injects LIMIT via sqlglot; the Athena path
-        previously relied only on the result-fetch cap, so a query without a
-        LIMIT still scanned the full table server-side. This caps the scan.
+        Caps the server-side scan, as the JDBC path does via sqlglot.
 
         Operates ONLY on the top-level SELECT's own LIMIT (``parsed.args["limit"]``)
         — NEVER a descendant/subquery LIMIT. Mutating an inner LIMIT would change
@@ -537,11 +514,10 @@ class AthenaQueryExecutor:
         message is the only person who can act on it — and without the principal
         ARN they cannot.
 
-        This matters more than a usual error-message tidy-up because these two
-        failures are invisible until first query. Registration probes the
-        connector with ``SHOW DATABASES`` as the *discovery* role, so a source
+        These two failures are invisible until first query: registration probes
+        the connector with ``SHOW DATABASES`` as the *discovery* role, so a source
         granted discovery but not serve passes registration, approval and
-        induction cleanly, then fails here.
+        induction, then fails here.
 
         Returns a new error rather than raising so the caller keeps the original
         as ``__cause__``; the untouched Athena text stays in the traceback.
@@ -597,8 +573,7 @@ class AthenaQueryExecutor:
         outside the query because the alias is local to it.
 
         Not specific to custom connectors: any Athena-backed VKG query that sorts
-        on a computed value can hit this. A no-op when nothing collides, so
-        queries that work today pass through unchanged.
+        on a computed value can hit this. A no-op when nothing collides.
         """
         try:
             parsed = sqlglot.parse_one(sql, dialect="trino")
@@ -660,12 +635,8 @@ class AthenaQueryExecutor:
         the actual PG table name (income). When VKG provides physical names
         via datasourceRouting, this becomes a no-op.
 
-        Only called for federated JDBC sources. Connector-backed sources — every
-        sub-type in ``CONNECTOR_BACKED_SUB_TYPES`` — are excluded (see
-        ``_CatalogContext.rewrite_crawled_names``) because for them this is not a
-        no-op but a corruption: a real table named ``sales_orders`` in database
-        ``sales`` would be rewritten to ``orders``, a name its connector has never
-        heard of.
+        Only called for federated JDBC sources; connector-backed sources are
+        excluded (see ``_CatalogContext.rewrite_crawled_names``).
         """
         if not schema:
             return sql
@@ -719,17 +690,9 @@ class AthenaQueryExecutor:
             return _CatalogContext(catalog="", database=self._default_database)
 
         if not data_source_id or data_source_id == "default":
-            # No explicit routing id. Pinning "any DATABASE source" is sound ONLY
-            # when the namespace has exactly one — with two or more, the first-seen
-            # source silently answers for same-named tables that belong to a
-            # DIFFERENT source, running the query against the wrong physical
-            # database. So resolve the SOLE database source when there
-            # is one, and otherwise refuse rather than guess.
-            #
-            # Fully-qualified SQL never reaches this branch — execute() routes it
-            # to the neutral-context path above — so a legitimately cross-source
-            # statement is unaffected; only a BARE statement with no routing id and
-            # an ambiguous (>=2) namespace is refused here.
+            # No explicit routing id: pin the SOLE database source, and with two or
+            # more refuse rather than let the first-seen one answer for same-named
+            # tables of another source. Fully-qualified SQL never reaches here.
             db_count = await self._sources.database_source_count(namespace)
             if db_count >= 2:
                 logger.warning(
@@ -756,16 +719,6 @@ class AthenaQueryExecutor:
             return _CatalogContext(catalog="", database=self._default_database)
 
         # Which nested catalog under AwsDataCatalog this source lives in, if any.
-        # Three kinds reach here and all three are addressed the same way, via
-        # QueryExecutionContext.Catalog:
-        #
-        #   * a JDBC source's managed federated catalog, and a custom connector's
-        #     LAMBDA catalog — both system-provisioned, both recorded in
-        #     `athenaDataCatalogName`;
-        #   * a native Glue source whose database sits in a non-root catalog (a
-        #     customer's own federated catalog, or a cross-account one), which the
-        #     caller declares at create and which is recorded in `athenaCatalog`.
-        #
         # The Glue case is read from `athenaCatalog` rather than
         # `athenaDataCatalogName` deliberately: `athenaDataCatalogName` is the
         # system-managed attribute that DELETE keys its Lake-Formation-admin
@@ -788,16 +741,9 @@ class AthenaQueryExecutor:
         if federated_catalog:
             sub_type = source.get("sourceSubType") or ""
             is_connector_backed = sub_type in CONNECTOR_BACKED_SUB_TYPES
-            # Whether this source resolves its own database, as opposed to being
-            # keyed by a Glue-crawled schema. Keyed POSITIVELY on the kinds that do
-            # (see `_OWN_DATABASE_SUB_TYPES`) rather than on "is not federated JDBC",
-            # so the `public` fallback below is reached by NAMING the federated-JDBC
-            # path — it is that path's engines' default schema, not a general default.
-            #
-            # `not sub_type` keeps a legacy row that predates the attribute on its
-            # historical resolution: it is a Glue or JDBC source, and for a JDBC one
-            # the outcome is unchanged either way, since a row with no sub-type took
-            # this arm before this set existed.
+            # Whether this source resolves its own database rather than being keyed
+            # by a Glue-crawled schema (see `_OWN_DATABASE_SUB_TYPES`); `not sub_type`
+            # keeps a legacy row on its historical resolution.
             resolves_own_database = sub_type in _OWN_DATABASE_SUB_TYPES or caller_declared or not sub_type
             discovered = source.get("discoveredSchemas") or []
             if discovered:
@@ -832,23 +778,10 @@ class AthenaQueryExecutor:
             return _CatalogContext(
                 catalog=federated_catalog,
                 database=schema,
-                # The crawled-name rewrite exists for R2RML names produced by a
-                # Glue crawler on the federated-JDBC path. It substring-strips a
-                # `{schema}_` prefix from every table name, which for a
-                # connector-backed source is not a no-op but a corruption: a genuine
-                # table named `sales_orders` in database `sales` would be rewritten
-                # to `orders`, a table its connector has never heard of. The gate is SET
-                # MEMBERSHIP because an exact comparison against one sub-type silently
-                # corrupts every other connector-backed one.
-                #
-                # A caller-declared nested catalog is excluded for exactly that
-                # reason. It is a NATIVE Glue source: its R2RML is generated from
-                # Glue table metadata, so the names already ARE the catalog's own
-                # names and there is no crawler-added prefix to strip. Applying the
-                # strip would corrupt any table whose name begins with its database
-                # name. Excluding it also keeps this flag's value unchanged for
-                # every row that reaches here via `athenaDataCatalogName`, which is
-                # every row that predates the caller-declared path.
+                # The crawled-name strip corrupts connector-backed names (see
+                # `_CatalogContext.rewrite_crawled_names`). A caller-declared nested
+                # catalog is a native Glue source whose R2RML names are already the
+                # catalog's own, so it is excluded too.
                 rewrite_crawled_names=not is_connector_backed and not caller_declared,
             )
 

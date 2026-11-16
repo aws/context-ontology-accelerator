@@ -19,12 +19,9 @@ echo ""
 
 # ── 1. Required toolchain versions (Node, uv, Java 17-24, pnpm) ──────────
 # Node and uv minimums come from package.json "engines" and pyproject.toml
-# "required-version" (see check-tool-version.sh). We only check presence and
-# version here; installing the tools is a one-time local setup step (see
-# scripts/setup-dev.sh) and is intentionally not automated in this script,
-# since CI provisions its own toolchain and never calls deploy.sh. uv is checked
-# because an old uv does not stop `cdk synth`: the Python Lambda bundling falls
-# back to Docker after printing uv's version error.
+# "required-version" (see check-tool-version.sh). uv is checked because an old uv
+# does not stop `cdk synth`: the Python Lambda bundling falls back to Docker
+# after printing uv's version error.
 for _tool in node uv; do
   if TOOL_CHECK="$("$REPO_ROOT/scripts/check-tool-version.sh" "$_tool")"; then
     ok "$TOOL_CHECK"
@@ -128,12 +125,9 @@ fi
 # The build pulls base images from ECR Public (hosted only in us-east-1,
 # regardless of deploy region). We do NOT force `docker login`: a user who
 # configures a credential helper for ECR Public (credHelpers "public.ecr.aws"
-# -> ecr-login, or a credsStore) authenticates automatically on pull and CANNOT
-# `docker login` at all — the helper has no writable credential store, so login
-# exits non-zero. Forcing it turned a valid (AWS-recommended) setup into a hard
-# preflight failure (issue #89). Instead: skip the explicit login when a helper
-# is configured, and treat an inability to log in as a WARNING — ECR Public also
-# serves anonymous (rate-limited) pulls, so a failed login must not block deploy.
+# -> ecr-login, or a credsStore) authenticates on pull and cannot `docker login`
+# (no writable credential store). So skip the login when a helper is configured,
+# and treat a failed login as a WARNING: ECR Public also serves anonymous pulls.
 
 # Path to the active engine's config.json (Docker honors $DOCKER_CONFIG).
 _engine_config_file() {
@@ -264,9 +258,7 @@ fi
 # ── 8. CDK bootstrap in every region the deploy touches ───────────────────
 # The *-edge-waf stack ALWAYS deploys to us-east-1 (CloudFront-scope WAF WebACLs
 # and CloudFront ACM certs exist only there), so a non-us-east-1 deploy needs
-# BOTH regions bootstrapped. Without this the deploy runs for a long while and
-# then fails on that one stack with a bootstrap error — the docs showed a single
-# `cdk bootstrap <REGION>` and never mentioned the second one.
+# BOTH regions bootstrapped.
 if command -v aws >/dev/null 2>&1 && aws sts get-caller-identity >/dev/null 2>&1; then
   _bootstrap_regions="$REGION"
   [ "$REGION" != "us-east-1" ] && _bootstrap_regions="$REGION us-east-1"
@@ -289,8 +281,8 @@ fi
 # ── 9. Effective Bedrock model IDs are invocable from the deploy region ───
 # Two checks, with different strengths, on the model IDs the stacks will
 # actually deploy — the value in /{prefix}/config when set, else the built-in
-# default (#1020: with no config every default is a `us.` profile, so a
-# non-US deploy reaches CREATE_COMPLETE and fails at the first Bedrock call).
+# default (with no config every default is a `us.` profile, so a non-US deploy
+# reaches CREATE_COMPLETE and fails at the first Bedrock call).
 #
 #   ERROR  a geographic inference profile the deploy region's geography does
 #          not publish (`us.` in ap-northeast-1). Deterministic; bin/app.ts

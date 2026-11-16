@@ -81,9 +81,6 @@ describe("label maps cover the boundary-control step IDs", () => {
 });
 
 describe("agentic mode trace rendering", () => {
-  // The agentic loop emits BARE step IDs (no t1./t2./t3. prefix). Without explicit
-  // entries the entire agentic trace renders unlabeled, so this asserts the set
-  // stays in sync with the Python trace.record() call sites.
   const AGENTIC_STEP_IDS = [
     "agentic_session_start",
     "decompose",

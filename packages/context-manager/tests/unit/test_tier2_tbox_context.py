@@ -116,14 +116,7 @@ class TestTBoxContextBuilder:
         context = await builder.build([], "demo", query="How many policies exist?")
 
         assert len(context.classes) >= 1
-        # named-graph resolution + count query + entity fallback, which is now TWO
-        # queries (matched classes, then their datatype properties) so property-row
-        # volume can no longer evict a matched class. OP skipped: 1 class; aiContext
-        # skipped: no URIs. The leading resolution query is what
-        # binds every later query to this namespace's graphs instead of filtering a
-        # cluster-wide scan; it is cached per namespace, so it is once per build at
-        # most, not once per query. The last query fetches the selected classes'
-        # steward annotations (descriptions, synonyms, glossary terms, tags).
+        # graph resolution, count, matched classes, their datatype properties, steward annotations.
         assert client.query.call_count == 5
 
     async def test_build_empty_result_from_neptune(self):
@@ -171,17 +164,7 @@ class TestTBoxContextBuilder:
         assert context.token_estimate <= 500
 
     async def test_truncation_leaves_room_for_steward_annotations(self):
-        """Truncation stops short of max_tokens so table annotations still fit (#1167 review)."""
-        client = _make_graph_client([])
-        builder = TBoxContextBuilder(client, graph_uri_template="https://test.local/{namespace}")
-        seen: list[int] = []
-        real = builder._truncate
-
-        def _spy(context, max_tokens):
-            seen.append(max_tokens)
-            return real(context, max_tokens)
-
-        builder._truncate = _spy
+        """Truncation stops short of max_tokens so table annotations still fit."""
         graph_results = [
             {
                 "class": f"http://example.org/ontology#Class{i}",
@@ -194,7 +177,15 @@ class TestTBoxContextBuilder:
             for i in range(100)
         ]
         client = _make_graph_client(graph_results)
-        builder._graph = client
+        builder = TBoxContextBuilder(client, graph_uri_template="https://test.local/{namespace}")
+        seen: list[int] = []
+        real = builder._truncate
+
+        def _spy(context, max_tokens):
+            seen.append(max_tokens)
+            return real(context, max_tokens)
+
+        builder._truncate = _spy
         hits = [_make_ontology_hit(f"http://example.org/ontology#Class{i}") for i in range(20)]
         await builder.build(hits, "demo", max_tokens=1000)
         assert seen == [int(1000 * (1 - _ANNOTATION_BUDGET_SHARE))]
@@ -278,12 +269,7 @@ class TestTBoxTruncationPriority:
     """The token budget is spent on classes first.
 
     A class missing from the prompt cannot be queried at all; a class that
-    arrives with only some of its column hints is still answerable. A single
-    proportional ratio across all four lists got its value from whichever list
-    dominates the estimate — the datatype properties, at ~10 per class — so
-    property volume alone evicted mapped classes: on a 75-class namespace the
-    class list reached the prompt with 60 entries, a fifth of the schema gone,
-    dropped in Neptune's arbitrary row order.
+    arrives with only some of its column hints is still answerable.
     """
 
     @staticmethod
@@ -388,12 +374,7 @@ class TestTBoxTruncationPriority:
     def test_budget_smaller_than_the_metrics_empties_the_hint_lists(self):
         """A budget the metrics alone overrun must not KEEP hints.
 
-        Metrics are charged first and are never cut here, so a caller that sets
-        max_tokens below their cost drives the remaining budget negative. The
-        hint ratio is then negative, and ``object_properties[: int(n * ratio)]``
-        is a NEGATIVE slice — it keeps all but the last few instead of none, so
-        the one path that is supposed to shed the most context sheds the least
-        and blows the budget it was handed. Both hint lists must come back empty.
+        The remaining budget goes negative, and both hint lists must come back empty.
         """
         builder = self._builder()
         context = TBoxContext(

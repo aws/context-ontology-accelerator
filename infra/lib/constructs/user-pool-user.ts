@@ -12,13 +12,7 @@ import { createHash } from "node:crypto";
 import { SCLConstruct } from "./scl-construct";
 import { InitialCognitoUserAttributes } from "../types";
 
-/**
- * Properties for {@link UserPoolUser}.
- *
- * Creates an initial admin user in a Cognito User Pool via a custom resource.
- * Cognito emails a temporary password only to a real `initialAdminEmail`; the
- * default placeholder user gets no invitation. No Secrets Manager secret.
- */
+/** Properties for {@link UserPoolUser}. */
 export interface UserPoolUserProps {
   /** The Cognito User Pool to create the admin user in. */
   readonly userPool: cognito.UserPool;

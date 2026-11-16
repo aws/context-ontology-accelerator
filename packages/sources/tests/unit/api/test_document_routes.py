@@ -12,9 +12,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from coa_control_plane_server.models.source_type import SourceType
 
-# ---------------------------------------------------------------------------
-# Environment setup — must happen before module import
-# ---------------------------------------------------------------------------
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
 os.environ.setdefault("SOURCE_SCAN_JOBS_TABLE", "test-scan-jobs")
 os.environ.setdefault("NAMESPACES_TABLE", "test-namespaces")
@@ -23,7 +20,6 @@ os.environ.setdefault("BUCKET_NAME", "test-bucket")
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
 _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
-_SOURCE_ID = "src-doc-001"
 
 # Import sources_handler FIRST to resolve circular import, then document_routes
 from coa_common.constants import bucket_namespace_tag_key  # noqa: E402, I001
@@ -31,14 +27,11 @@ import coa_sources.api.sources_handler  # noqa: F401, I001
 import coa_sources.api.document_routes as _docr  # noqa: E402, I001
 
 _DOCR = "coa_sources.api.document_routes"
-_SH = "coa_sources.api.sources_handler"
 
 
 @pytest.fixture(autouse=True)
 def reset_lazy_clients():
     """Reset module-level lazy client globals between tests to prevent cross-test pollution."""
-    from unittest.mock import patch
-
     import coa_sources.api.namespace_counters as nc
     import coa_sources.api.sources_handler as sh
 
@@ -91,11 +84,6 @@ def _make_doc_req(
     req.extraction_config = extraction_config
     req.upload_id = upload_id
     return req
-
-
-# ===================================================================
-# _create_document_source
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -413,20 +401,9 @@ class TestCreateDocumentSource:
         assert put_item["s3Prefixes"] == ["data/"]
 
 
-# ===================================================================
-# _create_document_source — namespace sourceCount maintenance
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestCreateDocumentSourceCounter:
-    """The namespace ``sourceCount`` must be incremented when a DOCUMENTS
-    source is created.
-
-    The autouse ``reset_lazy_clients`` fixture patches
-    ``adjust_namespace_source_count`` globally; each test re-patches it with a
-    local handle so the call can be asserted.
-    """
+    """The namespace ``sourceCount`` is incremented when a DOCUMENTS source is created."""
 
     def test_create_increments_namespace_source_count(self):
         mock_dao = MagicMock()
@@ -466,11 +443,6 @@ class TestCreateDocumentSourceCounter:
         mock_counter.assert_not_called()
 
 
-# ===================================================================
-# _handle_upload_urls
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestHandleUploadUrls:
     def _make_upload_event(self, body=None):
@@ -496,8 +468,8 @@ class TestHandleUploadUrls:
         assert len(body["uploadUrls"]) == 1
         assert body["uploadUrls"][0]["filename"] == "doc.pdf"
         assert "uploadUrl" in body["uploadUrls"][0]
-        # Regression: never sign ContentLength — under SigV4 it forces the
-        # browser to PUT exactly that many bytes or get a 403 (see !1018).
+        # Never sign ContentLength: under SigV4 it forces the browser to PUT exactly
+        # that many bytes or get a 403.
         assert "ContentLength" not in mock_s3.generate_presigned_url.call_args.kwargs["Params"]
 
     def test_upload_urls_multiple_files(self):

@@ -568,15 +568,7 @@ class NeptuneDBGraphStore(GraphStore):
         return self.get_ontology_by_uri(oid)
 
     def get_ontology_by_uri(self, uri: str) -> dict | None:
-        """Fetch an ontology's metadata from its named graph.
-
-        Args:
-            uri: The ontology URI to look up.
-
-        Returns:
-            The ontology attributes as a dict, or None when the URI is
-            malformed or no triples exist for it.
-        """
+        """Fetch an ontology's metadata from its named graph."""
         try:
             iri = _iri(uri)
         except ValueError:
@@ -881,9 +873,6 @@ class NeptuneDBGraphStore(GraphStore):
             query_backend: When set (``"RDF_SPARQL"`` for a graph class), emit the
                 ``coa:queryBackend`` gate signal. ``None`` for SQL.
             data_source_id: When set, emit ``coa:dataSourceId`` (graph class binding).
-
-        Returns:
-            A dict with the stored class URI and owning ontology id.
         """
         graph_uri = self._graph_for(ontology_uri)
         triples = self._class_triples(
@@ -930,19 +919,7 @@ class NeptuneDBGraphStore(GraphStore):
         domains=None,
         ranges=None,
     ):
-        """Project a property (label, comment, domains, ranges) into a graph.
-
-        Args:
-            ontology_uri: URI of the owning ontology (selects the named graph).
-            prop_uri: URI of the property to store.
-            label: ``rdfs:label`` value for the property.
-            comment: ``rdfs:comment`` value for the property.
-            domains: Domain class URIs; blank-node domains are skipped.
-            ranges: Range URIs (class IRIs or datatypes); blank-node ranges are skipped.
-
-        Returns:
-            A dict with the stored property URI and owning ontology id.
-        """
+        """Project a property (label, comment, domains, ranges) into a graph."""
         graph_uri = self._graph_for(ontology_uri)
         triples = self._property_triples(ontology_uri, prop_uri, label, comment, domains, ranges)
         self._emit_insert(graph_uri, triples)
@@ -1904,7 +1881,7 @@ class NeptuneDBGraphStore(GraphStore):
             # annotation property carries both owl:AnnotationProperty and a
             # generic rdf:Property stamp (store_property); with no range it would
             # otherwise fall through to object_properties, overcounting the
-            # "Relationships" badge by one with an empty domain/range row (#33).
+            # "Relationships" badge by one with an empty domain/range row.
             # Exclude it from BOTH buckets unless it is also explicitly declared
             # an object or datatype property.
             if OWL + "AnnotationProperty" in types and not is_object and not is_datatype:

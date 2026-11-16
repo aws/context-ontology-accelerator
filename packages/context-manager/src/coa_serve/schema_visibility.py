@@ -3,8 +3,7 @@
 
 """Response-level schema suppression for schema-blind callers.
 
-ADR: decompose-viewnamespace-schema-visibility, suppression scheme (a)
-"results only". A caller that lacks ``viewSource`` must not receive source
+A caller that lacks ``viewSource`` receives results only: it must not receive source
 schema (table/column names, compiled SQL); a caller that lacks
 ``viewOntology`` must not receive ontology schema (class/property IRIs,
 generated SPARQL). The caller still gets the answer: result rows, the
@@ -119,8 +118,6 @@ def schema_visibility_scope(namespace: str, vis: SchemaVisibility) -> Iterator[N
         except ValueError:
             logger.debug("schema_visibility_scope_reset_skipped")
 
-
-# ── Schema names a model was shown (constant-smuggling defence) ─────────────
 
 # Bare table, column and database names that were put in a model prompt, or
 # returned to an agent by a schema tool, while serving a caller without
@@ -294,8 +291,6 @@ def _identifier_view(result: QueryResult) -> dict[str, Any]:
     }
 
 
-# ── Identifier redaction (answer text, rows, supporting content, replay) ────
-
 # An IRI, optionally in SPARQL angle brackets.
 _IRI_RE = re.compile(r"<?(https?://[^\s<>\"')\]]+)>?")
 # A dotted SQL identifier (catalog.schema.table or schema.table); starts with a letter.
@@ -389,19 +384,6 @@ def _collect(result: Mapping[str, Any], vis: SchemaVisibility) -> tuple[set[str]
     return {f for f in source if len(f) > 2}, {f for f in ontology if len(f) > 2}
 
 
-def collect_withheld_identifiers(result: Mapping[str, Any], vis: SchemaVisibility) -> set[str]:
-    """Schema identifiers present in a (camelCase) result that ``vis`` withholds.
-
-    Ontology identifiers come from the graph context's class/predicate IRIs and
-    the generated SPARQL; source identifiers from the compiled SQL and the
-    retrieved/expanded table lists. Only unmistakable identifiers are collected
-    (full IRIs, identifier-like IRI local names, dotted table names), so plain
-    words in an answer are never redacted.
-    """
-    source, ontology = _collect(result, vis)
-    return source | ontology
-
-
 def _compile(source: set[str], ontology: set[str]) -> re.Pattern[str] | None:
     """One alternation over every identifier, longest first (so the longest match wins).
 
@@ -487,15 +469,6 @@ def redact_identifiers(text: str, identifiers: set[str]) -> str:
     return pattern.sub(_REDACTED, text) if pattern is not None else text
 
 
-def redact_answer_text(text: str, identifiers: set[str], vis: SchemaVisibility) -> str:
-    """Redact withheld identifiers, plus every fragment IRI when ontology is withheld."""
-    if vis.full or not text:
-        return text
-    return _Redactor(pattern=_compile(set(), set(identifiers)), fragment_iris=not vis.ontology).text(text)
-
-
-# ── Constant-derived result values (source schema withheld) ─────────────────
-#
 # The SQL firewall refuses a statement that can only echo text (no table, or
 # only constants), but one data-dependent projection beside a constant passes:
 # ``SELECT COUNT(*) AS n, 'customers, invoices' AS t FROM orders``. Rather than

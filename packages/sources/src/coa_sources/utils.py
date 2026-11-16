@@ -16,28 +16,11 @@ def _clean_vocabulary(values: list[Any], *, field: str) -> list[str]:
     """Validate one vocabulary list from the API. Entries are stored verbatim.
 
     Trims entries, drops empties, and rejects duplicates and over-long lists.
-    Spelling is **not** rewritten: graphrag-toolkit joins the preferred list
-    straight into the prompt (``format_list`` is a plain newline join) and imposes
-    no format of its own, so the caller's spelling is the caller's choice.
-
-    Note what this means downstream: the toolkit *does* title-case the
-    classification the LLM emits (``format_classification`` at
-    ``topic_utils.py:112``), so a label like ``"Style archetype"`` reaches the
-    graph as ``"Style Archetype"``, and ``"StyleArchetype"`` reaches it as
-    ``"Stylearchetype"``. That difference is surfaced in the console rather than
-    corrected here — see ``predictStoredForm`` in
-    ``packages/web-app/src/utils/extraction-vocabulary.ts``.
-
-    Duplicates are compared case-insensitively because two spellings that differ
-    only in case cannot be told apart once the parser has title-cased them, so
-    accepting both would configure a distinction that cannot exist.
-
-    The comparison uses ``str.lower()``, NOT ``str.casefold()``, to stay in exact
-    step with the console's ``toLowerCase()``. ``casefold()`` folds more than
-    JavaScript does — it maps German "ß" to "ss", so ``["Straße", "STRASSE"]``
-    would be rejected here while the console accepted it, and the caller would
-    hit a 400 only after filling in the whole form. Mirrored validation is the
-    reason both checks exist, so they have to agree.
+    Spelling is **not** rewritten. Duplicates are compared case-insensitively
+    because the toolkit title-cases labels, so spellings differing only in case
+    cannot be told apart downstream. The comparison uses ``str.lower()``, not
+    ``str.casefold()``, to match the console's ``toLowerCase()`` (``casefold()``
+    maps "ß" to "ss", which the console would accept).
 
     Raises:
         ValueError: with a caller-actionable message. The document create route

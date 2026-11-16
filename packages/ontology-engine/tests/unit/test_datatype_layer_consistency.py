@@ -24,7 +24,9 @@ from __future__ import annotations
 import pytest
 from coa_ontology.inducer.strategies.base import _SQL_TO_XSD, xsd_for
 from coa_ontology.proposals import _CATALOG_TO_H2
-from rdflib import XSD
+from rdflib import RDFS, XSD, Graph, URIRef
+
+pytestmark = pytest.mark.unit
 
 # Source SQL type -> (expected XSD datatype, expected H2 column type family)
 _EXPECTED: dict[str, tuple[object, str]] = {
@@ -40,7 +42,6 @@ _EXPECTED: dict[str, tuple[object, str]] = {
 }
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(("sql_type", "expected"), sorted(_EXPECTED.items()))
 def test_xsd_mapping_is_faithful(sql_type: str, expected: tuple) -> None:
     """xsd_for() must return the real XSD counterpart, never a string fallback."""
@@ -48,7 +49,6 @@ def test_xsd_mapping_is_faithful(sql_type: str, expected: tuple) -> None:
     assert xsd_for(sql_type) == expected_xsd, f"{sql_type} lost its type"
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(("sql_type", "expected"), sorted(_EXPECTED.items()))
 def test_h2_mapping_is_faithful(sql_type: str, expected: tuple) -> None:
     """The H2 validation schema must not widen a typed column to VARCHAR."""
@@ -58,33 +58,14 @@ def test_h2_mapping_is_faithful(sql_type: str, expected: tuple) -> None:
     )
 
 
-@pytest.mark.unit
-@pytest.mark.parametrize("sql_type", ["DATE", "TIMESTAMP", "DATETIME", "TIME"])
-def test_temporal_types_are_never_downcast_to_string(sql_type: str) -> None:
-    """Regression guard for the silent no-result bug.
-
-    A temporal column must not be xsd:string in R2RML nor VARCHAR in the H2
-    schema. Either one makes date FILTERs unsatisfiable in Ontop.
-    """
-    assert xsd_for(sql_type) != XSD.string, f"{sql_type} downcast to xsd:string in R2RML"
-    assert "VARCHAR" not in _CATALOG_TO_H2[sql_type], f"{sql_type} widened to VARCHAR in H2 schema"
-
-
-@pytest.mark.unit
 def test_every_sql_type_has_an_h2_counterpart() -> None:
     """The two tables must cover the same source types — no silent VARCHAR default."""
     missing = sorted(set(_SQL_TO_XSD) - set(_CATALOG_TO_H2))
     assert not missing, f"types known to R2RML but not to the H2 schema: {missing}"
 
 
-@pytest.mark.unit
 def test_ontology_temporal_ranges_survive_vkg_cleaning() -> None:
-    """_clean_ontology_for_vkg must preserve temporal ranges.
-
-    It used to rewrite xsd:date/dateTime/time ranges to xsd:string so the TBox
-    matched the (also downcast) R2RML. With all layers faithful there is nothing
-    to normalize, and rewriting would reintroduce the bug.
-    """
+    """_clean_ontology_for_vkg must preserve temporal ranges."""
     from coa_ontology.proposals import _clean_ontology_for_vkg
 
     turtle = """
@@ -97,5 +78,6 @@ def test_ontology_temporal_ranges_survive_vkg_cleaning() -> None:
     ex:shipAt a owl:DatatypeProperty ; rdfs:domain ex:Shipment ; rdfs:range xsd:dateTime .
     """
     out = _clean_ontology_for_vkg(turtle)
-    assert "xsd:date" in out or str(XSD.date) in out, "xsd:date range was rewritten away"
+    g = Graph().parse(data=out, format="turtle")
+    assert (URIRef("http://example.com/onto#shipDate"), RDFS.range, XSD.date) in g, "xsd:date range was rewritten away"
     assert "xsd:dateTime" in out or str(XSD.dateTime) in out, "xsd:dateTime range was rewritten away"

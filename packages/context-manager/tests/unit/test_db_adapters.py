@@ -1,16 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the per-engine direct-JDBC adapters.
-
-Each engine's connection/session/dialect/limit behavior is co-located in its
-adapter (clients/db_adapters/*). These tests assert:
-- the registry resolves the right adapter and fail-safes to PostgreSQL,
-- inject_limit emits LIMIT (PG/Redshift/MySQL) vs TOP (SQL Server),
-- the SSL context is permissive, the Redshift dialect skips the probe,
-- PostgreSQL issues SET search_path + SET LOCAL statement_timeout, MySQL issues
-  SET SESSION max_execution_time and NO search_path.
-"""
+"""Unit tests for the per-engine direct-JDBC adapters."""
 
 from __future__ import annotations
 
@@ -135,8 +126,6 @@ class TestInjectLimit:
     def test_inject_limit_reraises_non_sqlglot_errors(self):
         """A genuine bug (not a parse failure) must surface, not fall into the
         string fallback — inject_limit catches SqlglotError specifically."""
-        from unittest.mock import patch
-
         from coa_serve.clients.db_adapters import get_adapter
 
         parse_target = "coa_serve.clients.db_adapters.base.sqlglot.parse_one"
@@ -164,13 +153,10 @@ class TestInjectLimit:
         from coa_serve.clients.db_adapters import get_adapter
 
         out = get_adapter(engine).inject_limit("SELECT * FROM (SELECT a FROM t LIMIT 999999) z", 100)
-        # inner limit preserved
         assert "999999" in out
-        # a top-level cap of 100 was applied (LIMIT for most, TOP for tsql)
         if engine == "SQLSERVER":
             assert "TOP 100" in out
         else:
-            # two LIMITs now present: inner 999999 + outer 100
             assert out.rstrip().endswith("LIMIT 100")
 
 
@@ -453,8 +439,6 @@ class TestMySQLAdapter:
         """When neither max_execution_time NOR max_statement_time can be set, the
         query still runs but a mysql_statement_timeout_unset warning is emitted
         (the client-side wait_for is the last-resort bound)."""
-        from unittest.mock import patch
-
         from coa_serve.clients.db_adapters.mysql import MySQLAdapter
         from sqlalchemy.exc import OperationalError
 
@@ -659,8 +643,6 @@ class TestSqlServerAdapter:
     def test_top_fallback_logs_and_returns_unchanged_for_uncappable_shape(self):
         """A shape we can't safely rewrite (leading WITH) is returned unchanged AND
         logged, so the uncapped path is diagnosable rather than a silent memory risk."""
-        from unittest.mock import patch
-
         from coa_serve.clients.db_adapters.sqlserver import SqlServerAdapter
 
         adapter = SqlServerAdapter()

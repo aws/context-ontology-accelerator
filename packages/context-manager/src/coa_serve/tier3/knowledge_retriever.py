@@ -3,14 +3,10 @@
 
 """Tier 3 orchestrator -- parallel retrieval + single-shot LLM synthesis.
 
-Runs four retrieval sources in parallel (partial failure tolerant):
-1. VKG Structured Context -- exploratory SPARQL from entity URIs or failed
-   Tier 2 SPARQL hint, translated via VKG for partial structured data.
-2. Document Chunks -- k-NN search against chunk_{namespace_short_id} index.
-3. Neptune Graph Traversal -- 1-2 hop traversal from entity URIs.
-4. Catalog Summary -- always included; from MetricResolver.list_all().
-
-After retrieval, assembles all context and makes one LLM Converse call.
+Runs document k-NN search and Neptune graph traversal in parallel (partial failure
+tolerant), or delegates retrieval to the lexical retriever when one is configured.
+Precomputed structured data and the catalog summary are passed in. After
+retrieval, assembles all context and makes one LLM Converse call.
 """
 
 from __future__ import annotations
@@ -59,11 +55,10 @@ GRAPH_TRAVERSE_TIMEOUT_S = _float_env("TIER3_GRAPH_TIMEOUT", _PER_SOURCE_TIMEOUT
 # is advisory: when it does not arrive in time, synthesis uses the generic
 # "match the question's language" directive instead of waiting. The call runs
 # alongside retrieval, whose per-source bound is 10 s by default, so the same
-# bound here rarely adds to the request's latency; 5 s timed out live when the
-# model reasoned before naming the tag.
+# bound here rarely adds to the request's latency.
 ANSWER_LANGUAGE_TIMEOUT_S = 10.0
 
-# Callback type aliases
+
 OnTokenCallback = Callable[[str], Awaitable[None]]
 
 
@@ -77,7 +72,7 @@ OnTokenCallback = Callable[[str], Awaitable[None]]
 # app renders the new top-level `relationships` list as blank arrow rows, so the web
 # app still has to ship before this service, or together with it. Delete this block
 # (and the note in external-docs/content/serve.md) one release after the web app
-# ships, tracked by #984.
+# ships.
 _EMIT_DEPRECATED_SUPPORTING_CONTENT_ALIASES = True
 
 
@@ -188,10 +183,10 @@ class Tier3Result:
     # Best-effort/partial signal. The hand-rolled and lexical-baseline paths
     # leave this at the default (False) and derive partiality from
     # ``degraded_sources`` at assembly time; the agentic path sets it on
-    # time-budget-expiry / all-tools-fail / no-context paths (Req 7.5-7.8, 9.6-9.7).
+    # time-budget-expiry / all-tools-fail / no-context paths.
     partial: bool = False
-    # Query artifacts the agentic path built + executed to reach its answer
-    # (#1166). ``query_used`` is the SQL, ``sparql_generated`` the SPARQL — same
+    # Query artifacts the agentic path built + executed to reach its answer.
+    # ``query_used`` is the SQL, ``sparql_generated`` the SPARQL — same
     # two fields Standard mode surfaces. When multiple structured statements ran,
     # these carry the LAST of each kind (the query that produced the final
     # numbers, matching Standard's single-query semantics). The hand-rolled and
@@ -271,7 +266,7 @@ class KnowledgeRetriever:
             trace: TraceCollector for progressive step emission.
             retriever_strategy: Resolved lexical retriever strategy for this
                 request. Used only when a lexical retriever is configured;
-                ignored entirely on the hand-rolled path (3.1).
+                ignored entirely on the hand-rolled path.
             model_id: Optional per-call LLM model override for synthesis.
             hide_governed: For a caller whose grant declares ``allowedMetrics``: traverse without the
                 governed-metrics graph.
@@ -303,10 +298,8 @@ class KnowledgeRetriever:
                 model_id=model_id,
             )
 
-        # Build parallel retrieval coroutines
         coros: list[tuple[str, Coroutine]] = []
 
-        # Graph traversal (skip if no graph traverser)
         if self._graph is not None:
             hidden: dict[str, Any] = {"hide_governed": True} if hide_governed else {}
             if entity_uris:
@@ -315,11 +308,9 @@ class KnowledgeRetriever:
                 graph_coro = self._graph.traverse(query, namespace, **hidden)
             coros.append(("graph_traverse", graph_coro))
 
-        # Vector search requires an embedding and a vector retriever; skip if unavailable
         if embedding is not None and self._vector is not None:
             coros.append(("vector_search", self._vector.search(embedding, namespace)))
 
-        # Execute all retrieval in parallel with partial failure tolerance and per-source timeouts
         results: dict[str, tuple[Any, int]] = {}
         degraded_sources: list[dict] = []
         timeout_map = {"vector_search": VECTOR_SEARCH_TIMEOUT_S, "graph_traverse": GRAPH_TRAVERSE_TIMEOUT_S}
@@ -329,7 +320,6 @@ class KnowledgeRetriever:
         # so earlier turns in another language cannot decide it (see synthesizer).
         language_task = asyncio.ensure_future(self._resolve_answer_language(query, conversation_history, model_id))
 
-        # Wall-clock timer wraps the gather so parallel retrieval shows true elapsed time
         gather_start = time.perf_counter()
         gathered = await asyncio.gather(*(tc[1] for tc in timed_coros))
         gather_wall_ms = int((time.perf_counter() - gather_start) * 1000)
@@ -337,7 +327,6 @@ class KnowledgeRetriever:
         for i, (name, _) in enumerate(timed_coros):
             results[name] = gathered[i]
 
-        # Extract results with fallback for failures
         vec_chunks: list[Any] = []
         if "vector_search" in results:
             vec_result, vec_ms = results["vector_search"]
@@ -413,7 +402,6 @@ class KnowledgeRetriever:
                 parallel_group=StepId.T3_RETRIEVE,
             )
 
-        # Group wrapper carries wall-clock time for the parallel gather
         group_status = "degraded" if degraded_sources else ("skipped" if not coros else "success")
         trace.record(
             StepId.T3_RETRIEVE,
@@ -444,7 +432,6 @@ class KnowledgeRetriever:
 
         language = await self._answer_language_kwargs(language_task, trace_steps, trace)
 
-        # Synthesize (stream when on_token callback is provided)
         try:
             if on_token and hasattr(self._synthesizer, "synthesize_stream"):
                 synthesis = await self._synthesizer.synthesize_stream(
@@ -531,10 +518,10 @@ class KnowledgeRetriever:
         """Delegate retrieval to the graphrag-toolkit baseline retriever.
 
         The retriever already degrades to an empty ``BaselineResult`` with an
-        error trace step on timeout / internal error (task 6). An additional
+        error trace step on timeout / internal error. An additional
         defensive ``try/except`` here guarantees that an unexpected raise out of
         ``retrieve`` still records an error trace step and proceeds with empties,
-        so a lexical failure never fails the whole Tier 3 resolve (2.9, 2.18).
+        so a lexical failure never fails the whole Tier 3 resolve.
         """
         if trace is None:
             trace = TraceCollector()

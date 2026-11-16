@@ -6,10 +6,6 @@
 Mocks external services (Bedrock, DynamoDB, data-catalog HTTP, ontology-catalog)
 and runs the full induction pipeline synchronously, then verifies the proposal
 ontology and R2RML output.
-
-Run:
-    cd ontology-workbench
-    pytest tests/test_induction_e2e.py -v
 """
 
 import json
@@ -31,17 +27,8 @@ pytestmark = pytest.mark.unit
 def _isolate_induction_globals():
     """Snapshot/restore the ``induce_catalog`` process globals per test.
 
-    ``_run_induction`` and the router mutate ``_jobs`` / ``_job_namespaces`` as
-    module globals (job register + namespace lookup). Without teardown, an entry
-    leaked by a mid-test assertion failure changes the behavior of unrelated
-    tests under some collection orderings. Snapshot before, restore after —
-    pytest teardown runs even when assertions fail. Mirrors the guard in
-    ``test_induce_catalog_cost_metrics.py``.
-
-    NB: the in-flight induction LOCK and proposal rows live in the ``client``
-    fixture's per-test in-memory DynamoDB, not here; the worker-thread reaping
-    that keeps those hermetic is done in ``client`` itself (it must run while
-    that fixture's ``_get_table`` patch is still active — see the note there).
+    ``_run_induction`` and the router mutate ``_jobs`` / ``_job_namespaces``;
+    restoring them keeps a leaked entry from changing unrelated tests.
     """
     from coa_ontology import induce_catalog
 
@@ -138,10 +125,7 @@ def client():
     def fake_query(**kwargs):
         # Namespace-registry Query: PK = NAMESPACE#{ns} AND begins_with(SK,
         # "ONTOLOGY#"), with an optional ontology_type FilterExpression.
-        # list_ontologies_registry now paginates on LastEvaluatedKey, so this
-        # MUST return a real dict (no LastEvaluatedKey) rather than a bare
-        # MagicMock — otherwise resp.get("LastEvaluatedKey") is truthy forever
-        # and the drain-all loop spins.
+        # Must return a real dict without LastEvaluatedKey, or the drain loop spins.
         values = kwargs.get("ExpressionAttributeValues", {})
         pk = values.get(":pk")
         skp = values.get(":skp", "")
@@ -184,7 +168,6 @@ def client():
     # "OSError: [Errno 39] Directory not empty". Tolerate the residual files.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         os.environ["INDUCE_OUTPUT_DIR"] = tmpdir
-        os.environ["CATALOG_SOURCE"] = "http"
 
         # Mock S3 — store artifacts in memory
         s3_store = {}
@@ -232,16 +215,9 @@ def client():
             patch("coa_ontology.dynamo_store._get_table", return_value=mock_table),
             patch("coa_ontology.dynamo_store._get_s3", return_value=mock_s3),
             patch("coa_ontology.induce_catalog._fetch_catalog", side_effect=fake_fetch_catalog),
-            # Stub the CloudWatch metrics seam. In production this is best-effort
-            # (it swallows its own errors), but the REAL call builds a boto3
-            # cloudwatch client and does a PutMetricData that, in the unmocked
-            # test env, fails only after a slow STS/GetCallerIdentity retry. That
-            # runs in the worker's finally BETWEEN setting the job COMPLETED and
-            # release_induction_lock — widening that window enough that a test
-            # which polls "completed" and immediately re-triggers hits the
-            # still-held lock (409 instead of 202), an ordering/timing flake.
-            # Stubbing it keeps lock release prompt and deterministic without
-            # touching the lock/visibility behavior the tests assert.
+            # Stub the CloudWatch metrics seam: unmocked, it fails only after a
+            # slow STS retry in the worker's finally, between COMPLETED and
+            # release_induction_lock, so an immediate re-trigger would 409.
             patch("coa_ontology.induce_catalog.emit_induction_job_metrics"),
         ):
             from coa_ontology.main import _patched_build_pipeline, app
@@ -257,20 +233,11 @@ def client():
 
             from coa_ontology import induce_catalog
 
-            # Record every REAL induction worker this test starts so we can join
-            # them before the mocks unwind. A worker sets its job to COMPLETED
-            # *before* its finally writes the proposal + releases the lock, so a
-            # test's poll loop returns while the worker is still executing its
-            # tail. Since dynamo_store._get_table is patched at MODULE level
-            # (shared across threads), a straggler surviving into the NEXT test
-            # calls _get_table() and resolves THAT test's fresh in-memory table —
-            # writing a phantom STRUCTURED proposal / lock row into it. The next
-            # fresh induction then sees a pending proposal (or held lock) and
-            # wrongly returns 409 instead of 202. This flakes only under some
-            # PYTHONHASHSEED orderings because test order + thread-finish timing
-            # shift with the seed. Recording at start() (instead of matching
-            # threads by _target) is robust: CPython clears Thread._target once
-            # run() returns, so an enumerate-based match races the worker's exit.
+            # Record every real induction worker so it is joined before the mocks
+            # unwind. A worker marks its job COMPLETED before its finally writes
+            # the proposal and releases the lock; a straggler surviving into the
+            # next test would write into that test's fresh table and cause a 409.
+            # Record at start(): CPython clears Thread._target once run() returns.
             started_workers: list = []
             _RealThread = induce_catalog.Thread
 
@@ -284,11 +251,7 @@ def client():
             # their scope — they start no real worker, so started_workers stays
             # empty for them. All other tests get the recording wrapper.
             with (
-                patch.object(
-                    __import__("coa_ontology.induce_catalog", fromlist=["_build_pipeline"]),
-                    "_build_pipeline",
-                    _test_build_pipeline,
-                ),
+                patch.object(induce_catalog, "_build_pipeline", _test_build_pipeline),
                 patch.object(induce_catalog, "Thread", _RecordingThread),
             ):
                 try:
@@ -306,7 +269,6 @@ class TestInductionE2E:
     def test_induction_healthcare(self, client):
         http, tmpdir, dynamo = client
 
-        # Step 1: Submit induction
         resp = http.post(
             "/induce/?namespace=default",
             json={
@@ -324,7 +286,6 @@ class TestInductionE2E:
         # the assertion that actually matters.
         assert job["status"] not in ("completed", "failed")
 
-        # Step 2: Poll until done (sync in test — background thread)
         import time
 
         for _ in range(30):
@@ -342,7 +303,6 @@ class TestInductionE2E:
         assert report["novel_classes_created"] > 0
         assert report["induced_ontology_id"] is not None  # proposal_id
 
-        # Step 3: Verify proposal in DynamoDB
         proposal_id = report["induced_ontology_id"]
         resp = http.get(f"/ontology/proposals/{proposal_id}")
         assert resp.status_code == 200
@@ -358,15 +318,9 @@ class TestInductionE2E:
         r2rml_turtle = stored.get("r2rml_turtle", "")
         assert ontology_turtle, "expected ontology_turtle hydrated from the store"
 
-        # Regression for #536: column_matches was previously written inline into the
-        # DDB proposal item (cap-protected only at [:100]) but had zero readers
-        # anywhere in the codebase — dead data behind a silent ceiling that risked
-        # blowing the 400 KB DDB item limit on wide schemas. The write site was
-        # deleted; full match data (including column-level) remains available via
-        # InductionReport and the S3 matches.json artifact.
+        # column_matches must not be inlined into the DDB item (400 KB limit).
         assert "column_matches" not in (stored.get("metadata") or {})
 
-        # Step 4: Parse and verify the proposal ontology
         g = Graph()
         g.parse(data=ontology_turtle, format="turtle")
 
@@ -389,23 +343,18 @@ class TestInductionE2E:
         assert "claims_claimId" in dt_prop_names
         assert "patients_dateOfBirth" in dt_prop_names
 
-        # Step 5: Verify R2RML
-        r2rml = r2rml_turtle
-        assert r2rml
+        assert r2rml_turtle
         rg = Graph()
-        rg.parse(data=r2rml, format="turtle")
+        rg.parse(data=r2rml_turtle, format="turtle")
         RR = "http://www.w3.org/ns/r2rml#"
         triples_maps = set(rg.subjects(RDF.type, URIRef(f"{RR}TriplesMap")))
         assert len(triples_maps) == 3  # claims, patients, providers
 
-        # Step 6: List proposals
         resp = http.get("/ontology/proposals/")
         assert resp.status_code == 200
         proposals = resp.json()["proposals"]
-        assert len(proposals) >= 1
         assert any(p["proposal_id"] == proposal_id for p in proposals)
 
-        # Step 7: Update proposal (user review)
         modified_turtle = ontology_turtle.replace("Proposal Ontology", "User Reviewed Ontology")
         resp = http.post(
             "/ontology/proposals/update",
@@ -422,7 +371,6 @@ class TestInductionE2E:
         assert resp.status_code == 200
         assert "User Reviewed Ontology" in ds.get_proposal_by_id(proposal_id, namespace="default")["ontology_turtle"]
 
-        # Step 7b: Update via the presigned-PUT path (large-ontology bypass).
         # The client first asks for presigned PUT URLs, uploads the edited
         # Turtle straight to S3 (simulated here by writing to the artifact's
         # deterministic key), then commits with ``ontology_uploaded`` instead
@@ -456,7 +404,6 @@ class TestInductionE2E:
             "Uploaded Reviewed Ontology" in ds.get_proposal_by_id(proposal_id, namespace="default")["ontology_turtle"]
         )
 
-        # Step 8: Verify files on disk
         job_dir = os.path.join(tmpdir, job_id)
         assert os.path.exists(os.path.join(job_dir, "proposal-ontology.ttl"))
         assert os.path.exists(os.path.join(job_dir, "r2rml-mappings.ttl"))
@@ -615,12 +562,10 @@ class TestInductionE2E:
 
 
 class TestInductionInFlightVisibilityAndLock:
-    """Regression tests for the in-flight window (issue I-3f1f50cc).
+    """In-flight window between trigger and the worker's proposal write.
 
-    The prior guard only blocked once a pending PROPOSAL row existed — which
-    happens at worker END — so nothing was visible during the run and a second
-    trigger slipped through. These tests suppress the worker thread so the
-    trigger-time state (stub proposal + lock) is observable, and assert:
+    These tests suppress the worker thread so the trigger-time state (stub
+    proposal + lock) is observable, and assert:
       1. a stub proposal (status ``inducing``) is listed immediately;
       2. a second trigger during the in-flight window is blocked with 409;
       3. releasing the lock (worker end) lets a new run start.
@@ -671,8 +616,7 @@ class TestInductionInFlightVisibilityAndLock:
             assert resp.status_code == 202
             first_job = resp.json()["job_id"]
 
-            # Second trigger DURING the in-flight window — this is the bug: the
-            # old guard let it through because no pending PROPOSAL existed yet.
+            # A second trigger during the in-flight window must 409.
             resp = http.post(
                 "/induce/?namespace=default",
                 json={
@@ -729,8 +673,7 @@ class TestInductionInFlightVisibilityAndLock:
     def test_lock_released_when_post_acquire_step_fails(self, client):
         """If a write AFTER acquiring the lock fails (put_job here), the router
         releases the lock so the namespace isn't wedged until stale-takeover.
-        The worker's finally can't cover this — the worker thread never starts.
-        (Addresses MR !531 CRITICAL review finding.)"""
+        The worker's finally can't cover this — the worker thread never starts."""
         http, tmpdir, dynamo = client
         import coa_ontology.dynamo_store as ds
 
@@ -756,7 +699,7 @@ class TestInductionInFlightVisibilityAndLock:
         )
 
     def test_proposal_written_just_before_lock_acquire_still_blocks(self, client):
-        """Check-then-act race (AppSec finding V2298834428): the running worker
+        """Check-then-act race: the running worker
         writes its pending proposal and releases the lock in the gap between a
         new trigger's proposal check and its lock acquire. The proposal check
         must run UNDER the lock so this trigger 409s instead of starting a
@@ -801,14 +744,6 @@ class TestInductionInFlightVisibilityAndLock:
         )
 
 
-if __name__ == "__main__":
-    from rdflib import URIRef  # noqa: E402 — needed for test
-
-    pytest.main([__file__, "-v"])
-
-
-# ── Integration test — uses real services when env vars are set ──────────
-
 _DATA_CATALOG_URL = os.environ.get("TEST_DATA_CATALOG_URL")
 _DYNAMODB_TABLE = os.environ.get("TEST_DYNAMODB_TABLE")
 _NA_GRAPH_ID = os.environ.get("TEST_NA_GRAPH_ID")
@@ -826,10 +761,7 @@ def live_client():
     if _NA_ENDPOINT:
         os.environ["NA_ENDPOINT"] = _NA_ENDPOINT
 
-    # ignore_cleanup_errors: the induction runs in a daemon thread that may
-    # still be writing artifacts into tmpdir when the context exits, racing
-    # rmtree and intermittently raising "OSError: Directory not empty" at
-    # teardown (flaky CI failure). Tolerate it — the tmpdir is disposable.
+    # ignore_cleanup_errors: same worker-thread teardown race as ``client``.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         os.environ["INDUCE_OUTPUT_DIR"] = tmpdir
         # Force reimport to pick up new env vars

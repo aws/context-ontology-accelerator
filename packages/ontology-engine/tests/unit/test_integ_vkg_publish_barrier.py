@@ -26,7 +26,7 @@ pytestmark = pytest.mark.unit
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "integ" / "test_accept_ontology_components.py"
 
 if not _MODULE_PATH.exists():
-    pytest.skip("tests/integ/ is absent or incomplete in this checkout (public mirror)", allow_module_level=True)
+    pytest.skip("tests/integ/ is absent or incomplete in this checkout", allow_module_level=True)
 
 
 @pytest.fixture(scope="module")

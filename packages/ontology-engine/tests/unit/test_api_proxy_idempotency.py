@@ -118,8 +118,6 @@ def test_proxy_other_routes_bypass_idempotency(mod) -> None:
     get_store.assert_not_called()
 
 
-# ── Every job-starting POST behind the proxy ─────────────────────────────────
-
 _OPENAPI = (
     Path(__file__).resolve().parents[4]
     / "smithy-generated"

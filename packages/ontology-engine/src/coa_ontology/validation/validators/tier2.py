@@ -76,7 +76,6 @@ class StructuralMetricsValidator(OntologyValidator):
         # Store metrics in kwargs for the report builder to pick up
         kwargs.setdefault("_metrics_out", {}).update(metrics.model_dump())
 
-        # Flag anomalies
         if class_count > 0 and rr is not None and rr < 0.1:
             findings.append(
                 ValidationFinding(

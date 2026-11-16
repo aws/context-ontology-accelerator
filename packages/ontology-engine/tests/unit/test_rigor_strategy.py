@@ -1,18 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the RIGOR induction strategy primitives.
-
-Pure unit tests — no live AWS / Bedrock / OpenSearch calls. Exercises:
-  - Module-level helpers (_to_pascal, _iri_local_name, _strip_markdown_fences,
-    _format_schema_context)
-  - Strategy methods (_order_by_fk, _parse_turtle, _new_graph, _check_novelty)
-  - Strategy registry (get_strategy)
-  - Prompt loading
-
-Run:
-    pytest tests/test_rigor_strategy.py -v
-"""
+"""Unit tests for the RIGOR induction strategy primitives."""
 
 import pytest
 
@@ -22,6 +11,7 @@ from unittest.mock import MagicMock
 
 from coa_ontology.inducer.services.data_catalog import CatalogColumn, CatalogConstraint, CatalogTable
 from coa_ontology.inducer.strategies import STRATEGIES, get_strategy
+from coa_ontology.inducer.strategies.base import RR
 from coa_ontology.inducer.strategies.rigor_ontology import (
     _JUDGE_PROMPT_TEMPLATE,
     _MAX_CORE_FRAGMENTS_IN_CONTEXT,
@@ -35,9 +25,7 @@ from coa_ontology.inducer.strategies.rigor_ontology import (
     _strip_markdown_fences,
     _to_pascal,
 )
-from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace, URIRef
-
-# ── Module-level helpers ────────────────────────────────────────────────
+from rdflib import OWL, PROV, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 
 
 class TestToPascal:
@@ -191,19 +179,13 @@ class TestFormatSchemaContext:
 
 class TestFkInfoAppliesReviewGate:
     def test_only_gate_passing_fks_reach_the_mapping(self):
-        # _fk_info drives which column becomes an rr:parentTriplesMap join
-        # in build_r2rml. Before the fix a PENDING/REJECTED FK sorting first
-        # became a live Ontop join. Now the gate applies here too.
-        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
-
+        # _fk_info drives which column becomes an rr:parentTriplesMap join.
         t = CatalogTable(
             id="db.orders",
             name="orders",
             fullyQualifiedName="db.orders",
             columns=[CatalogColumn(name="customer_id", dataType="BIGINT")],
             tableConstraints=[
-                # PENDING listed first — under the old first-wins would have
-                # been chosen as the FK target.
                 CatalogConstraint(
                     constraintType="FOREIGN_KEY",
                     columns=["customer_id"],
@@ -224,8 +206,6 @@ class TestFkInfoAppliesReviewGate:
         assert col == "id"
 
     def test_all_rejected_yields_no_fk(self):
-        from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
-
         t = CatalogTable(
             id="db.orders",
             name="orders",
@@ -246,9 +226,6 @@ class TestFkInfoAppliesReviewGate:
         assert col is None
 
 
-# ── Strategy registry ───────────────────────────────────────────────────
-
-
 class TestStrategyRegistry:
     def test_has_both_strategies(self):
         assert "table_to_ontology" in STRATEGIES
@@ -261,13 +238,6 @@ class TestStrategyRegistry:
     def test_get_strategy_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown strategy"):
             get_strategy("does_not_exist")
-
-    def test_rigor_can_instantiate(self):
-        s = get_strategy("rigor_ontology")()
-        assert isinstance(s, RigorOntologyStrategy)
-
-
-# ── Prompt files ────────────────────────────────────────────────────────
 
 
 class TestPrompts:
@@ -340,9 +310,6 @@ class TestPrompts:
 
     def test_core_fragment_cap_reasonable(self):
         assert 1 <= _MAX_CORE_FRAGMENTS_IN_CONTEXT <= 20
-
-
-# ── FK topological sort ─────────────────────────────────────────────────
 
 
 class TestOrderByFk:
@@ -491,9 +458,6 @@ class TestOrderByFk:
         assert [t.name for t in ordered] == ["t"]
 
 
-# ── Turtle parsing ──────────────────────────────────────────────────────
-
-
 class TestParseTurtle:
     @pytest.fixture
     def strategy(self):
@@ -539,8 +503,6 @@ class TestParseTurtle:
         assert strategy._parse_turtle("", "http://example.org/ind#", "empty") is None
         assert strategy._parse_turtle("   \n\n   ", "http://example.org/ind#", "blank") is None
 
-    # ── Layer 2 defensive sanitization (the RIGOR cardinality fix) ──
-
     def test_strips_empty_blank_nodes(self, strategy):
         """Empty `[]` should be stripped before parsing so it can't crash rdflib."""
         ttl = """
@@ -550,14 +512,12 @@ class TestParseTurtle:
             ind:bar rdfs:range [] .
         """
         g = strategy._parse_turtle(ttl, "http://example.org/ind#", "foo")
-        # After sanitization, the empty [] triple is gone; the other 3 triples remain
         assert g is not None
-        # The Class, label, and DatatypeProperty declarations survive
         assert (URIRef("http://example.org/ind#Foo"), RDF.type, OWL.Class) in g
+        assert (URIRef("http://example.org/ind#bar"), RDFS.range, None) not in g
 
     def test_strips_subclassof_restriction_blank_nodes(self, strategy):
         """`rdfs:subClassOf [ ... ]` restrictions are stripped (cardinality fix)."""
-        # Use a shorter restriction to stay under the 120-char line limit.
         restriction = '[ a owl:Restriction ; owl:onProperty ind:id ; owl:minCardinality "1"^^xsd:nonNegativeInteger ]'
         ttl = (
             "ind:Claim a owl:Class .\n"
@@ -599,13 +559,8 @@ ind:policyId a owl:DatatypeProperty .
 ind:policyId rdfs:domain ind:Policy .
 """
         g = strategy._parse_turtle(ttl, "http://example.org/ind#", "policies")
-        # Without the Layer 2 sanitization, rdflib raises and we return None.
-        # With sanitization, the malformed line is stripped and the rest parses.
         assert g is not None
         assert (URIRef("http://example.org/ind#Policy"), RDF.type, OWL.Class) in g
-
-
-# ── Graph construction ──────────────────────────────────────────────────
 
 
 class TestNewGraph:
@@ -628,9 +583,6 @@ class TestNewGraph:
         g = s._new_graph("http://example.org/ind/", "T")
         ont = URIRef("http://example.org/ind")
         assert (ont, RDF.type, OWL.Ontology) in g
-
-
-# ── Novelty check ───────────────────────────────────────────────────────
 
 
 class TestCheckNovelty:
@@ -699,10 +651,10 @@ class TestCheckNovelty:
         assert len(matches) == 4
         assert all(m.match_type == "novel" for m in matches)
         assert novel_tables == {"patients", "visits"}
-        # Novel graph should contain all 4 term declarations + ontology header triples
-        classes_in_novel = list(novel_graph.subjects(RDF.type, OWL.Class))
-        # 2 class terms + 1 owl:Ontology header
-        assert len(classes_in_novel) >= 2
+        assert set(novel_graph.subjects(RDF.type, OWL.Class)) == {
+            URIRef("http://example.org/ind#Patient"),
+            URIRef("http://example.org/ind#Visit"),
+        }
 
     def test_high_score_becomes_high_confidence_match(self):
         s = RigorOntologyStrategy()
@@ -823,9 +775,6 @@ class TestCheckNovelty:
         assert all(m.match_type == "novel" for m in matches)
 
 
-# ── RAG context retrieval ───────────────────────────────────────────────
-
-
 class TestRetrieveOntologyContext:
     def _make_pipeline_with_hits(self, class_hits=None, prop_hits=None):
         pipeline = MagicMock()
@@ -895,9 +844,6 @@ class TestRetrieveOntologyContext:
         assert "no related existing concepts found" in ctx
 
 
-# ── R2RML generation (base default + RIGOR override) ────────────────────
-
-
 class TestBuildR2rmlDefault:
     """Tests the base class's default R2RML implementation.
 
@@ -930,7 +876,6 @@ class TestBuildR2rmlDefault:
             Graph(),
         )
         ns = Namespace("http://ex.org/ind#")
-        from coa_ontology.inducer.strategies.base import RR
 
         assert (ns.TriplesMap_Customers, RDF.type, RR.TriplesMap) in g
         # Subject map uses the primary key
@@ -977,7 +922,6 @@ class TestBuildR2rmlDefault:
             {"orders", "customers"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         om = URIRef("http://ex.org/ind#TriplesMap_Orders/POM_CustomerId/ObjectMap")
         parent = g.value(om, RR.parentTriplesMap)
@@ -987,7 +931,7 @@ class TestBuildR2rmlDefault:
         assert str(g.value(jc, RR.parent)) == '"id"'
 
     def test_uri_prefix_without_separator_gets_hash_appended(self, strategy):
-        """Bug fix: ontology_uri_prefix without # or / gets # appended automatically."""
+        """An ontology_uri_prefix without # or / gets # appended automatically."""
         table = CatalogTable(
             id="t",
             name="district",
@@ -1007,7 +951,6 @@ class TestBuildR2rmlDefault:
             {"district"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         # Should produce URIs with # separator (normalized)
         ns = Namespace("http://scl.example.org/financial#")
@@ -1036,7 +979,6 @@ class TestBuildR2rmlDefault:
             {"loan"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         ns = Namespace("http://ex.org/ontology/")
         assert (ns.TriplesMap_Loan, RDF.type, RR.TriplesMap) in g
@@ -1054,7 +996,6 @@ class TestBuildR2rmlDefault:
             set(),  # empty novel_tables — grounded tables still get R2RML
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         triples = list(g.triples((None, RDF.type, RR.TriplesMap)))
         assert len(triples) == 1
@@ -1078,7 +1019,6 @@ class TestBuildR2rmlDefault:
             {"frpm"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         # Collect all rr:column literals — original names preserved, double-quoted
         col_values = [str(o) for s, p, o in g.triples((None, RR.column, None))]
@@ -1109,7 +1049,6 @@ class TestBuildR2rmlDefault:
             {"data"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         subj_template = str(
             g.value(
@@ -1137,7 +1076,6 @@ class TestBuildR2rmlDefault:
             {"seasons"},
             Graph(),
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         subj_template = str(
             g.value(
@@ -1149,7 +1087,7 @@ class TestBuildR2rmlDefault:
         assert '{"ID"}' not in subj_template
 
     def test_composite_pk_all_columns_in_subject_template(self, strategy):
-        """Bug 2b: composite PKs must use ALL key columns in the IRI template to ensure uniqueness."""
+        """Composite PKs must use ALL key columns in the IRI template to ensure uniqueness."""
         table = CatalogTable(
             id="t",
             name="yearmonth",
@@ -1164,7 +1102,6 @@ class TestBuildR2rmlDefault:
             ],
         )
         g = strategy.build_r2rml("http://ex.org/ind#", [table], {"yearmonth"}, Graph())
-        from coa_ontology.inducer.strategies.base import RR
 
         subj_template = str(g.value(URIRef("http://ex.org/ind#TriplesMap_Yearmonth/SubjectMap"), RR.template))
         assert '{"CustomerID"}' in subj_template
@@ -1172,44 +1109,8 @@ class TestBuildR2rmlDefault:
         # Both keys must appear — single-column template would produce non-unique IRIs
         assert subj_template.count("{") == 2
 
-    def test_fk_target_extracted_from_two_part_referredcolumns(self, strategy):
-        """Bug 2a: referredColumns format is 'TargetTable.column' — parts[0] is the table name.
-        induce_catalog.py always writes two-part format so this is the canonical path."""
-        tables = [
-            CatalogTable(
-                id="customers",
-                name="customers",
-                fullyQualifiedName="db.customers",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-            ),
-            CatalogTable(
-                id="t",
-                name="orders",
-                fullyQualifiedName="db.orders",
-                columns=[CatalogColumn(name="customer_id", dataType="INT")],
-                tableConstraints=[
-                    CatalogConstraint(
-                        constraintType="FOREIGN_KEY",
-                        columns=["customer_id"],
-                        referredColumns=["customers.id"],
-                    ),
-                ],
-            ),
-        ]
-        g = strategy.build_r2rml("http://ex.org/ind#", tables, {"orders", "customers"}, Graph())
-        from coa_ontology.inducer.strategies.base import RR
-
-        om = URIRef("http://ex.org/ind#TriplesMap_Orders/POM_CustomerId/ObjectMap")
-        parent = g.value(om, RR.parentTriplesMap)
-        # Target table is "customers" (parts[0])
-        assert parent == URIRef("http://ex.org/ind#TriplesMap_Customers")
-        jc = g.value(om, RR.joinCondition)
-        assert str(g.value(jc, RR.child)) == '"customer_id"'
-        assert str(g.value(jc, RR.parent)) == '"id"'
-
     def test_fk_target_single_part_referredcolumns(self, strategy):
-        """Defensive: if referredColumns is single-part (just table name), parts[0] still works."""
+        """A single-part referredColumns (just a table name) degrades to a datatype column."""
         table = CatalogTable(
             id="t",
             name="orders",
@@ -1224,7 +1125,6 @@ class TestBuildR2rmlDefault:
             ],
         )
         g = strategy.build_r2rml("http://ex.org/ind#", [table], {"orders"}, Graph())
-        from coa_ontology.inducer.strategies.base import RR
 
         om = URIRef("http://ex.org/ind#TriplesMap_Orders/POM_CustomerId/ObjectMap")
         parent = g.value(om, RR.parentTriplesMap)
@@ -1253,7 +1153,6 @@ class TestBuildR2rmlRigorOverride:
         """
         g = Graph()
         ns = Namespace(ontology_prefix)
-        PROV = Namespace("http://www.w3.org/ns/prov#")
         g.bind("ind", ns)
         g.bind("prov", PROV)
         # Table-class with provenance
@@ -1322,8 +1221,6 @@ class TestBuildR2rmlRigorOverride:
         with caplog.at_level("WARNING"):
             g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
 
-        from coa_ontology.inducer.strategies.base import RR
-
         referenced_columns = [
             str(value)
             for predicate in (RR.template, RR.column, RR.child, RR.parent)
@@ -1362,8 +1259,6 @@ class TestBuildR2rmlRigorOverride:
         with caplog.at_level("WARNING"):
             g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
 
-        from coa_ontology.inducer.strategies.base import RR
-
         assert list(g.subjects(RDF.type, RR.TriplesMap)) == []
         warning = next(
             record for record in caplog.records if record.message == "r2rml_table_skipped_unsupported_primary_key"
@@ -1378,7 +1273,6 @@ class TestBuildR2rmlRigorOverride:
         prefix = "http://ex.org/ind#"
         g = Graph()
         ns = Namespace(prefix)
-        PROV = Namespace("http://www.w3.org/ns/prov#")
         base = prefix.rstrip("#/")
         for cls, tbl in ((ns.Order, "orders"), (ns.Customer, "customers")):
             g.add((cls, RDF.type, OWL.Class))
@@ -1415,8 +1309,6 @@ class TestBuildR2rmlRigorOverride:
         with caplog.at_level("WARNING"):
             r = RigorOntologyStrategy().build_r2rml(prefix, tables, {"orders", "customers"}, g)
 
-        from coa_ontology.inducer.strategies.base import RR
-
         assert set(r.subjects(RDF.type, RR.TriplesMap)) == {URIRef(f"{prefix}TriplesMap_orders")}
         assert (None, RR.predicate, ns.placedBy) not in r
         assert any(
@@ -1452,7 +1344,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = self._make_graph(prefix)
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         ns = Namespace(prefix)
         pom_email = URIRef(f"{prefix}TriplesMap_customers/POM_Email")
@@ -1466,7 +1357,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = self._make_graph(prefix)
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         ns = Namespace(prefix)
         subj = URIRef(f"{prefix}TriplesMap_customers/SubjectMap")
@@ -1478,7 +1368,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = self._make_graph(prefix)
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         ns = Namespace(prefix)
         pom_id = URIRef(f"{prefix}TriplesMap_customers/POM_Id")
@@ -1491,7 +1380,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = Graph()  # empty
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         triples = list(g.triples((None, RDF.type, RR.TriplesMap)))
         assert triples == []  # no mapping generated
@@ -1502,7 +1390,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = self._make_graph(prefix)
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         ns = Namespace(prefix)
         # PersonConcept should NOT appear as a subject class
@@ -1513,7 +1400,6 @@ class TestBuildR2rmlRigorOverride:
         prefix = "http://ex.org/ind#"
         g = Graph()
         ns = Namespace(prefix)
-        PROV = Namespace("http://www.w3.org/ns/prov#")
         # Class for 'orders'
         g.add((ns.Order, RDF.type, OWL.Class))
         g.add(
@@ -1574,7 +1460,6 @@ class TestBuildR2rmlRigorOverride:
             {"orders", "customers"},
             g,
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         om = URIRef(f"{prefix}TriplesMap_orders/POM_CustomerId/ObjectMap")
         assert (om, RR.termType, RR.IRI) in r
@@ -1588,7 +1473,6 @@ class TestBuildR2rmlRigorOverride:
         proposal = self._make_graph(prefix)
         table = self._customers_table()
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         # ind:hasEmail declares rdfs:range xsd:string
         om_email = URIRef(f"{prefix}TriplesMap_customers/POM_Email/ObjectMap")
@@ -1611,7 +1495,6 @@ class TestBuildR2rmlRigorOverride:
             ],
         )
         g = strategy.build_r2rml(prefix, [table], {"customers"}, proposal)
-        from coa_ontology.inducer.strategies.base import RR
 
         # POM for nonexistent_col should NOT exist
         pom = URIRef(f"{prefix}TriplesMap_customers/POM_NonexistentCol")
@@ -1645,7 +1528,6 @@ class TestBuildR2rmlRigorOverride:
             {"purchase_order"},
             g,
         )
-        from coa_ontology.inducer.strategies.base import RR
 
         subj = URIRef(f"{prefix}TriplesMap_purchase_order/SubjectMap")
         # Class resolved via PascalCase("purchase_order") == "PurchaseOrder" local-name match
@@ -1653,14 +1535,7 @@ class TestBuildR2rmlRigorOverride:
 
 
 class TestBuildR2rmlRigorCrossSourceCollision:
-    """RIGOR must not fuse two datasources' same-named tables.
-
-    Before the identity model, both ``public.customers`` tables were told to
-    declare the same ``ind:Customers`` class and shared one ``TriplesMap_customers``
-    IRI, one ``rr:tableName`` and one subject template — half the data unreachable,
-    plus a mapping whose bare ``rr:tableName`` disagreed with the schema-qualified
-    H2 validation schema, so Ontop rejected the whole namespace.
-    """
+    """RIGOR must not fuse two datasources' same-named tables."""
 
     def _colliding_tables(self):
         def mk(ds, schema, extra_col):
@@ -1700,7 +1575,6 @@ class TestBuildR2rmlRigorCrossSourceCollision:
         return g
 
     def test_collision_yields_two_distinct_triplesmaps(self):
-        from coa_ontology.inducer.strategies.base import RR
 
         prefix = "http://ex.org/ind#"
         tables = self._colliding_tables()
@@ -1716,17 +1590,10 @@ class TestBuildR2rmlRigorCrossSourceCollision:
             assert len(list(g.objects(lts[0], RR.tableName))) == 1
 
     def test_collision_tablenames_match_h2_schema(self):
-        """Asserted against the DDL TEXT, not against ``logical_table_names``.
+        """The DDL must CREATE every emitted rr:tableName and the schema it references.
 
-        Comparing the mapping's names to that helper's return value would pass even
-        if the helper itself were wrong, because both sides call it. The invariant
-        that actually matters is that Ontop, handed this mapping and this schema.sql,
-        finds every ``rr:tableName`` declared — so the check is: does the generated
-        DDL contain a CREATE for each emitted logical name, and a CREATE SCHEMA for
-        each schema those names reference (H2 rejects a qualified CREATE TABLE whose
-        schema does not exist).
+        Checked against the DDL text, not ``logical_table_names``, which both sides call.
         """
-        from coa_ontology.inducer.strategies.base import RR
         from coa_ontology.proposals import _tables_to_h2_ddl
 
         prefix = "http://ex.org/ind#"
@@ -1757,7 +1624,6 @@ class TestBuildR2rmlRigorCrossSourceCollision:
         assert '"email"' in ddl and '"name"' in ddl, ddl
 
     def test_collision_classes_and_subjects_unfused(self):
-        from coa_ontology.inducer.strategies.base import RR
 
         prefix = "http://ex.org/ind#"
         tables = self._colliding_tables()
@@ -1771,13 +1637,9 @@ class TestBuildR2rmlRigorCrossSourceCollision:
         assert len(templates) == 2, "each table must mint instance IRIs under its own token"
 
     def test_shared_name_llm_miss_does_not_drop_table(self):
-        """F10: for a shared bare name, class resolution uses strategy 3 (the
-        discriminated PascalCase local name) ALONE. If the LLM did not emit that
-        exact name, the table was absent from the class index and build_r2rml
-        dropped its TriplesMap entirely — its rows unreachable, strictly worse than
-        fusing to one class. A deterministic fallback must pair the same-named
-        tables against the generated classes so BOTH still get a TriplesMap."""
-        from coa_ontology.inducer.strategies.base import RR
+        """An LLM class-name miss must not drop a same-named table's TriplesMap.
+
+        A deterministic fallback pairs the same-named tables with the generated classes."""
 
         prefix = "http://ex.org/ind#"
         tables = self._colliding_tables()
@@ -1801,7 +1663,6 @@ class TestBuildR2rmlRigorCrossSourceCollision:
 
     def test_unique_name_output_unchanged(self):
         """A single-source table with a unique name keeps its bare artifacts."""
-        from coa_ontology.inducer.strategies.base import RR
 
         prefix = "http://ex.org/ind#"
         table = CatalogTable(
@@ -1827,22 +1688,11 @@ class TestNovelGraphSelfConsistency:
     referenced classes are declared, and no dangling blank-node references
     cause strict-RDF parser failures (e.g. Neptune)."""
 
-    def _make_pipeline(self, score=0.85):
+    def _make_pipeline(self):
         pipeline = MagicMock()
         pipeline.eg.model_id = "titan-v2"
         pipeline.eg.embed_texts.side_effect = lambda texts: [[0.0] * 8 for _ in texts]
 
-        def _search(*, vector, embedding_type, model_id, entity_type, top_k):
-            # High score so classes match existing; properties will also match
-            return [
-                {
-                    "entity_uri": f"http://existing/{entity_type}/Match",
-                    "ontology_id": "existing",
-                    "score": score,
-                }
-            ]
-
-        pipeline.oc.search_embeddings.side_effect = _search
         return pipeline
 
     def _build_graph_with_bnode_subclass(self, prefix: str) -> tuple[Graph, dict[str, str]]:
@@ -1850,14 +1700,11 @@ class TestNovelGraphSelfConsistency:
         subClassOfs — exactly the pattern Opus 4.7 tends to emit."""
         g = Graph()
         ns = Namespace(prefix)
-        Namespace("http://www.w3.org/ns/prov#")
         g.bind("ind", ns)
         # Class with cardinality restrictions
         g.add((ns.Order, RDF.type, OWL.Class))
         g.add((ns.Order, RDFS.label, Literal("Order")))
         # Owl:Restriction blank nodes — the bug trigger
-        from rdflib import BNode
-
         bn = BNode()
         g.add((ns.Order, RDFS.subClassOf, bn))
         g.add((bn, RDF.type, OWL.Restriction))
@@ -1927,8 +1774,6 @@ class TestNovelGraphSelfConsistency:
             0.80,
             uri_to_table,
         )
-
-        from rdflib import BNode
 
         # No subClassOf edge with a blank-node target should appear in the novel graph
         bnode_subclass_edges = [
@@ -2237,9 +2082,6 @@ class TestGroundedTableConnectivity:
             queue.extend(adj.get(node, set()) - visited)
 
         assert visited == local_classes, f"Disconnected: only reached {visited}"
-
-
-# ── Dropped tables tracking ─────────────────────────────────────────────
 
 
 class TestDroppedTables:

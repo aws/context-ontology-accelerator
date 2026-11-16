@@ -11,12 +11,6 @@ from coa_common.constants import validate_ontology_uri_prefix
 from coa_control_plane_server.models.induction_job_status import (
     InductionJobStatus as JobStatus,
 )
-from coa_control_plane_server.models.induction_strategy import (  # noqa: F401
-    InductionStrategy,
-)
-from coa_control_plane_server.models.proposal_status import (  # noqa: F401
-    ProposalStatus,
-)
 from pydantic import BaseModel, field_validator
 
 
@@ -39,10 +33,6 @@ class InductionRequest(BaseModel):
     @classmethod
     def _validate_uri_prefix(cls, v: str) -> str:
         return validate_ontology_uri_prefix(v)
-
-
-# JobStatus is re-exported from the Smithy-generated InductionJobStatus enum.
-# Generated enum uses UPPERCASE attributes (PENDING, COMPLETED).
 
 
 class ConceptMatch(BaseModel):

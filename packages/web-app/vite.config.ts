@@ -31,7 +31,5 @@ export default defineConfig({
       },
     },
   },
-  // NOTE: Vitest config (including coverage thresholds) lives in vitest.config.ts,
-  // which Vitest resolves with priority over this file. Do not add a `test` block
-  // here — it would be silently ignored (see vitest.config.ts, ORR QAL-A-2).
+  // Vitest reads vitest.config.ts, so a `test` block here is ignored.
 });

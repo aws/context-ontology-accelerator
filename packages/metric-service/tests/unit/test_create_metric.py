@@ -29,9 +29,6 @@ def _permissive_source_lookup(monkeypatch: pytest.MonkeyPatch):
     yield
 
 
-# ── Test helpers ────────────────────────────────────────────────────────
-
-
 def _make_event(body: dict | None = None, namespace: str = "test-ns") -> dict:
     """Build a minimal API Gateway proxy event."""
     return {
@@ -69,14 +66,10 @@ def _valid_body() -> dict:
     }
 
 
-# ── Validation tests ────────────────────────────────────────────────────
-
-
 class TestValidation:
     @patch("coa_metrics.api.create_metric._get_neptune")
     def test_missing_body_returns_400(self, mock_neptune: MagicMock) -> None:
         event = _make_event(body=None)
-        event["body"] = None
         resp = handler(event, None)
         assert resp["statusCode"] == 400
         assert "required" in json.loads(resp["body"])["message"]
@@ -146,9 +139,6 @@ class TestValidation:
         assert "must be nested" in msg
 
 
-# ── Conflict tests ──────────────────────────────────────────────────────
-
-
 class TestDataSourceIdFormat:
     """dataSourceId is charset-checked before any source lookup or write."""
 
@@ -177,9 +167,6 @@ class TestConflict:
         resp = handler(_make_event(body=_valid_body()), None)
         assert resp["statusCode"] == 409
         assert "already exists" in json.loads(resp["body"])["message"]
-
-
-# ── Success tests ───────────────────────────────────────────────────────
 
 
 class TestSuccess:
@@ -299,9 +286,6 @@ class TestSuccess:
         assert resp["statusCode"] == 500
 
 
-# ── Soft validation tests ───────────────────────────────────────────────
-
-
 class TestValidateSoft:
     def _request(self) -> CreateMetricRequestContent:
         return CreateMetricRequestContent.model_validate(_valid_body())
@@ -388,9 +372,6 @@ class TestValidateSoft:
         assert _validate_soft(self._request(), "test-ns") == []
 
 
-# ── Ontology concept resolution tests ───────────────────────────────────
-
-
 class TestOntologyConceptResolution:
     """Test that create_metric resolves concept names to URIs before writing."""
 
@@ -443,14 +424,8 @@ class TestOntologyConceptResolution:
         mock_neptune.create_metric.assert_called_once()
 
 
-# ── SQL persistence validation (#617 / #1050) ──────────────────────────
-
-
 class TestSqlPersistenceValidation:
-    """#617/#1050: a non-SELECT fragment or unparseable SQL is a hard 400 at
-    onboarding — the serve-time firewall enforces the same SELECT-only rule, so
-    such a metric must not be persisted. (This supersedes #161, which had made
-    fragments/parse errors soft warnings; only DML/DDL remains a separate 400.)"""
+    """A non-SELECT fragment or unparseable SQL is a hard 400 and is not persisted."""
 
     def _publishing_neptune(self, mock_neptune_factory: MagicMock) -> MagicMock:
         mock_neptune = MagicMock()
@@ -463,8 +438,6 @@ class TestSqlPersistenceValidation:
         body = json.loads(resp["body"])
         return " ".join(w["message"] for w in body.get("warnings", []))
 
-    # ── HARD: fragments and parse errors are rejected at onboarding ──────
-
     @pytest.mark.parametrize("fragment", ["COUNT(*)", "SUM(orders.total_amount)", "AVG(price)"])
     @patch("coa_metrics.api.create_metric._validate_soft")
     @patch("coa_metrics.api.create_metric._get_opensearch")
@@ -476,9 +449,7 @@ class TestSqlPersistenceValidation:
         mock_validate_soft: MagicMock,
         fragment: str,
     ) -> None:
-        """A fragment is rejected (#617/#1050): the serve firewall only executes
-        full SELECTs, so a persisted fragment fails at query time. Must 400 and
-        not persist."""
+        """A fragment is rejected: the serve firewall only executes full SELECTs."""
         mock_neptune = self._publishing_neptune(mock_neptune_factory)
         body = _valid_body()
         body["expression"] = {"dialects": [{"dialect": "TRINO", "expression": fragment}]}
@@ -520,8 +491,7 @@ class TestSqlPersistenceValidation:
     @patch("coa_metrics.api.create_metric._get_opensearch")
     @patch("coa_metrics.api.create_metric._get_neptune")
     def test_unparseable_expression_returns_400(self, mock_neptune_factory: MagicMock, mock_oss: MagicMock) -> None:
-        """A syntactically-broken expression is an ERROR check → hard 400
-        (#617/#1050), not a soft warning."""
+        """A syntactically-broken expression is a hard 400, not a soft warning."""
         mock_neptune = self._publishing_neptune(mock_neptune_factory)
         body = _valid_body()
         body["expression"] = {"dialects": [{"dialect": "TRINO", "expression": "SELECT FROM WHERE ((("}]}
@@ -543,8 +513,6 @@ class TestSqlPersistenceValidation:
         assert resp["statusCode"] == 201
         assert "full SELECT statement" not in self._warning_messages(resp)
 
-    # ── HARD: DML/DDL still 400 (security boundary) ──────────────────────
-
     @pytest.mark.parametrize(
         "sql",
         [
@@ -563,9 +531,6 @@ class TestSqlPersistenceValidation:
         assert resp["statusCode"] == 400
         assert "data-modifying" in json.loads(resp["body"])["message"]
         mock_neptune.return_value.create_metric.assert_not_called()
-
-
-# ── APPROVED-source enforcement ──────────────────────────────────
 
 
 class TestSourceApprovalEnforcement:
@@ -614,11 +579,8 @@ class TestSourceApprovalEnforcement:
         mock_neptune.create_metric.assert_called_once()
 
 
-# ── sourceTable enforcement (#161) ──────────────────────────────────────
-
-
 class TestSourceTableEnforcement:
-    """#161: sourceTable is a hard block, but only on provable absence."""
+    """sourceTable is a hard block, but only on provable absence."""
 
     @patch("coa_metrics.api.create_metric._validate_soft")
     @patch("coa_metrics.api.create_metric.check_source_table_exists")
@@ -709,12 +671,9 @@ class TestSourceTableEnforcement:
         mock_check: MagicMock,
         mock_validate_soft: MagicMock,
     ) -> None:
-        """!1133 (Kun's review): the validator can tag table_reference ERROR on
-        provable absence, but that metadata check has its own dedicated gate
-        (check_source_table_exists, using a different lookup). When the dedicated
-        gate says publish (None), an ERROR-severity table_reference finding must
-        NOT independently 400 — onboarding blocks only on sql_syntax/sql_shape
-        (BLOCKING_CHECKS). Regression guard for the old severity-based filter."""
+        """An ERROR-severity table_reference finding warns but does not block.
+
+        Only BLOCKING_CHECKS (sql_syntax/sql_shape) return 400."""
         mock_neptune = MagicMock()
         mock_neptune.get_metric.return_value = None
         mock_neptune_factory.return_value = mock_neptune
@@ -738,9 +697,7 @@ class TestSourceTableEnforcement:
         mock_check: MagicMock,
         mock_validate_soft: MagicMock,
     ) -> None:
-        """Complement to the above: a sql_shape ERROR (a BLOCKING_CHECK) must
-        still 400 and not persist, so the narrower filter did not disable the
-        onboarding gate #617/#1050 added."""
+        """A sql_shape ERROR (a BLOCKING_CHECK) still returns 400 and does not persist."""
         mock_neptune = MagicMock()
         mock_neptune.get_metric.return_value = None
         mock_neptune_factory.return_value = mock_neptune

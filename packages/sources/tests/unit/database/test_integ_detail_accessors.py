@@ -3,14 +3,9 @@
 
 """Unit tests pinning the GetSource field paths the integ suite reads.
 
-These exist because getting a path wrong is a SILENT test bug: reading a nested
-field off the top level yields ``None``, and the assertion then reports "the
-pipeline never produced it" on a scan that in fact succeeded. That happened —
-`athenaDataCatalogName` was read off the top level while the API nests it under
-``databaseDetails`` — so the contract is now asserted here, without needing a
-deployed environment.
-
-The sample payload is a real GetSource response for a completed Oracle scan.
+Reading a field nested under ``databaseDetails`` off the top level yields ``None``,
+which would fail an integ assertion on a scan that succeeded. The sample payload is
+shaped like a GetSource response for a completed Oracle scan.
 """
 
 from __future__ import annotations
@@ -31,7 +26,7 @@ _ORACLE_DETAIL = {
     "databaseDetails": {
         "jdbcConfiguration": {
             "engine": "ORACLE",
-            "host": "scl-integ-test-databases-ora-0c754f0ccbcdc7d6.elb.us-east-1.amazonaws.com",
+            "host": "oracle.example.com",
             "port": 1521,
             "databaseName": "FREEPDB1",
             "schemaFilter": "SCL_TEST",
@@ -39,8 +34,8 @@ _ORACLE_DETAIL = {
         "metadataEnrichmentEnabled": False,
         "tablesDiscovered": 8.0,
         "lastScanJobId": "2026-08-05T15:59:00Z",
-        "glueConnectionName": "scldevds_09f896f977de809c",
-        "athenaDataCatalogName": "scldevds_09f896f977de809c",
+        "glueConnectionName": "coadevds_0123456789abcdef",
+        "athenaDataCatalogName": "coadevds_0123456789abcdef",
     },
 }
 
@@ -48,11 +43,9 @@ _ORACLE_DETAIL = {
 def test_federation_refs_are_read_from_database_details() -> None:
     """The regression: these live under databaseDetails, never at the top level."""
     details = database_details(_ORACLE_DETAIL)
-    assert details["athenaDataCatalogName"] == "scldevds_09f896f977de809c"
-    assert details["glueConnectionName"] == "scldevds_09f896f977de809c"
+    assert details["athenaDataCatalogName"] == "coadevds_0123456789abcdef"
+    assert details["glueConnectionName"] == "coadevds_0123456789abcdef"
     assert details["lastScanJobId"] == "2026-08-05T15:59:00Z"
-    # Proof the top level does NOT carry them — a direct .get() would be None and
-    # every catalog assertion would fail on a perfectly good scan.
     assert _ORACLE_DETAIL.get("athenaDataCatalogName") is None
 
 

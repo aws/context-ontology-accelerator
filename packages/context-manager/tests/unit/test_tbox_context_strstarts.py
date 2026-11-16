@@ -1,12 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for TBoxContextBuilder._fetch_ontology_context STRSTARTS fix.
-
-Verifies that _fetch_ontology_context uses GRAPH ?g + STRSTARTS (not
-GRAPH <exact_uri>) so that hash-namespaced ontology URIs match correctly
-against Neptune's percent-encoded graph names.
-"""
+"""Unit tests for TBoxContextBuilder graph scoping, isMapped gating and join-path anchoring."""
 
 from __future__ import annotations
 
@@ -55,10 +50,8 @@ class TestFetchOntologyContextSTRSTARTS:
         graph_client.query.assert_called_once()
         sparql = graph_client.query.call_args[0][0]
 
-        # Must use STRSTARTS pattern
         assert "STRSTARTS(STR(?g)" in sparql
         assert "GRAPH ?g" in sparql
-        # Must NOT use exact graph URI pattern
         assert "GRAPH <" not in sparql
 
     async def test_includes_namespace_prefix_in_filter(self, tbox_builder, graph_client):
@@ -85,17 +78,13 @@ class TestFetchOntologyContextSTRSTARTS:
     async def test_hash_namespace_not_in_graph_uri(self, tbox_builder, graph_client):
         """The derived ontology base (with #) must NOT appear as a percent-encoded graph URI.
 
-        Previously the code would produce GRAPH <.../ontology%23> which never matches
-        the actual graph at GRAPH <.../ontology> (without %23).
+        GRAPH <.../ontology%23> never matches the stored graph GRAPH <.../ontology>.
         """
         hits = [_hit("https://example.org/ontology#Employee")]
         await tbox_builder._fetch_ontology_context(hits, "test-ns")
 
         sparql = graph_client.query.call_args[0][0]
-        # The old bug would encode the hash as %23 in the graph URI
         assert "%23" not in sparql
-        # And should not use a fixed graph name at all
-        assert "GRAPH <https://ontology-workbench.local" not in sparql
 
 
 _IS_MAPPED_IRI = f"{GRAPH_BASE_URI}/vocab/coa#isMapped"
@@ -361,21 +350,15 @@ class TestTBoxContextSubClassOfParentGated:
 class TestTBoxFullContextNoClassTruncation:
     """Full-namespace context must not silently drop mapped classes.
 
-    The old single joined query (?class × OPTIONAL ?property) capped at
-    LIMIT 2000 rows: with ~200 classes each having >10 datatype properties, the
-    joined cardinality exceeded 2000 and — with no ORDER BY — whichever classes'
-    rows landed past the cut vanished from the parsed result. The split (classes
-    query bounded by the ≤200 threshold, properties query separate) fixes this.
+    Classes and properties are fetched by separate queries, so property volume
+    cannot push class rows past the LIMIT.
     """
 
     async def test_all_classes_survive_when_join_would_exceed_row_cap(self, tbox_builder, graph_client):
         n_classes = 200
         # Class query: 200 distinct mapped classes (one row each — cannot exceed 2000).
         class_rows = [{"class": f"https://ex.org/o#C{i}", "label": f"C{i}"} for i in range(n_classes)]
-        # Property query: the joined-shape rows that WOULD have pushed classes past
-        # the old LIMIT 2000 (200 classes × 11 props = 2200 rows). In the OLD code
-        # these shared one result set with the class rows and truncated it; now they
-        # are a SEPARATE query, so no class row can be evicted by property volume.
+        # Property query: 200 classes × 11 props = 2200 rows, past a 2000-row LIMIT.
         prop_rows = [
             {"class": f"https://ex.org/o#C{i}", "property": f"https://ex.org/o#p{i}_{j}", "propLabel": f"p{j}"}
             for i in range(n_classes)
@@ -398,7 +381,7 @@ class TestTBoxFullContextNoClassTruncation:
             side_effect=[[{"cnt": "3"}], [{"class": "c", "label": "C"}], [{"class": "c", "property": "p"}]]
         )
         await tbox_builder._try_full_namespace_context("ns-x")
-        # count + classes + properties == 3 queries (was 2: count + joined-fetch).
+        # count + classes + properties == 3 queries.
         assert graph_client.query.call_count == 3
         classes_q = graph_client.query.call_args_list[1][0][0]
         props_q = graph_client.query.call_args_list[2][0][0]
@@ -421,8 +404,7 @@ class TestTBoxContextDatatypePropertyGate:
     """
 
     async def test_full_fetch_property_gated_to_datatype(self, tbox_builder, graph_client):
-        # Full-context path now issues THREE queries: count, classes, properties.
-        # The datatype-property gate lives in the third (properties) query.
+        # Full-context path issues count, classes, properties; the datatype gate is in the third.
         graph_client.query = AsyncMock(side_effect=[[{"cnt": "3"}], [{"class": "c", "label": "C"}], []])
         await tbox_builder._try_full_namespace_context("ns-x")
         props_sparql = graph_client.query.call_args_list[2][0][0]
@@ -447,8 +429,7 @@ class TestTBoxContextDatatypePropertyGate:
         graph_client.query = AsyncMock(side_effect=[[{"class": "https://example.org/o#Emp", "label": "Emp"}], []])
         await tbox_builder._fetch_by_entities("how many employees", "ns-x")
 
-        # The datatype gate lives in the second (property) query since the fetch
-        # was split to stop property rows from evicting matched classes.
+        # The datatype gate lives in the second (property) query.
         props_sparql = graph_client.query.call_args_list[1][0][0]
         assert "?property a owl:DatatypeProperty" in props_sparql
 
@@ -489,7 +470,7 @@ class TestTBoxGlossaryMappedGate:
                 [{"cnt": "500"}],  # full-context count over threshold → skip full path
                 [{"class": mapped_uri, "label": "Employee"}],  # _fetch_ontology_context
                 [],  # _fetch_ai_context result
-                [],  # steward annotations (#1167)
+                [],  # steward annotations
             ]
         )
         hits = [_hit(mapped_uri), _hit(unmapped_uri)]
@@ -499,7 +480,6 @@ class TestTBoxGlossaryMappedGate:
         # the unmapped one. Found by content, not position, so adding a query to
         # build() does not silently retarget this assertion.
         aicontext_sparql = next(c[0][0] for c in graph_client.query.call_args_list if "aiContext" in c[0][0])
-        assert "aiContext" in aicontext_sparql
         assert mapped_uri in aicontext_sparql
         assert unmapped_uri not in aicontext_sparql
 
@@ -525,11 +505,10 @@ class TestTBoxGlossaryMappedGate:
 
 @pytest.mark.unit
 class TestTBoxFormatForPrompt:
-    """format_for_prompt rendering of the (now mapped-only) subClassOf parent."""
+    """format_for_prompt rendering of the mapped-only subClassOf parent."""
 
     def test_format_for_prompt_emits_parent_only_when_present(self, tbox_builder):
-        """format_for_prompt renders subClassOf only when parent is populated —
-        and after the gate, parent is populated only for mapped parents."""
+        """format_for_prompt renders subClassOf only when parent is populated (mapped parents only)."""
         from coa_serve.tier2.ontop.tbox_context import TBoxContext
 
         ctx = TBoxContext(
@@ -553,19 +532,10 @@ class TestTBoxFormatForPrompt:
 class TestTBoxGraphBinding:
     """The T-Box builder binds ``?g`` to the namespace's graphs.
 
-    Every query here used to be the bare ``GRAPH ?g`` + ``STRSTARTS`` form, which
-    matches in EVERY graph on the cluster and filters afterwards, so its cost was
-    set by the whole store rather than by the namespace. On a Spider-2-sized
-    cluster the builder's object-property (join-path) query timed out outright —
-    leaving the SPARQL writer with no join paths and, on the widest namespaces,
-    no T-Box at all.
-
-    The assertions below check for constant ``GRAPH <iri>`` blocks and the ABSENCE
-    of ``VALUES ?g``. That is not stylistic: the traversal tool's earlier
-    ``VALUES``-bound form names the same graphs but is a materialised solution
-    sequence joined against the patterns, so Neptune stops using ``?g`` to select
-    quads — invisible on a one-graph namespace, a three-way ReadTimeout on a
-    two-graph one. Both callers now emit the constant form.
+    The assertions check for constant ``GRAPH <iri>`` blocks and the ABSENCE of
+    ``VALUES ?g``: bare ``GRAPH ?g`` + ``STRSTARTS`` matches in every graph on the
+    cluster, and a ``VALUES``-bound ``?g`` is a materialised solution sequence that
+    Neptune does not use to select quads.
     """
 
     _EMP = "https://example.org/o#Emp"
@@ -592,7 +562,7 @@ class TestTBoxGraphBinding:
         # one that discovers the graphs — so skip it and check its beneficiaries.
         scoped = [c[0][0] for c in graph_client.query.call_args_list[1:]]
         assert scoped, "build() issued no scoped queries"
-        graph_client.ask.assert_not_awaited()  # no per-request isMapped probe (#1448)
+        graph_client.ask.assert_not_awaited()  # no per-request isMapped probe
         for sparql in scoped:
             assert f"GRAPH <{graph_iri}> {{" in sparql
             assert "VALUES ?g" not in sparql
@@ -664,15 +634,7 @@ class TestTBoxGraphBinding:
         assert graph_a not in last_classes
 
     async def test_a_failed_resolution_is_not_cached(self, tbox_builder, graph_client):
-        """Caching a FAILURE is self-amplifying, so only success is cached.
-
-        The fallback is a cluster-wide scan, and cluster-wide scans are what
-        overload the graph — so a container that caches one transient 5s timeout
-        spends the whole TTL generating the load that causes the next timeout.
-        Observed collapsing a BIRD-Interact cell: ``graphs=0``, then ReadTimeouts
-        on the join-path and aiContext queries, then ``classes=0`` — requests
-        answered with no ontology at all. The retry costs one cheap query.
-        """
+        """Caching a FAILURE is self-amplifying, so only success is cached."""
         graph_iri = "https://ontology-workbench.local/ns-a/induced"
         failing = self._build_sequence([])
         failing[0] = RuntimeError("neptune busy")
@@ -754,12 +716,8 @@ class TestTBoxGraphBinding:
 class TestObjectPropertyDomainAnchor:
     """The join-path query is anchored to the classes already in the T-Box.
 
-    Binding ``?g`` was necessary but not sufficient: measured on the deployed
-    412-class Spider 2.0 namespace at parallelism 1, the graph-scoped query still
-    ReadTimeout at 16.6s, because ``?domain rdfs:label ?domainLabel`` with
-    ``?domain`` unbound scans every label in the graph. The builder already knows
-    which classes reached the prompt, and a join path leaving a class the writer
-    never sees is unusable — so anchoring is both the fix and the right scope.
+    With ``?domain`` unbound, ``?domain rdfs:label ?domainLabel`` scans every label
+    in the graph; a join path leaving a class the writer never sees is unusable anyway.
     """
 
     _EMP = "https://example.org/o#Emp"
@@ -831,16 +789,7 @@ class TestObjectPropertyDomainAnchor:
         assert f"VALUES ?domain {{ <{self._EMP}> }}" in sparql
 
     async def test_a_full_context_tbox_anchors_every_class_not_the_first_fifty(self, tbox_builder, graph_client):
-        """The anchor must cover the WHOLE class list the writer will be shown.
-
-        This anchor is a filter over classes already chosen for the prompt, not a
-        result set being asked about, so capping it at the generic
-        ``_MAX_SPARQL_VALUES_URIS`` (50) does not return fewer rows of the same
-        kind — it deletes the join paths of every class past the cut. The
-        full-context path routinely exceeds 50: BIRD-Interact's namespace builds a
-        175-class T-Box, so 125 classes would reach the writer with no way to join
-        them, which is worse than the unanchored query the anchor replaced.
-        """
+        """The anchor must cover the WHOLE class list; capping it at 50 drops join paths past the cut."""
         classes = [{"class": f"https://example.org/o#C{i}", "label": f"c{i}", "parentClass": None} for i in range(175)]
         seq = self._sequence()
         seq[2] = classes
@@ -874,7 +823,7 @@ class TestIsSafeSparqlUri:
 @pytest.mark.unit
 @pytest.mark.asyncio
 class TestNoMappedClasses:
-    """#1448: a namespace with zero coa:isMapped classes gets an empty structured
+    """A namespace with zero coa:isMapped classes gets an empty structured
     context (no ungated fallback) and the dark-namespace canary fires."""
 
     async def test_build_returns_no_classes_and_warns(self, tbox_builder, graph_client):

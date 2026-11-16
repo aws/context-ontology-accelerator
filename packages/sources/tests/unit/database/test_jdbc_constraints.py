@@ -52,8 +52,6 @@ def _mock_conn_with_constraints(*, pk_rows, fk_rows):
                 return [("public",)]
             if "primary key" in sql:
                 return pk_rows
-            # FK query joins referential_constraints (position-matched) rather
-            # than the old cartesian constraint_column_usage join.
             if "referential_constraints" in sql:
                 return fk_rows
             if "from information_schema.tables" in sql:
@@ -134,7 +132,6 @@ class TestDeterministicConstraints:
 
             def execute(sql, params=()):
                 state["sql"] = sql.lower()
-                # Fail on constraint queries
                 if "table_constraints" in state["sql"]:
                     raise Exception("permission denied for information_schema.table_constraints")
 

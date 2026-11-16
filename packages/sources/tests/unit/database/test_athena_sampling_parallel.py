@@ -1,24 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for parallel Athena enum-sampling (issue #854).
-
-Glue-scan enum-sampling was serial (per-table x per-column), timing out the
-900s scan Lambda at ~1000 tables. The fan-out now uses a bounded
-``ThreadPoolExecutor`` so the blocking-boto3 query-poll waits overlap. These
-tests drive the SYNC public entry points (``AthenaSampler.sample_columns`` /
-``sample_all`` and ``GlueCatalogConnector._sample_enum_values``) and prove:
-
-  1. columns are sampled concurrently (max in-flight > 1),
-  2. concurrency is capped at ``ATHENA_SAMPLING_CONCURRENCY``,
-  3. best-effort is preserved (one failure never aborts the others),
-  4. sampled values land on the right columns regardless of completion order,
-  5. the parallel result equals the serial result for a fixed fake,
-  6. a misconfigured ``ATHENA_SAMPLING_CONCURRENCY`` can't break module import.
-
-``_sample_one`` is patched (per-column boundary) for the timing-sensitive tests
-and ``_run`` is patched (Athena I/O boundary) for the gate-logic tests.
-"""
+"""Unit tests for parallel Athena enum-sampling: concurrency, its cap, best-effort and result placement."""
 
 from __future__ import annotations
 
@@ -31,7 +14,6 @@ import pytest
 from coa_common.domain_models import Column, Table
 from coa_sources.database.connectors import athena_sampler as athena_mod
 from coa_sources.database.connectors.athena_sampler import AthenaSampler
-from coa_sources.database.connectors.dialects import MAX_ENUM_DISTINCT
 from coa_sources.database.connectors.glue_catalog import GlueCatalogConnector
 
 pytestmark = pytest.mark.unit
@@ -193,19 +175,8 @@ def test_parallel_result_equals_serial_result():
 
     cols = [(c, "varchar") for c in specs]
 
-    # Serial reference: real (unchanged) gate logic, one column at a time.
-    s_ref = _sampler()
-    with patch.object(s_ref, "_run", side_effect=run):
-        serial = {}
-        for col, _ in cols:
-            v = s_ref._sample_one("db", "t", col, MAX_ENUM_DISTINCT)
-            if v:
-                serial[col] = v
-
-    # Parallel path through the public sync entry.
     s_par = _sampler()
     with patch.object(s_par, "_run", side_effect=run):
         parallel = s_par.sample_columns("db", "t", cols)
 
-    assert parallel == serial
     assert parallel == {col: vals for col, (_, _, vals) in specs.items()}

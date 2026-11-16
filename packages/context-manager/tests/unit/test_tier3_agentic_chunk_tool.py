@@ -54,7 +54,7 @@ async def test_document_window_evidence_retains_source_and_becomes_supporting_co
 
     context = AccumulatedContext()
     context.add(result)
-    assert AgenticRetriever._supporting_content(context) == (
+    assert AgenticRetriever._supporting_content_with_drops(context)[0] == (
         {
             "chunkId": "chunk-adjacent",
             "text": "The adjacent page contains the requested figure.",

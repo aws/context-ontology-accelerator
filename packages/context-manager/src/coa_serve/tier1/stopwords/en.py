@@ -27,7 +27,7 @@ GROUPS: tuple[str, ...] = (
     # Greetings and sign-offs. A chat UI wraps the question in conversational
     # padding ("Hello. What was total revenue? Thank you"); none of these asks
     # anything of the SQL, so omitting them let politeness alone trip the gate and
-    # pointlessly demote a fully-consumed question to Tier 2 (review ask).
+    # pointlessly demote a fully-consumed question to Tier 2.
     #
     # Only words that cannot be anything BUT padding are listed. Note the absences:
     # "morning"/"afternoon"/"evening" are excluded despite "good morning", because

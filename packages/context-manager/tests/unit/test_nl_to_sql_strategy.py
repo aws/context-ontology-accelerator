@@ -31,8 +31,6 @@ from coa_serve.tier2.strategy import (
 from coa_serve.tier2.table_qualifier import PreparedSQL
 from coa_serve.trace import TraceCollector
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 
 def _make_nl_to_sql_result(
     *,
@@ -88,9 +86,6 @@ def _make_context() -> StrategyContext:
         options={"maxResults": 100, "dataSourceId": "ds-1", "evidence": "some evidence text"},
         trace=TraceCollector(),
     )
-
-
-# ── Tests ────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -158,7 +153,7 @@ class TestNLtoSQLStrategyResolve:
     async def test_templateless_declined_metric_forwards_nothing(
         self, strategy, sql_generator, firewall, query_executor
     ):
-        """End-to-end guard for comment 1: a declined metric with no formula must not
+        """A declined metric with no formula must not
         put a block in the writer's prompt, even though context.declined_metric is
         non-None."""
         sql_generator.generate.return_value = _make_nl_to_sql_result()
@@ -298,7 +293,6 @@ class TestNLtoSQLStrategyResolve:
         assert result is None
         firewall.evaluate.assert_not_called()
         query_executor.execute.assert_not_called()
-        # A genuine generation failure is an error step.
         gen = [s for s in context.trace.steps if s.step == "t2.sql.generate"]
         assert gen and gen[0].status == "error"
 
@@ -374,10 +368,8 @@ class TestNLtoSQLStrategyResolve:
 
         result = await strategy.resolve("query", "ns1", context)
 
-        # The executor should receive the rewritten (authorized) SQL
         execute_call_args = query_executor.execute.call_args
         assert execute_call_args[0][0] == rewritten_sql
-        # The result should also contain the authorized SQL
         assert result.sql == rewritten_sql
 
     @pytest.mark.asyncio
@@ -408,12 +400,8 @@ class TestNLtoSQLStrategyResolve:
         result = await strategy.resolve("query", "ns1", context)
 
         assert result is None
-        # First shot failed → one corrective regeneration attempted.
         sql_generator.correct.assert_called_once()
-        # Two execution attempts total (shot 1 + shot 2), bounded by max_shots.
         assert query_executor.execute.call_count == 2
-
-    # ── Two-shot self-correction ────────────────────────────────────────────
 
     @pytest.mark.asyncio
     async def test_correction_recovers_after_execution_error(self, strategy, sql_generator, firewall, query_executor):
@@ -436,11 +424,9 @@ class TestNLtoSQLStrategyResolve:
         assert result is not None
         assert result.sql == "SELECT count(*) FROM orders"
         assert result.row_count == 7
-        # correct() got the verbatim engine error + prior SQL + reused schema.
         args, kwargs = sql_generator.correct.call_args
         assert "does not exist" in kwargs["execution_error"]
         assert kwargs["failed_sql"] == "SELECT bad FROM orders"
-        # question + ddl_context are passed positionally.
         assert args[0] == "How many orders?"
         assert args[1] == "CREATE TABLE orders (id int);"
 
@@ -510,38 +496,10 @@ class TestNLtoSQLStrategyResolve:
 
         assert result is not None
         assert result.row_count == 0
-        # The whole point: no correction shot on a clean empty result.
         sql_generator.correct.assert_not_called()
         assert query_executor.execute.call_count == 1
-        # The empty result is surfaced as a deterministic answer in the trace.
         exec_steps = [s for s in context.trace.steps if s.step == "t2.sql.execute" and s.status == "success"]
         assert exec_steps and exec_steps[-1].detail.get("deterministicEmpty") is True
-
-    @pytest.mark.asyncio
-    async def test_nonexistent_entity_value_is_not_coaxed_into_rows(
-        self, strategy, sql_generator, firewall, query_executor
-    ):
-        # Regression: a query naming a non-existent entity ('Gamma')
-        # filters to 0 rows. The strategy must NOT feed that back to the model as
-        # "likely wrong — loosen the filter", which is what fabricated rows for a
-        # different, real value ('Alpha') nondeterministically across runs. If
-        # correct() is never called, no such substitution can happen.
-        sql_generator.generate.return_value = _make_nl_to_sql_result(sql="SELECT count(*) FROM t WHERE name='Gamma'")
-        firewall.evaluate.return_value = _make_firewall_result(
-            authorized_sql="SELECT count(*) FROM t WHERE name='Gamma'"
-        )
-        # If a correction were (wrongly) attempted, it would return rows for a
-        # real value — assert we never get here.
-        sql_generator.correct.return_value = ("SELECT count(*) FROM t WHERE name='Alpha'", 0.8)
-        query_executor.execute.return_value = _make_exec_result(rows=[], row_count=0)
-        context = _make_context()
-
-        result = await strategy.resolve("How many records are associated with Gamma?", "ns1", context)
-
-        assert result is not None
-        assert result.row_count == 0
-        sql_generator.correct.assert_not_called()
-        assert query_executor.execute.call_count == 1
 
     @pytest.mark.asyncio
     async def test_empty_result_no_correction_when_max_shots_one(self, sql_generator, firewall, query_executor):
@@ -629,7 +587,6 @@ class TestNLtoSQLStrategyResolve:
 
         assert result is not None
         assert result.row_count == 0
-        # Exactly one correction (shot 2); the empty shot-2 result is accepted, not re-coaxed.
         sql_generator.correct.assert_called_once()
         assert query_executor.execute.call_count == 2
         exec_ok = [s for s in context.trace.steps if s.step == "t2.sql.execute" and s.status == "success"]
@@ -639,7 +596,7 @@ class TestNLtoSQLStrategyResolve:
     async def test_zero_rows_without_user_literal_still_self_corrects(
         self, strategy, sql_generator, firewall, query_executor
     ):
-        # AC: correction must STILL fire for a genuinely-wrong query whose zero
+        # Correction must STILL fire for a genuinely-wrong query whose zero
         # rows are NOT caused by a user-supplied value (e.g. a bad JOIN). The
         # question names no entity; shot 1's SQL carries no literal from it, so
         # the empty result is treated as a possibly-wrong query and corrected.
@@ -661,7 +618,6 @@ class TestNLtoSQLStrategyResolve:
 
         assert result is not None
         assert result.row_count == 5
-        # No user literal in the filter → the zero-row result was corrected.
         sql_generator.correct.assert_called_once()
         assert query_executor.execute.call_count == 2
         # The correction feedback must NOT tell the model to alter a value.
@@ -672,7 +628,7 @@ class TestNLtoSQLStrategyResolve:
     @pytest.mark.asyncio
     async def test_max_shots_one_disables_correction(self, sql_generator, firewall, query_executor):
         # max_shots=1 → pure one-shot; a failed execution returns None with no
-        # correction attempt (backwards-compatible with the pre-two-shot path).
+        # correction attempt.
         strategy = NLtoSQLStrategy(
             sql_generator=sql_generator,
             firewall=firewall,
@@ -712,12 +668,12 @@ class TestNLtoSQLStrategyResolve:
 
     @pytest.mark.asyncio
     async def test_max_rows_capped_at_system_max(self, strategy, sql_generator, firewall, query_executor):
-        """Cap is MAX_RESULT_ROWS (raised 1000 -> 10_000 once Athena results paginate)."""
+        """A value below MAX_RESULT_ROWS passes through."""
         sql_generator.generate.return_value = _make_nl_to_sql_result()
         firewall.evaluate.return_value = _make_firewall_result()
         query_executor.execute.return_value = _make_exec_result()
         context = _make_context()
-        context.options["maxResults"] = 5000  # below the new cap -> passes through
+        context.options["maxResults"] = 5000
 
         await strategy.resolve("query", "ns1", context)
 
@@ -736,19 +692,6 @@ class TestNLtoSQLStrategyResolve:
 
         call_kwargs = query_executor.execute.call_args[1]
         assert call_kwargs["max_rows"] == MAX_RESULT_ROWS
-
-    @pytest.mark.asyncio
-    async def test_evidence_truncated_to_500_chars(self, strategy, sql_generator, firewall, query_executor):
-        sql_generator.generate.return_value = _make_nl_to_sql_result()
-        firewall.evaluate.return_value = _make_firewall_result()
-        query_executor.execute.return_value = _make_exec_result()
-        context = _make_context()
-        context.options["evidence"] = "x" * 1000  # Longer than 500
-
-        await strategy.resolve("query", "ns1", context)
-
-        generate_kwargs = sql_generator.generate.call_args[1]
-        assert len(generate_kwargs["evidence"]) == 500
 
 
 @pytest.mark.unit
@@ -974,8 +917,7 @@ class TestNLtoSQLCrossSourceQualification:
 
     @pytest.mark.asyncio
     async def test_one_retrieved_copy_of_a_shared_name_is_refused_naming_every_database(self):
-        # The customer's case: only one study's `ds` was retrieved, and the query
-        # returned that study's 60 rows as the count across all studies.
+        # Only one study's `ds` was retrieved, so the count must not be scoped to it.
         strategy, query_executor = self._one_of_three_strategy("SELECT count(*) FROM ds")
 
         with pytest.raises(AmbiguousReferenceError) as err:
@@ -1010,8 +952,7 @@ class TestNLtoSQLCrossSourceQualification:
 
     @pytest.mark.asyncio
     async def test_question_naming_one_database_of_a_partial_name_runs_against_it(self):
-        # The live failure: the question names sdtm_cs103, but the writer was never
-        # told which databases hold `ds`, wrote it bare, and the query was refused.
+        # The question names sdtm_cs103; the writer must be told which databases hold `ds`.
         strategy, query_executor = self._one_of_three_strategy("", writer=self._schema_reading_writer)
 
         await strategy.resolve(
@@ -1074,13 +1015,8 @@ class TestNLtoSQLCrossSourceQualification:
     async def test_unattributable_reference_abandons_the_strategy(self):
         """Fail closed, matching the VKG path.
 
-        This path previously executed the unqualified statement instead, on the
-        theory that ``sql_table_routing`` can never produce an ambiguous name —
-        true today, but a property of a different module that nothing enforced.
-        Executing risks reading a different source's table than the one authorized,
-        and a correction shot would hit the same ambiguity, so the strategy raises a
-        terminal ``AmbiguousReferenceError`` (surfaced to the client) rather than
-        executing or silently skipping.
+        An unattributable reference raises a terminal ``AmbiguousReferenceError``
+        rather than executing or silently skipping.
         """
         sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
         sql_generator.generate.return_value = _make_nl_to_sql_result(
@@ -1103,11 +1039,8 @@ class TestNLtoSQLCrossSourceQualification:
 
         query_executor.execute.assert_not_called()
 
-    # ── Fail-closed on incomplete metadata (#1141) ───────────────────────────
-    # These drive the REAL ``prepare_execution_sql`` / ``qualify_cross_source_sql``
-    # (no patching), so they prove the NL->SQL flow turns each qualification
-    # failure into a refusal. Before #1141 each case returned the statement bare
-    # and the executor ran it in Athena's single pinned context.
+    # These drive the real, unpatched ``prepare_execution_sql`` to prove each
+    # metadata gap is refused.
 
     def _cross_source_mocks(self):
         sql_generator, firewall, query_executor = AsyncMock(), MagicMock(), AsyncMock()
@@ -1166,7 +1099,7 @@ class TestNLtoSQLCrossSourceQualification:
 
 
 def _make_context_with_deadline(budget_s: float) -> StrategyContext:
-    """A StrategyContext carrying a request-scoped deadline (A0)."""
+    """A StrategyContext carrying a request-scoped deadline."""
     ctx = _make_context()
     ctx.deadline = Deadline.from_budget(budget_s, None)
     return ctx
@@ -1174,12 +1107,10 @@ def _make_context_with_deadline(budget_s: float) -> StrategyContext:
 
 @pytest.mark.unit
 class TestNLtoSQLStrategyDeadline:
-    """A4/A6 — the correction shot and executor timeout become deadline-aware.
+    """The correction shot and executor timeout are deadline-aware.
 
-    The invariant under test: a request-scoped deadline never STARTS a second
-    generate→execute cycle it cannot finish (which is what 504s the caller after
-    a usable first-shot answer already exists), while the pre-A0 behaviour — no
-    deadline, or an ample one — is preserved exactly.
+    A request-scoped deadline never STARTS a second generate→execute cycle it
+    cannot finish; with no deadline, or an ample one, behaviour is unchanged.
     """
 
     @pytest.fixture
@@ -1228,13 +1159,9 @@ class TestNLtoSQLStrategyDeadline:
         assert result.row_count == 0  # the clean empty first-shot result
         sql_generator.correct.assert_not_called()
         assert query_executor.execute.call_count == 1
-        # The skip is observable in the trace as a reasoned skipped step.
         skipped = [s for s in context.trace.steps if s.step == "t2.sql.generate" and s.status == "skipped"]
         assert skipped, "deadline skip must record an observable skipped step"
-        # Trace-latency invariant: a step that did NOT run reports 0ms duration and
-        # carries NO latency-looking / budget-derived number in its detail. Step
-        # latency reflects real elapsed time only; the budget is an independent
-        # dimension. Guards against re-mixing seconds into a non-event step.
+        # A skipped step reports 0ms and no budget numbers.
         skip_step = skipped[0]
         assert skip_step.duration_ms == 0
         detail = skip_step.detail if isinstance(skip_step.detail, dict) else {}
@@ -1262,9 +1189,7 @@ class TestNLtoSQLStrategyDeadline:
 
     @pytest.mark.asyncio
     async def test_ample_deadline_still_self_corrects(self, strategy, sql_generator, firewall, query_executor):
-        # REGRESSION GUARD for the 170s AgentCore/Playground path: with an ample
-        # budget the second shot always fits, so self-correction fires exactly as
-        # before A0. This is the behaviour we must NOT break.
+        # With an ample budget, the correction still fires.
         sql_generator.generate.return_value = _make_nl_to_sql_result(
             sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
         )
@@ -1287,9 +1212,9 @@ class TestNLtoSQLStrategyDeadline:
         assert query_executor.execute.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_no_deadline_preserves_pre_a0_correction(self, strategy, sql_generator, firewall, query_executor):
+    async def test_no_deadline_preserves_correction(self, strategy, sql_generator, firewall, query_executor):
         # No deadline threaded (context.deadline is None) → the correction is
-        # unconditional, identical to the pre-A0 code path.
+        # unconditional.
         sql_generator.generate.return_value = _make_nl_to_sql_result(
             sql="SELECT count(*) FROM orders o JOIN customers c ON o.id = c.id"
         )

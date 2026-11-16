@@ -18,9 +18,6 @@ from coa_metrics.metadata_reconciler import (
 pytestmark = pytest.mark.unit
 
 
-# ── Mock store ──────────────────────────────────────────────────────────
-
-
 class MockMetadataStore(MetadataStore):
     """In-memory metadata store for testing."""
 
@@ -46,7 +43,6 @@ class MockMetadataStore(MetadataStore):
                 "synonyms": synonyms,
             }
         )
-        # Apply to in-memory state
         existing = self._data.get(data_source_id)
         if existing is None:
             existing = DatasetMetadata(data_source_id=data_source_id)
@@ -57,9 +53,6 @@ class MockMetadataStore(MetadataStore):
             existing.description_source = description_source
         if synonyms is not None:
             existing.synonyms = synonyms
-
-
-# ── Tests ───────────────────────────────────────────────────────────────
 
 
 class TestReconcileMetadata:

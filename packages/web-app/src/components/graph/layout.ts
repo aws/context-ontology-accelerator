@@ -266,8 +266,6 @@ export function layoutForceGraph(
   // Lay out each component around its own origin and measure its bounding box.
   // Spacing scales *per component* with that component's own maxDegree, so a
   // 24-spoke hub cluster blooms while a 3-node side cluster stays compact.
-  // Sqrt scaling matches the exact knob OntologyGraphFlow uses when it chose
-  // to drive this at the global level, but applied one component at a time.
   const laidOut = components.map((ids) => {
     const idSet = new Set(ids);
     const degree = new Map<string, number>();

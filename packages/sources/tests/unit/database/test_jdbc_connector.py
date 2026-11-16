@@ -150,7 +150,6 @@ class TestTestConnection:
         result = connector.test_connection(base_config)
 
         assert result.success
-        # 4 checks now: network, auth, database (SELECT 1), schema_access
         assert len(result.checks) == 4
         assert [c.check for c in result.checks] == ["network", "auth", "database", "schema_access"]
         assert all(c.status == "ok" for c in result.checks)
@@ -178,10 +177,7 @@ class TestTestConnection:
     @patch("coa_sources.database.connectors.jdbc.boto3")
     @patch("coa_sources.database.connectors.jdbc.socket.create_connection")
     def test_unsupported_engine_rejected_before_any_io(self, mock_socket, mock_boto3, connector, base_config):
-        # An engine with no enabled dialect can never be discovered, so the
-        # connection test must FAIL (it used to return success with a warning,
-        # which let a source be created that could never be scanned) — and it must
-        # do so before opening a socket or reading the credential secret.
+        # An engine with no dialect fails before any socket or secret read.
         base_config["engine"] = "DB2"
         mock_socket.return_value = MagicMock()
 
@@ -225,8 +221,6 @@ class TestTestConnection:
         mock_sm_client.get_secret_value.return_value = {
             "SecretString": json.dumps({"username": "admin", "password": "secret"})
         }
-        # Runs on the default POSTGRESQL engine, so the connect + schema probe
-        # execute too (an engine without a dialect is now rejected up front).
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [("public",)]
@@ -413,8 +407,7 @@ class TestDiscoverMetadata:
     @patch("coa_sources.database.connectors.jdbc.boto3")
     def test_schema_exclude_filter_adds_to_system_defaults(self, mock_boto3, connector, base_config):
         self._patch_creds(mock_boto3)
-        # A caller-supplied exclude ADDS to the default system-schema exclude: it
-        # used to replace it, so excluding 'staging' brought pg_catalog in (#168).
+        # A caller-supplied exclude adds to the default system-schema exclude.
         base_config["schema_exclude_filter"] = "staging"
         conn = self._build_mock_conn(
             schemas=["public", "staging", "pg_catalog"],
@@ -444,7 +437,7 @@ class TestDiscoverMetadata:
     def test_regex_schema_exclude_naming_system_schemas_still_excludes_them_and_warns(
         self, mock_boto3, connector, base_config
     ):
-        """The issue's exclude: system schemas stay out, and the no-op regex is reported."""
+        """A regex exclude naming system schemas: they stay out, and the no-op regex is reported."""
         self._patch_creds(mock_boto3)
         base_config["schema_exclude_filter"] = "^(pg_catalog|information_schema)$"
         _mock_pg8000.connect.return_value = self._three_schemas()
@@ -509,7 +502,7 @@ class TestDiscoverMetadata:
         assert "Did you mean 'b'?" in result.filter_warnings[0]
 
     def test_zero_match_schema_check_names_glob_syntax_and_suggests(self, connector):
-        """The SCAN_FAILED message for the issue's include filter says what syntax it expected."""
+        """The SCAN_FAILED message for a regex include filter says what syntax it expected."""
         from coa_sources.database.connectors.dialects import get_dialect
 
         dialect = MagicMock(wraps=get_dialect("POSTGRESQL"))
@@ -573,8 +566,6 @@ class TestDiscoverMetadata:
         _mock_pg8000.connect.return_value = conn
 
         result = connector.discover_metadata(base_config)
-        # Only `orders` (matches include, doesn't match exclude). `orders_staging`
-        # matches include but is excluded; `products` doesn't match include.
         assert [t.table_id for t in result.tables] == ["public.orders"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
@@ -623,13 +614,7 @@ class TestDiscoverMetadata:
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
     def test_table_filter_pipe_list_matches_any_glob(self, mock_boto3, connector, base_config):
-        """A pipe-delimited list of globs includes a table matching ANY of them.
-
-        Matches the source-creation UI, which labels this field "regex" with an
-        ``orders|customers`` placeholder. The names need not share a common
-        glob — exactly the case for isolating an arbitrary table subset (e.g. a
-        Formula-1 dataset's circuits/drivers/races/... out of a shared schema).
-        """
+        """A pipe-delimited list of globs includes a table matching ANY of them."""
         self._patch_creds(mock_boto3)
         base_config["table_filter"] = "circuits|drivers|races|status"
         conn = self._build_mock_conn(
@@ -643,8 +628,6 @@ class TestDiscoverMetadata:
 
         result = connector.discover_metadata(base_config)
 
-        # All four listed tables, and ONLY those. `superhero` isn't listed;
-        # `race` must NOT match the `races` glob (full-match, not substring).
         assert sorted(t.name for t in result.tables) == ["circuits", "drivers", "races", "status"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
@@ -663,15 +646,11 @@ class TestDiscoverMetadata:
 
         result = connector.discover_metadata(base_config)
 
-        # `constructor*` expands to both constructor tables; `drivers` exact; surrounding
-        # whitespace around list entries is tolerated. `races` is excluded.
         assert sorted(t.name for t in result.tables) == ["constructorresults", "constructors", "drivers"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
     def test_table_exclude_filter_pipe_list_excludes_any(self, mock_boto3, connector, base_config):
-        """The list semantics apply to EXCLUDE filters too: a table is excluded
-        if it matches ANY entry. (``_compile_filter`` is shared by include and
-        exclude paths, so this pins the exclude behavior explicitly.)"""
+        """A table is excluded if it matches ANY entry of the exclude list."""
         self._patch_creds(mock_boto3)
         base_config["table_exclude_filter"] = "*_staging|*_tmp|audit_log"
         names = ["orders", "orders_staging", "customers_tmp", "audit_log", "products"]
@@ -684,16 +663,11 @@ class TestDiscoverMetadata:
 
         result = connector.discover_metadata(base_config)
 
-        # Excluded: orders_staging (*_staging), customers_tmp (*_tmp), audit_log
-        # (exact). Survivors: orders, products.
         assert sorted(t.name for t in result.tables) == ["orders", "products"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
     def test_filter_glob_character_class_with_comma_is_not_split(self, mock_boto3, connector, base_config):
-        """A comma INSIDE a glob character class (``[...]``) must not be treated
-        as a list delimiter — ``log_[a,c]`` is one glob matching ``log_a`` /
-        ``log_c`` (and the literal ``,``), NOT the two broken globs ``log_[a``
-        and ``c]``."""
+        """A comma inside a glob character class (``[...]``) is not a list delimiter."""
         self._patch_creds(mock_boto3)
         base_config["table_filter"] = "log_[a,c]"
         names = ["log_a", "log_b", "log_c", "log_ac"]
@@ -706,8 +680,6 @@ class TestDiscoverMetadata:
 
         result = connector.discover_metadata(base_config)
 
-        # `[a,c]` is a single-char class {a, c, ,} — matches log_a and log_c,
-        # NOT log_b (not in class) and NOT log_ac (class matches exactly one char).
         assert sorted(t.name for t in result.tables) == ["log_a", "log_c"]
 
     @patch("coa_sources.database.connectors.jdbc.boto3")
@@ -780,7 +752,6 @@ class TestDiscoverMetadata:
         _mock_pg8000.connect.return_value = conn
 
         first = connector.discover_metadata(base_config).tables[0].technical_metadata_hash
-        # Reset and run again — same inputs must yield same hash
         _mock_pg8000.connect.reset_mock()
         _mock_pg8000.connect.return_value = self._build_mock_conn(
             schemas=["public"],

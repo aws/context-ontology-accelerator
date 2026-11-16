@@ -171,9 +171,7 @@ export const ProfilePage: React.FC = () => {
             content: (
               <SpaceBetween size="s">
                 {/* A failed grants query must not read as "you have no roles":
-                    an empty table is indistinguishable from a genuinely
-                    unprivileged account, which is the same silent-wrong-view
-                    failure the handler's fan-out fix removes server-side. */}
+                    an empty table looks like an unprivileged account. */}
                 {grantsError && (
                   <Alert type="error" header={t("Failed to load your roles")}>
                     {grantsError.message}

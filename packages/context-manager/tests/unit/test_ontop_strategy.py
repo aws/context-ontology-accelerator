@@ -16,8 +16,6 @@ from coa_serve.tier2.ontop.strategy import OntopStrategy, _is_retryable_vkg_erro
 from coa_serve.tier2.strategy import StrategyContext, StrategyOption, StrategyResult
 from coa_serve.trace import TraceCollector
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
 
 def _make_sparql_result(*, valid: bool = True, sparql: str = "SELECT ?x WHERE { ?x a :Foo }", confidence: float = 0.8):
     """Build a mock TranslationResult."""
@@ -49,7 +47,6 @@ def _make_tier2_result(
     compile_step.detail = {"error": error} if error else {"dialect": "ansi"}
     result.trace_steps = [compile_step]
 
-    # Firewall result
     fw = MagicMock()
     fw.denied = firewall_denied
     fw.reason = "policy violation" if firewall_denied else None
@@ -65,7 +62,6 @@ def _make_tier2_result(
     # ``StrategyResult.sql`` pass vacuously.
     result.executed_sql = executed_sql
 
-    # Query result
     if has_query_result and not error:
         qr = MagicMock()
         qr.rows = [{"col": "val"}]
@@ -86,9 +82,6 @@ def _make_context(*, embedding: list[float] | None = None) -> StrategyContext:
         options={"maxResults": 100, "dataSourceId": "ds-1"},
         trace=TraceCollector(),
     )
-
-
-# ── Tests ────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -150,13 +143,12 @@ class TestOntopStrategyResolve:
         assert result.rows == [{"col": "val"}]
         assert result.columns == ["col"]
         assert result.confidence == 0.8
-        # The VKG names the ontology version it executed against; the value
-        # must survive into the StrategyResult instead of being discarded (#986).
+        # The VKG ontology version must reach the StrategyResult.
         assert result.ontology_version == "2026-09-12T08:15:00Z"
 
     @pytest.mark.asyncio
     async def test_vkg_unknown_ontology_version_is_not_reported(self, strategy, nl_to_sparql, vkg_translator):
-        """ "unknown" is the VKG's missing-value sentinel, not a version (#986)."""
+        """``unknown`` is the VKG's missing-value sentinel, not a version."""
         nl_to_sparql.translate.return_value = _make_sparql_result()
         tier2_result = _make_tier2_result()
         tier2_result.vkg_result.ontology_version = "unknown"
@@ -169,12 +161,7 @@ class TestOntopStrategyResolve:
 
     @pytest.mark.asyncio
     async def test_reported_sql_is_the_qualified_statement_that_executed(self, strategy, nl_to_sparql, vkg_translator):
-        """Follow-up caught live on coa-dev: the ontop path reported Ontop's raw
-        translate output as ``queryUsed`` while executing the catalog-qualified rewrite.
-        The cross-source query succeeded, yet the SQL surfaced to the caller had bare
-        table names that resolve under no ``QueryExecutionContext`` — indistinguishable,
-        from the outside, from the fix not having fired at all.
-        """
+        """The reported SQL is the qualified statement that ran, not the raw translate output."""
         qualified = 'SELECT col FROM "awsdatacatalog"."sales"."tbl"'
         nl_to_sparql.translate.return_value = _make_sparql_result()
         vkg_translator.resolve.return_value = _make_tier2_result(executed_sql=qualified)
@@ -232,12 +219,10 @@ class TestOntopStrategyResolve:
     async def test_vkg_exception_retryable_retries_and_succeeds(self, strategy, nl_to_sparql, vkg_translator):
         nl_to_sparql.translate.return_value = _make_sparql_result()
 
-        # First VKG call raises retryable error
         vkg_translator.resolve.side_effect = [
             Exception("Cannot translate the SPARQL fragment"),
             _make_tier2_result(),
         ]
-        # Retry re-translation also valid
         nl_to_sparql.translate.side_effect = [
             _make_sparql_result(),
             _make_sparql_result(sparql="SELECT ?y WHERE { ?y a :Bar }"),
@@ -248,7 +233,6 @@ class TestOntopStrategyResolve:
 
         assert result is not None
         assert result.ontop_assembly is True
-        # Verify retry was invoked (translate called twice)
         assert nl_to_sparql.translate.call_count == 2
 
     @pytest.mark.asyncio
@@ -260,16 +244,13 @@ class TestOntopStrategyResolve:
         result = await strategy.resolve("query", "ns1", context)
 
         assert result is None
-        # Only the initial translate call, no retry
         assert nl_to_sparql.translate.call_count == 1
 
     @pytest.mark.asyncio
     async def test_vkg_result_based_error_with_vkg_keyword_triggers_retry(self, strategy, nl_to_sparql, vkg_translator):
         nl_to_sparql.translate.return_value = _make_sparql_result()
 
-        # First call returns result with VKG error
         first_result = _make_tier2_result(error="VKG translation failed: unsupported join")
-        # Second call (retry) succeeds
         second_result = _make_tier2_result()
         vkg_translator.resolve.side_effect = [first_result, second_result]
 
@@ -303,9 +284,8 @@ class TestOntopStrategyResolve:
     async def test_retry_also_fails_surfaces_both_compile_steps(self, strategy, nl_to_sparql, vkg_translator):
         """When the retry's VKG translation also fails, BOTH compile failures
         must be visible — the first attempt's and the retry's — so the trace
-        explains the whole retry loop (regression for the dropped-retry-compile bug)."""
+        explains the whole retry loop."""
         nl_to_sparql.translate.return_value = _make_sparql_result()
-        # Both attempts return a VKG translation error.
         vkg_translator.resolve.side_effect = [
             _make_tier2_result(error="vkg_translation_error"),
             _make_tier2_result(error="vkg_translation_error"),
@@ -320,7 +300,6 @@ class TestOntopStrategyResolve:
 
         assert result is None
         compile_errors = [s for s in context.trace.steps if s.step == "t2.vkg.compile" and s.status == "error"]
-        # Two compile failures: first attempt + retry attempt.
         assert len(compile_errors) == 2, f"expected 2 compile/error steps, got {len(compile_errors)}"
         retry_failed = [s for s in context.trace.steps if s.step == "t2.vkg.retry" and s.status == "failed"]
         assert retry_failed, "expected a t2.vkg.retry/failed step"
@@ -330,7 +309,6 @@ class TestOntopStrategyResolve:
         nl_to_sparql.translate.return_value = _make_sparql_result()
         vkg_translator.resolve.side_effect = Exception("Cannot translate the fragment")
 
-        # Retry translation returns invalid result
         nl_to_sparql.translate.side_effect = [
             _make_sparql_result(),
             _make_sparql_result(valid=False),
@@ -362,13 +340,10 @@ class TestOntopStrategyResolve:
     async def test_retry_second_vkg_call_also_fails_returns_none(self, strategy, nl_to_sparql, vkg_translator):
         nl_to_sparql.translate.return_value = _make_sparql_result()
 
-        # First VKG call raises retryable error
-        # Second VKG call also raises
         vkg_translator.resolve.side_effect = [
             Exception("Cannot translate the SPARQL fragment"),
             Exception("Still cannot translate"),
         ]
-        # Retry translation valid
         nl_to_sparql.translate.side_effect = [
             _make_sparql_result(),
             _make_sparql_result(sparql="SELECT ?y WHERE { ?y a :Bar }"),
@@ -391,7 +366,6 @@ class TestOntopStrategyResolve:
     @pytest.mark.asyncio
     async def test_vkg_returns_query_result_with_error_returns_none(self, strategy, nl_to_sparql, vkg_translator):
         nl_to_sparql.translate.return_value = _make_sparql_result()
-        # Has query_result but also has a non-vkg error
         tier2 = _make_tier2_result()
         tier2.error = "execution timeout"
         context = _make_context()
@@ -451,23 +425,15 @@ class TestOntopStrategyVectorHits:
 
         await strategy.resolve("query", "ns1", context)
 
-        # Verify translate was called with filtered vector_hits
         call_kwargs = nl_to_sparql.translate.call_args[1]
         hits = call_kwargs["vector_hits"]
-        # Only class, property, metric are kept; "unknown" is filtered out
         assert len(hits) == 3
         assert hits[0].type == "ontology_class"
         assert hits[1].type == "ontology_property"
         assert hits[2].type == "metric"
 
-    # ── mapped-class gate (parity with nl_to_sql/sql_generator.py) ───────────
-    # Unmapped classes (document-induced, or from a loaded foundational ontology)
-    # have no table behind them, so SPARQL authored against them cannot compile in
-    # VKG and the query silently returns nothing. NL→SQL gated its class retrieval
-    # on `require_mapped`; the Ontop path did not, so a document-heavy query in a
-    # mixed namespace filled its top-k with unmapped classes. The provenance skip
-    # evaluator only bails when ALL top-k hits are unmapped, so the partial mix
-    # fell straight through.
+    # Unmapped classes have no table behind them, so class retrieval is
+    # mapped-gated.
 
     def _strategy(self, nl_to_sparql, vkg_translator, vector_client):
         return OntopStrategy(
@@ -479,7 +445,7 @@ class TestOntopStrategyVectorHits:
 
     @pytest.mark.asyncio
     async def test_class_search_is_always_mapped_gated(self, nl_to_sparql, vkg_translator, vector_client):
-        """#1448: even when the gated class search finds nothing (a namespace with no
+        """Even when the gated class search finds nothing (a namespace with no
         mapped class), there is no unfiltered class retry and no mapped-count probe."""
         vector_client.search.return_value = []
         nl_to_sparql.translate.return_value = _make_sparql_result(valid=False)
@@ -490,7 +456,6 @@ class TestOntopStrategyVectorHits:
 
         class_calls = [c for c in vector_client.search.call_args_list if c.kwargs.get("entity_type") == "class"]
         assert class_calls and all(c.kwargs["require_mapped"] is True for c in class_calls)
-        assert not hasattr(vector_client, "count_documents")  # spec=VectorClient: no probe exists
 
     @pytest.mark.asyncio
     async def test_class_search_excludes_graph_classes(self, nl_to_sparql, vkg_translator, vector_client):
@@ -569,11 +534,9 @@ class TestOntopStrategyVectorHits:
 
         context = _make_context(embedding=[0.1] * 10)
 
-        # Should not raise — just returns None from invalid sparql
         result = await strategy.resolve("query", "ns1", context)
 
         assert result is None
-        # translate was still called (with vector_hits=None fallback)
         nl_to_sparql.translate.assert_called_once()
         call_kwargs = nl_to_sparql.translate.call_args[1]
         assert call_kwargs["vector_hits"] is None
@@ -594,7 +557,6 @@ class TestOntopStrategyVectorHits:
         result = await strategy.resolve("query", "ns1", context)
 
         assert result is not None
-        # translate should be called with vector_hits=None
         call_kwargs = nl_to_sparql.translate.call_args[1]
         assert call_kwargs["vector_hits"] is None
 

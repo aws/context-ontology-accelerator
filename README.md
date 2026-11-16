@@ -67,6 +67,7 @@ semantic-context/
 ├── libs/ts-shared/      # Shared TypeScript interfaces and constants
 ├── connectors/          # Athena federation connectors: toolkit, reference connector, Databricks
 ├── coa-ai/skills/       # Agent skills for driving a deployed COA (control-plane)
+├── coa-ai/workflow-agents/ # Self-hosted workflow-agents MCP server (Python)
 ├── scripts/             # CI-agnostic build/test/deploy scripts
 └── external-docs/       # Published documentation (getting-started, deployment guides)
 ```

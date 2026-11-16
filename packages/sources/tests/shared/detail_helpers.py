@@ -4,10 +4,7 @@
 """Accessors for the GetSource response shape, shared by the sources integ tests.
 
 Kept in a plain module (not conftest) so the unit suite can import it by path and
-pin the field paths without a deployed environment. Getting these wrong is a
-silent test bug rather than a loud one: reading a nested field off the top level
-yields ``None``, which every assertion then reports as "the pipeline never
-produced it" — a false failure on a working scan.
+pin the field paths without a deployed environment.
 """
 
 from __future__ import annotations
@@ -39,15 +36,10 @@ def source_scan_error(
 ) -> str:
     """Return the failed scan's ``errorMessage``, or ``""`` when unavailable.
 
-    GetSource projects ``errorMessage`` for DOCUMENT sources only
-    (``_build_document_detail``); for a DATABASE source the driver's message
-    lives on the scan job, keyed by the ISO-timestamp job id that
-    ``databaseDetails.lastScanJobId`` carries. That id contains ``:``, so it is
-    percent-encoded here — the handler unquotes it.
-
-    Returns ``""`` rather than raising: callers use this to CLASSIFY a failure
-    they have already detected, so a lookup problem must not replace the real
-    assertion failure with an unrelated error.
+    For a DATABASE source the message lives on the scan job keyed by
+    ``databaseDetails.lastScanJobId``, which contains ``:`` and so is
+    percent-encoded here. Returns ``""`` rather than raising so a lookup problem
+    does not replace the real assertion failure.
     """
     job_id = database_details(detail).get("lastScanJobId")
     if not job_id:

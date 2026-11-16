@@ -10,13 +10,7 @@ export interface NamespaceInfo {
    * loads, or to `""` when there is no id at all.
    */
   name: string;
-  /**
-   * Whether the current user can open this namespace. Derived from
-   * `GetNamespace(id)` succeeding rather than erroring (notably with the
-   * server's `AccessDeniedError`). `true` only once the request has
-   * positively confirmed access; `false` while loading, on any error, or for
-   * an empty id (fail-safe).
-   */
+  /** `true` only once `GetNamespace(id)` succeeds. */
   canAccess: boolean;
   /** Whether the underlying `GetNamespace` request is still in flight. */
   isLoading: boolean;
@@ -26,22 +20,9 @@ export interface NamespaceInfo {
  * Resolves a namespace id to both its display name and whether the current
  * user can open it, from a single shared `GetNamespace(id)` call.
  *
- * Authorization in COA is enforced server-side (Cedar policies); the client
- * has no role/permission abstraction. Rather than re-deriving access
- * client-side by enumerating every grant type that could authorize a
- * namespace (namespace grant, platform grant, group grant, etc. — a list
- * that silently drifts out of sync with the server's policy), this hook asks
- * the server directly: `GetNamespace(id)` succeeds only when the caller is
- * authorized to open the namespace and the namespace exists (`namespace.smithy`
- * declares both `AccessDeniedError` and `NotFoundError` on the operation).
- * `canAccess` is simply "did that request succeed".
- *
- * **Fail-safe by design.** This is a UX signal, not a security control — it
- * can never grant visibility the server would deny, because it IS the
- * server's answer. When the request hasn't resolved yet (loading) or failed
- * for any reason (403, 404, network), `canAccess` is `false`, so a crumb
- * stays plain text rather than linking into a namespace the user may not be
- * allowed to open.
+ * Access comes from `GetNamespace(id)` succeeding, which the server authorizes
+ * with Cedar policies. It is a UX signal that fails safe: while loading or on
+ * any error `canAccess` is `false`.
  */
 export function useNamespace(namespaceId: string | undefined): NamespaceInfo {
   const { data, isSuccess, isLoading } = useGetNamespace(namespaceId ?? "");

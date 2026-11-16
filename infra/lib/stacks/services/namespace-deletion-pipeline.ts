@@ -6,34 +6,26 @@
  *
  * Runs the cascading namespace cleanup asynchronously so the DELETE
  * /namespaces/{id} API call can return 202 immediately instead of blocking
- * on cleanup work that can exceed API Gateway's 29s integration timeout
- *.
+ * on cleanup that can exceed API Gateway's 29s integration timeout.
  *
  * Pipeline:
  *   DeleteSources -> DeleteMetrics -> DeleteOntology -> DeletePlatform -> Finalize
  *   (any step's Catch -> MarkFailed -> Fail)
  *
- * DeleteSources/DeleteMetrics/DeletePlatform are steps whose underlying
- * cleanup is safe to retry: source/metric deletes are idempotent against a
- * 404, and the platform teardown in cleanup.py (VKG service, Athena
- * workgroup, DataZone project) raises on failure but treats already-deleted
- * as done.  Each step gets 3
- * retries with backoff before the chain proceeds to MarkFailed, per the #213
- * acceptance criteria.
+ * DeleteSources/DeleteMetrics/DeletePlatform are safe to retry: source/metric
+ * deletes are idempotent against a 404, and the platform teardown in
+ * cleanup.py (VKG service, Athena workgroup, DataZone project) raises on
+ * failure but treats already-deleted as done. Each step gets 3 retries with
+ * backoff before the chain proceeds to MarkFailed.
  *
- * DeleteOntology is NOT in that group. It owns the AOSS vector
- * index, which is one index per namespace against a collection with a hard
- * 1000-index cap. Finalize deletes the namespace record, so an ontology
- * teardown that "logged and continued" would orphan that index forever —
- * nothing can target a namespace that no longer exists — until the collection
- * hits its cap and every embedding write in the deployment fails with
- * index_limit_breached. So delete_all_ontologies raises, the 3 retries apply,
- * and on exhaustion the Catch lands DELETE_FAILED, which is recoverable.
- *
- * Finalize (namespace record + name reservation delete) is the other
- * must-succeed step — it has no continue-on-failure path, since a
- * namespace whose finalize failed needs to remain retryable via
- * DELETE_FAILED rather than silently vanish from being "mostly" deleted.
+ * DeleteOntology and Finalize must succeed. DeleteOntology owns the AOSS
+ * vector index (one per namespace, hard 1000-index cap per collection);
+ * Finalize deletes the namespace record, so an ontology teardown that
+ * continued past a failure would orphan the index, since nothing can target a
+ * deleted namespace. delete_all_ontologies therefore raises, and on
+ * exhaustion the Catch lands DELETE_FAILED, which is recoverable. Finalize
+ * (namespace record + name reservation) likewise stays retryable via
+ * DELETE_FAILED.
  */
 import * as cdk from "aws-cdk-lib";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
@@ -76,9 +68,6 @@ export interface NamespaceDeletionPipelineProps {
    * Those indexes are namespace-scoped — every doc source in a namespace shares
    * one GraphRAG tenant id — so they become garbage only when the namespace is
    * deleted, and DeleteSources is where "no sources remain" becomes true.
-   * Nothing deleted them before, leaving one index set per deleted namespace
-   * against a collection AOSS caps at 1000 indexes; past that every embedding
-   * write in the deployment fails with index_limit_breached.
    *
    * Optional so a deployment without an AOSS collection still synthesizes; the
    * cleanup no-ops when OSS_ENDPOINT is unset.
@@ -449,12 +438,7 @@ export class NamespaceDeletionPipeline extends Construct {
     });
     markFailed.next(deletionFailed);
 
-    // Each step catches into MarkFailed after its own retries are
-    // exhausted — a single terminal failure path, no continue-past-failure
-    // for any step. (The MVP simplification called for in #213 — "steps
-    // 2-5 may be stubs" — doesn't apply here since delete_sources/
-    // delete_metrics call the real, already-implemented sources-api and
-    // metric-api delete paths rather than stubs.)
+    // Each step catches into MarkFailed after its retries are exhausted.
     deleteSources.addCatch(markFailed, { resultPath: "$.error" });
     deleteMetrics.addCatch(markFailed, { resultPath: "$.error" });
     deleteOntology.addCatch(markFailed, { resultPath: "$.error" });

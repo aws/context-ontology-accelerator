@@ -69,8 +69,7 @@ function linesNamingTheTag(): Array<{
 }
 
 describe("the connector tag is never applied by this app", () => {
-  // The whole point of the file. `Tags.of(...)` is the propagating form and the one
-  // the LLD names as the realistic path; a `tags:` prop on a construct is the
+  // `Tags.of(...)` is the propagating form; a `tags:` prop on a construct is the
   // direct form. Neither may carry this key.
   it("applies coa:connector to no resource in infra/lib", () => {
     const applications = linesNamingTheTag().filter(({ text }) => {

@@ -1,14 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The cardinality probe's ROW bound (GH-131 follow-up).
+"""The cardinality probe's ROW bound.
 
 ``PROBE_TIMEOUT_MS`` bounds how long one probe statement may run. It does not
 bound how much it reads, so a table with N string columns could still spend
 N × the timeout — work proportional to schema width inside a fixed Lambda.
 ``PROBE_MAX_ROWS`` bounds the read itself, and both the JDBC dialects and the
 Glue/Athena sampler build their probe SQL from the same two helpers so the bound
-cannot apply to one path and not the other (it previously applied to neither).
+cannot apply to one path and not the other.
 """
 
 from __future__ import annotations
@@ -138,10 +138,7 @@ class TestProbeMaxRowsEnv:
             env["PROBE_MAX_ROWS"] = value
         with patch.dict(os.environ, env, clear=True):
             importlib.reload(d)
-            try:
-                return d.PROBE_MAX_ROWS
-            finally:
-                pass
+            return d.PROBE_MAX_ROWS
 
     def teardown_method(self):
         os.environ.pop("PROBE_MAX_ROWS", None)
