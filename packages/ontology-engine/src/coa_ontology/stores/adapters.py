@@ -42,14 +42,7 @@ class StoreOntologyCatalogAdapter:
     """
 
     def __init__(self, graph_store: GraphStore, vector_store: VectorStore, namespace: str | None = None):
-        """Bind the adapter to a graph store, vector store, and namespace.
-
-        Args:
-            graph_store: Backend graph store for ontology/class metadata.
-            vector_store: Backend vector store for embedding search and storage.
-            namespace: Namespace this adapter is bound to; authoritative for
-                all operations unless a per-call ``namespace`` overrides it.
-        """
+        """Bind the adapter to a graph store, vector store, and namespace."""
         self.graph = graph_store
         self.vec = vector_store
         self.namespace = namespace
@@ -66,27 +59,7 @@ class StoreOntologyCatalogAdapter:
         top_k: int = 5,
         namespace: str | None = None,
     ):
-        """Search embeddings for the nearest entities to a query vector.
-
-        Args:
-            vector: Query embedding vector.
-            embedding_type: Which embedding variant to search (e.g. label, comment).
-            model_id: Embedding model identifier the vector was produced with.
-            entity_type: Kind of entity to match (``"class"`` or ``"property"``).
-            ontology_id: Restrict results to a single ontology when provided.
-            top_k: Maximum number of nearest hits to return.
-            namespace: Optional per-call namespace override; when None the
-                adapter's bound namespace is used.
-
-        Returns:
-            List of hit dicts (nearest matches serialized from dataclasses).
-        """
-        # This adapter is namespace-bound at construction (self.namespace),
-        # which is authoritative. Accept an optional per-call ``namespace``
-        # for signature-compatibility with OntologyCatalogClient (so callers
-        # like GroundingService._recall can pass it uniformly regardless of
-        # which catalog implementation they hold); an explicit non-None value
-        # overrides the bound one.
+        """Search embeddings for the nearest entities to a query vector."""
         ns = namespace if namespace is not None else self.namespace
         hits = self.vec.search_nearest(
             vector=vector,

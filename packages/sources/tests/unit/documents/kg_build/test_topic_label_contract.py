@@ -79,7 +79,6 @@ def test_parse_extracted_topics_fullwidth_colon_on_single_label_is_tolerated():
 
 
 def test_parse_extracted_topics_all_fullwidth_colons_yield_zero_topics():
-    # The full-width-colon failure the commit names: when every label's colon is
-    # full-width (`：`), the parser matches no label and drops to zero.
+    # When every label's colon is full-width (`：`), the parser matches no label and drops to zero.
     reply = _REPLY.format(**_ENGLISH).replace(":", "：")
     assert _count(reply) == 0

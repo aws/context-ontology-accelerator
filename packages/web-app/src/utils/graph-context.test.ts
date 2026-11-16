@@ -37,10 +37,6 @@ describe("normalizeGraphContext", () => {
     expect(normalizeGraphContext("abc")).toBeUndefined();
   });
 
-  // The defect this function exists to prevent. A conditional spread left a
-  // non-array `entities` in place, so `"abc".length === 3` read as truthy, the
-  // renderer called `.map` on a string, and the error boundary replaced the whole
-  // chat panel — the conversation view lost to one malformed field.
   it("replaces a string entities field with an empty array", () => {
     const normalized = normalizeGraphContext({ entities: "abc" });
 
@@ -83,8 +79,6 @@ describe("normalizeGraphContext", () => {
     }
   });
 
-  // One level down from the case above: the entity guard checks only uri/label,
-  // so a malformed nested field used to reach the renderer and crash the panel.
   it("sanitizes nested entity and relationship fields", () => {
     const normalized = normalizeGraphContext({
       entities: [

@@ -105,7 +105,6 @@ export class NetworkStack extends SCLStack {
     super(scope, id, props);
     this.addComponentTag("foundation");
 
-    // ── VPC (create or import) ───────────────────────────────────────
     const existingVpcId = this.node.tryGetContext("vpc_id") as
       | string
       | undefined;
@@ -156,14 +155,10 @@ export class NetworkStack extends SCLStack {
             "VPC, or unset aoss_vpc_endpoint_id to let COA create its own VPC.",
         );
       }
-      // Pin VPC AZs to AgentCore-supported physical zones. AZ *names*
-      // (us-east-1a/b/…) map to different physical AZ *IDs* per account,
-      // so a fixed ``maxAzs: 2`` lands on supported zones in one account
-      // and unsupported ones in another (our 9923 testing account failed
-      // with "subnets in unsupported availability zones"). The app
-      // entrypoint resolves the supported names for the deploying account
-      // via ``resolveAgentCoreAzNames`` and passes them in here. When not
-      // provided (unit synth), fall back to the default 2-AZ spread.
+      // Pin VPC AZs to AgentCore-supported physical zones: AZ names map to different AZ IDs
+      // per account, so the app entrypoint resolves the supported names via
+      // ``resolveAgentCoreAzNames`` and passes them in. Without them (unit synth), fall back
+      // to the default 2-AZ spread.
       const azNames = props?.agentCoreAzNames;
       const vpcCidr = this.ctxString("vpc_cidr");
       if (vpcCidr) {
@@ -199,7 +194,6 @@ export class NetworkStack extends SCLStack {
       });
     }
 
-    // ── VPC Endpoints ────────────────────────────────────────────────
     // Only created for new VPCs. Imported VPCs are expected to have
     // their own endpoints managed externally.
     if (!existingVpcId) {
@@ -309,8 +303,6 @@ export class NetworkStack extends SCLStack {
       });
     }
 
-    // ── Security Groups ──────────────────────────────────────────────
-
     // Neptune - allow inbound 8182 from the ECS + Lambda SGs only (not the
     // whole VPC CIDR). Neptune is a database; it never initiates connections,
     // so outbound stays disabled. Ingress rules are added below, after the
@@ -318,27 +310,20 @@ export class NetworkStack extends SCLStack {
     this.neptuneSecurityGroup = new ec2.SecurityGroup(this, "NeptuneSG", {
       vpc: this.vpc,
       securityGroupName: this.prefixed("neptune-sg"),
-      // Generic description: GroupDescription is immutable in CloudFormation,
-      // so keep it rule-agnostic to avoid future SG replacements. Actual rules
-      // are defined below and in the surrounding comments.
+      // GroupDescription is immutable in CloudFormation; keep it rule-agnostic to avoid replacement.
       description: "Neptune cluster security group",
       allowAllOutbound: false, // Neptune is a database; it doesn't initiate connections
     });
 
-    // ECS - egress restricted to least privilege. Fargate tasks pull private
-    // ECR images (via the ECR api/dkr interface endpoints + S3 gateway
-    // endpoint) and call AWS service APIs on 443. 443 egress is intentionally
-    // left open to 0.0.0.0/0 rather than scoped to the VPC CIDR: the
-    // interface endpoints above cover the AWS APIs privately, but gateway
-    // endpoints (S3/DynamoDB) route to AWS public IP ranges via prefix lists,
-    // and some SDK calls may still fall back to public regional endpoints.
-    // Fully scoping egress (443 -> VPC CIDR + S3/DDB prefix lists) is a planned
-    // follow-up pending connectivity validation. All non-HTTPS, non-Neptune
-    // outbound is denied.
+    // ECS - egress restricted to least privilege. Fargate tasks pull private ECR images
+    // (ECR api/dkr interface endpoints + S3 gateway endpoint) and call AWS service APIs on
+    // 443. 443 egress is left open to 0.0.0.0/0 rather than the VPC CIDR because gateway
+    // endpoints (S3/DynamoDB) route to AWS public IP ranges via prefix lists and some SDK
+    // calls may fall back to public regional endpoints. All non-HTTPS, non-Neptune outbound
+    // is denied.
     this.ecsSecurityGroup = new ec2.SecurityGroup(this, "EcsSG", {
       vpc: this.vpc,
       securityGroupName: this.prefixed("ecs-sg"),
-      // Generic description (immutable in CFN — keep rule-agnostic).
       description: "ECS Fargate tasks security group",
       allowAllOutbound: false,
     });
@@ -384,7 +369,6 @@ export class NetworkStack extends SCLStack {
     this.lambdaSecurityGroup = new ec2.SecurityGroup(this, "LambdaSG", {
       vpc: this.vpc,
       securityGroupName: this.prefixed("lambda-sg"),
-      // Generic description (immutable in CFN — keep rule-agnostic).
       description: "Lambda functions security group",
       allowAllOutbound: false,
     });
@@ -483,8 +467,7 @@ export class NetworkStack extends SCLStack {
       this.sparqlSourceEgressSecurityGroup = sparqlSg;
     }
 
-    // Neptune ingress — scoped to the ECS + Lambda SGs (least privilege),
-    // replacing the previous VPC-CIDR-wide rule.
+    // Neptune ingress: scoped to the ECS + Lambda SGs (least privilege).
     this.neptuneSecurityGroup.addIngressRule(
       this.ecsSecurityGroup,
       ec2.Port.tcp(8182),
@@ -511,7 +494,6 @@ export class NetworkStack extends SCLStack {
       "Allow HTTPS from ECS tasks",
     );
 
-    // ── Cloud Map Namespace ────────────────────────────────────────────
     this.serviceNamespace = new servicediscovery.PrivateDnsNamespace(
       this,
       "ServiceNamespace",
@@ -550,19 +532,12 @@ export class NetworkStack extends SCLStack {
     );
     // Supported source-DB engines/ports (see database/connectors/dialects.py):
     // PostgreSQL 5432, MySQL 3306, SQL Server 1433, Redshift 5439, Oracle 1521.
-    // Snowflake (443) and any AWS API the connector calls are covered by the
-    // 443 rule below.
-    //
-    // DESTINATION SCOPE: a managed Glue connector reaching a customer database
-    // or a SaaS warehouse has no enumerable destination set, so the default is
-    // `0.0.0.0/0` for these ports. Where the destinations ARE known — egress via
-    // a fixed NAT/proxy range, or source databases on known ranges — narrow all
-    // of this connector's internet-bound egress with one knob:
+    // Snowflake (443) and any AWS API the connector calls are covered by the 443 rule below.
+    // A managed Glue connector reaching a customer database or SaaS warehouse has no
+    // enumerable destination set, so the default is `0.0.0.0/0` for these ports. Where the
+    // destinations are known, narrow all internet-bound egress of this connector with
     //   -c connector_egress_cidrs=10.20.0.0/16,192.0.2.10/32
-    // Same shape as `jdbc_peer_cidrs` (see addJdbcConnectivity), and it applies
-    // to the DB ports, OCSP 80 and 443 alike rather than special-casing one
-    // port. Cross-network JDBC (peering/TGW/PrivateLink) is already scoped to
-    // its configured CIDRs by the JdbcConnectivity construct.
+    // It applies to the DB ports, OCSP 80 and 443 alike.
     for (const peer of connectorEgressPeers) {
       for (const port of [5432, 3306, 1433, 5439, 1521]) {
         this.connectorSecurityGroup.addEgressRule(
@@ -572,19 +547,11 @@ export class NetworkStack extends SCLStack {
         );
       }
     }
-    // OCSP certificate-revocation checks. OCSP is an HTTP protocol and always
-    // uses port 80 — there is no HTTPS variant to fold into the 443 rule below.
-    // snowflake-connector-python checks revocation on every connect; without
-    // this rule each attempt burns ~5-30s per responder before failing open
-    // (measured ValidationLatency of 184s on a Snowflake scan, against a 900s
-    // Lambda timeout). Egress-only, and OCSP responses are signed, so plaintext
-    // transport is the intended design rather than a weakening.
-    //
-    // Only the Snowflake driver does internet OCSP — every other engine talks
-    // to a private endpoint. A deployment with no Snowflake source can drop the
-    // rule entirely with `-c connector_ocsp_egress=false`; the cost of doing so
-    // while Snowflake IS in use is soft-fail revocation checking plus the
-    // latency above, so it is on by default.
+    // OCSP certificate-revocation checks use plain HTTP on port 80 (OCSP responses are
+    // signed, so plaintext is by design). snowflake-connector-python checks revocation on
+    // every connect; without this rule each attempt burns ~5-30s per responder before
+    // failing open. Only the Snowflake driver does internet OCSP; a deployment without
+    // Snowflake sources can drop the rule with `-c connector_ocsp_egress=false`.
     addConfiguredOcspEgress(this.connectorSecurityGroup, "managed connector");
     for (const peer of connectorEgressPeers) {
       this.connectorSecurityGroup.addEgressRule(
@@ -601,7 +568,6 @@ export class NetworkStack extends SCLStack {
       this.addJdbcConnectivity(this.vpc as ec2.Vpc);
     }
 
-    // ── CfnOutputs ──────────────────────────────────────────────────
     new cdk.CfnOutput(this, "VpcId", {
       value: this.vpc.vpcId,
       description: "SemanticContext VPC ID",

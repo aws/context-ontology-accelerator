@@ -48,20 +48,13 @@ async def screen_chunks(
     Graceful degradation: if the guardrail is entirely unreachable (all
     evaluations fail with connection errors), returns all chunks as allowed
     with a warning log. The other defense layers (spotlighting, primary
-    guardrail) still protect against injection.
-
-    Args:
-        screener: Shared GuardrailScreener instance.
-        chunks: Retrieved chunks from vector search.
-        timeout_ms: Per-chunk evaluation timeout in milliseconds.
-
-    Returns:
-        ChunkScreeningOutcome per chunk in the same order as input.
+    guardrail) still protect against injection. Returns one outcome per chunk, in
+    input order.
     """
     if not chunks:
         return []
 
-    async def _evaluate_one(chunk: ChunkResult, index: int) -> ChunkScreeningOutcome:
+    async def _evaluate_one(chunk: ChunkResult) -> ChunkScreeningOutcome:
         try:
             results = await asyncio.wait_for(
                 screener.ascreen_texts([chunk.text]),
@@ -87,12 +80,9 @@ async def screen_chunks(
             logger.warning("chunk_screener_unexpected", chunk_id=chunk.chunk_id, error=str(e))
             return ChunkScreeningOutcome(chunk=chunk, allowed=True, reason="error")
 
-    outcomes = await asyncio.gather(*[_evaluate_one(chunk, i) for i, chunk in enumerate(chunks)])
+    outcomes = await asyncio.gather(*[_evaluate_one(chunk) for chunk in chunks])
 
-    # If ALL outcomes are "error" (guardrail entirely unreachable), log warning
-    # and allow all chunks through (graceful degradation).
-    all_errors = all(o.reason == "error" for o in outcomes)
-    if all_errors and len(outcomes) > 0:
+    if all(o.reason == "error" for o in outcomes):
         logger.warning("chunk_screener_all_unreachable", chunk_count=len(chunks))
 
     excluded_count = sum(1 for o in outcomes if not o.allowed)

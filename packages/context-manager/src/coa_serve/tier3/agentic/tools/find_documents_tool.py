@@ -35,7 +35,7 @@ limits on the graph query, the search proxy's result cap, and a per-channel
 timeout inside the controller's per-tool timeout. A failing channel degrades to
 the other one; the tool never raises.
 
-Import discipline (Requirement 12.3): stdlib + ``structlog`` + sibling
+Import discipline: stdlib + ``structlog`` + sibling
 dependency-free modules only.
 """
 
@@ -162,7 +162,7 @@ class FindDocumentsTool:
         graph_rows, keyword_hits, notes = await self._search(namespace, clean, cls)
         try:
             sources = await self._registry.document_sources(namespace)
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning(
                 "find_documents_sources_error", namespace=namespace, error=str(exc)[:200], error_type=type(exc).__name__
             )

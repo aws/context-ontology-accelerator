@@ -2,12 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * TableDetail's breadcrumb trail conditionally appends an `Edit` crumb when
- * the page is in any of its three editing states (column edit, table-level
- * edit, or keys edit). This is a branch producing a different-length crumb
- * array, the same shape of hazard the Explorer/Induction branch on
- * OntologyClassDetail has a dedicated test for, so it gets one here too
- * rather than only being verified by reading the source.
+ * TableDetail's breadcrumb trail appends an `Edit` crumb while any edit state
+ * (column, table-level, or keys) is open.
  */
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";

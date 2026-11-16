@@ -389,3 +389,37 @@ class TestQueryStrategyForwarding:
         await execute_query(mock_cm, "revenue by region", "sales", profile, "tok")
         payload, _token = mock_cm.invoke.call_args[0]
         assert "strategy" not in payload["options"]
+
+
+_EXECUTE_HELPERS = [
+    pytest.param(execute_query, {"result": {"tier": 2, "trace": []}}, id="query"),
+    pytest.param(execute_translate_sparql, {"result": {"sparql": "SELECT * {}"}}, id="translate_sparql"),
+    pytest.param(execute_rag_retrieval, {"result": {"supportingContent": [], "trace": []}}, id="rag_retrieval"),
+    pytest.param(
+        execute_graph_traversal,
+        {"result": {"graphContext": {"entities": [], "relationships": []}, "trace": []}},
+        id="graph_traversal",
+    ),
+]
+
+
+@pytest.mark.unit
+class TestRuntimeSessionIdForwarding:
+    """Every execution helper hands its ``runtime_session_id`` to ``cm_client.invoke``.
+
+    Dropping it would silently cold-start a new Context Manager microVM per call.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("helper", "cm_response"), _EXECUTE_HELPERS)
+    async def test_execute_helper_forwards_runtime_session_id(self, mock_cm, profile, helper, cm_response):
+        mock_cm.invoke.return_value = cm_response
+        await helper(mock_cm, "q", "sales", profile, "tok", runtime_session_id="coa-mcp-x")
+        assert mock_cm.invoke.call_args.kwargs["runtime_session_id"] == "coa-mcp-x"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("helper", "cm_response"), _EXECUTE_HELPERS)
+    async def test_execute_helper_without_runtime_session_id_forwards_none(self, mock_cm, profile, helper, cm_response):
+        mock_cm.invoke.return_value = cm_response
+        await helper(mock_cm, "q", "sales", profile, "tok")
+        assert mock_cm.invoke.call_args.kwargs["runtime_session_id"] is None

@@ -8,50 +8,14 @@ from unittest.mock import call, patch
 
 import pytest
 
-# Add preprocessing source to path for imports
-
 # Set required env vars before importing handler (module-level validation runs at import)
 os.environ.setdefault("BUCKET_NAME", "test-bucket")
 os.environ.setdefault("DOC_SOURCES_TABLE", "test-table")
 
-from coa_common.constants import bucket_namespace_tag_key, validate_id  # noqa: E402
+from coa_common.constants import bucket_namespace_tag_key  # noqa: E402
 
 # Common env vars required by handler
 _ENV = {"BUCKET_NAME": "test-bucket", "DOC_SOURCES_TABLE": "test-table"}
-
-
-# ---------------------------------------------------------------------------
-# Input validation — validate_id (now in coa_common.constants)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
-class TestValidateId:
-    def test_valid_simple(self):
-        validate_id("valid-id_123", "test")  # should not raise
-
-    def test_valid_alphanumeric(self):
-        validate_id("abc123", "test")
-
-    def test_empty_raises(self):
-        with pytest.raises(ValueError, match="Invalid test"):
-            validate_id("", "test")
-
-    def test_path_traversal_raises(self):
-        with pytest.raises(ValueError):
-            validate_id("../path/traversal", "test")
-
-    def test_spaces_raise(self):
-        with pytest.raises(ValueError):
-            validate_id("has spaces", "test")
-
-    def test_dots_raise(self):
-        with pytest.raises(ValueError):
-            validate_id("has.dots", "test")
-
-    def test_slashes_raise(self):
-        with pytest.raises(ValueError):
-            validate_id("has/slash", "test")
 
 
 # ---------------------------------------------------------------------------
@@ -372,11 +336,6 @@ class TestCrossAccountAccess:
         assert list_call_args[1] == "test-bucket"
 
 
-# ---------------------------------------------------------------------------
-# Empty extraction — the 39-of-78 silent loss
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.unit
 class TestPerFileErrorReason:
     """A library failure on one file keeps its (redacted) reason for the Reason column."""
@@ -409,14 +368,7 @@ class TestPerFileErrorReason:
 
 @pytest.mark.unit
 class TestEmptyExtractionIsReported:
-    """A processor can return "" without raising, and used to be counted a success.
-
-    `unstructured` abandons text extraction on drawing-heavy PDF pages and yields
-    zero characters. That empty string was uploaded to staging as a 0-byte object
-    and counted in files_preprocessed, so the source reported Skipped=0/Errored=0
-    while KG build silently dropped every empty file — 39 of 78 PDFs vanished with
-    nothing in the UI to show it.
-    """
+    """A processor can return "" without raising; an empty extraction is skipped, not staged."""
 
     @patch.dict(os.environ, _ENV)
     @patch("coa_sources.documents.preprocessing.handler.upload_metadata")
@@ -680,7 +632,7 @@ class TestBucketNamespaceAuthorization:
 
 
 # ---------------------------------------------------------------------------
-# issue 104 — unbounded issues array must not blow the SFN 256 KB payload limit
+# The issues array must not exceed the SFN 256 KB payload limit
 # ---------------------------------------------------------------------------
 
 

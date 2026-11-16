@@ -245,18 +245,11 @@ class TestAgenticStrategy:
         assert record.args[1] == "skipped"
 
     @pytest.mark.asyncio
-    async def test_missing_strands_returns_none(self):
+    async def test_missing_strands_returns_none(self, monkeypatch):
         vector, firewall, executor = self._clients()
         strat = self._build(firewall, executor, vector)
-        saved = sys.modules.get("strands")
-        sys.modules["strands"] = None
-        try:
-            assert await strat.resolve("q", "ns1", _ctx()) is None
-        finally:
-            if saved is None:
-                sys.modules.pop("strands", None)
-            else:
-                sys.modules["strands"] = saved
+        monkeypatch.setitem(sys.modules, "strands", None)
+        assert await strat.resolve("q", "ns1", _ctx()) is None
 
     @pytest.mark.asyncio
     async def test_graph_tool_needs_both_the_flag_and_a_client(self, monkeypatch):
@@ -286,10 +279,6 @@ class TestAgenticStrategy:
 
     @pytest.mark.asyncio
     async def test_per_request_option_enables_the_tool_with_the_env_flag_off(self, monkeypatch):
-        # The A/B that motivates this: with-traversal and without-traversal have to
-        # be measurable on ONE deployment, or the delta is confounded with the
-        # image difference between two. The default stays off, so the paired arm
-        # opts in per request.
         from . import strands_fake
 
         monkeypatch.delenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", raising=False)

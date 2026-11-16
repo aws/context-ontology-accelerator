@@ -1,16 +1,15 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Uniform Tool contract and result for the Agentic Retriever (Req 2, Req 11).
+"""Uniform Tool contract and result for the Agentic Retriever.
 
 Every retrieval capability the reasoning agent can invoke — Retrieval_Strategy
 tools, the Graph_Traversal tool, the Vector_Search tool, the Ontology_Lookup
 tool — implements the single :class:`Tool` Protocol defined here and returns a
 :class:`ToolResult`. The uniform contract is what lets the registry enumerate
-tools for the planner and the controller invoke any tool the same way
-(Req 11.1).
+tools for the planner and the controller invoke any tool the same way.
 
-Import discipline (Requirement 12.3): this module is dependency-free — it uses
+Import discipline: this module is dependency-free — it uses
 only the standard library and ``typing`` and never imports ``graphrag_toolkit``.
 """
 
@@ -22,7 +21,7 @@ from typing import Any, Protocol, runtime_checkable
 
 @dataclass(frozen=True)
 class ExecutedQuery:
-    """A query artifact a structured tool built and executed (#1166).
+    """A query artifact a structured tool built and executed.
 
     ``kind`` is ``"sql"`` or ``"sparql"``; ``query`` is the statement text. The
     VKG path produces BOTH a SPARQL statement and the SQL it compiles to, so a
@@ -38,12 +37,12 @@ class ExecutedQuery:
 
 @dataclass(frozen=True)
 class ToolResult:
-    """Uniform output of every Tool invocation (Req 11.1).
+    """Uniform output of every Tool invocation.
 
     A Tool never raises out of ``invoke`` for an expected retrieval failure
     (timeouts, backend errors); it returns a ``ToolResult`` whose ``detail``
     records the degradation so the controller can incorporate a degraded,
-    non-fatal outcome and continue (Req 9.1-9.2). The passthrough ``chunks`` /
+    non-fatal outcome and continue. The passthrough ``chunks`` /
     ``entities`` carry the native retrieval objects forward for final synthesis,
     while ``items`` holds their normalized dict form for accumulation/dedupe.
 
@@ -67,13 +66,13 @@ class ToolResult:
             records it in ``degraded_sources`` and marks the session partial.
         produced_directions: Candidate sub-question seeds this result surfaced
             (e.g. one per discovered competitor) that the controller may open as
-            Exploration_Branches subject to the fan-out cap (Req 13.4).
+            Exploration_Branches subject to the fan-out cap.
         executed_queries: The query artifacts a structured tool built and ran to
             produce ``rows`` — one ``ExecutedQuery`` per generated statement (SQL
             from NL→SQL, SPARQL + its compiled SQL from the VKG path). Document /
             graph / ontology tools leave this empty. Surfaced (gated by
             ``includeDebugInfo``) on the final ``QueryResult`` so Deep Reasoning
-            returns the same query artifacts Standard mode does (#1166).
+            returns the same query artifacts Standard mode does.
     """
 
     items: tuple[dict, ...] = ()
@@ -88,11 +87,11 @@ class ToolResult:
 
 @runtime_checkable
 class Tool(Protocol):
-    """Uniform tool contract (Req 2, Req 11).
+    """Uniform tool contract.
 
     The four interface fields — ``name``, ``description``, ``input_schema``,
     ``output_schema`` — are all REQUIRED and must be present on every registered
-    Tool (Req 11.1). ``input_schema`` declares the accepted input fields and
+    Tool. ``input_schema`` declares the accepted input fields and
     their types; ``output_schema`` declares the produced output fields and their
     types. The async ``invoke`` performs the retrieval and returns a
     :class:`ToolResult`, always scoped to the request ``namespace``.

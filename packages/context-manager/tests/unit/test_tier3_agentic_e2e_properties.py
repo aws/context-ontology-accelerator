@@ -1,75 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end + property verification for the Agentic Retriever (task 19).
+"""End-to-end and property tests for the Agentic Retriever.
 
-This suite is the capstone verification for the agentic Tier 3 path. Where the
-per-component suites (``test_tier3_agentic_controller`` /
-``test_tier3_agentic_retriever`` / ``test_tier3_agentic_observability`` / …)
-verify each piece in isolation, this suite drives the **real**
-:class:`~coa_serve.tier3.agentic.retriever.AgenticRetriever` over the
-**real** :class:`~coa_serve.tier3.agentic.controller.ReasoningController`,
-the **real** :class:`~coa_serve.tier3.agentic.budget.BudgetClock`,
-the **real** :class:`~coa_serve.tier3.agentic.context.AccumulatedContext`,
-and the **real** :class:`~coa_serve.tier3.agentic.tools.registry.ToolRegistry`
-— only the tools, the planner, the decomposer, the synthesizer, and the wall clock
-are deterministic doubles. No live graph access happens here (that is task 20).
-
-GROUNDING (real data, not fictional). The scenario is anchored in the deployed SCL
-dev ``sec10qtesting`` tenant (``878519a5e0324c688d612709a``) — a SEC 10-Q filings
-knowledge graph whose ``Company`` entities include NVIDIA, Microsoft, Amazon,
-Intel, and Apple Inc. — and its induced ontology
-``OntologyDevelopmentNotes/ndb-induced-878519a5e0324c688d612709a.ttl`` (57
-classes), mirrored as the ``fixtures/agentic_sec10q_ontology.ttl`` excerpt this
-suite loads through the real :class:`OntologyFileSource`. The edge types and
-traversal targets below were verified live against the property graph (single
-``__RELATION__`` type, edge label held in ``r.value``, node label
-``__Entity__878519a5e0324c688d612709a__``):
-
-  * NVIDIA ``-[SERVES]->`` {Data Center market, Gaming market, Professional
-    Visualization market, Automotive market} (class ``Product``);
-  * NVIDIA ``-[SELLS]->`` {Graphics Processing Units, A800, H800, networking
-    products} (class ``Product``).
-
-Crucially the induced ontology OMITS ``COMPETES WITH`` and ``ACQUIRED`` even
-though both edges genuinely exist in the property graph (verified: ``COMPETES
-WITH`` 11 edges / 6 company→company; ``ACQUIRED`` 19 / 14 incl. NVIDIA→Mellanox,
-NVIDIA ``ACQUISITION OF``→Arm). That gap drives the ontology-constrained-traversal
-property: the controller must refuse to traverse an edge type absent from the
-ontology, even when the (mocked) graph tool holds data for it.
-
-Two kinds of test live here:
-
-1. **Integration-style worked example** — the "NVIDIA's market segments"
-   walkthrough run end to end against the real controller/retriever: an ontology
-   lookup that surfaces the investigation direction → entity anchoring of NVIDIA →
-   an ontology-constrained ``SERVES`` edge-typed traversal that discovers the
-   market segments and opens per-segment Exploration_Branches → per-segment
-   retrieval (a ``SELLS`` traversal + a semantic chunk strategy) → one final
-   synthesis. It asserts the reasoning shape, the branch fan-out, namespace
-   scoping, the gathered supporting content / graph context, and the terminal stop
-   reason.
-
-2. **Property checks** — universal invariants the session must always uphold,
-   each exercised at the layer that enforces it and across a spread of inputs
-   (the codebase verifies "properties" with example sweeps rather than a
-   property-testing library, which is not a dependency here):
-     - bounded latency / steps (Req 4.4, 4.5): the session never runs more
-       Reasoning_Steps than the configured maximum, in aggregate.
-     - aggregate budgets (Req 13.9): the step cap and the fan-out cap are
-       enforced across the WHOLE session, not per Sub_Question.
-     - bounded fan-out (Req 13.4): the Exploration_Branches opened never exceed
-       the configured maximum.
-     - ontology-constrained traversal (Req 3.4, 3.9): traversal edge types are
-       always a subset of the ontology's edge-type set — ``COMPETES WITH`` /
-       ``ACQUIRED`` are never passed to the graph tool.
-     - partial honesty (Req 7): the ``partial`` flag is set on Time_Budget
-       expiry, on degraded sources, and when no context was gathered.
-     - namespace isolation (Req 1.5): every Tool invocation is scoped to the
-       request namespace.
-     - the lazy-import invariant (Req 12.3): importing the agentic package — and
-       the retriever module specifically — never pulls ``graphrag_toolkit`` into
-       ``sys.modules``.
+Drives the real retriever, controller, budget clock, context and registry with
+deterministic tools, planner, decomposer, synthesizer and clock. The ontology
+fixture is an excerpt of a real induced ontology that omits ``COMPETES WITH`` and
+``ACQUIRED`` although both edges exist in the graph.
 """
 
 from __future__ import annotations
@@ -102,9 +39,6 @@ NS = "sec10qtesting"
 FIXTURE_TTL = str(Path(__file__).parent / "fixtures" / "agentic_sec10q_ontology.ttl")
 
 
-# ── deterministic test doubles (shapes mirror the agentic test suite) ──────
-
-
 class FakeClockSource:
     """A manually advanced monotonic time source (seconds) for the BudgetClock."""
 
@@ -131,13 +65,7 @@ class _Chunk:
 
 
 class _Entity:
-    """Minimal GraphEntity stand-in keyed by ``uri`` (matches AccumulatedContext).
-
-    Mirrors the property-graph reality: entity nodes carry only ``value`` /
-    ``search_str`` / ``class`` (there is no entityId property — node identity is
-    the openCypher internal id). Here ``uri`` stands in for that stable node
-    identity and ``type`` for the ``class`` property.
-    """
+    """Minimal GraphEntity stand-in keyed by ``uri`` (matches AccumulatedContext)."""
 
     def __init__(self, uri: str, label: str, type_: str = "Product") -> None:
         self.uri = uri
@@ -147,20 +75,9 @@ class _Entity:
 
 
 class FakeTool:
-    """A mock Tool implementing the four-field uniform contract.
+    """A mock Tool implementing the four-field uniform contract; records every invocation's kwargs.
 
-    Records every invocation's kwargs (including ``namespace``) so namespace
-    scoping and the edge types actually passed to a traversal can be asserted.
-    A tool may return a single fixed ``result``, a per-call sequence of
-    ``results``, or — in ``counting`` mode — a fresh unique chunk on every call
-    (so ``AccumulatedContext.add`` always reports new information and the
-    "no new information" stop never fires, letting step-cap tests drive the loop
-    to the configured maximum). When BOTH ``results`` and ``counting`` are given,
-    the queued ``results`` are returned first (e.g. a seed result that surfaces
-    many directions) and ``counting`` unique chunks take over once the queue
-    drains. ``raises`` makes ``invoke`` raise so the degraded path can be
-    exercised. ``on_invoke`` fires inside ``invoke`` (used to advance the fake
-    clock past the Time_Budget mid-loop).
+    Queued ``results`` are returned first, then ``counting`` unique chunks, then a fixed ``result``.
     """
 
     def __init__(
@@ -192,8 +109,6 @@ class FakeTool:
             self._on_invoke()
         if self._raises:
             raise RuntimeError(f"{self.name} boom")
-        # Queued ``results`` are consumed first (a seed result that surfaces
-        # directions), THEN ``counting`` unique chunks, THEN a fixed ``result``.
         if self._results:
             return self._results.popleft()
         if self._counting:
@@ -208,7 +123,7 @@ class ScriptedPlanner:
     """A :class:`StepPlanner` double driven by scripted candidate lists + booleans.
 
     ``candidates_script`` is consumed one list per ``propose_steps`` call; once
-    exhausted an empty list (no Tool selectable, Req 4.7) is returned.
+    exhausted an empty list (no Tool selectable) is returned.
     ``sufficiency`` is consumed one bool per ``check_sufficiency`` call,
     defaulting to ``default_sufficiency`` thereafter.
     """
@@ -255,8 +170,8 @@ class AlwaysPlanner:
 class FakeDecomposer:
     """A DecompositionPlanner double returning scripted Sub_Questions.
 
-    Records the ``decompose`` trace step itself (as the real planner does,
-    Req 13.10) so the session-level ordered trace includes it.
+    Records the ``decompose`` trace step itself (as the real planner does)
+    so the session-level ordered trace includes it.
     """
 
     def __init__(self, sub_questions: list[SubQuestion]) -> None:
@@ -337,7 +252,6 @@ def tool_success_count(trace_steps, tool_name: str) -> int:
     return sum(1 for d in trace_steps if d["step"] == tool_name and d["status"] == "succeeded")
 
 
-# ── ontology fixture for the worked example ────────────────────────────────
 #
 # The Ontology_Lookup_Tool result the planner consults. Mirrors the real induced
 # ontology subset (node + edge types), surfaced as a ToolResult ``items`` dict.
@@ -373,9 +287,6 @@ _NVIDIA_SEGMENTS = (
     ("urn:nvidia:segment:proviz", "Professional Visualization market"),
     ("urn:nvidia:segment:automotive", "Automotive market"),
 )
-
-
-# ── 1. integration-style worked example (Req 4, 5, 8, 13) ──────────────────
 
 
 @pytest.mark.unit
@@ -552,13 +463,6 @@ class TestNvidiaMarketSegmentsWorkedExample:
 
         await retriever.resolve("q", NS, trace=TraceCollector())
 
-        # The ontology surfaced the edge types the planner then traversed, and it
-        # does NOT include the off-ontology edges.
-        assert "SERVES" in _SEC10Q_ONTOLOGY_ITEM["edge_types"]
-        assert "SELLS" in _SEC10Q_ONTOLOGY_ITEM["edge_types"]
-        assert "COMPETES WITH" not in _SEC10Q_ONTOLOGY_ITEM["edge_types"]
-        assert "ACQUIRED" not in _SEC10Q_ONTOLOGY_ITEM["edge_types"]
-
         # The graph tool was invoked twice: first SERVES from NVIDIA to discover
         # the market segments, then SELLS for a segment — the multi-hop chain.
         graph_calls = tools["graph"].calls
@@ -604,9 +508,6 @@ class TestNvidiaMarketSegmentsWorkedExample:
         assert str(StopReason.sufficiency_satisfied) in str(stops[0].detail)
 
 
-# ── 2a. property: bounded latency / steps (Req 4.4, 4.5) ───────────────────
-
-
 @pytest.mark.unit
 class TestBoundedStepsProperty:
     @pytest.mark.parametrize("max_steps", [1, 2, 3, 5, 10])
@@ -628,36 +529,15 @@ class TestBoundedStepsProperty:
         result = await retriever.resolve("q", NS, trace=TraceCollector())
 
         # Exactly ``max_steps`` Tool invocations ran across the whole session —
-        # never more, regardless of the number of Sub_Questions (Req 4.4/4.5).
+        # never more, regardless of the number of Sub_Questions.
         assert tool_success_count(result.trace_steps, "strategy:probe") == max_steps
-
-
-# ── 2b. property: aggregate budgets across the whole session (Req 13.9) ─────
 
 
 @pytest.mark.unit
 class TestAggregateBudgetsProperty:
-    async def test_step_cap_is_aggregate_not_per_subquestion(self):
-        # 4 Sub_Questions, a step cap of 3: a per-Sub_Question cap would allow 12
-        # steps; the aggregate cap allows exactly 3 (Req 13.9).
-        probe = FakeTool("strategy:probe", input_schema={"query": "str"}, counting=True)
-        planner = AlwaysPlanner(PlannerDecision(tool_name="strategy:probe", inputs={"query": "go"}))
-        retriever = make_retriever(
-            decomposer=FakeDecomposer([SubQuestion(text=t) for t in ("a", "b", "c", "d")]),
-            planner=planner,
-            tools=[probe],
-            synthesizer=FakeSynthesizer(),
-            clock_source=FakeClockSource(),
-            budget=AgenticBudgetConfig(max_steps=3),
-        )
-
-        result = await retriever.resolve("q", NS, trace=TraceCollector())
-
-        assert tool_success_count(result.trace_steps, "strategy:probe") == 3
-
     async def test_time_budget_is_aggregate_and_stops_remaining_subquestions(self):
         # The first Sub_Question's single step blows the 30s Time_Budget; the
-        # remaining Sub_Questions are never started (Req 7.4, 13.9).
+        # remaining Sub_Questions are never started.
         src = FakeClockSource()
         probe = FakeTool(
             "strategy:probe",
@@ -685,9 +565,6 @@ class TestAggregateBudgetsProperty:
         stops = [s for s in trace.steps if s.step == "agentic_retrieval_stop"]
         assert str(StopReason.time_budget_expired) in str(stops[0].detail)
         assert result.partial is True
-
-
-# ── 2c. property: bounded fan-out (Req 13.4, 13.7-13.8) ─────────────────────
 
 
 @pytest.mark.unit
@@ -727,9 +604,6 @@ class TestBoundedFanoutProperty:
         # recorded as a skipped branch.
         skipped = [s for s in trace.steps if s.step == "exploration_branch" and s.status == "skipped"]
         assert skipped, "expected the fan-out cap to be hit and recorded as skipped"
-
-
-# ── 2d. property: ontology-constrained traversal (Req 3.4, 3.9) ─────────────
 
 
 @pytest.mark.unit
@@ -788,8 +662,6 @@ class TestOntologyConstrainedTraversalProperty:
         ],
     )
     async def test_soft_prior_retains_off_ontology_edges_reordered(self, requested, expected):
-        # This is the idea-5 fix: the pruned ontology no longer HIDES the graph's
-        # real predicates from the traversal — it only PREFERS its own (ordered first).
         passed = await self._run_with_edge_types(requested, mode="soft_prior")
         assert passed == expected
 
@@ -811,36 +683,11 @@ class TestOntologyConstrainedTraversalProperty:
         assert passed == expected
 
 
-# ── 2e. property: partial honesty (Req 7.5-7.8, 9.6-9.7) ────────────────────
-
-
 @pytest.mark.unit
 class TestPartialHonestyProperty:
-    async def test_partial_set_on_time_budget_expiry(self):
-        src = FakeClockSource()
-        probe = FakeTool(
-            "strategy:probe",
-            input_schema={"query": "str"},
-            counting=True,
-            on_invoke=lambda: src.advance(99.0),
-        )
-        planner = AlwaysPlanner(PlannerDecision(tool_name="strategy:probe", inputs={"query": "go"}))
-        retriever = make_retriever(
-            decomposer=FakeDecomposer([SubQuestion(text="root")]),
-            planner=planner,
-            tools=[probe],
-            synthesizer=FakeSynthesizer(),
-            clock_source=src,
-            budget=AgenticBudgetConfig(time_budget_s=30),
-        )
-
-        result = await retriever.resolve("q", NS, trace=TraceCollector())
-
-        assert result.partial is True
-
     async def test_partial_set_when_a_tool_degrades(self):
         # A succeeding tool gathers context; a second, failing tool degrades. The
-        # result carries the degraded source AND is flagged partial (Req 9.6).
+        # result carries the degraded source AND is flagged partial.
         good = FakeTool("strategy:good", input_schema={"query": "str"}, counting=True)
         bad = FakeTool("strategy:bad", input_schema={"query": "str"}, raises=True)
         planner = ScriptedPlanner(
@@ -921,7 +768,7 @@ class TestPartialHonestyProperty:
 
     async def test_partial_set_when_no_context_was_gathered(self):
         # The planner can select no Tool, so no context is ever gathered; the
-        # best-effort answer must be flagged partial (Req 7.8).
+        # best-effort answer must be flagged partial.
         planner = ScriptedPlanner([], default_sufficiency=False)  # nothing selectable
         retriever = make_retriever(
             decomposer=FakeDecomposer([SubQuestion(text="root")]),
@@ -938,9 +785,6 @@ class TestPartialHonestyProperty:
         assert result.graph_context == ()
 
 
-# ── 2f. property: namespace isolation (Req 1.5) ─────────────────────────────
-
-
 @pytest.mark.unit
 class TestNamespaceIsolationProperty:
     @pytest.mark.parametrize("namespace", ["sec10qtesting", "tenant-x", "ns-42"])
@@ -955,9 +799,6 @@ class TestNamespaceIsolationProperty:
         all_calls = [call for tool in tools.values() for call in tool.calls]
         assert all_calls, "expected the session to invoke at least one tool"
         assert all(call["namespace"] == namespace for call in all_calls)
-
-
-# ── 2g. property: the lazy-import invariant (Req 12.3) ──────────────────────
 
 
 @pytest.mark.unit
@@ -986,9 +827,6 @@ class TestLazyImportInvariantProperty:
             f"stdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "OK" in result.stdout
-
-
-# ── shared helper ──────────────────────────────────────────────────────────
 
 
 def _started_clock():

@@ -1,12 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The whole-translation wall clock for the NL->SPARQL route.
-
-Kept in its own module rather than appended to ``test_tier2_nl_to_sparql.py``:
-that file's tail is where every pending change to this route adds its class, so a
-new class there is a merge conflict with no semantic content.
-"""
+"""The whole-translation wall clock for the NL->SPARQL route."""
 
 from __future__ import annotations
 
@@ -27,13 +22,7 @@ class TestTranslationTimeoutBudget:
     """``SERVE_VKG_TRANSLATION_TIMEOUT_S``, the whole-translation wall clock.
 
     It bounds the T-Box build, the LLM call, validation and every
-    validate-and-retry attempt together, so on a wide namespace it stops being a
-    backstop and becomes the binding constraint: measured over 727 BIRD-Interact
-    translations, p50 29.1s / p90 44.7s / max 59.6s against a 60s cap, with 6.9%
-    already returning ``translation_timed_out`` — and that was on a T-Box
-    truncated to ~66 of its 175 classes. Completing the T-Box lengthens the
-    prompt, so an unraisable 60s would charge a strictly better T-Box with a worse
-    answer rate. Hence a knob, with the shipped default untouched.
+    validate-and-retry attempt together; the shipped default is unchanged.
     """
 
     def _translator(self, **kw) -> NLtoSPARQL:

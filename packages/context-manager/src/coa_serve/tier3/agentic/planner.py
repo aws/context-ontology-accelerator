@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bedrock-backed reasoning planner for the Agentic Retriever (Req 4.3, 5, 6.1-6.2).
+"""Bedrock-backed reasoning planner for the Agentic Retriever.
 
 :class:`BedrockStepPlanner` is the concrete
 :class:`~coa_serve.tier3.agentic.controller.StepPlanner` the
@@ -9,29 +9,12 @@
 Bedrock :class:`~coa_serve.clients.base.LLMClient` (a Bedrock
 Converse concern that is SEPARATE from final synthesis but runs under the same
 client + region and never bypasses the synthesis-time guardrail) into the narrow
-planner Protocol:
+planner Protocol. The planner is best-effort and NEVER raises: a failure degrades
+to "no candidate selectable" for :meth:`propose_steps` and to ``False`` for
+:meth:`check_sufficiency`.
 
-- :meth:`propose_steps` asks the planner LLM for one or more candidate next-step
-  decisions over the accumulated context and the registry's Tool specs (Req 4.3),
-  framed so the model prefers a Retrieval_Strategy_Tool or a prepared
-  Query_Template over an ad-hoc graph query (Req 5). The controller still enforces
-  that preference deterministically, so a misbehaving planner cannot defeat it.
-- :meth:`check_sufficiency` asks the planner LLM for the explicit boolean
-  Sufficiency_Check decision after a step (Req 6.1-6.2).
-
-Both decisions are requested as small, structured JSON objects so they are
-deterministic to parse and trivial to mock in unit tests (a mocked
-``LLMClient.converse`` returning scripted JSON drives the planner with no live
-Bedrock call). The planner is best-effort and NEVER raises: a Converse failure,
-a guardrail block, or an unparseable / empty response degrades to "no candidate
-selectable" for :meth:`propose_steps` (the loop then stops, Req 4.7) and to
-``False`` for :meth:`check_sufficiency` (the loop continues under the budget/step
-caps).
-
-Import discipline (Requirement 12.3): this module imports only the dependency-
-free sibling models / controller instruction string and ``structlog``; the
-planner :class:`LLMClient`, :class:`AccumulatedContext`, and :class:`SubQuestion`
-are referenced structurally and typed under ``TYPE_CHECKING``, so importing this
+Import discipline: the planner :class:`LLMClient`, :class:`AccumulatedContext`,
+and :class:`SubQuestion` are typed under ``TYPE_CHECKING``, so importing this
 module never pulls ``graphrag_toolkit`` (or the concrete Bedrock client) into
 ``sys.modules``.
 """
@@ -61,7 +44,7 @@ logger = structlog.get_logger(__name__)
 
 
 def _relevance_ranked_context() -> bool:
-    """Whether to surface carried chunks by relevance instead of recency (idea 8).
+    """Whether to surface carried chunks by relevance instead of recency.
 
     Opt-in via ``AGENTIC_RELEVANCE_RANKED_CONTEXT=1`` (default off, preserving the
     recency behavior). Read at call time so it is easy to toggle per run/test.
@@ -83,19 +66,16 @@ _MAX_EDGE_TYPES_IN_SUMMARY = 50
 # growing unbounded as context accumulates.
 _MAX_ENTITIES_IN_SUMMARY = 20
 
-# Caps on the carried reasoning state echoed back into the planner prompt (ideas
-# 2/3/4): how many recent attempts to list, and how many chunk snippets (and their
-# width) to surface so the planner reasons about CONTENT, not just counts.
+# Caps on the carried reasoning state echoed back into the planner prompt: how many
+# recent attempts to list, and how many chunk snippets (and their width) to surface
+# so the planner reasons about CONTENT, not just counts.
 _MAX_ATTEMPTS_IN_SUMMARY = 8
 _MAX_CHUNK_SNIPPETS_IN_SUMMARY = 3
 _MAX_CHUNK_SNIPPETS_IN_ASSESS = 12
 _CHUNK_SNIPPET_WIDTH = 280
 _ASSESS_SNIPPET_WIDTH = 500
-# Structured rows surfaced to the planner/assessor. Rows gathered by the
-# NL->SQL / metric tools were previously invisible to both prompts (only
-# chunks/entities were rendered), so a tabular sub-question that had ALREADY
-# been answered was assessed as "no data" — the loop then wandered into
-# unrelated tools and the working answer denied having any data.
+# Structured rows surfaced to the planner/assessor, so a tabular sub-question that
+# is already answered is not assessed as "no data".
 _MAX_ROWS_IN_SUMMARY = 3
 _MAX_ROWS_IN_ASSESS = 12
 _ROW_SNIPPET_WIDTH = 200
@@ -200,8 +180,7 @@ _STOP_WHEN_DONE_INSTRUCTION = (
 
 # Optional chunk-window guidance, appended to the propose prompt ONLY when the
 # chunk_window tool is actually registered (it is gated off by default via
-# AGENTIC_ENABLE_CHUNK_WINDOW). Advertising it unconditionally caused the planner
-# to select an unregistered tool (unknown_tool:chunk_window) and waste a step.
+# AGENTIC_ENABLE_CHUNK_WINDOW), so the planner never selects an unregistered tool.
 _CHUNK_WINDOW_INSTRUCTION = (
     "\n\nEXPAND AROUND A RELEVANT CHUNK. If a retrieved chunk is on-topic but seems "
     "to be missing an adjacent detail (a specific figure, period, or label that "
@@ -275,7 +254,7 @@ _MAX_DOCUMENT_MATCHES_IN_SUMMARY = 5
 _MATCH_SNIPPET_WIDTH = 200
 
 # System instruction for the combined Sufficiency_Check + grounded best-guess
-# answer (Req 6.1-6.2; improvement idea 2). The planner both decides whether the
+# answer. The planner both decides whether the
 # gathered context is enough AND produces its current best answer grounded ONLY in
 # that context — never its own parametric/prior knowledge — so the running guess
 # handed to the synthesizer cannot smuggle in ungrounded facts.
@@ -300,7 +279,7 @@ _ASSESS_RESPONSE_SHAPE = (
     '{"sufficient": <true|false>, "working_answer": "<your grounded best answer>"}'
 )
 # The same shape with the reported confidence, used only while the stop signals
-# are elicited (StopSignalConfig.elicit); at default settings the prompt is main's.
+# are elicited (StopSignalConfig.elicit); default settings use the shape above.
 _ASSESS_RESPONSE_SHAPE_WITH_CONFIDENCE = (
     "Respond with ONLY a JSON object of this exact shape, and no prose outside it:\n"
     '{"sufficient": <true|false>, "confidence": <number from 0 to 1>, '
@@ -387,9 +366,9 @@ def parse_confidence(value: Any) -> float | None:
 
 
 class BedrockStepPlanner:
-    """Concrete :class:`StepPlanner` over a Bedrock :class:`LLMClient` (Req 4.3, 5, 6).
+    """Concrete :class:`StepPlanner` over a Bedrock :class:`LLMClient`.
 
-    A single instance is built once at startup (task 18 wiring) and reused across
+    A single instance is built once at startup and reused across
     requests; it is stateless. Unit tests inject a mocked :class:`LLMClient` whose
     ``converse`` returns scripted JSON, so both planner decisions are fully
     deterministic without a live Bedrock call.
@@ -422,7 +401,6 @@ class BedrockStepPlanner:
         self._guardrail_id_provider = guardrail_id_provider
         self._max_tokens = max_tokens
         self._max_question_chars = max_question_chars
-        # Service-scoped early-stop settings (all off by default).
         self._stop_signals = stop_signals if stop_signals is not None else StopSignalConfig()
 
     def _effective_guardrail_id(self) -> str | None:
@@ -437,8 +415,6 @@ class BedrockStepPlanner:
             return gid or None
         return self._guardrail_id
 
-    # ── next-step selection (Req 4.3, 5) ───────────────────────────────
-
     async def propose_steps(
         self,
         *,
@@ -446,15 +422,15 @@ class BedrockStepPlanner:
         context: AccumulatedContext,
         tool_specs: list[dict],
     ) -> list[PlannerDecision] | None:
-        """Return candidate next-step decisions for the current context (Req 4.3).
+        """Return candidate next-step decisions for the current context.
 
         Consults the planner LLM with the sub-question, a compact summary of the
         accumulated context, and the registry's Tool specs. Returns the parsed
         :class:`PlannerDecision` candidates (the controller selects among them by
-        the hard preference ordering, Req 5). Returns an empty list when there
+        the hard preference ordering). Returns an empty list when there
         are no tools or the planner proposed none (``{"candidates": []}``, which
         under options.singleCallSteps means "enough"), and ``None`` — no Tool can
-        be selected (Req 4.7), never a stop — when the Converse call fails, the
+        be selected, never a stop — when the Converse call fails, the
         guardrail blocks, or the response is unparseable.
         """
         if not tool_specs:
@@ -517,7 +493,7 @@ class BedrockStepPlanner:
                 temperature=0.0,
                 max_tokens=max_tokens,
             )
-        except Exception as exc:  # noqa: BLE001 - planner must never raise (Req 4.7)
+        except Exception as exc:  # noqa: BLE001 - planner must never raise
             logger.warning("planner_propose_error", error=str(exc), error_type=type(exc).__name__)
             return None
 
@@ -540,7 +516,7 @@ class BedrockStepPlanner:
                     temperature=0.0,
                     max_tokens=max_tokens,
                 )
-            except Exception as exc:  # noqa: BLE001 - planner must never raise (Req 4.7)
+            except Exception as exc:  # noqa: BLE001 - planner must never raise
                 logger.warning("planner_propose_error", error=str(exc), error_type=type(exc).__name__)
                 return None
             if getattr(result, "guardrail_blocked", False):
@@ -568,10 +544,8 @@ class BedrockStepPlanner:
         payload = self._extract_json_object(text or "")
         return payload is None or not isinstance(payload.get("candidates"), list)
 
-    # ── sufficiency + grounded best-guess (Req 6.1-6.2; idea 2) ─────────
-
     async def assess(self, *, sub_question: SubQuestion, context: AccumulatedContext) -> tuple[bool, str]:
-        """Return ``(sufficient, working_answer)`` for the gathered context (idea 2).
+        """Return ``(sufficient, working_answer)`` for the gathered context.
 
         One Converse call that both runs the boolean Sufficiency_Check and produces
         the agent's current best answer grounded ONLY in the gathered context (no
@@ -641,7 +615,7 @@ class BedrockStepPlanner:
         return str(verdict.get("problem") or "").strip()[:500]
 
     async def check_sufficiency(self, *, sub_question: SubQuestion, context: AccumulatedContext) -> bool:
-        """Return only the boolean Sufficiency_Check decision (Req 6.1-6.2).
+        """Return only the boolean Sufficiency_Check decision.
 
         Retained for the :class:`StepPlanner` Protocol; delegates to :meth:`assess`
         and discards the working answer. The controller prefers :meth:`assess`
@@ -649,8 +623,6 @@ class BedrockStepPlanner:
         """
         sufficient, _ = await self.assess(sub_question=sub_question, context=context)
         return sufficient
-
-    # ── prompt construction ─────────────────────────────────────────────
 
     def _build_propose_prompt(
         self,
@@ -681,7 +653,7 @@ class BedrockStepPlanner:
         )
 
     def _build_assess_prompt(self, question: str, context: AccumulatedContext) -> str:
-        """Build the combined sufficiency + grounded-best-answer prompt (idea 2).
+        """Build the combined sufficiency + grounded-best-answer prompt.
 
         Includes a content-bearing view of the gathered context — actual chunk
         snippets (not just counts), the anchored entities, and any prior grounded
@@ -799,7 +771,7 @@ class BedrockStepPlanner:
                     f"the sub-question, no further tools are needed:\n{joined}"
                 )
         # Predicates discovered present on anchored entities via an 'edge_types'
-        # probe (idea 5 soft-prior). These are REAL graph relationships the pruned
+        # probe (soft-prior). These are REAL graph relationships the pruned
         # ontology may omit — the planner may traverse them with 'edge_typed'.
         present_edges = list(getattr(context, "present_edge_types", ()) or ())
         if present_edges:
@@ -823,7 +795,7 @@ class BedrockStepPlanner:
                     "'entity_ids' to an edge_typed graph traversal: " + "; ".join(listed)
                 )
 
-        # Recent attempts (idea 3/4): so the planner can SEE what it already tried
+        # Recent attempts: so the planner can SEE what it already tried
         # and whether it produced anything, and deliberately escalate / not repeat.
         attempts = getattr(context, "attempt_history", []) or []
         if attempts:
@@ -841,7 +813,7 @@ class BedrockStepPlanner:
                     if status == "succeeded"
                     else status
                 )
-                # Carry the planner's own rationale for the step (E-cheap) so the
+                # Carry the planner's own rationale for the step so the
                 # next step builds on prior intent rather than re-deriving it.
                 why = a.get("reasoning", "")
                 why_suffix = f"  [why: {why}]" if why else ""
@@ -850,8 +822,8 @@ class BedrockStepPlanner:
 
         # Snippets of the gathered chunks so tool selection can reason about CONTENT,
         # not just counts — and their ids so the planner can expand around a relevant
-        # chunk via the chunk-window tool (idea 6). Ranked by relevance rather than
-        # recency when idea 8 is enabled.
+        # chunk via the chunk-window tool. Ranked by relevance rather than
+        # recency when AGENTIC_RELEVANCE_RANKED_CONTEXT is enabled.
         use_rel = _relevance_ranked_context()
         getter = getattr(context, "relevant_chunk_refs", None) if use_rel else None
         if getter is None:
@@ -873,7 +845,7 @@ class BedrockStepPlanner:
                     joined = "\n".join(f"  [chunk] {s}" for s in snippets)
                     summary += f"\nMost recent chunk snippets:\n{joined}"
 
-        # The agent's running grounded best-guess so far (idea 2) — so a later step
+        # The agent's running grounded best-guess so far — so a later step
         # builds on it rather than restarting.
         working = getattr(context, "working_answer", "") or ""
         if working:
@@ -966,8 +938,6 @@ class BedrockStepPlanner:
             "\nSource documents seen so far (pass a source_key — or, when only a doc_id is listed, "
             "that doc_id — to read_document to read the full text):\n" + "\n".join(lines)
         )
-
-    # ── parsing ──────────────────────────────────────────────────────────
 
     def _parse_candidates(self, text: str) -> list[PlannerDecision]:
         """Parse the planner's JSON decision into candidate :class:`PlannerDecision`s.

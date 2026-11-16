@@ -62,7 +62,6 @@ export function IdentityPage() {
   useBreadcrumbTrail([{ text: t("Administration") }, { text: t("Identity") }]);
   const { data: rolesData, isLoading: rolesLoading } = useListPlatformRoles();
 
-  // Only PLATFORM-scoped roles are managed from this page.
   const platformRoles = useMemo<RoleSummary[]>(
     () =>
       (rolesData?.roles ?? []).filter((r) => r.scope === RoleScope.PLATFORM),
@@ -92,8 +91,6 @@ export function IdentityPage() {
   );
 }
 
-// ── Members tab ────────────────────────────────────────────────────────
-
 function MembersTab({ roles }: { roles: RoleSummary[] }) {
   const { locale, t } = useAppI18n();
   const {
@@ -118,7 +115,6 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
     [grantsData],
   );
 
-  // Map roleId → display name so the table shows "Platform Admin" not the id.
   const roleNameMap = useMemo(
     () =>
       new Map(
@@ -129,8 +125,6 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
     [roles],
   );
 
-  // useCollection handles client-side filtering + pagination over the loaded
-  // pages; selection is managed as controlled state below.
   const {
     items,
     collectionProps,
@@ -224,8 +218,6 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
     Promise.allSettled(
       selected.map((g) => deleteGrant.mutateAsync({ grantId: g.grantId! })),
     ).then((results) => {
-      // allSettled preserves order, so a rejected result maps back to the
-      // grant at the same index — surface which principals failed.
       const failed = results
         .map((r, i) => (r.status === "rejected" ? selected[i]! : null))
         .filter((g): g is PlatformGrantSummary => g !== null);
@@ -374,8 +366,6 @@ function MembersTab({ roles }: { roles: RoleSummary[] }) {
   );
 }
 
-// ── Roles tab ──────────────────────────────────────────────────────────
-
 function RolesTab({
   roles,
   isLoading,
@@ -446,8 +436,6 @@ function RolesTab({
   );
 }
 
-// ── Grant platform role modal ────────────────────────────────────────────
-
 function GrantPlatformRoleModal({
   roles,
   visible,
@@ -472,7 +460,6 @@ function GrantPlatformRoleModal({
   );
   const [error, setError] = useState<string | null>(null);
 
-  // Role options are the PLATFORM-scoped roles (e.g. Platform Admin / Viewer).
   const roleOptions = useMemo<SelectProps.Option[]>(
     () =>
       roles
@@ -485,7 +472,6 @@ function GrantPlatformRoleModal({
     [roles],
   );
 
-  // Reset the form whenever the modal is (re)opened.
   React.useEffect(() => {
     if (visible) {
       setPrincipalType(PrincipalType.USER);

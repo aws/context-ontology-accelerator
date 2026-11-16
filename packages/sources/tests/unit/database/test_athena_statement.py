@@ -135,8 +135,8 @@ def _throttle_error(code: str = "TooManyRequestsException") -> ClientError:
 def _clock(*readings: float):
     """A ``time.monotonic`` stub returning ``readings`` in order, then repeating the last.
 
-    Needed because the runner now refuses to submit a statement it has no time
-    left to await, so a zero budget fails before reaching the phase under test.
+    Needed because the runner refuses to submit a statement it has no time left
+    to await, so a zero budget fails before reaching the phase under test.
     Driving the clock explicitly pins WHICH phase notices the deadline.
     """
     remaining = list(readings)

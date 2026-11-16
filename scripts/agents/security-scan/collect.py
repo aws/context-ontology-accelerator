@@ -101,9 +101,6 @@ def paginate(client: Any, operation: str, items_key: str, **kwargs: Any) -> Iter
         yield from page.get(items_key, [])
 
 
-# Pick the scan
-
-
 def latest_scan(client: Any, agent_space_id: str, title: str) -> dict[str, Any]:
     """Return the newest scan of the review, which must have fully finished.
 
@@ -144,9 +141,6 @@ def scanned_commit(job: dict[str, Any], fallback: str) -> str:
     sources = job.get("sourceCode") or [{}]
     match = SOURCE_COMMIT.search(sources[0].get("s3Location", ""))
     return match.group(1) if match else fallback
-
-
-# Fetch its findings
 
 
 def fetch_findings(client: Any, agent_space_id: str, job_id: str) -> list[dict[str, Any]]:
@@ -312,9 +306,6 @@ def count_linked(findings: list[dict[str, Any]], assignment: dict[str, str], iss
     )
 
 
-# The judge: one model call per scan
-
-
 def ask_judge(bedrock: Any, new: dict[str, Any], known: dict[str, Any]) -> dict[str, tuple[str | None, float]]:
     """One model call: {new alias: (known alias or None, confidence)} for the aliased findings and issues."""
     reply = bedrock.converse(
@@ -423,9 +414,6 @@ def best_claim_per_issue(claims: Mapping[str, tuple[str | None, float]]) -> dict
         new_alias: (known_alias if known_alias and winner.get(known_alias) == new_alias else None)
         for new_alias, (known_alias, _) in claims.items()
     }
-
-
-# Build the GitLab SAST report
 
 
 def build_report(

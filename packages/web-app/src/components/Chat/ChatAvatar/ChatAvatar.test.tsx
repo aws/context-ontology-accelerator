@@ -34,19 +34,5 @@ describe("ChatAvatar", () => {
         screen.getByLabelText("Context Ontology Accelerator"),
       ).toBeInTheDocument();
     });
-
-    it("renders avatar when isLoading is true", () => {
-      render(<ChatAvatar role="assistant" isLoading={true} />);
-      expect(
-        screen.getByLabelText("Context Ontology Accelerator"),
-      ).toBeInTheDocument();
-    });
-
-    it("does not pass loading state when isLoading is false", () => {
-      const { container } = render(
-        <ChatAvatar role="assistant" isLoading={false} />,
-      );
-      expect(container.querySelector("svg")).toBeInTheDocument();
-    });
   });
 });

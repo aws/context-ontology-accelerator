@@ -15,7 +15,7 @@ export type {
 } from "@coa/control-plane-client";
 
 // Bound each collection so the response stays well under the API Gateway /
-// Lambda 6 MB response limit (#143). The detail view renders this page and
+// Lambda 6 MB response limit. The detail view renders this page and
 // shows the true totals (totalClasses / totalObjectProperties /
 // totalDatatypeProperties) from the response.
 export const OVERVIEW_PAGE_LIMIT = 2000;

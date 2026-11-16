@@ -2,8 +2,8 @@
 
 Tier 3 retrieval strategy that uses the graphrag-toolkit's built-in retrievers
 against the lexical knowledge graph. This is the **default** Tier 3 path
-(`TIER3_STRATEGY=lexical-baseline`); the older hand-rolled retrieval
-(VectorRetriever + GraphTraverser) is now the selectable alternative.
+(`TIER3_STRATEGY=lexical-baseline`); the hand-rolled retrieval
+(VectorRetriever + GraphTraverser) is the selectable alternative.
 
 ## What this is
 
@@ -37,10 +37,6 @@ uses graphrag is controlled by `TIER3_STRATEGY`:
 | `lexical-baseline` (default) | graphrag with the deployment default (`LEXICAL_RETRIEVER_STRATEGY`, `topic_beam`) | graphrag with that strategy |
 | `hand-rolled` | hand-rolled (VectorRetriever + GraphTraverser) | graphrag with that strategy |
 
-So on the default `lexical-baseline` deployment a request with no
-`retrieverStrategy` runs graphrag with `topic_beam`; set
-`TIER3_STRATEGY=hand-rolled` for the older vector+graph path.
-
 ## Retriever strategies
 
 Once `lexical-baseline` is enabled, the graphrag retrieval strategy is selectable
@@ -52,7 +48,7 @@ retriever configuration:
 |----------|---------------|-------|
 | `topic_beam` | `for_semantic_guided_search` | **Default.** Strongest single-shot on the SEC-10-Q benchmark (45.13% strict vs 34.36% hand-rolled, 195 q). |
 | `chunk_based_semantic` | `for_traversal_based_search` | Fast (~0.48s p50 SEC-10Q); the safety fallback when an invalid strategy is configured. |
-| `traversal` | `for_traversal_based_search` | The previously-hardcoded weighted set (ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5). Slowest + least accurate. |
+| `traversal` | `for_traversal_based_search` | The weighted set (ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5). Slowest + least accurate. |
 
 ### Selecting a strategy
 
@@ -75,15 +71,8 @@ The strategy is resolved once per request with precedence
   deployment default, so a request with no `retrieverStrategy` runs the
   hand-rolled path.
 
-In other words: passing `retrieverStrategy` always engages graphrag; omitting it
-falls back to whatever `TIER3_STRATEGY` selects (hand-rolled, or the
-`lexical-baseline` deployment default).
-
 The resolved strategy name is recorded in the trace / response metadata so eval
 runs and request logs attribute results to the strategy that produced them.
-
-> When graphrag is engaged with no explicit strategy (the `lexical-baseline`
-> deployment default), the strategy is `topic_beam`.
 
 ## Store connections
 
@@ -107,14 +96,13 @@ multi-tenancy contract: the derived `tenant_id` **must match the value kg-build
 wrote**, or retrieval targets a non-existent tenant partition (suffixed
 `__Chunk{tenant}__` labels / `chunk_{tenant}` index) and returns zero documents.
 Engines are cached per `(effective_tenant, strategy.name)` so a per-request
-strategy override does not collide with the cache. This derivation is the default
-and is unchanged.
+strategy override does not collide with the cache.
 
 ### Default-tenant override (eval-only seam — not request-reachable)
 
 `BaselineLexicalRetriever` accepts an optional constructor parameter
-`tenant_id_override` (default `None` = derive from namespace, i.e. unchanged
-production behaviour):
+`tenant_id_override` (default `None` = derive from namespace, the production
+behaviour):
 
 - `None` → derive the tenant from the namespace (production default).
 - `DEFAULT_TENANT_OVERRIDE` (the sentinel `"__graphrag_default_tenant__"`) →

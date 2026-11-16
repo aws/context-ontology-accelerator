@@ -8,8 +8,7 @@ import { useListSources } from "./use-list-sources";
  * Resolve `dataSourceId` → human-readable source name for a namespace.
  *
  * Returns a Map keyed by `sourceId`. When a source has no name, the id is used
- * as the fallback value. Shared by metric views (list + detail) so the
- * id→name resolution lives in one place.
+ * as the fallback value.
  */
 export function useSourceNameById(namespaceId: string): Map<string, string> {
   const { data: sourcesData } = useListSources(namespaceId);

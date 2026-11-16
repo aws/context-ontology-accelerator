@@ -395,7 +395,6 @@ def _fetch_catalog_from_fixture(datasource_id: str) -> dict:
     /app/fixtures/sample_data/<datasource>.json (Docker layout) or the
     local source tree fallback.
     """
-    import json
     from pathlib import Path
 
     fixture_root = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "data-catalog" / "sample_data"
@@ -483,7 +482,7 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     "columns": [fk["column"]],
                     "referredColumns": [f"{fk['targetTable']}.{fk['targetColumn']}"],
                     "relationshipType": fk.get("source") or None,
-                    # Governance (#1088): the approved-only induction gate reads
+                    # Governance: the approved-only induction gate reads
                     # reviewStatus; targetDatasourceId lets a cross-source FK
                     # resolve its parent class in the other source's tables.
                     "reviewStatus": fk.get("reviewStatus") or None,
@@ -512,8 +511,7 @@ def _catalog_to_tables(catalog: dict) -> list[dict]:
                     # sourceSchema = database name (maps to PostgreSQL schema /
                     # Athena database). Without it _generate_schema_sql cannot
                     # qualify same-named tables across schemas and silently emits
-                    # colliding bare `CREATE TABLE IF NOT EXISTS "<name>"` DDL —
-                    # the #149 cause-A failure mode. Mirrors main.py induce path.
+                    # colliding bare `CREATE TABLE IF NOT EXISTS "<name>"` DDL.
                     "sourceSchema": db_name or None,
                     "description": bm.get("description"),
                     "synonyms": bm.get("synonyms", []),
@@ -686,7 +684,7 @@ def _load_grounding_ontologies(
 # ── Background worker ───────────────────────────────────────────────────
 # Watchdog heartbeat interval — the worker bumps the job's ``updated_at`` this
 # often while induce()/build_r2rml/Store run, so a long-but-alive run is never
-# mistaken for an orphan by the stale sweep. Coarse on purpose (R3: keep DDB
+# mistaken for an orphan by the stale sweep. Coarse on purpose (keep DDB
 # write volume low); 45s << the 1h stale window with wide margin.
 _HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("INDUCTION_HEARTBEAT_SECONDS", "45"))
 
@@ -700,21 +698,11 @@ _WATCHDOG_LOG_EVERY_N_FAILURES = 10
 def _watchdog_loop(job_id: str, namespace: str, stop_event: Event, interval: float, region: str | None = None) -> None:
     """Bump the job's liveness timestamp every ``interval`` seconds until stopped.
 
-    ``stop_event.wait(interval)`` is the clock: it returns True the instant the
-    event is set (clean, immediate shutdown — no waiting out the full interval)
-    and False on timeout (a heartbeat tick). Touch-only — ``touch_job`` never
-    writes ``status`` — so a tick that races a terminal write can only bump
-    ``updated_at``, never resurrect a finished job. Best-effort: a transient DDB
-    error on one tick must not kill the heartbeat for the rest of the run, but a
-    persistently-wedged heartbeat is logged (rate-limited) for visibility.
-
-    Each tick also emits ``InductionHeartbeat`` + ``InductionWorkerMemoryBytes``
-    to ``COA/Ontology`` (out-of-process OOM observability, #784): a run
-    SIGKILLed by the OOM-killer never reaches the terminal metric emit in
-    ``finally``, so the per-tick trail is the only signal that dates the crash
-    and captures the pre-OOM memory ramp. The emit is best-effort on its own
-    (swallows its errors), and is additionally guarded here so a raising client
-    can't break the touch heartbeat.
+    Touch-only (``touch_job`` never writes ``status``), so a tick cannot
+    resurrect a finished job. Best-effort per tick; persistent failures are
+    logged, rate-limited. Each tick also emits ``InductionHeartbeat`` and
+    ``InductionWorkerMemoryBytes`` to ``COA/Ontology``: an OOM-killed run never
+    reaches the terminal metric, so this trail dates the crash.
     """
     consecutive_failures = 0
     while not stop_event.wait(interval):
@@ -902,25 +890,9 @@ def _run_induction(
                 source_type="STRUCTURED",
             )
 
-        # Step 1.5: Build the pipeline/adapters and assemble the grounding pool.
-        # The GroundingLoad stage timer emits GroundingLoadDurationMs on exit. This
-        # is a distinct span from FetchMetadata because _load_grounding_ontologies
-        # network-fetches foundational ontologies (schema.org / FIBO) as TTL — a
-        # one-time cost that must NOT be conflated with the per-datasource catalog
-        # fetch it used to sit under (esp. on the 50k rung where seeding schema.org
-        # adds a real network round-trip).
-        #
-        # The grounding pool is EXACTLY what the caller provided (resolved below)
-        # — nothing is auto-appended server-side. The namespace's accepted induced
-        # ontology is no longer force-included: the UI pre-checks it as a default
-        # selection (so it arrives in ``grounding_ontology_ids`` and is resolved
-        # like any other pick), but the user can deselect it. With no selections,
-        # the pool is empty and grounding runs against nothing (all-novel) rather
-        # than a namespace-wide search — see the empty-list contract on
-        # ``grounding_ontology_ids`` below.
-        #
-        # Nearest-sensible-span note: the embedder cost-tracker wiring +
-        # namespace-bound store override live in this block too (pipeline setup).
+        # Step 1.5: Build the pipeline and grounding pool. GroundingLoad is its own
+        # span because foundational ontologies are network-fetched as TTL. The pool
+        # is exactly the caller's selection; nothing is appended server-side.
         with _stage_timer("GroundingLoad", cost_tracker):
             pipeline = build_pipeline_fn(config)
 
@@ -941,14 +913,6 @@ def _run_induction(
             ns_graph, ns_vec = build_stores(namespace=ns)
             pipeline.oc = StoreOntologyCatalogAdapter(ns_graph, ns_vec, namespace=ns)
 
-            # Lazy-load any foundational ontologies the user picked
-            # in the induction modal that aren't yet loaded + embedded into
-            # this namespace. The modal sends a list of curated catalog keys
-            # (e.g. "fibo-agreements") — we resolve each to its URI, check
-            # the namespace registry, and fire the foundational loader for
-            # any that are missing OR have empty embedding indexes.
-            # ``resolved_grounding_ids`` is the list of ontology URIs
-            # (registry IDs) we'll pass to the strategy for filter scoping.
             resolved_grounding_ids: list[str] = []
             if body.grounding_ontology_ids:
                 resolved_grounding_ids = _load_grounding_ontologies(
@@ -990,13 +954,7 @@ def _run_induction(
                 embedding_backend=body.embedding_backend,
                 scoring_strategy=body.scoring_strategy,
                 structural_weight=body.structural_weight,
-                # Pass the resolved pool AS-IS, including an empty list. An empty
-                # pool ([] or None) is an explicit "no grounding scope" signal (user
-                # selected no ontologies and the namespace has no accepted induced
-                # ontologies) — the grounding recall returns no candidates rather
-                # than falling back to a namespace-wide search, which would ground
-                # against a loaded-but-unselected ontology. Grounding is always
-                # scoped to exactly this pool; there is no unscoped/global recall.
+                # Pass as-is: an empty pool means no grounding (no global fallback).
                 grounding_ontology_ids=resolved_grounding_ids,
                 grounding_mode=body.grounding_mode,
                 cost_tracker=cost_tracker,
@@ -1079,14 +1037,8 @@ def _run_induction(
                     # this dict before the DynamoDB write) to stay under the 400 KB
                     # item limit. The S3 artifact receives the FULL match set.
                     "matches": _floats_to_decimal([m.model_dump() for m in matches if not m.source_column]),
-                    # NOTE: column_matches (matches with source_column set) are intentionally
-                    # NOT persisted here. They lived inline in this dict for months but had
-                    # zero readers anywhere in the codebase. Full match data,
-                    # including column-level, is available via the in-memory InductionReport
-                    # (schemas.py:64, field `matches`) and the S3 matches.json artifact
-                    # written by put_proposal_matches_s3. Adding them back requires a real
-                    # consumer AND the S3-offload plumbing — never inline in this dict, the
-                    # per-candidate lists blow the 400 KB DynamoDB item limit on wide schemas.
+                    # Column-level matches are not persisted inline: they would exceed the
+                    # 400 KB DynamoDB item limit. They are in the S3 matches.json artifact.
                     "grounding_ontologies_used": grounding_report_uris,
                     "structural_fingerprint": fingerprint,
                     "has_constraint_config": True,
@@ -1129,8 +1081,6 @@ def _run_induction(
                 matched_count=matched_count,
                 tables_processed=len(all_tables),
                 columns_processed=sum(len(t.columns) for t in all_tables),
-                # Count only — the full novel-table list is ~365KB at 20k and
-                # blows the 400KB item cap; nothing reads it back.
                 novel_tables_count=len(novel_tables),
                 source_type="STRUCTURED",
             )
@@ -1320,33 +1270,14 @@ def start_induction(body: WorkbenchInductionRequest, request: Request, namespace
             namespace_language=namespace_language,
         )
 
-    # Enforce one in-flight induction at a time per namespace, in two layers:
-    #
-    #  1. block-until-reviewed: a completed-but-unreviewed proposal
-    #     (pending/updated) still blocks a new run — preserves prior behavior.
-    #  2. in-flight lock: a race-free conditional lock (acquire_induction_lock)
-    #     blocks a SECOND trigger while the first run is still executing. The
-    #     old code did only layer 1, but the proposal row does not exist during
-    #     the in-flight window (it's written at worker end), so a concurrent
-    #     trigger slipped straight through.
-    #
-    # The check is scoped to STRUCTURED proposals so a pending unstructured
-    # proposal does not block a new structured run (and vice versa).
-    #
-    # The blocking set lives in proposals.py (PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION),
-    # derived from the Smithy-generated ProposalStatus enum, so this guard and the
-    # accept guard cannot drift. It covers unreviewed work (pending / updated /
-    # accept_failed) AND an accept that is actively merging (accepting /
-    # embeddings_sync) — the induction lock is only held for the duration of an
-    # induction, so without the in-flight accept states a new induction can start
-    # mid-merge and leave two competing structured proposals in the namespace.
-    #
-    # Layer 1 is checked AFTER layer 2's lock is acquired, not before. Checking
-    # first left a check-then-act gap: a trigger could see no proposal, the
-    # running worker could then write its pending proposal and release the
-    # lock, and the trigger would acquire it and start a duplicate run beside
-    # an unreviewed proposal. The worker writes its proposal before releasing,
-    # so once we hold the lock the proposal read is authoritative.
+    # One in-flight induction per namespace, in two layers:
+    #  1. block-until-reviewed: a STRUCTURED proposal in
+    #     PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION (unreviewed or mid-accept)
+    #     blocks a new run;
+    #  2. in-flight lock (acquire_induction_lock) blocks a second trigger while a
+    #     run executes, when no proposal row exists yet.
+    # Layer 1 is checked after the lock is acquired: the worker writes its
+    # proposal before releasing, so the read is then authoritative.
     from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
 
     job_id = str(uuid.uuid4())
@@ -1453,7 +1384,7 @@ _TERMINAL_JOB_STATUSES = dynamo_store.TERMINAL_JOB_STATUSES
 # A DDB induction job non-terminal for longer than this with no live thread on
 # this task is treated as orphaned (its worker died on an ECS restart) and
 # reported as failed, so the poll can terminate instead of spinning forever.
-# Kept generous: A2's liveness heartbeat (touch_job) keeps a slow-but-alive run
+# Kept generous: the watchdog heartbeat (touch_job) keeps a slow-but-alive run
 # fresh, so shortening this only risks false-failing a live long run.
 _STALE_INDUCTION_SECONDS = int(os.getenv("INDUCTION_JOB_STALE_SECONDS", "3600"))  # 1h (induction is long)
 _STALE_JOB_ERROR = "Induction worker did not complete (task restarted or timed out)"
@@ -1511,21 +1442,10 @@ _INCLUDE_FULL_REPORT = {"report", "full"}
 def _poll_shape(job: "JobResponse | dict[str, Any]", include: str | None) -> "JobResponse | dict[str, Any]":
     """Return a poll-shaped job: ``report.matches[]`` dropped unless opted in.
 
-    At 50k tables ``report.matches`` holds ~836k entries → multi-MB, which blows
-    the API-proxy Lambda's 6MB response cap (413 ``RequestEntityTooLarge``) and
-    makes the completed job unpollable. A status poll only needs scalar counts +
-    terminal state, so by default we empty ``matches`` (a contract-compatible
-    empty list — the Smithy ``matches`` member stays present) while keeping every
-    scalar count, ``status``, ``proposal_id``/``duplicate_of`` and ``error``.
-
-    ``include`` in ``{"report", "full"}`` returns the full body incl. matches
-    (opt-in for the rare debugging caller; accepts it may 413 at huge scale).
-
-    Handles BOTH poll shapes without mutating the caller's object:
-      - in-memory ``JobResponse`` (pydantic) → ``model_copy`` with an emptied
-        report copy (the canonical ``_jobs`` entry is never touched, so an
-        ``include=report`` re-poll still sees all matches);
-      - DynamoDB item (``dict``) → shallow-copied dict with ``report.matches`` emptied.
+    Large ``report.matches`` lists exceed the API-proxy Lambda's 6 MB response
+    cap, so ``matches`` is emptied unless ``include`` is ``"report"`` or
+    ``"full"``. Works on a ``JobResponse`` or a DynamoDB item and never mutates
+    the caller's object.
     """
     if include in _INCLUDE_FULL_REPORT:
         return job
@@ -1610,28 +1530,8 @@ def _job_summary(item: dict[str, Any]) -> dict[str, Any]:
 
     ``ListInductionJobs`` declares ``InductionJobSummaryList`` — jobId, status,
     createdAt, sourceType, tablesProcessed, novelClassesCreated, error — and
-    nothing else. The handler used to return whole ``JobResponse`` objects, which
-    over-returned against its own contract and serialized the full
-    ``report.matches[]`` for every job in the list. At 50k tables a single report
-    holds ~836k match entries, so a list of completed jobs could blow the
-    API-proxy Lambda's 6MB response cap (413 ``RequestEntityTooLarge``).
-
-    Dropping ``report`` wholesale, rather than emptying ``matches``, is what the
-    contract already specifies: the two scalars a caller needs off the report
-    (``tables_processed``, ``novel_classes_created``) are persisted as top-level
-    attributes precisely so the list never has to carry the report at all.
-    Per-match detail lives on the proposal and is read via the proposal endpoints.
-
-    Keys are snake_case to match this service's actual wire format, which the web
-    app consumes (``job_id``, ``created_at`` — see the ``InductionJob`` interface
-    in ``web-app/src/services/ontology-engine.ts``). Smithy declares them
-    camelCase; that casing drift predates this change and spans the whole
-    ontology-engine surface, so it is deliberately not addressed here.
-
-    A missing ``source_type`` falls back to ``STRUCTURED``, which the contract
-    mandates rather than merely permits: "Items lacking this attribute on read
-    SHALL be treated as STRUCTURED for backward compatibility" (pre-schema-delta
-    rows predate the discriminator).
+    nothing else; ``report`` is dropped. Keys are snake_case, the wire format the
+    web app consumes. A missing ``source_type`` is ``STRUCTURED``.
     """
     return {
         "job_id": item.get("job_id"),
@@ -1683,12 +1583,7 @@ def list_jobs(
     (see :data:`dynamo_store.MAX_SCAN_CALLS_PER_PAGE`). Keep paging until
     ``nextToken`` is absent.
 
-    Reads the durable job rows, NOT the in-memory ``_jobs`` dict. ``_jobs`` only
-    holds jobs started by the task serving the request and is wiped on every
-    deployment, so the previous implementation returned ``[]`` in steady state
-    while dozens of job rows sat in DynamoDB — it could not list a job started by
-    another task, or survive a restart. ``count_active_jobs`` below already read
-    durably for exactly this reason.
+    Reads the durable DynamoDB job rows.
 
     Each entry is the Smithy ``InductionJobSummary`` shape — scalar status and
     counts only. The induction report, including ``report.matches[]``, is
@@ -1761,9 +1656,7 @@ def count_active_jobs(namespace: str) -> dict[str, int]:
     """Count non-terminal induction jobs, ingest jobs, and accepting proposals.
 
     Backed by durable DynamoDB reads (dynamo_store.list_jobs /
-    list_ingest_jobs / list_proposals), not the in-memory ``_jobs`` dict used
-    by ``GET /jobs`` above — that dict only reflects jobs tracked by the
-    current running container and would miss jobs started before a restart.
+    list_ingest_jobs / list_proposals).
     Used by the namespace-deletion precondition check (control-plane
     delete_handler) to block deletion while any of these could still be
     writing to the namespace's ontology data that the deletion pipeline is
@@ -1777,12 +1670,8 @@ def count_active_jobs(namespace: str) -> dict[str, int]:
     background writer and does not count — only "accepting" does.
     """
     jobs = dynamo_store.list_jobs(namespace=namespace, source_type=None, limit=1000)
-    # Self-heal: an orphaned induction row (hard worker death) that went stale
-    # AFTER the last boot would otherwise block namespace deletion forever — no
-    # restart runs to trigger the lazy get_job sweep, and this counter alone
-    # never swept. Age-gate-sweep stale non-terminal rows to ``failed`` here so
-    # the next delete attempt self-heals with no restart. Fresh (alive) rows and
-    # already-terminal rows are untouched.
+    # Sweep stale non-terminal rows to ``failed`` here so an orphaned row
+    # cannot block namespace deletion forever.
     active_jobs = sum(
         1 for job in jobs if _sweep_job_if_stale(job, namespace).get("status") not in _TERMINAL_JOB_STATUSES
     )

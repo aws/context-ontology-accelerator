@@ -132,23 +132,15 @@ RESOLVE_TIMEOUT_S = max(10, min(int(os.environ.get("RESOLVE_TIMEOUT_S", "120")),
 
 
 def _build_deadline(request) -> Deadline:
-    """Build the request-scoped deadline (A0) for a query.
+    """Build the request-scoped deadline for a query.
 
     The transport budget is ``RESOLVE_TIMEOUT_S`` — set per-transport by the
     deploying stack (REST/data-layer path vs the longer AgentCore/Playground
     path). The caller may narrow it via ``options.timeoutMs`` but never widen it.
-
-    ``options.timeoutMs`` is read here — this is what makes the long-declared but
-    previously-inert Smithy field actually govern the request budget (closes the
-    accept-and-ignore contract defect).
     """
     from .deadline import Deadline
 
-    caller_timeout_ms = None
-    options = getattr(request, "options", None) or {}
-    if isinstance(options, dict):
-        caller_timeout_ms = options.get("timeoutMs")
-    return Deadline.from_budget(RESOLVE_TIMEOUT_S, caller_timeout_ms)
+    return Deadline.from_budget(RESOLVE_TIMEOUT_S, request.options.get("timeoutMs"))
 
 
 # Namespace format constraint — mirrors InvokeRequest.namespace so the 400/404
@@ -174,8 +166,7 @@ def _register_sparql_strategy(
 
     Ships dark: with the switch off the list is untouched. Inserted just before Ontop,
     so in a mixed namespace the default chain runs NL→SQL, then NL→SPARQL, then
-    Ontop (LLD §3.3): Ontop answers from the SQL mappings with a low measured
-    accuracy, and running it first left graph questions to a weak SQL answer. The
+    Ontop: Ontop answers from the SQL mappings with a low measured accuracy. The
     runner only selects it for a namespace that has a graph source, or a request
     that pins it. ``firewall`` is the SQL strategies' own, so Cedar admits the same
     principals to the graph path as to the SQL path.
@@ -214,20 +205,11 @@ async def _ensure_initialized():
             return
         config = await asyncio.to_thread(load_config)
 
-        # Live guardrail config: the guardrail SSM parameters are the only serve
-        # config that can change under a running container (an operator edits
-        # <prefix>/bedrock/guardrail-id with no redeploy). Reading them through a
-        # short-TTL provider on the hot path — rather than capturing the value
-        # frozen in ``config`` at startup — is what lets an operator change reach
-        # a warm, session-pinned instance within the TTL instead of only after
-        # the microVM cycles. Prime it off the request thread so the
-        # first SSM read does not block the event loop.
+        # The guardrail SSM parameters can change under a running container, so they
+        # are read through a short-TTL provider (see guardrail_config). prime() does
+        # the first SSM read off the event loop; if it raises, _orchestrator stays
+        # None and the next request retries the whole init.
         guardrail_provider = build_guardrail_config_provider()
-        # prime() does the first SSM read off the request thread. If it raises
-        # (transient SSM blip at startup), _orchestrator stays None and the
-        # _init_lock releases, so the NEXT request re-enters _ensure_initialized
-        # and retries the whole init — this is a retry-on-next-request, not a
-        # permanent-until-microVM-cycles failure.
         await asyncio.to_thread(guardrail_provider.prime)
         _guardrail_provider = guardrail_provider
 
@@ -249,6 +231,8 @@ async def _ensure_initialized():
         neptune_client = NeptuneGraphClient(endpoint=config.neptune_endpoint)
         opensearch_client = OpenSearchVectorClient(endpoint=config.opensearch_endpoint)
         bedrock_client = BedrockLLMClient(model_id=config.bedrock_model_id, region=config.bedrock_region)
+        # Imports llama-index (about 1s): off the event loop, and a broken install fails init.
+        await asyncio.to_thread(bedrock_client.prime)
         # VKG endpoint used as template: "://vkg." is replaced with "://vkg-{ns}." per request
 
         from .clients.sources_registry import SourcesRegistry
@@ -261,16 +245,15 @@ async def _ensure_initialized():
         _sources_registry = sources_registry
         athena_executor = AthenaQueryExecutor(region=config.bedrock_region, sources_registry=sources_registry)
 
-        # single-vs-cross-source dispatcher (Serve LLD §2.2.1 Option D).
-        # Direct JDBC is the DEFAULT fast path for single-source queries (one
-        # catalog, all-qualified tables, a resolvable DATABASE source) because
-        # direct asyncpg (~20-50ms p50) avoids Athena's federation cold-start;
-        # complex/federated/cross-source queries use Athena. The composite only
-        # routes to JDBC after confirming the source is a DATABASE source
-        # (has_jdbc_endpoint gate) — Glue-native/S3 sources always use Athena.
-        # Built by default when a data-sources table is configured; set
+        # Single-vs-cross-source dispatcher. Direct JDBC is the default fast path
+        # for single-source queries (one catalog, all-qualified tables, a resolvable
+        # DATABASE source) because direct asyncpg (~20-50ms p50) avoids Athena's
+        # federation cold-start; complex/federated/cross-source queries use Athena.
+        # The composite only routes to JDBC after confirming the source is a
+        # DATABASE source (has_jdbc_endpoint gate) — Glue-native/S3 sources always
+        # use Athena. Built by default when a data-sources table is configured; set
         # SCL_DISABLE_JDBC_DISPATCH=true as an operational off-switch (composite
-        # then degrades to Athena-only = the prior behaviour).
+        # then degrades to Athena-only).
         source_db_executor = None
         jdbc_disabled = os.environ.get("SCL_DISABLE_JDBC_DISPATCH", "").lower() == "true"
         if not jdbc_disabled and config.data_sources_table:
@@ -290,7 +273,7 @@ async def _ensure_initialized():
         # into Redshift execution (queryEngine=REDSHIFT). Built by default when a
         # data-sources table is configured; set SCL_DISABLE_REDSHIFT_DISPATCH=true
         # as an operational off-switch (composite then routes those sources to
-        # Athena — the prior behaviour). Never regresses non-Redshift sources.
+        # Athena). Never regresses non-Redshift sources.
         redshift_executor = None
         redshift_disabled = os.environ.get("SCL_DISABLE_REDSHIFT_DISPATCH", "").lower() == "true"
         if not redshift_disabled and config.data_sources_table:
@@ -315,10 +298,8 @@ async def _ensure_initialized():
 
         # Build tier resolvers
         metric_resolver = MetricResolver(neptune_client=neptune_client)
-        # Load metrics from Neptune at startup (fire-and-forget — start()
-        # spawns a background refresh task that keeps metrics fresh).
-        # _ensure_initialized runs inside the running event loop, so use
-        # create_task directly (get_event_loop is deprecated in this context).
+        # Load metrics from Neptune at startup; start() spawns a background
+        # refresh task.
         asyncio.create_task(metric_resolver.start())
         # few-shot example loader (S3). Inert unless ONTOLOGY_BUCKET is set,
         # in which case namespace-scoped examples.json replaces the generic prompt
@@ -448,14 +429,8 @@ async def _ensure_initialized():
         _sparql_client_cache = sparql_strategy.client_cache if sparql_strategy is not None else None
         structured_query_tier = StructuredQueryTier(strategies=strategies)
 
-        # Deep-reasoning Tier 3 path. Built so a deployment default
-        # (TIER3_STRATEGY=deep-reasoning) OR a per-request
-        # options.mode="deep-reasoning" can engage it; construction is
-        # cheap and keeps the graphrag_toolkit import lazy (the registry's
-        # strategy/graph tools defer toolkit access to first invoke). Imported here
-        # (not at module load) so the serve module import stays graphrag-free. A
-        # construction failure must NOT break startup — the orchestrator simply runs
-        # the existing Tier 3 paths — so we degrade with a warning.
+        # Deep-reasoning Tier 3 path. Imported here so the serve module import stays
+        # graphrag-free; a construction failure only logs a warning.
         #
         # Built AFTER structured_query_tier so the agentic registry can expose the
         # nl_to_sql tool over the same Tier-2 engine; per-namespace composition
@@ -548,9 +523,6 @@ def _format_validation_errors(e: ValidationError) -> list[dict]:
     return errors
 
 
-# ── Data Layer isolated action handlers ──────────────────────────────────────
-
-
 def _error(status_code: int, message: str, request_id: str) -> dict:
     return {
         "message": message,
@@ -581,7 +553,7 @@ async def _handle_translate(payload: dict, request_id: str) -> dict:
         logger.error("translate_error", error=str(e), request_id=request_id)
         raise QueryTranslationError("Translation failed") from e
 
-    # Replay full pipeline steps (context_assembly, llm_call, validation) — E8
+    # Replay full pipeline steps (context_assembly, llm_call, validation)
     if result.trace_steps:
         trace.add_dicts(result.trace_steps)
 
@@ -592,10 +564,8 @@ async def _handle_translate(payload: dict, request_id: str) -> dict:
         "sparqlQuery": result.sparql,
         "confidence": {"score": result.confidence, "rationale": ""},
         "trace": trace.steps_serializable,
-        # Null BY DESIGN, not by omission (#986): translation never touches the
-        # VKG, and no in-band artifact names the ontology snapshot it ran
-        # against. A namespace-level "current version" would not be the version
-        # THIS translation used, so reporting one here would be a false claim.
+        # Null by design: translation never touches the VKG, so no ontology
+        # snapshot version applies.
         "ontologyVersion": None,
         "requestId": request_id,
         "statusCode": 200,
@@ -930,15 +900,13 @@ async def _persist_turn(
     """Best-effort persistence of a completed query turn to session history."""
     try:
         answer = response.result.synthesized_answer or ""
-        turn_metadata: dict | None = None
-        if response.result:
-            turn_metadata = response.result.model_dump(
-                by_alias=True,
-                exclude_none=True,
-                exclude={"synthesized_answer", "supporting_content", "llm_usage"},
-            )
-            turn_metadata["requestId"] = request_id
-            turn_metadata["query"] = query
+        turn_metadata: dict | None = response.result.model_dump(
+            by_alias=True,
+            exclude_none=True,
+            exclude={"synthesized_answer", "supporting_content", "llm_usage"},
+        )
+        turn_metadata["requestId"] = request_id
+        turn_metadata["query"] = query
         await _session_manager.append_turn(
             user_id=session_user_id,
             session_id=session_id,
@@ -1112,7 +1080,7 @@ async def _resolve_blocking(request, request_id: str, schema_vis: SchemaVisibili
     response.result.metadata = {**(response.result.metadata or {}), "totalMs": total_ms}
     response.result.llm_usage = _llm_usage_metrics(tracker)
     response.requestId = request_id
-    # Results-only for a schema-blind caller (ADR): withhold every schema-bearing
+    # Results-only for a schema-blind caller: withhold every schema-bearing
     # field, not only the SQL/SPARQL artifacts.
     scrub_query_result(response.result, schema_vis)
     yield response.model_dump(by_alias=True, exclude_none=True, mode="json")
@@ -1174,13 +1142,9 @@ async def _stream_query(payload: dict, request, request_id: str, session_user_id
             emitter.done()
             return response
         except AccessDeniedError:
-            # Authorization denials must not leak the trace steps that led
-            # to the denial — a T1_FIREWALL step's detail names the
-            # restricted tables in the deny reason and would otherwise
-            # reach any authenticated caller via SSE before the 403.
+            # Authorization denials must not leak the trace steps that led to the
+            # denial: a T1_FIREWALL step's detail names the restricted tables.
             # `discard()` cancels pending step-emit tasks without delivering.
-            # This is what keeps the trace stream from leaking restricted
-            # table names to a caller who was just denied.
             trace.discard()
             emitter.close()
             raise
@@ -1256,8 +1220,8 @@ async def _bind_namespace_label_preference(
 ) -> dict | None:
     """Resolve the namespace language once and bind this request's label preference.
 
-    Readers choose display labels from the namespace's immutable language
-    (namespace-language LLD §2.2.5). The existence gate has just read the
+    Readers choose display labels from the namespace's immutable language.
+    The existence gate has just read the
     namespace item, so the registry answers from that read. When the item is
     missing or unreadable the request fails closed rather than reading as
     English; only a deployment with no namespaces table at all (existence could
@@ -1291,13 +1255,9 @@ async def _authorize_namespace_access(
 ) -> tuple[ResolvedProfile | None, dict | None]:
     """Resolve the caller's roles and run the Cedar namespace-admission gate.
 
-    The SINGLE namespace authorization point for every namespace-scoped surface —
+    The single namespace authorization point for every namespace-scoped surface —
     the isolated ``translate`` / ``kbSearch`` / ``graphTraverse`` actions AND the
-    Tier-1/2/3 query path. Namespace authorization previously lived only inside
-    ``SQLFirewall`` (the Tier-1/2 SQL execution sites), so the isolated retrieval
-    actions and the whole Tier-3 retrieval/synthesis path reached their data sinks
-    ungated: any authenticated IdP user could read any namespace's document
-    chunks, graph entities and synthesized answers (F-2, CWE-862).
+    Tier-1/2/3 query path (CWE-862).
 
     JWT identity is authoritative; ``payload_profile`` userId/groups are a
     fallback used only when no JWT was forwarded (local/dev). Fails CLOSED: a
@@ -1306,8 +1266,7 @@ async def _authorize_namespace_access(
     bypass).
 
     Both the grant lookup (DynamoDB) and the Cedar evaluation (``cedarpy`` plus a
-    possible policy read) are synchronous/blocking, and this gate now runs on
-    EVERY namespace-scoped request — so both are dispatched via
+    possible policy read) are blocking, so both are dispatched via
     ``asyncio.to_thread`` to keep them off the event loop.
 
     CANONICAL-ID CONSTRAINT: the decision is evaluated on the namespace string the
@@ -1315,14 +1274,11 @@ async def _authorize_namespace_access(
     ``resourceRoles.contains({role, resourceUID: resource.id})`` and the control
     plane writes grants with ``resourceId`` = the namespace **UUID** (see
     ``grants/create_handler.py``), so a caller must pass the canonical id to be
-    authorized. A namespace *name* — which ``namespace_exists`` does resolve, and
-    which ``_NAMESPACE_PATTERN`` permits — therefore DENIES even for a legitimately
-    granted principal. Deliberate for now: fail-closed is the safe side, and
-    canonicalizing here WITHOUT also canonicalizing the retrieval layer's tenant
-    derivation would admit the caller and then read under a tenant derived from the
-    unresolved name (the separate tenant-scoping issue). All three shipped surfaces
-    send the id — Playground route param, data-layer ``{namespaceId}``, MCP
-    ``namespaceId`` — so no supported caller is affected today.
+    authorized. A namespace *name* therefore DENIES even for a granted principal.
+    This fails closed: canonicalizing here without also canonicalizing the
+    retrieval layer's tenant derivation would admit the caller and then read
+    under a tenant derived from the unresolved name. The Playground, data-layer
+    and MCP callers all send the id.
 
     Returns:
         ``(resolved_profile, None)`` when allowed — the resolved profile is handed
@@ -1389,13 +1345,11 @@ async def invoke(payload: dict, context=None):
 
     request_id = payload.get("requestId") or str(uuid.uuid4())
 
-    # ── Extract authenticated user identity ───────────────────────────────
     # See identity.py for the full trust model explanation.
     _jwt_user_id, _jwt_email, _jwt_groups = extract_jwt_identity(context)
     if not context:
         logger.info("invoke_no_context", payload_keys=list(payload.keys()))
 
-    # ── Session CRUD actions (delegated to session_actions module) ──────
     action = payload.get("action")
     if action == "getRecentSession" and _session_metadata:
         user_id = resolve_user_id(payload, _jwt_user_id, _jwt_email)
@@ -1441,7 +1395,6 @@ async def invoke(payload: dict, context=None):
         yield await handle_delete_session(payload, request_id, user_id, _session_metadata)
         return
 
-    # ── Data Layer isolated actions ────────────────────────────────────────
     # Strip injectable ROLE fields only. Keep identity fields (userId, groups,
     # email) — the full-query path below needs them for resolve_profile().
     payload.setdefault("profile", {})
@@ -1465,7 +1418,6 @@ async def invoke(payload: dict, context=None):
             }
             return
 
-    # ── Namespace format validation ────────────────────────────────────────
     # Reject malformed namespaces (path traversal, spaces, special chars) with a
     # 400 BEFORE any downstream lookup, so callers get a validation error instead
     # of a 404 masking their input mistake. The regex matches the constraint on
@@ -1481,17 +1433,10 @@ async def invoke(payload: dict, context=None):
         }
         return
 
-    # ── Namespace existence gate (query + retrieval actions) ───────────────
-    # translate / kbSearch / graphTraverse and the query path below all operate
-    # on a specific namespace. A request for a namespace that does not exist must
-    # return 404 — otherwise the query path silently falls through to a Tier-3
-    # "no information available" 200, masking a caller's typo'd/stale namespace.
-    # Session CRUD actions returned above and are intentionally NOT gated here.
-    # namespace_exists() returns None when it cannot check. We fail CLOSED when the
-    # namespaces table IS configured (so None means a genuine lookup error — do not
-    # serve a namespace we could not verify, F-2). When the table is NOT configured
-    # (feature absent, e.g. a minimal/dev deployment) None means "cannot check" and
-    # we proceed, so an unconfigured deployment stays usable.
+    # A request for a namespace that does not exist returns 404 rather than a
+    # Tier-3 "no information available" 200. Session CRUD actions returned above
+    # and are not gated. namespace_exists() returns None when it cannot check:
+    # fail closed when the namespaces table is configured, proceed when it is not.
     if namespace and _sources_registry is not None:
         namespace_present = await _sources_registry.namespace_exists(namespace)
         if namespace_present is False:
@@ -1506,17 +1451,9 @@ async def invoke(payload: dict, context=None):
             yield language_error
             return
 
-    # ── Namespace admission gate (Cedar) ───────────────────────────────────
-    # Run the coarse "may this principal query this namespace at all?" decision
-    # ONCE, here, before dispatching either the isolated retrieval actions
-    # (translate/kbSearch/graphTraverse) or the Tier-1/2/3 query path. Previously
-    # this gate existed only inside SQLFirewall at the Tier-1/2 SQL-execution
-    # sites, so the isolated actions and the entire Tier-3 retrieval/synthesis
-    # path were ungated — any authenticated IdP user could read any namespace's
-    # chunks, graph and synthesized answers (F-2, CWE-862). Session CRUD actions
-    # returned above and are intentionally NOT gated (they are user-scoped, not
-    # namespace-data reads). The resolved profile is reused by the query path
-    # below to avoid a second grant lookup.
+    # Single namespace admission gate (see _authorize_namespace_access). Session
+    # CRUD actions returned above and are not gated (they are user-scoped). The
+    # resolved profile is reused by the query path below.
     resolved_profile: ResolvedProfile | None = None
     if namespace:
         resolved_profile, authz_error = await _authorize_namespace_access(
@@ -1565,7 +1502,6 @@ async def invoke(payload: dict, context=None):
         yield e.to_dict(request_id)
         return
 
-    # ── Query resolution (streaming SSE) ──────────────────────────────────
     try:
         request = InvokeRequest(
             query=payload.get("query", ""),
@@ -1584,10 +1520,6 @@ async def invoke(payload: dict, context=None):
         }
         return
 
-    # JWT identity is authoritative when present. The request
-    # body is attacker-controlled for direct callers (Playground SSE), so we must
-    # NOT trust profile.userId/groups over the cryptographically-validated JWT.
-    # profile.* values are only used as fallback when no JWT is forwarded.
     upstream_user_id, upstream_groups = resolve_principal(request.profile, _jwt_user_id, _jwt_email, _jwt_groups)
     _reserved_keys = (
         "userId",
@@ -1624,19 +1556,6 @@ async def invoke(payload: dict, context=None):
         )
         resolved.inject_into(request.profile)
 
-    # ``includeDebugInfo`` returns the generated SQL/SPARQL, i.e. the physical
-    # schema. The per-artifact authorization now lives in the orchestrator's
-    # response assembly (ADR: decompose-viewnamespace-schema-visibility): the SQL
-    # artifact is gated on ``viewSource`` and the SPARQL artifact on
-    # ``viewOntology``, each evaluated through the fail-closed Cedar authorizer
-    # (``Orchestrator._resolve_include_sql`` / ``_resolve_include_sparql``). That
-    # is the single enforcement point, so the flag is forwarded unchanged here —
-    # a caller who holds neither right still receives both fields withheld, and a
-    # caller who holds one receives only the artifact that right discloses. The
-    # old coarse role-list pre-gate (``may_view_debug_info``) is removed: it
-    # collapsed the two independent rights into one all-or-nothing decision and
-    # would have overridden the finer split, keeping artifacts hidden on the UI
-    # for roles that legitimately regained access under the decomposition.
     logger.info(
         "invoke",
         namespace=request.namespace,
@@ -1644,7 +1563,6 @@ async def invoke(payload: dict, context=None):
         request_id=request_id,
     )
 
-    # ── Determine streaming mode ──────────────────────────────────────────
     # If "stream": true in payload, yield SSE events progressively.
     # Otherwise yield a single dict (backward compat for MCP/data-layer callers).
     stream_mode = payload.get("stream", False)
@@ -1658,7 +1576,6 @@ async def invoke(payload: dict, context=None):
                 yield event
             return
 
-        # ── Streaming SSE mode ────────────────────────────────────────────
         session_user_id = _jwt_user_id or upstream_user_id
         async for event in _handle_streaming_query(payload, request, request_id, session_user_id):
             yield event

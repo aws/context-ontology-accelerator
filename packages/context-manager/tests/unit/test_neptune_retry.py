@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Neptune serve client uses a split connect/read timeout and bounded retry."""
+"""Neptune serve client uses a split connect/read timeout."""
 
 from __future__ import annotations
 
@@ -18,9 +18,6 @@ def test_neptune_http_client_has_split_timeout():
 
     client = nmod.NeptuneGraphClient(endpoint="db.example.com", region="us-east-1")
 
-    async def _run() -> httpx.AsyncClient:
-        return await client._get_http()
-
-    http = asyncio.run(_run())
+    http = asyncio.run(client._get_http())
     assert isinstance(http.timeout, httpx.Timeout)
     assert http.timeout.connect == 2.0

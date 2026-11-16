@@ -1,16 +1,8 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Orchestrates the Playground chat via SSE streaming.
- *
- * Replaces the WebSocket-based use-playground-chat.ts:
- * - Queries via HTTP POST (use-playground-stream)
- * - Sessions via HTTP POST actions (use-sessions)
- * - Token buffering preserved (use-token-buffer)
- * - No row buffering needed (full rows in single done event)
- * - No connection state (no heartbeat, no reconnection)
- */
+/** Orchestrates the Playground chat: SSE query stream, session actions and
+ *  token buffering. */
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import type {
   ChatMessage,
@@ -27,20 +19,13 @@ import { useTokenBuffer } from "./use-token-buffer";
 /**
  * Build the request's `options` object.
  *
- * `includeDebugInfo` is set to `true` from the Playground, so the "Compiled
- * artifacts" panel shows the SQL (`queryUsed`) and SPARQL (`sparqlGenerated`)
- * by default to every role allowed to see them. The flag is only a request:
- * serve returns the SQL only to a caller holding `viewSource` and the SPARQL
- * only to one holding `viewOntology`, so a data-analyst (and any custom role
- * without those rights) still gets neither. Visibility is decided server-side,
- * not by this flag.
+ * `includeDebugInfo` is only a request: serve returns the SQL only to a caller
+ * holding `viewSource` and the SPARQL only to one holding `viewOntology`.
  *
- * One helper rather than conditional spreads, because
- * `...(mode && { options: { mode } })` followed by the same for `strategy` would
- * have the second overwrite the first — both assign the whole `options` key.
+ * One helper rather than conditional spreads, because two
+ * `...(x && { options: {...} })` spreads would overwrite each other.
  *
- * Exported for test: the Playground page test mocks this whole hook, so there is
- * no other coverage of the request shape.
+ * Exported for test: the Playground page test mocks this whole hook.
  */
 export function buildOptions(
   mode?: ExecutionMode,
@@ -102,10 +87,9 @@ export function usePlaygroundChatSSE({
     messagesRef.current = state.messages;
   }, [state.messages]);
 
-  // ── Token buffering (75ms flush, same as WS version) ──
   const tokenBuffer = useTokenBuffer(dispatch);
 
-  // Delayed "response.assemble" step for UX polish (same as WS version)
+  // Delayed "response.assemble" step for UX polish.
   const pendingTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(
     new Set(),
   );
@@ -117,7 +101,6 @@ export function usePlaygroundChatSSE({
     };
   }, []);
 
-  // ── Sessions (REST-based) ──
   const sessions = useSessions({
     queryEndpoint,
     oidcConfig,
@@ -125,7 +108,6 @@ export function usePlaygroundChatSSE({
     dispatch,
   });
 
-  // ── Streaming event handler ──
   const handleEvent = useCallback(
     (event: StreamingEvent) => {
       switch (event.type) {
@@ -148,11 +130,9 @@ export function usePlaygroundChatSSE({
           break;
 
         case "done": {
-          // Capture session ID from streaming response
           if (event.sessionId) {
             sessions.captureSessionId(event.sessionId);
           }
-          // Flush any buffered tokens
           const buffered = tokenBuffer.flush(event.requestId);
           if (buffered) {
             dispatch({
@@ -201,21 +181,17 @@ export function usePlaygroundChatSSE({
           break;
 
         default:
-          // Unknown event type, skip
           break;
       }
     },
     [tokenBuffer, sessions],
   );
 
-  // ── SSE stream hook ──
   const { submit, isStreaming, cancel } = usePlaygroundStream({
     queryEndpoint,
     oidcConfig,
     onEvent: handleEvent,
   });
-
-  // ── Public API ──
 
   const sendQuery = useCallback(
     (query: string, mode?: ExecutionMode, strategy?: QueryStrategy) => {

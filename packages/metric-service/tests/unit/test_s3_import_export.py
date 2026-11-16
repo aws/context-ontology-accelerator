@@ -15,9 +15,6 @@ from coa_metrics.source_status import PERMISSIVE_ENV
 pytestmark = pytest.mark.unit
 
 
-# ── GetOsiUploadUrl tests ───────────────────────────────────────────────
-
-
 class TestGetOsiUploadUrl:
     """Tests for the get_osi_upload_url handler."""
 
@@ -104,9 +101,6 @@ class TestGetOsiUploadUrl:
         assert resp["statusCode"] == 500
 
 
-# ── Import with S3 key tests ───────────────────────────────────────────
-
-
 @pytest.mark.parametrize(
     "s3_key",
     [
@@ -176,9 +170,8 @@ class TestImportFromS3:
         mock_neptune.return_value.get_metric.return_value = None
         mock_neptune.return_value.create_metric.return_value = None
 
-        # Permissive lookup: this test covers the S3 read path, not the #564
-        # APPROVED-source enforcement import applies per metric (which would
-        # otherwise fail closed with a 503 — DATA_SOURCES_TABLE is unset here).
+        # Permissive lookup: this test covers the S3 read path, not source approval
+        # (which would fail closed with a 503 since DATA_SOURCES_TABLE is unset).
         env = {"OSI_BUCKET_NAME": "test-bucket", PERMISSIVE_ENV: "true"}
         with patch.dict("os.environ", env):
             resp = handler(self._make_event(body={"s3Key": "test-ns/imports/abc/file.yaml"}), None)
@@ -269,15 +262,11 @@ class TestImportFromS3:
     def test_inline_size_limit_enforced(self) -> None:
         from coa_metrics.api.import_osi import handler
 
-        # 6MB of content (exceeds 5MB limit)
         large_content = "x" * (6 * 1024 * 1024)
         resp = handler(self._make_event(body={"content": large_content}), None)
 
         assert resp["statusCode"] == 413
         assert "5MB" in json.loads(resp["body"])["message"]
-
-
-# ── Export to S3 tests ──────────────────────────────────────────────────
 
 
 class TestExportToS3:

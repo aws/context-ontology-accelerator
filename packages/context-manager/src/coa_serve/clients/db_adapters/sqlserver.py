@@ -4,36 +4,21 @@
 """SQL Server adapter (python-tds / pytds, pure-Python, run in a threadpool).
 
 There is no maintained SQLAlchemy async driver for SQL Server that avoids a
-native ODBC dependency. Rather than bake unixODBC + msodbcsql18 into the serve
-runtime image, this adapter reuses ``python-tds`` — the SAME pure-Python driver
-the discovery side already uses (``connectors/dialects.py`` ``SqlServerDialect``)
-— and runs its blocking calls in ``asyncio.to_thread`` so the event loop is never
-blocked.
+native ODBC dependency, so this adapter uses ``python-tds`` (the same pure-Python
+driver the discovery side uses) and runs its blocking calls in
+``asyncio.to_thread``.
 
-Connection model — CONNECT-PER-QUERY (deliberate):
-- pytds connections are synchronous and NOT concurrency-safe, and a shared cached
-  connection creates two hazards: (a) LRU eviction could ``close()`` a socket while
-  another coroutine is mid-query on it, and (b) an ``asyncio.wait_for`` query
-  timeout cannot cancel the OS thread, so the abandoned thread would keep using the
-  connection and a subsequent query on the same (reused) connection would interleave
-  on a non-thread-safe socket → TDS protocol corruption. To avoid BOTH, each
-  ``run()`` opens a FRESH pytds connection, executes, and closes it — all inside one
-  ``asyncio.to_thread`` unit. There is no shared mutable connection to race on, and a
-  poisoned/abandoned connection is never reused. Single-source metric lookups are
-  low-QPS, so the per-query connect cost is acceptable (the same trade-off the plan
-  accepted for pytds/aiomysql not using SQLAlchemy pooling).
-- The cached ``ConnHandle`` is therefore just the resolved ``DBCredentials`` (no live
-  socket); ``close()`` is a no-op.
+Connection model — CONNECT-PER-QUERY: pytds connections are synchronous and NOT
+concurrency-safe. A shared cached connection could be closed by LRU eviction
+while another coroutine is mid-query, and an ``asyncio.wait_for`` timeout cannot
+cancel the OS thread, so a reused connection could interleave on a non-thread-safe
+socket (TDS protocol corruption). Each ``run()`` therefore opens, executes and
+closes a fresh connection in one ``asyncio.to_thread`` unit; the cached
+``ConnHandle`` is just the resolved ``DBCredentials``.
 
-Other engine-specific behavior:
-- Row-limit idiom is ``SELECT TOP N`` — the base ``inject_limit`` renders the ROOT
-  sqlglot ``limit`` node as ``TOP`` for the ``tsql`` dialect; this class only
-  overrides ``_limit_fallback`` so a parse failure never emits a literal ``LIMIT``
-  that SQL Server would reject.
-- Statement timeout is enforced driver-side via pytds ``timeout`` (server aborts the
-  query) plus an outer ``asyncio.wait_for`` bound.
-- No ``search_path``; SQL reaching here is fully qualified (``schema.table``),
-  matching the discovery connector's convention.
+Row-limit idiom is ``SELECT TOP N``; ``_limit_fallback`` is overridden so a parse
+failure never emits a literal ``LIMIT``. SQL reaching here is fully qualified
+(``schema.table``); there is no ``search_path``.
 """
 
 from __future__ import annotations
@@ -60,13 +45,7 @@ class SqlServerAdapter(EngineAdapter):
     default_port: ClassVar[int] = 1433
 
     async def open_connection(self, creds: DBCredentials) -> ConnHandle:
-        """Return the resolved credentials as the cached handle — NO live socket.
-
-        The actual pytds connection is opened per-query inside ``run()`` (see the
-        module docstring for why a shared cached connection is unsafe here). Caching
-        the immutable creds keeps the executor's cache/adapter contract unchanged
-        while avoiding any shared mutable connection state.
-        """
+        """Return the resolved credentials as the cached handle — NO live socket."""
         return creds
 
     async def run(
@@ -79,14 +58,9 @@ class SqlServerAdapter(EngineAdapter):
     ) -> tuple[list[dict[str, Any]], list[str]]:
         """Open a fresh pytds connection, run the SELECT, and close it — in one thread.
 
-        The timeout is enforced BOTH driver-side (pytds ``timeout=timeout_seconds`` so
-        the server aborts the query and the worker thread returns) AND with an outer
-        ``asyncio.wait_for`` bound. Because a new connection is opened and closed per
-        call, an abandoned thread (if ``wait_for`` fires first) can never corrupt a
-        subsequent query. Bind ``params`` are not supported on this path (pytds uses
-        ``%s`` paramstyle, not the SQLAlchemy ``:name`` style the other adapters
-        accept) — the serve layer always passes fully-materialized SQL, so a non-empty
-        ``params`` here is a programming error, rejected loudly.
+        The timeout is enforced driver-side and with an outer ``asyncio.wait_for``.
+        Bind ``params`` are not supported (pytds uses ``%s`` paramstyle); the serve
+        layer passes fully-materialized SQL, so non-empty ``params`` is rejected.
         """
         if params:
             raise ValueError(
@@ -97,17 +71,12 @@ class SqlServerAdapter(EngineAdapter):
         def _connect_execute() -> tuple[list[dict[str, Any]], list[str]]:
             import pytds  # noqa: PLC0415
 
-            # TLS: pytds encrypts the LOGIN handshake by default (enc_login_only)
-            # but leaves the DATA stream plaintext unless the server REQUIRES
-            # encryption OR a ``cafile`` is supplied. We deliberately pass no
-            # ``cafile``: pytds only offers full-stream TLS *with* CA/hostname
-            # verification, and source endpoints (RDS/managed SQL Server) commonly
-            # present certs that don't chain to the container trust store — the same
-            # reason base.build_ssl_context uses CERT_NONE for the other engines.
-            # The security boundary is therefore credentials + VPC/SG network
-            # isolation, not TLS peer-identity (matches the asyncpg/aiomysql posture;
-            # see base.build_ssl_context). A future hardening step could bundle the
-            # AWS RDS/SQL Server CA and pass ``cafile`` to encrypt the data channel.
+            # TLS: pytds encrypts the LOGIN handshake but leaves the DATA stream
+            # plaintext unless the server requires encryption or a ``cafile`` is
+            # supplied. No ``cafile`` is passed: pytds only offers full-stream TLS with
+            # CA/hostname verification, and managed SQL Server certs commonly don't
+            # chain to the container trust store (see base.build_ssl_context). The
+            # boundary is credentials + VPC/SG isolation.
             # timeout = per-query server-side abort; login_timeout bounds connect.
             connection = pytds.connect(
                 server=creds.host,
@@ -124,9 +93,6 @@ class SqlServerAdapter(EngineAdapter):
                 try:
                     cur.execute(sql)
                     columns = [d[0] for d in cur.description] if cur.description else []
-                    # strict=True: columns come from cur.description and each row from
-                    # the same cursor, so lengths always match — strict surfaces a
-                    # driver/protocol mismatch loudly instead of silently truncating.
                     rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()] if columns else []
                     return rows, columns
                 finally:
@@ -170,11 +136,7 @@ class SqlServerAdapter(EngineAdapter):
         prefix_len = len(stripped) - len(lowered)
         upper = lowered.upper()
         if not upper.startswith("SELECT "):
-            # Cannot safely inject TOP into this shape (e.g. a leading WITH CTE), so
-            # the SQL goes to the server UNCAPPED and only the executor's post-fetch
-            # rows[:max_rows] slice bounds the caller. Log so a reachable case (the
-            # upstream sqlglot firewall should already have rejected unparseable SQL)
-            # is diagnosable rather than a silent memory risk.
+            # Cannot safely inject TOP into this shape; see _top_fallback.
             logger.warning("sqlserver_top_fallback_uncapped", sql_len=len(sql), max_rows=max_rows)
             return stripped
         # Preserve a leading DISTINCT / ALL quantifier before TOP.

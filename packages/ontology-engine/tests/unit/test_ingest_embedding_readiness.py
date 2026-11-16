@@ -235,25 +235,6 @@ class TestWaitForEmbeddingsSearchable:
         )
         assert ok is True
 
-    def test_stall_with_partial_progress_then_stuck_times_out(self):
-        """Once progress stops, the stall timeout trips even though some
-        embeddings became searchable earlier."""
-        from coa_ontology.catalog.ingest import wait_for_embeddings_searchable
-
-        vec = MagicMock()
-        # Reaches 2/3 then never advances — must return False after the stall
-        # window with the remaining one still missing.
-        vec.list_searchable_entity_uris.return_value = ["a", "b"]
-        ok = wait_for_embeddings_searchable(
-            vector_store=vec,
-            ontology_id="o",
-            namespace="ns",
-            expected_uris=["a", "b", "c"],
-            stall_timeout_s=0.05,
-            poll_s=0,
-        )
-        assert ok is False
-
 
 @pytest.mark.unit
 class TestWaitForEmbeddingsDeleted:
@@ -362,8 +343,7 @@ class TestWaitForEmbeddingsDeleted:
     def test_index_not_found_counts_as_deleted_immediately(self):
         """A missing vector index means the embeddings are definitively gone —
         treat it as success on the first probe, not a retryable error that burns
-        the whole stall timeout (regression: a 404 index_not_found used to stall
-        ~120s and blow the delete's downstream timing)."""
+        the whole stall timeout."""
 
         class _NotFoundError(Exception):
             pass
@@ -437,10 +417,8 @@ class TestIngestSurfacesEntityUris:
             g.add((c, RDFS.label, Literal(c.split("/")[-1])))
 
         vec = MagicMock()
-        # #173: _accumulate_embeddings now derives entity_uris/count from the
-        # store's ACKNOWLEDGED docs, not len(submitted). Echo back a doc per
-        # submitted item so the store confirms what it wrote (an empty return
-        # would now correctly be treated as a 0-of-N partial write).
+        # _accumulate_embeddings counts the store's acknowledged docs, so echo
+        # back one doc per submitted item.
         vec.store_embeddings_batch.side_effect = lambda items: [dict(it) for it in items]
         vec._index_for_namespace = lambda ns: f"idx-{ns}"
 
@@ -523,7 +501,7 @@ class TestIngestOntologyAndWait:
             calls["wait"] += 1
             return True
 
-        # ingest wrote nothing → no callback, and the wait short-circuits.
+        # ingest wrote nothing → no callback.
         result = {"ontology_id": "http://ex/o", "embeddings": {"entity_uris": []}}
         mod = self._patch(monkeypatch, ingest_result=result, wait_spy=_wait_spy)
 

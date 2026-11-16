@@ -9,10 +9,10 @@
  * hook trims every other page: a link when the user has access, plain text
  * when not.
  */
-import { render, waitFor, cleanup } from "@testing-library/react";
+import { render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { GraphSearchPage } from "./GraphSearch";
 import type { BreadcrumbItem } from "@components/BreadcrumbProvider";
 
@@ -103,8 +103,6 @@ beforeEach(() => {
   captured = [];
   canAccess.mockReset();
 });
-
-afterEach(() => cleanup());
 
 describe("GraphSearch namespace breadcrumb — grant trimming", () => {
   it("links the namespace crumb when the user has access", async () => {

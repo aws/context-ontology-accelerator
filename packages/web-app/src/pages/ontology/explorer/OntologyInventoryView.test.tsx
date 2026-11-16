@@ -1,13 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import {
-  render,
-  fireEvent,
-  waitFor,
-  cleanup,
-  within,
-} from "@testing-library/react";
+import { render, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { OntologyInventoryView } from "./OntologyInventoryView";
@@ -120,7 +114,6 @@ function selectFilter(view: ReturnType<typeof renderView>, id: string) {
 
 describe("OntologyInventoryView", () => {
   beforeEach(() => {
-    cleanup();
     vi.clearAllMocks();
   });
 
@@ -265,11 +258,8 @@ describe("OntologyInventoryView", () => {
       }),
     ]);
 
-    // Fake timers must be installed BEFORE render so they own the interval the
-    // component schedules. `shouldAdvanceTime` keeps promises/RTL queries
-    // working. Driving the clock beats waiting on it: a real 4-6s wait holds a
-    // vitest worker for the whole duration and made the suite's timing-sensitive
-    // tests flaky under parallel load.
+    // Install fake timers BEFORE render so they own the component's interval;
+    // `shouldAdvanceTime` keeps promises/RTL queries working.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const view = renderView();

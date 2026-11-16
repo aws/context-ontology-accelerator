@@ -1,20 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for SPARQLValidator Stage-4 projection-alias determinism check (B1b).
+"""Unit tests for the SPARQLValidator Stage-4 projection-alias determinism check.
 
-Stage 4 fails-closed on the deterministically-detectable half of the NL→SPARQL
-non-determinism defect (fashion-findings B1b): an aggregate projection that
-carries NO stable, descriptive alias. The SAME question then returns columns
-named ``?productCount`` on one run and ``?count`` (or an engine-invented label)
-on the next, which breaks typed clients with a KeyError ~1 run in 3.
-
-These tests exercise the check in isolation via the private
-``_validate_projection_aliases`` (no Neptune round-trip needed — the check is
-pure text analysis), plus a set of NEGATIVE CONTROLS proving it does NOT
-over-block legitimate multi-aggregate projections (the prompt's own SUM(IF(...))
-ratio/difference patterns). A check that cannot pass a valid query is as useless
-as one that cannot fail an invalid one.
+Stage 4 rejects aggregate projections with no stable, descriptive alias. Negative
+controls check it does not over-block legitimate multi-aggregate projections.
 """
 
 from __future__ import annotations
@@ -57,7 +47,7 @@ PASSING = {
     "distinct_form": ("SELECT DISTINCT ?colorName (COUNT(?p) AS ?productCount) WHERE { ?p :color ?colorName }"),
 }
 
-# ── Queries that MUST FAIL (the B1b defect shapes) ─────────────────────────────
+# ── Queries that MUST FAIL (aggregates without a stable alias) ─────────────────
 FAILING = {
     "aggregate_no_alias": "SELECT (COUNT(?product)) WHERE { ?product a :Product }",
     "bare_alias_count": "SELECT ?colorName (COUNT(?product) AS ?count) WHERE { ?product :color ?colorName }",
@@ -71,7 +61,6 @@ FAILING = {
 }
 
 
-@pytest.mark.unit
 class TestProjectionAliasDeterminism:
     """Stage 4 rejects unstable aggregate projections, passes stable ones."""
 
@@ -102,7 +91,6 @@ class TestProjectionAliasDeterminism:
         assert validator._validate_projection_aliases("not sparql at all").valid
 
 
-@pytest.mark.unit
 class TestProjectionAliasThroughFullValidate:
     """The check must be reached through the public validate() pipeline, so a
     real generation actually benefits — not just a unit-level private call."""
@@ -134,12 +122,7 @@ class TestProjectionAliasThroughFullValidate:
         assert result.valid, result.error
 
 
-# ── Entity-count determinism (B1a): COUNT(?entity) must be DISTINCT ────────────
-# Measured live N=10 on the HAVING/GROUP-BY family: the SAME question produced
-# COUNT(?claim) on 8 runs and COUNT(DISTINCT ?claim) on 2, where ?claim was bound
-# via `?claim a ind:Claims`. The answer matched only because the test dataset had
-# no duplicate rows per group; on 1-to-many data the plain COUNT inflates and the
-# answer flips run-to-run. This is decidable from the SPARQL text alone.
+# Plain COUNT over a typed entity inflates on 1-to-many data, so it must be DISTINCT.
 ENTITY_COUNT_FAILING = {
     # ?claim / ?c is a typed class instance -> plain COUNT must be DISTINCT.
     "grouped_entity_count": (
@@ -171,7 +154,6 @@ ENTITY_COUNT_PASSING = {
 }
 
 
-@pytest.mark.unit
 class TestEntityCountDeterminism:
     """Stage 4 rejects plain COUNT(?entity) over a typed class instance and steers
     to COUNT(DISTINCT ?entity); leaves literal/untyped counts and COUNT(*) alone."""
@@ -208,15 +190,8 @@ class TestEntityCountDeterminism:
         assert validator._validate_projection_aliases(sparql).valid
 
 
-# ── Bot-finding regressions (MR !1102 review) ────────────────────────────────
-
-
 class TestTopLevelParenGroups:
-    """Isolated tests for the paren-parsing helper that decides accept/reject.
-
-    (CRITICAL bot finding: this accept/reject-controlling helper had zero
-    dedicated unit coverage.)
-    """
+    """Isolated tests for the paren-parsing helper that decides accept/reject."""
 
     def test_flat_single_group(self, validator):
         groups, spans = validator._top_level_paren_groups("(COUNT(?p) AS ?n)")
@@ -231,8 +206,7 @@ class TestTopLevelParenGroups:
         # 3+ levels of nesting must collapse into a single top-level group.
         text = "(IF(BOUND(COALESCE(?a, ?b)), 1, 0) AS ?flag)"
         groups, _ = validator._top_level_paren_groups(text)
-        assert len(groups) == 1
-        assert groups[0] == "IF(BOUND(COALESCE(?a, ?b)), 1, 0) AS ?flag"
+        assert groups == ["IF(BOUND(COALESCE(?a, ?b)), 1, 0) AS ?flag"]
 
     def test_empty_group(self, validator):
         groups, spans = validator._top_level_paren_groups("()")
@@ -260,7 +234,7 @@ class TestTopLevelParenGroups:
 
 class TestMaskStringLiterals:
     """The SELECT-boundary regex must not be fooled by braces/keywords inside
-    string literals (MEDIUM bot finding)."""
+    string literals."""
 
     def test_mask_is_length_preserving(self, validator):
         src = 'BIND(CONCAT("{a}", ?x) AS ?y)'
@@ -270,7 +244,6 @@ class TestMaskStringLiterals:
     def test_mask_blanks_interior_keeps_quotes(self, validator):
         masked = validator._mask_string_literals('"{WHERE}"')
         assert masked == '"       "'  # 7 interior chars blanked, quotes kept
-        assert "{" not in masked and "WHERE" not in masked
 
     def test_select_with_embedded_brace_in_bind_not_truncated(self, validator):
         # A '{' inside a BIND string literal in the projection, PLUS a real WHERE.
@@ -289,7 +262,7 @@ class TestMaskStringLiterals:
 
 
 class TestTypedBlankNodeSubject:
-    """Entity-count-DISTINCT must also catch typed blank-node subjects (MEDIUM)."""
+    """Entity-count-DISTINCT must also catch typed blank-node subjects."""
 
     def test_typed_blank_node_count_rejected(self, validator):
         sparql = "SELECT (COUNT(?claim) AS ?claimCount) WHERE { ?claim a :Claim . _:b1 a :Claim }"

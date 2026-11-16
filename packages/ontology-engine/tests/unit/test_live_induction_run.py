@@ -3,22 +3,6 @@
 
 """Contract tests for the bundled live-induction harness (``scripts/live_induction_run.py``).
 
-Regression coverage for issue #175, whose two defects both let the harness
-report success against behaviour the shipped API never exhibits:
-
-1. **Accept step** — ``accept_proposal`` returns an ``AcceptProposalResponse``
-   *pydantic model* (not a dict) with ``status="accepting"`` (async 202), and a
-   background worker later flips the proposal to ``accepted`` / ``accept_failed``.
-   The old harness subscripted the model (``a["status"]`` → ``TypeError``) and
-   asserted a synchronous ``"accepted"`` / a non-existent ``"already_accepted"``
-   status. The fix (``accept_proposal_direct``) polls the proposal to a terminal
-   state and normalizes the result.
-2. **Grounding** — the harness never populated ``grounding_ontology_ids`` and
-   defaulted to the ``rigor_ontology`` strategy (which ``del``\\ s the grounding
-   scope), so grounding was never attempted yet the run still "passed". The fix
-   threads a grounding scope + a grounding-capable strategy and adds a fail-loud
-   gate keyed on ``report.grounding_ontologies_used``.
-
 The harness lives under ``scripts/`` (not an importable package), and its module
 top-level does env validation + ``sys.exit`` on missing config, so it is loaded
 by file path with the required env pre-seeded and its downstream deps stubbed.
@@ -153,9 +137,6 @@ def _install_fake_proposals(monkeypatch, *, accept_status, poll_statuses):
     return accept_calls
 
 
-# ── Fix A: accept polls the async worker to a terminal state ──────────────
-
-
 def test_accept_polls_accepting_to_accepted(harness, monkeypatch):
     """202 'accepting' → poll → terminal 'accepted'; returns a normalized dict."""
     monkeypatch.setattr(harness, "_ACCEPT_POLL_INTERVAL_S", 0, raising=False)
@@ -217,7 +198,7 @@ def test_accept_missing_status_field_raises(harness, monkeypatch):
 
 
 def test_positive_int_env_rejects_non_numeric(harness, monkeypatch):
-    """Non-numeric poll-timeout env fails loudly at parse (issue #175 fail-loud)."""
+    """Non-numeric poll-timeout env fails loudly at parse (fail-loud)."""
     monkeypatch.setenv("INDUCTION_ACCEPT_POLL_TIMEOUT_S", "not-a-number")
     with pytest.raises(RuntimeError, match="must be a valid integer"):
         harness._positive_int_env("INDUCTION_ACCEPT_POLL_TIMEOUT_S", 300, maximum=3600)
@@ -227,9 +208,6 @@ def test_positive_int_env_clamps_to_maximum(harness, monkeypatch):
     """An over-large timeout is clamped to the maximum rather than accepted unbounded."""
     monkeypatch.setenv("INDUCTION_ACCEPT_POLL_TIMEOUT_S", "999999")
     assert harness._positive_int_env("INDUCTION_ACCEPT_POLL_TIMEOUT_S", 300, maximum=3600) == 3600
-
-
-# ── Fix B: grounding fail-loud gate ───────────────────────────────────────
 
 
 def test_grounding_gate_fires_when_requested_but_nothing_grounded(harness):

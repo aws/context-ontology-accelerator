@@ -15,10 +15,9 @@ import coa_sources.database.pipeline.federation_handler  # noqa: F401
 import pytest
 from coa_sources.database import glue_ownership as _go
 
-from tests.unit.conftest import dao_double  # noqa: E402
+from tests.unit.conftest import dao_double
 
 MODULE = "coa_sources.database.pipeline.federation_handler"
-PROVISIONER = "coa_sources.database.connectors.glue_connection_provisioner"
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +48,28 @@ def _secret_bound():
     """
     with patch(f"{MODULE}.require_secret_namespace_binding") as require:
         yield require
+
+
+# The account every GLUE_DATABASE case below declares as its `catalogId`, and
+# the account `_deployment_account` pins the grant to — so a case is
+# same-account unless it says otherwise.
+_LOCAL_ACCOUNT = "123456789012"
+
+
+@pytest.fixture(autouse=True)
+def _deployment_account():
+    """Pin the account the native LF grant would be made in.
+
+    ``native_grant_target_error`` compares a source's declared ``catalogId``
+    against this account to decide whether there is anything local to grant, and
+    the real resolver calls STS.
+    """
+    import coa_sources.database.connectors.glue_connection_provisioner as prov
+
+    previous = prov._account_id
+    prov._account_id = _LOCAL_ACCOUNT
+    yield
+    prov._account_id = previous
 
 
 _EVENT = {
@@ -98,13 +119,16 @@ class TestFederationHandler:
         grant.assert_called_once_with(
             database_name="retail_demo",
             principal_arn="arn:aws:iam::123:role/serve",
+            # No stored configuration, so the source declares no catalog — which
+            # is this account's own root catalog, the one the grant is made in.
+            catalog_id="",
         )
         dao.update.assert_called_once()
         assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
         assert out == {"provisioned": False, "reason": "glue-native", "queryable": True}
 
     def test_glue_native_grant_is_refused_for_an_unowned_database(self):
-        """F-8: this function runs as a Lake Formation admin and the principal it
+        """This function runs as a Lake Formation admin and the principal it
         grants is the SHARED serve runtime role, so a grant here makes the database
         readable by every namespace's queries. It verifies ownership rather than
         trusting that source-create did — this step is reached from the stored row.
@@ -219,7 +243,6 @@ class TestFederationHandler:
             patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/serve"),
             patch(f"{MODULE}.grant_consumer_select_native", return_value=True),
         ):
-            # Must not raise despite DDB failure.
             out = handler(_EVENT)
         assert out == {"provisioned": False, "reason": "glue-native", "queryable": True}
 
@@ -410,14 +433,8 @@ class TestCustomConnectorBranch:
 class TestDatabricksBranch:
     """The same branch as CUSTOM_CONNECTOR, reached through the shared set.
 
-    This is one of the two switches that FAILED OPEN. Adding the sub-type to
-    ``_HANDLED_SUB_TYPES`` only silences the tripwire below; the write that flips
-    ``queryable`` was a separate exact-equality comparison, and anything else fell
-    through to a ``not JDBC_DATABASE`` no-op returning ``not-jdbc``. Create persists
-    ``queryable: False`` and discovery writes it only for GLUE_DATABASE — so a source
-    that missed this branch would scan cleanly, resolve no catalog at serve, and be
-    skipped by ``sql_namespace_scope``, which also silently defeats the namespace-scope
-    requirement this sub-type depends on.
+    A source that missed this branch would stay ``queryable: False`` and be skipped
+    at serve.
     """
 
     _ITEM = {"sourceSubType": "DATABRICKS_SQL_WAREHOUSE", "athenaDataCatalogName": "coadevds_abc123"}
@@ -432,10 +449,7 @@ class TestDatabricksBranch:
         assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
 
     def test_makes_no_grant_of_any_kind(self):
-        """Not because there is nothing to grant on — there is a credential — but
-        because COA never holds a grant on it. The connector assumes the CUSTOMER's role
-        at request time, so there is nothing to grant here and nothing to revoke at
-        delete."""
+        """The connector assumes the customer's role at request time, so COA makes no grant."""
         from coa_sources.database.pipeline.federation_handler import handler
 
         ctx, _ = _patch_dao(dict(self._ITEM))
@@ -536,8 +550,6 @@ class TestGrantSecretReadToConsumer:
     """The serve runtime's read grant must be namespace-bound."""
 
     def _run(self, namespace_id="ns-1"):
-        import json
-
         from botocore.exceptions import ClientError
         from coa_sources.database.pipeline.federation_handler import _grant_secret_read_to_consumer
 

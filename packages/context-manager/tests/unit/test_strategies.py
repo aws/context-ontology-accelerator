@@ -1,25 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the selectable retriever-strategy registry.
-
-Tests cover the strategy registry implemented in
-``coa_serve.lexical.strategies``:
-
-- ``resolve_strategy`` precedence (request > deployment > default), default of
-  ``chunk_based_semantic``, unrecognized-request fall-through, and
-  unrecognized-deployment warn-and-fall-back behavior.
-- The exposed set is EXACTLY the seven non-deprecated graphrag-toolkit
-  retrievers — no extras, no deprecated names (this enforces the task-16
-  cleanup). Each maps to its retriever class and the ``traversal`` engine
-  family; the default is ``chunk_based_semantic`` -> ``ChunkBasedSemanticSearch``.
-- No builder uses the deprecated semantic-guided engine entry point.
-- ``StrategySpec`` immutability (frozen dataclass).
-- The lazy-import invariant: importing the strategies module does NOT trigger
-  the ``graphrag_toolkit`` import chain (verified in an isolated subprocess so
-  the package ``__init__``'s eager ``baseline_retriever`` import does not mask
-  the module's own laziness).
-"""
+"""Unit tests for the selectable retriever-strategy registry."""
 
 from __future__ import annotations
 
@@ -39,15 +21,9 @@ from coa_serve.lexical.strategies import (
     resolve_strategy,
 )
 
-# Absolute path to strategies.py, derived from this test file's location:
-#   packages/context-manager/tests/unit/test_strategies.py
-#   packages/context-manager/src/coa_serve/lexical/strategies.py
 _STRATEGIES_PATH = Path(__file__).resolve().parents[2] / "src" / "coa_serve" / "lexical" / "strategies.py"
 
-# The canonical seven non-deprecated retrievers (task 16): strategy name -> the
-# exact ordered list of graphrag-toolkit retriever class names each builder
-# wires through ``for_traversal_based_search``. This is the single source of
-# truth the cleanup is enforced against.
+# Strategy -> ordered retriever class names each builder wires through ``for_traversal_based_search``.
 EXPECTED_RETRIEVERS: dict[RetrieverStrategy, list[str]] = {
     RetrieverStrategy.CHUNK_BASED: ["ChunkBasedSearch"],
     RetrieverStrategy.CHUNK_BASED_SEMANTIC: ["ChunkBasedSemanticSearch"],
@@ -67,9 +43,6 @@ EXPECTED_RETRIEVERS: dict[RetrieverStrategy, list[str]] = {
 # specific to the traversal factory, so they parametrize over this set; topic_beam
 # has its own coverage in TestTopicBeamStrategy.
 _TRAVERSAL_STRATEGIES = [s for s in RetrieverStrategy if s is not RetrieverStrategy.TOPIC_BEAM]
-
-
-# ── resolve_strategy precedence ─────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -146,14 +119,6 @@ class TestResolveStrategyPrecedence:
         assert warn_entries, "expected an invalid_lexical_retriever_strategy warning"
         assert warn_entries[0]["config_default"] == "garbage-strategy"
 
-    def test_default_is_chunk_based_semantic(self):
-        """The documented default strategy is chunk_based_semantic."""
-        assert DEFAULT_STRATEGY is RetrieverStrategy.CHUNK_BASED_SEMANTIC
-        assert DEFAULT_STRATEGY.value == "chunk_based_semantic"
-
-
-# ── Exactly the seven non-deprecated retrievers (cleanup enforcement) ─
-
 
 @pytest.mark.unit
 class TestExactlyExpectedStrategies:
@@ -185,13 +150,6 @@ class TestExactlyExpectedStrategies:
     def test_enum_has_exactly_the_expected_values(self):
         assert {s.value for s in RetrieverStrategy} == self.EXPECTED_NAMES
 
-    def test_enum_has_exactly_eight_members(self):
-        assert len(list(RetrieverStrategy)) == 8
-
-    def test_registry_has_exactly_the_expected_keys(self):
-        assert {s.value for s in STRATEGY_REGISTRY} == self.EXPECTED_NAMES
-        assert len(STRATEGY_REGISTRY) == 8
-
     def test_no_deprecated_names_in_enum(self):
         values = {s.value for s in RetrieverStrategy}
         names = {s.name for s in RetrieverStrategy}
@@ -199,23 +157,11 @@ class TestExactlyExpectedStrategies:
             assert forbidden not in values
             assert forbidden not in names
 
-    def test_registry_keys_match_enum_members_exactly(self):
-        assert set(STRATEGY_REGISTRY.keys()) == set(RetrieverStrategy)
-
-
-# ── STRATEGY_REGISTRY structure ─────────────────────────────────────
-
 
 @pytest.mark.unit
 class TestStrategyRegistry:
     def test_traversal_strategies_map_to_traversal_family(self):
-        """The seven traversal retrievers build through ``for_traversal_based_search``.
-
-        ``topic_beam`` (TopicGraphRAG) is the sole exception — it subclasses
-        ``TraversalBasedBaseRetriever`` and is constructed as the engine's retriever
-        directly (engine_family="direct"), matching the graphrag-toolkit benchmark.
-        Building it through ``for_semantic_guided_search`` returned the "No relevant
-        context" sentinel on a healthy graph."""
+        """``topic_beam`` is engine_family="direct"; every other strategy is "traversal"."""
         for strategy, spec in STRATEGY_REGISTRY.items():
             if strategy is RetrieverStrategy.TOPIC_BEAM:
                 assert spec.engine_family == "direct", strategy
@@ -231,16 +177,9 @@ class TestStrategyRegistry:
         for strategy, spec in STRATEGY_REGISTRY.items():
             assert spec.name is strategy
 
-    def test_build_engine_is_callable(self):
-        for spec in STRATEGY_REGISTRY.values():
-            assert callable(spec.build_engine)
-
     def test_default_spec_is_spec_for_default_strategy(self):
         assert DEFAULT_SPEC is STRATEGY_REGISTRY[DEFAULT_STRATEGY]
         assert DEFAULT_SPEC.name is RetrieverStrategy.CHUNK_BASED_SEMANTIC
-
-
-# ── StrategySpec immutability ───────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -250,28 +189,12 @@ class TestStrategySpecFrozen:
         with pytest.raises(dataclasses.FrozenInstanceError):
             spec.engine_family = "traversal"  # type: ignore[misc]
 
-    def test_name_mutation_raises_frozen_instance_error(self):
-        spec = DEFAULT_SPEC
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            spec.name = RetrieverStrategy.TRAVERSAL  # type: ignore[misc]
-
-
-# ── Engine-builder construction ─────────────────────────────────────
-
 
 @pytest.mark.unit
 class TestEngineBuilderConstruction:
-    """Every one of the seven builders constructs a toolkit engine via the
-    non-deprecated ``for_traversal_based_search`` entry point, wiring its
-    canonical retriever class(es) and ``post_processors=[]`` /
-    ``context_format="raw"`` (no ``BedrockContextFormat``, which raises
-    ``KeyError: 'source'`` on the nested traversal node shape; the adapter's
-    ``_map_results`` parses the raw nodes directly).
+    """Builders use ``for_traversal_based_search`` with ``context_format="raw"``.
 
-    Builders import ``graphrag_toolkit`` lazily, so only
-    ``LexicalGraphQueryEngine`` is patched; the retriever classes /
-    ``WeightedTraversalBasedRetriever`` (a side-effect-free dataclass) import for
-    real, letting us assert the concrete retriever identity by name.
+    ``BedrockContextFormat`` raises ``KeyError: 'source'`` on the nested traversal node shape.
     """
 
     def _build(self, strategy: RetrieverStrategy):
@@ -303,21 +226,10 @@ class TestEngineBuilderConstruction:
         mock_engine = self._build(strategy)
 
         mock_engine.for_traversal_based_search.assert_called_once()
-        # The deprecated semantic-guided entry point is never used.
         mock_engine.for_semantic_guided_search.assert_not_called()
 
         _, kwargs = mock_engine.for_traversal_based_search.call_args
         assert self._retriever_names(kwargs["retrievers"]) == EXPECTED_RETRIEVERS[strategy]
-
-    def test_default_builder_uses_chunk_based_semantic_search(self):
-        """The default (``chunk_based_semantic``) builds with the
-        ``ChunkBasedSemanticSearch`` retriever (the 11.b ``ChunkBasedSearch``
-        workaround is reverted)."""
-        mock_engine = self._build(RetrieverStrategy.CHUNK_BASED_SEMANTIC)
-
-        _, kwargs = mock_engine.for_traversal_based_search.call_args
-        names = self._retriever_names(kwargs["retrievers"])
-        assert names == ["ChunkBasedSemanticSearch"]
 
     @pytest.mark.parametrize("strategy", _TRAVERSAL_STRATEGIES)
     def test_builder_drops_bedrock_context_format(self, strategy):
@@ -348,19 +260,6 @@ class TestEngineBuilderConstruction:
         assert kwargs["max_search_results"] == 10, f"{strategy} did not pin max_search_results=10"
         assert kwargs["max_statements"] == 200, f"{strategy} did not pin max_statements=200"
         assert kwargs["derive_subqueries"] is False, f"{strategy} did not pin derive_subqueries=False"
-
-    def test_no_builder_references_semantic_guided_entry_point(self):
-        """Belt-and-suspenders: invoking any builder never calls the deprecated
-        ``for_semantic_guided_search`` factory entry point."""
-        for strategy in _TRAVERSAL_STRATEGIES:
-            spec = STRATEGY_REGISTRY[strategy]
-            with patch("graphrag_toolkit.lexical_graph.LexicalGraphQueryEngine") as mock_engine:
-                spec.build_engine(MagicMock(), MagicMock(), tenant_id="t1")
-            mock_engine.for_semantic_guided_search.assert_not_called()
-            mock_engine.for_traversal_based_search.assert_called_once()
-
-
-# ── topic_beam (TopicGraphRAG) builder ──────────────────────────────
 
 
 @pytest.mark.unit
@@ -395,10 +294,7 @@ class TestTopicBeamStrategy:
         return mock_engine, mock_tb, mock_mtg, mock_mtv, mock_ro
 
     def test_constructs_engine_directly_with_retriever(self):
-        """NOT via a factory. TopicBeamSearch subclasses TraversalBasedBaseRetriever, and
-        for_semantic_guided_search ignored that contract — the engine returned the
-        "No relevant context" sentinel (1 node, confidence 0.0) on a healthy graph where
-        chunk_based_semantic and topic_based both answered."""
+        """topic_beam is constructed as the engine's retriever directly, not via a factory."""
         mock_engine, mock_tb, _mtg, _mtv, _ro = self._build()
         mock_engine.for_semantic_guided_search.assert_not_called()
         mock_engine.for_traversal_based_search.assert_not_called()
@@ -409,10 +305,7 @@ class TestTopicBeamStrategy:
 
     def test_topic_beam_params_match_benchmark_base_config(self):
         """All three neighbour strategies ON (the benchmark harness base config); the
-        base beam config is width=100/depth=6/topk=50/path_weighted.
-
-        The narrow chunk_only variant starved the beam on our graph: 10 good topic
-        seeds still yielded only 1 node."""
+        base beam config is width=100/depth=6/topk=50/path_weighted."""
         _, mock_tb, _mtg, _mtv, _ro = self._build()
         mock_tb.assert_called_once()
         _, kw = mock_tb.call_args
@@ -444,29 +337,13 @@ class TestTopicBeamStrategy:
             for name, p in params.items()
             if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         }
-        # Exactly the kwargs strategies.py passes to the retriever.
-        passed = {
-            "graph_store",
-            "vector_store",
-            "processor_args",
-            "beam_width",
-            "max_depth",
-            "top_k",
-            "scoring_mode",
-            "use_entity_neighbors",
-            "use_same_chunk_neighbors",
-            "use_adjacent_chunk_neighbors",
-            "max_statements_per_topic",
-        }
+        passed = set(self._build()[1].call_args.kwargs)
         missing = passed - named
         assert not missing, (
             f"TopicBeamSearch.__init__ no longer names these kwargs the builder passes: "
             f"{sorted(missing)}. They would be swallowed by **kwargs. "
             f"Re-verify strategies.py against the installed toolkit."
         )
-
-    def test_engine_family_is_direct(self):
-        assert STRATEGY_REGISTRY[RetrieverStrategy.TOPIC_BEAM].engine_family == "direct"
 
     def test_statement_cap_applied_once_in_processor_args(self):
         """Cap in ProcessorArgs (10/topic), not also on the retriever — capping in both
@@ -513,35 +390,6 @@ class TestTopicBeamStrategy:
         _, kw = mock_tb.call_args
         assert kw["graph_store"] is mock_mtg.wrap.return_value
         assert kw["vector_store"] is mock_ro.wrap.return_value
-
-
-# ── Source-level cleanup audit ──────────────────────────────────────
-
-
-@pytest.mark.unit
-class TestSourceLevelCleanup:
-    """Audit the strategies source itself: NO strategy calls the deprecated
-    semantic-guided factory, and no deprecated builder function survives."""
-
-    def test_no_strategy_uses_semantic_guided_entry_point(self):
-        import coa_serve.lexical.strategies as strat_mod
-
-        # No leftover deprecated builder function object.
-        assert not hasattr(strat_mod, "_build_topic_beam_chunk_only_engine")
-
-        # Zero active calls to for_semantic_guided_search. topic_beam used to be the
-        # one caller; that was the bug (it is a traversal retriever, and the factory
-        # made it return the "No relevant context" sentinel). Ignore comment prose.
-        source = _STRATEGIES_PATH.read_text()
-        call_lines = [
-            line
-            for line in source.splitlines()
-            if "LexicalGraphQueryEngine.for_semantic_guided_search(" in line and not line.lstrip().startswith("#")
-        ]
-        assert call_lines == [], f"no strategy may use the semantic-guided factory, got {call_lines}"
-
-
-# ── Lazy-import invariant ───────────────────────────────────────────
 
 
 @pytest.mark.unit

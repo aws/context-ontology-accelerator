@@ -87,7 +87,7 @@ def test_xsd_date_substituted_before_reasoner_and_original_graph_untouched() -> 
 def test_typed_literal_datatype_substituted_before_reasoner() -> None:
     """A typed literal ``"2020-01-01"^^xsd:date` (e.g. owl:hasValue / DataOneOf)
     is also OWL 2-map-excluded and aborts HermiT. The URIRef-range substitution
-    alone missed it (MR !593 review, tier1.py:59); the literal's datatype must be
+    alone missed it; the literal's datatype must be
     rewritten too — while the original graph keeps the xsd:date literal."""
     from coa_ontology.validation.validators.tier1 import ConsistencyValidator
 

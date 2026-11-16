@@ -198,8 +198,6 @@ export const GetNamespace: React.FC = () => {
               label: t("VKG health"),
               value: (() => {
                 const vkgHealth = ns.vkgHealth ?? VkgHealthStatus.UNKNOWN;
-                // Prefer the server-provided reason (the live cause) when
-                // present; fall back to the static per-status description.
                 const vkgHealthContent =
                   ns.vkgHealthReason ?? t(VKG_HEALTH_DESCRIPTIONS[vkgHealth]);
                 return (
@@ -258,8 +256,6 @@ export const GetNamespace: React.FC = () => {
   );
 };
 
-// ── Tabs ─────────────────────────────────────────────────────────────
-
 const NamespaceTabs: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const { t } = useAppI18n();
   return (
@@ -284,8 +280,6 @@ const NamespaceTabs: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     />
   );
 };
-
-// ── Sources tab ──────────────────────────────────────────────────────
 
 const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
@@ -387,8 +381,6 @@ const SourcesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     />
   );
 };
-
-// ── Ontologies tab ───────────────────────────────────────────────────
 
 const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
@@ -503,8 +495,6 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   );
 };
 
-// ── Metrics tab ──────────────────────────────────────────────────────
-
 const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   const navigate = useNavigate();
   const { t } = useAppI18n();
@@ -599,8 +589,6 @@ const MetricsTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
   );
 };
 
-// ── Edit Namespace Modal ─────────────────────────────────────────────
-
 interface EditNamespaceModalProps {
   namespaceId: string;
   displayName: string;
@@ -622,7 +610,6 @@ const EditNamespaceModal: React.FC<EditNamespaceModalProps> = ({
   const updateNamespace = useUpdateNamespace();
   const [error, setError] = useState<string | null>(null);
 
-  // Reset form when modal opens
   React.useEffect(() => {
     if (visible) {
       setDisplayName(initialDisplayName);

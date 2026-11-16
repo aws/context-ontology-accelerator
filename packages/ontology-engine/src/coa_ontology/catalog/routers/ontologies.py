@@ -90,7 +90,6 @@ from coa_ontology.catalog.schemas import (
 from coa_ontology.catalog.turtle_export import format_grouped_turtle, turtle_has_triples
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 from coa_ontology.query_params import require_enum_value
-from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported)
 from coa_ontology.stores.base import GraphStore, VectorStore
 
 router = APIRouter()
@@ -370,18 +369,7 @@ def get_ingest_status(ontology_id: str, job_id: str, namespace: str = "default")
 
 @router.get("/{ontology_id:path}", response_model=OntologyResponse)
 def get_ontology(ontology_id: str, namespace: str = "default"):
-    """Fetch one ontology, merging its registry metadata and graph-store row.
-
-    Args:
-        ontology_id: Identifier (or URI) of the ontology to fetch.
-        namespace: The namespace the ontology lives in.
-
-    Returns:
-        The merged ontology representation.
-
-    Raises:
-        HTTPException: 404 when the ontology exists in neither the registry nor the graph.
-    """
+    """Fetch one ontology, merging its registry metadata and graph-store row."""
     reg = dynamo_store.get_ontology_registry(namespace, ontology_id)
     graph_row = _graph(namespace).get_ontology(ontology_id)
     merged = _merge_registry_and_graph(reg, graph_row)
@@ -429,19 +417,7 @@ def create_ontology(body: OntologyCreate, namespace: str = "default"):
 
 @router.patch("/{ontology_id:path}", response_model=OntologyResponse)
 def update_ontology(ontology_id: str, body: OntologyUpdate, namespace: str = "default"):
-    """Apply a partial update to an ontology's registry and graph-store rows.
-
-    Args:
-        ontology_id: Identifier (or URI) of the ontology to update.
-        body: The fields to update (only set fields are applied).
-        namespace: The namespace the ontology lives in.
-
-    Returns:
-        The merged, updated ontology representation.
-
-    Raises:
-        HTTPException: 404 when the ontology exists in neither store.
-    """
+    """Apply a partial update to an ontology's registry and graph-store rows."""
     graph = _graph(namespace)
     existed_in_graph = bool(graph.get_ontology(ontology_id))
     existed_in_registry = bool(dynamo_store.get_ontology_registry(namespace, ontology_id))
@@ -802,15 +778,7 @@ def delete_ontologies(namespace: str = "default", ontology_id: str | None = None
 
 @router.delete("/{ontology_id:path}", status_code=204)
 def delete_ontology(ontology_id: str, namespace: str = "default"):
-    """Delete an ontology's registry row, named graph, and embeddings.
-
-    Args:
-        ontology_id: Identifier (or URI) of the ontology to delete.
-        namespace: The namespace the ontology lives in.
-
-    Raises:
-        HTTPException: 404 when the ontology existed in neither the registry nor the graph.
-    """
+    """Delete an ontology's registry row, named graph, and embeddings."""
     graph_store, vector_store = _stores(namespace)
     removed_registry = dynamo_store.delete_ontology_registry(namespace, ontology_id)
     removed_graph = graph_store.delete_ontology(ontology_id)
@@ -1171,15 +1139,6 @@ def fetch_ontology_from_source(
         updates["property_count"] = property_count
         updates["axiom_count"] = len(g)
 
-        # Optional: extract properties that reference the caller-supplied
-        # class URIs via domain/range. This is the replacement for
-        # sample_properties in config.yaml — the caller passes the class
-        # URIs it already knows about, and the engine walks the rdflib
-        # graph to find all properties linking to those classes.
-        #
-        # The original (pre-consolidation) setup.py did this client-side
-        # in rdflib; moving it here keeps setup.py thin and lets us benefit
-        # from the already-parsed graph in memory.
         if body is not None and (body.extract_properties_for_classes or body.extract_all_properties):
             from rdflib import URIRef
 
@@ -1268,7 +1227,6 @@ def fetch_ontology_from_source(
         else None
     )
 
-    # ── Option E: unresolved-reference detection ─────────────────────
     # When the caller tells us which ontology URIs they've already loaded,
     # scan the parsed graph for rdfs:subClassOf / rdfs:domain / rdfs:range
     # targets whose namespace isn't covered by any of them. These are
@@ -1350,9 +1308,6 @@ def fetch_ontology_from_source(
         properties=extracted_response,
         unresolved_references=unresolved_response,
     )
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────
 
 
 def _persist_upload(namespace: str, identifier: str, content: bytes, fmt: str) -> str:

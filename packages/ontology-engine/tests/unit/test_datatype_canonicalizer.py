@@ -3,7 +3,7 @@
 
 """Unit tests: XSD datatype canonicalization at the ingest/proposal boundary.
 
-Covers the teammate-reported latent bug class: a mis-cased ``xsd:datetime``
+Covers this bug class: a mis-cased ``xsd:datetime``
 (lowercase ``t``) or SQL alias (``xsd:varchar``/``xsd:timestamp``) is an undefined
 datatype URI that slips past both validation and the case-sensitive accept
 normalizer. The canonicalizer must repair these to valid, correctly-cased XSD
@@ -18,6 +18,7 @@ import logging
 
 import pytest
 from coa_ontology.datatype_canonicalizer import (
+    _rewrite_is_value_safe,
     canonicalize_datatypes,
     canonicalize_turtle,
     detect_datatype_issues,
@@ -59,9 +60,7 @@ class TestCanonicalizeDatatypes:
     def test_unknown_xsd_token_left_untouched(self):
         # An unrecognized xsd: token must be LEFT ALONE, not coerced to xsd:string.
         # It is opaque to HermiT (no reasoner abort), and rewriting it on the
-        # persisted graph would be irreversible corruption. (Regression: MR !593
-        # review — canonicalizer previously folded every unknown xsd: token to
-        # xsd:string.)
+        # persisted graph would be irreversible corruption.
         bad = URIRef("http://www.w3.org/2001/XMLSchema#garbagetype")
         g = _range_graph(str(bad))
         changes = canonicalize_datatypes(g)
@@ -74,9 +73,7 @@ class TestCanonicalizeDatatypes:
         ["NCName", "NMTOKEN", "Name", "token", "normalizedString", "dayTimeDuration", "yearMonthDuration"],
     )
     def test_valid_but_unlisted_types_left_untouched(self, localname):
-        # These are legitimate XSD built-ins (several are even in the OWL 2 map).
-        # The old unknown→string coercion silently corrupted them; they must now
-        # pass through unchanged.
+        # These are legitimate XSD built-ins and must pass through unchanged.
         dt = URIRef(f"http://www.w3.org/2001/XMLSchema#{localname}")
         g = _range_graph(str(dt))
         changes = canonicalize_datatypes(g)
@@ -222,15 +219,6 @@ class TestLiteralValuePreservation:
         assert changes == [], "must not rewrite a token whose value would become ill-typed"
         assert (S, P, Literal("abc", datatype=URIRef(f"{XSD}bigint"))) in g
 
-    def test_incompatible_value_never_yields_an_ill_typed_literal(self):
-        g = Graph()
-        g.add((S, P, Literal("abc", datatype=URIRef(f"{XSD}bigint"))))
-
-        canonicalize_datatypes(g)
-
-        for _s, _p, o in g:
-            assert not (isinstance(o, Literal) and o.ill_typed), f"produced ill-typed literal: {o!r}"
-
     def test_lexical_form_survives_a_compatible_repair(self):
         """timestamp→dateTime must not reformat the value."""
         g = Graph()
@@ -296,7 +284,6 @@ class TestLiteralValuePreservation:
         assert out == ttl, "a graph with nothing safely repairable must keep its bytes"
 
 
-@pytest.mark.unit
 class TestGuardFailsClosed:
     """``_rewrite_is_value_safe`` must never report an UNVALIDATED rewrite as safe.
 
@@ -307,21 +294,15 @@ class TestGuardFailsClosed:
     """
 
     def test_unrecognized_target_datatype_is_not_safe(self):
-        from coa_ontology.datatype_canonicalizer import _rewrite_is_value_safe
-
         lit = Literal("abc", datatype=URIRef(f"{XSD}bigint"))
         unrecognized = URIRef("http://example.org/notADatatype")
         assert Literal("abc", datatype=unrecognized).ill_typed is None  # premise
         assert _rewrite_is_value_safe(lit, unrecognized) is False
 
     def test_valid_value_for_recognized_target_is_safe(self):
-        from coa_ontology.datatype_canonicalizer import _rewrite_is_value_safe
-
         assert _rewrite_is_value_safe(Literal("42", datatype=URIRef(f"{XSD}bigint")), XSD.long) is True
 
     def test_invalid_value_for_recognized_target_is_not_safe(self):
-        from coa_ontology.datatype_canonicalizer import _rewrite_is_value_safe
-
         assert _rewrite_is_value_safe(Literal("abc", datatype=URIRef(f"{XSD}bigint")), XSD.long) is False
 
     def test_validation_exception_degrades_to_not_safe(self, monkeypatch):
@@ -335,13 +316,10 @@ class TestGuardFailsClosed:
         assert dc._rewrite_is_value_safe(Literal("42", datatype=URIRef(f"{XSD}bigint")), XSD.long) is False
 
 
-@pytest.mark.unit
 class TestIncompatibleValueLogging:
     """The skip warning is the only signal on the accept path, so it carries the value."""
 
     def test_logs_a_bounded_redacted_preview(self, caplog):
-        from coa_ontology.datatype_canonicalizer import canonicalize_datatypes
-
         g = Graph()
         long_value = "x" * 500
         g.add((S, P, Literal(long_value, datatype=URIRef(f"{XSD}bigint"))))

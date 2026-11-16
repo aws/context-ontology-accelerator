@@ -593,7 +593,7 @@ class TestPromptSchemaNames:
 
         client = BedrockLLMClient(model_id="test-model", region="us-east-1")
         with schema_visibility_scope("ns", _SOURCE_HIDDEN):
-            client._build_converse_kwargs(
+            client._build_converse_request(
                 "## Schema\nTable: payments | Columns: method:string", system="Table: invoices"
             )
             assert {"payments", "method", "invoices"} <= prompt_schema_names()

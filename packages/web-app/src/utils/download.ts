@@ -1,14 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Client-side file download helper.
- *
- * Wraps the standard Blob + ``URL.createObjectURL`` + anchor-click + revoke
- * pattern so pages don't each re-implement it. Used for downloading Turtle
- * artifacts (induced ontologies, compiled SHACL shapes) straight from the
- * browser without a round-trip through the API.
- */
+/** Download a text file client-side via a Blob object URL. */
 export function downloadTextFile(
   filename: string,
   text: string,

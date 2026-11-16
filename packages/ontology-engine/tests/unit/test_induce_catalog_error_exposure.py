@@ -22,7 +22,6 @@ def test_induction_failure_exposes_only_type_and_message() -> None:
     body = WorkbenchInductionRequest(
         datasource_ids=["nonexistent"],
         ontology_uri_prefix="http://test.org/",
-        grounding_ontologies=[],
     )
 
     with (
@@ -46,6 +45,4 @@ def test_induction_failure_exposes_only_type_and_message() -> None:
 
     assert job.status == JobStatus.FAILED
     assert job.error == "ValueError: bad datasource"
-    assert "Traceback" not in job.error
-    assert "File " not in job.error
     _jobs.pop("test-1", None)

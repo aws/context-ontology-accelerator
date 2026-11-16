@@ -4,7 +4,7 @@
 /**
  * The synonym field adds the typed word on Enter. An Enter that confirms an
  * IME conversion (Japanese, Chinese, Korean input) must not add it: the user
- * is still typing, and a half-finished word would land in the list (#1374).
+ * is still typing, and a half-finished word would land in the list.
  * The page-level call sites have no shared component, so this pins one of
  * them to `isSubmitEnter` against a revert to `detail.key === "Enter"`.
  */

@@ -1,27 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Bedrock-backed reasoning planner (task 18 wiring).
-
-Covers ``coa_serve.tier3.agentic.planner.BedrockStepPlanner``: the
-concrete :class:`StepPlanner` that adapts a Bedrock :class:`LLMClient` into the
-narrow planner Protocol the :class:`ReasoningController` consults. All tests
-inject a mocked ``LLMClient`` whose ``converse`` returns scripted JSON, so the
-planner decisions are fully deterministic without a live Bedrock call.
-
-Asserted behavior:
-- ``propose_steps`` parses the planner's ``{"candidates": [...]}`` JSON into
-  :class:`PlannerDecision`s, tolerating fences/prose and coercing fields (Req 4.3).
-- ``propose_steps`` returns ``[]`` (no tool selectable) when there are no tools,
-  the Converse call raises, the guardrail blocks, or the response is unparseable
-  (Req 4.7).
-- ``check_sufficiency`` parses ``{"sufficient": <bool>}`` and degrades to ``False``
-  on failure / guardrail block / unparseable response (Req 6.1-6.2).
-- The planner sends the static guidance via ``system`` and guard-tags the
-  sub-question via ``guard_content`` (guardrail not bypassed), at temperature 0.0.
-- The lazy-import invariant (Req 12.3): importing the planner does not import
-  ``graphrag_toolkit``.
-"""
+"""Unit tests for ``BedrockStepPlanner`` with a mocked ``LLMClient`` returning scripted JSON."""
 
 from __future__ import annotations
 
@@ -84,9 +64,6 @@ def _sq(text="Amazon competitors"):
     return SubQuestion(text=text)
 
 
-# ── propose_steps parsing (Req 4.3) ─────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestProposeSteps:
     @pytest.mark.asyncio
@@ -117,7 +94,7 @@ class TestProposeSteps:
         planner = BedrockStepPlanner(FakeLLM(text=text))
         decisions = await planner.propose_steps(sub_question=_sq(), context=AccumulatedContext(), tool_specs=_SPECS)
         assert [d.tool_name for d in decisions] == ["ontology_lookup", "strategy:entity_based"]
-        # Missing inputs default to {} (Req 2.4 contract checked later in controller).
+        # Missing inputs default to {}; the controller checks the input contract later.
         assert decisions[0].inputs == {}
 
     @pytest.mark.asyncio
@@ -168,9 +145,6 @@ class TestProposeSteps:
         assert "chunk-window tool" in llm2.calls[0]["system"]
 
 
-# ── propose_steps degradation (Req 4.7) ─────────────────────────────────
-
-
 @pytest.mark.unit
 class TestProposeStepsDegradation:
     @pytest.mark.asyncio
@@ -204,9 +178,6 @@ class TestProposeStepsDegradation:
         assert decisions is None  # a failed call is "no tool", never the planner's "enough"
 
 
-# ── check_sufficiency (Req 6.1-6.2) ─────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestCheckSufficiency:
     @pytest.mark.asyncio
@@ -238,9 +209,6 @@ class TestCheckSufficiency:
     async def test_false_when_missing_key(self):
         planner = BedrockStepPlanner(FakeLLM(text='{"other": true}'))
         assert await planner.check_sufficiency(sub_question=_sq(), context=AccumulatedContext()) is False
-
-
-# ── guardrail / determinism plumbing ────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -287,19 +255,15 @@ class TestPlannerCallShape:
             tool_specs=_SPECS,
         )
         system = fake.calls[-1]["system"].lower()
-        # The three graph-exploration steps.
         assert "ontology" in system and "first" in system
         assert "anchor" in system and "entit" in system
         assert "relationship" in system or "travers" in system
-        # Applies even without the user asking.
         assert "even when" in system or "standing strategy" in system
-        # Tells the planner a final semantic search is automatic, so it should
-        # focus on graph exploration (not spend a step on a plain semantic search).
         assert "semantic search" in system and ("end of the session" in system or "automatically" in system)
 
     @pytest.mark.asyncio
     async def test_assess_system_carries_language_constraint(self):
-        """Work item #901: the assess prompt (which produces working_answer, later injected
+        """The assess prompt (which produces working_answer, later injected
         into synthesis as <agent_preliminary_findings>) must instruct the model to write in
         the sub-question's language, so it cannot seed a foreign language into synthesis."""
         fake = FakeLLM(text='{"sufficient": true, "working_answer": "ok"}')
@@ -312,16 +276,9 @@ class TestPlannerCallShape:
         assert "ignore their language" in system.lower()
 
 
-# ── lazy-import invariant (Req 12.3) ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestStructuredRowsVisibility:
-    """Rows gathered by structured tools must be visible to BOTH planner prompts.
-
-    Before this, only chunks/entities were rendered: a sub-question fully
-    answered by NL->SQL rows was assessed as "no data", the working answer
-    denied having data, and tool selection wandered into unrelated tools."""
+    """Rows gathered by structured tools must be visible to BOTH planner prompts."""
 
     @pytest.mark.asyncio
     async def test_propose_prompt_reports_rows(self):
@@ -371,9 +328,6 @@ class TestLazyImportInvariant:
             f"importing planner leaked graphrag_toolkit or failed.\nstdout={result.stdout}\nstderr={result.stderr}"
         )
         assert "OK" in result.stdout
-
-
-# ── stop signals: elicited prompts, confidence parsing, carrier ─────────
 
 
 class _SeqLLM:

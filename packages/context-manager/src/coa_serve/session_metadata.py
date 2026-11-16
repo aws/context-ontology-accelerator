@@ -54,14 +54,7 @@ class SessionMetadataStore:
     """DynamoDB-backed session metadata for discovery and ordering."""
 
     def __init__(self, table_name: str, region: str | None = None, ttl_days: int = _DEFAULT_TTL_DAYS):
-        """Bind the DynamoDB session-metadata table and TTL policy.
-
-        Args:
-            table_name: DynamoDB table storing session metadata records.
-            region: AWS region for the DynamoDB client; uses the default when None.
-            ttl_days: Days before a session record expires via DynamoDB TTL.
-        """
-        self._table_name = table_name
+        """Bind the DynamoDB session-metadata table and TTL policy."""
         self._ttl_days = ttl_days
         self._ddb = boto3.resource("dynamodb", region_name=region, config=sync_boto_config())
         self._table = self._ddb.Table(table_name)
@@ -185,10 +178,7 @@ class SessionMetadataStore:
         ns_composite = _build_ns_composite(namespace_id, now) if namespace_id else ""
 
         # DynamoDB requires each clause keyword (SET, ADD, ...) to appear once with all
-        # of its assignments contiguous. Build the full SET clause first, THEN append the
-        # ADD clause — appending a SET assignment (", #nsla = :nsc") after "ADD ..." makes
-        # DynamoDB parse it as part of ADD and reject it with
-        # "Invalid UpdateExpression: Syntax error; token: '=', near: '#nsla = :nsc'".
+        # of its assignments contiguous, so build the full SET clause before ADD.
         set_assignments = ["lastActiveAt = :ts", "#ttl = :ttl"]
         expr_values: dict = {":ts": now, ":ttl": ttl, ":inc": 1}
         expr_names: dict = {"#ttl": "ttl"}

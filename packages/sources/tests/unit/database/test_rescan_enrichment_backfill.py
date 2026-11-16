@@ -3,11 +3,10 @@
 
 """A re-scan sends approved tables that have no metadata back through enrichment.
 
-Without this, a table approved with no description, synonyms, glossary terms or
-tags (approved while enrichment was off, or one an earlier enrichment run failed
-on) stayed empty on every
-re-scan, because a re-scan keeps approved items as they are and enrichment only
-fills PENDING_REVIEW items. Curated tables and columns must not change at all.
+A table approved with no description, synonyms, glossary terms or tags (approved
+while enrichment was off, or after a failed enrichment run) is marked for enrichment
+again, because enrichment only fills PENDING_REVIEW items. Curated tables and
+columns do not change at all.
 """
 
 from __future__ import annotations
@@ -83,9 +82,6 @@ def _scanned(table: Table) -> Table:
     )
 
 
-# ── needs_enrichment_backfill ──────────────────────────────────────────
-
-
 class TestNeedsEnrichmentBackfill:
     def test_approved_table_with_no_metadata_qualifies(self) -> None:
         assert needs_enrichment_backfill(_empty_table())
@@ -131,9 +127,6 @@ class TestNeedsEnrichmentBackfill:
         assert needs_enrichment_backfill(table)
 
 
-# ── mark_for_enrichment_backfill ───────────────────────────────────────
-
-
 class TestMarkForEnrichmentBackfill:
     def test_resets_the_table_and_its_empty_columns_only(self) -> None:
         curated_col = Column(name="code", data_type="string", business_metadata=_curated())
@@ -155,9 +148,6 @@ class TestMarkForEnrichmentBackfill:
         assert by_name["legacy"] == rejected_col
         # The input is untouched: discovery backs it up as the approved pre-image.
         assert table == before
-
-
-# ── build_rescan_backup ────────────────────────────────────────────────
 
 
 class TestBackupOfBackfilledTables:
@@ -184,9 +174,6 @@ class TestBackupOfBackfilledTables:
         # form in the backup a reject could not restore it.
         with pytest.raises(ValueError, match=empty.table_id):
             build_rescan_backup(diff, [], source_id="ds-1", scan_job_sk="sk", backfilled_tables=[empty.table_id])
-
-
-# ── discovery handler ──────────────────────────────────────────────────
 
 
 @pytest.fixture(autouse=True)
@@ -355,9 +342,6 @@ class TestDiscoveryBackfill:
         assert pre_image.columns[0].business_metadata.review_status == APPROVED
         assert curated.table_id not in second["backup"]["modified_backup"]
         assert second["tables_approved"] == first["tables_approved"] == 1
-
-
-# ── enrichment over what discovery wrote ───────────────────────────────
 
 
 def _bedrock_result() -> BedrockInvocationResult:

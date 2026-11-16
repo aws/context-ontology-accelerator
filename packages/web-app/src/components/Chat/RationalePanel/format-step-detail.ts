@@ -11,9 +11,6 @@ import type { AppTranslate } from "../../../i18n/LocaleProvider";
 /**
  * Per-step-type formatters that convert structured detail objects
  * from the backend into human-readable sentences for the execution plan.
- *
- * Each formatter receives the detail record and returns a display string.
- * Falls back to raw string detail or empty string for unknown shapes.
  */
 
 type DetailRecord = Record<string, unknown>;
@@ -97,9 +94,6 @@ function summarizeList(items: unknown, t: AppTranslate, max = 5): string {
 
 const _authorizeFormatter: Formatter = (d, t) => {
   const principal = d.principal ?? "unknown";
-  // "allow" with no row/column restriction to apply. Phrased as an outcome
-  // ("access authorized") rather than the implementation detail ("no filter
-  // injection required"), which read as a non-sequitur in the demo trace.
   if (d.decision === "allow")
     return t(
       "Access authorized for {principal} (no row/column restrictions).",
@@ -114,13 +108,10 @@ const _authorizeFormatter: Formatter = (d, t) => {
 
 const _firewallFormatter: Formatter = (d, t) => {
   // Backend emits {denied: false} on the pass path (t2.vkg.firewall) and
-  // {decision: "authorized"} elsewhere. The firewall validates the SQL — it
-  // does not "inject" — so a clean pass reads as "passed", not "no injection".
+  // {decision: "authorized"} elsewhere.
   if (d.denied === false || d.decision === "authorized")
     return t("SQL firewall passed — query is a safe read-only SELECT.");
-  // Error path: the firewall rejected the generated SQL (e.g. a low-confidence
-  // SPARQL translated to non-SELECT SQL). Explain the cause rather than showing
-  // the raw exception name; this is a non-fatal fallthrough to Tier 3.
+  // The firewall rejected the generated SQL; a non-fatal fallthrough to Tier 3.
   if (d.error)
     return t("SQL firewall blocked the query — {reason}.", {
       reason: humanizeError(d.error, t),
@@ -486,10 +477,8 @@ const STEP_FALLBACKS = {
 } satisfies Record<string, AppMessage>;
 
 /**
- * Format a trace step's detail for display in the execution plan.
- *
- * Always returns a non-empty string — uses fallback descriptions when
- * no structured detail is available from the backend.
+ * Format a trace step's detail for display in the execution plan, using
+ * fallback descriptions when the backend sends no structured detail.
  */
 export function formatStepDetail(
   stepName: string,
@@ -499,14 +488,12 @@ export function formatStepDetail(
   const fallback = STEP_FALLBACKS[stepName as keyof typeof STEP_FALLBACKS];
   if (!detail) return fallback ? translate(fallback) : "";
 
-  // Structured detail object — use formatter
   if (typeof detail === "object") {
     const formatter = stepFormatters[stepName];
     if (formatter) {
       const result = formatter(detail, translate);
       if (result) return result;
     }
-    // Generic error/message extraction
     if (detail.message && typeof detail.message === "string") {
       return String(detail.message);
     }
@@ -519,7 +506,6 @@ export function formatStepDetail(
     return fallback ? translate(fallback) : "";
   }
 
-  // String detail — clean up noise
   const trimmed = detail.trim();
   if (NOISE_VALUES.has(trimmed.toLowerCase())) {
     return fallback ? translate(fallback) : "";
@@ -541,15 +527,8 @@ export function formatStepDetail(
         confidence: m[1],
       });
   }
-  // The OTHER Tier-1 bypass. When more than one governed metric matches, the
-  // question is ambiguous for the single-metric path, so Tier 1 declines rather
-  // than execute just the first one. The backend records this as a BARE STRING
-  // ("3 metrics"), not an object, so the stepFormatters entry above never sees it
-  // and the raw fragment reached the UI verbatim. Phrase it like its sibling
-  // residual_qualifier_bypass: name the reason, then where the question goes.
-  // The count is pluralized rather than interpolated bare: the backend emits
-  // f"{count} metrics" unconditionally, so a hypothetical "1 metric" detail would
-  // otherwise render "matched 1 metrics".
+  // Tier 1 declines when more than one metric matches. The backend sends a bare
+  // "<n> metrics" string; pluralize the count.
   if (stepName === "t1.metric_match") {
     const m = trimmed.match(/^(\d+)\s+metrics?$/i);
     if (m) {
@@ -562,24 +541,15 @@ export function formatStepDetail(
       );
     }
   }
-  // The NL→SQL generate step records its failure detail as a BARE STRING
-  // (e.g. "retrieve_failed: Vector search proxy returned an error" or
-  // "empty_sql"), not an object — so the object formatter above never sees it.
-  // Humanize it here so the raw backend string never reaches the UI. This is a
-  // non-fatal fallthrough (VKG/Ontop runs next); the trace status already
-  // conveys skipped-vs-error, this is just the copy.
+  // The NL→SQL generate step sends its failure detail as a bare string.
   if (stepName === "t2.sql.generate") {
     return translate("NL→SQL skipped ({reason}); falling back to VKG.", {
       reason: humanizeError(trimmed, translate),
     });
   }
 
-  // Lexical retriever sends a string detail: "strategy=<name>; <N nodes
-  // retrieved | TimeoutError after Xs | GraphQueryError>". Parse it into a
-  // human sentence. On error the retriever returns no chunks (the graphrag
-  // engine does vector + Neptune content-fetch as one call), so synthesis runs
-  // without retrieved context — phrase it as a retrieval failure, not a
-  // partial success.
+  // Lexical retriever sends "strategy=<name>; <N nodes retrieved |
+  // TimeoutError after Xs | GraphQueryError>". On error it returns no chunks.
   if (stepName === "lexical_baseline_retrieve") {
     const outcome = trimmed.replace(/^strategy=[^;]*;\s*/i, "");
     const nodeMatch = outcome.match(/^(\d+)\s+nodes?\s+retrieved/i);
@@ -607,10 +577,6 @@ export function formatStepDetail(
         const msg =
           parsed.error || parsed.message || parsed.detail || parsed.reason;
         if (typeof msg === "string") return msg;
-        const values = Object.values(parsed);
-        if (values.every((v) => !v || (Array.isArray(v) && v.length === 0))) {
-          return fallback ? translate(fallback) : "";
-        }
       }
       return fallback ? translate(fallback) : "";
     } catch {
@@ -618,7 +584,6 @@ export function formatStepDetail(
     }
   }
 
-  // Snake_case identifiers → Title Case
   if (/^[a-z][a-z0-9_]+$/.test(trimmed)) {
     return trimmed.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }

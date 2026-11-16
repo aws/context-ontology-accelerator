@@ -21,23 +21,12 @@ class ServeError(Exception):
     error_type: str = "InternalError"
 
     def __init__(self, message: str):
-        """Store the human-readable message and pass it to the base Exception.
-
-        Args:
-            message: Human-readable error description.
-        """
+        """Store the human-readable message and pass it to the base Exception."""
         self.message = message
         super().__init__(message)
 
     def to_dict(self, request_id: str) -> dict:
-        """Serialize the error into the API's JSON error shape.
-
-        Args:
-            request_id: Request identifier echoed back to the caller.
-
-        Returns:
-            A dict with the error type, message, request id, and HTTP status code.
-        """
+        """Serialize the error into the API's JSON error shape."""
         return {
             "error": self.error_type,
             "message": self.message,
@@ -53,11 +42,7 @@ class AccessDeniedError(ServeError):
     error_type = "AccessDeniedError"
 
     def __init__(self, reason: str | None = None):
-        """Record the internal deny reason without leaking it in the client message.
-
-        Args:
-            reason: Internal explanation for the denial (not exposed to callers).
-        """
+        """Record the internal deny reason without leaking it in the client message."""
         self.reason = reason
         super().__init__("Access denied")
 
@@ -71,12 +56,7 @@ class NamespaceScopeDeniedError(AccessDeniedError):
     """
 
     def __init__(self, reason: str):
-        """Surface the policy reason as the client message.
-
-        Bypasses :class:`AccessDeniedError`'s reason-hiding (which exists for
-        data-level denies where the reason can be sensitive); a cross-namespace
-        SQL reference is a policy statement, safe to return to the caller.
-        """
+        """Surface the policy reason as the client message."""
         ServeError.__init__(self, reason)
         self.reason = reason
 
@@ -92,16 +72,11 @@ class AmbiguousReferenceError(ServeError):
     """A query names a table that more than one source or schema answers to — HTTP 400.
 
     A bare (unqualified) reference whose name exists in two or more of the
-    namespace's sources cannot be attributed to one physical table. Guessing one
-    can return a wrong answer as success (the same name in two databases), so the
-    query is refused rather than run against a guessed source.
-
-    Like :class:`NamespaceScopeDeniedError`, this is a *policy* statement about the
-    query — not sensitive data — so its message IS surfaced to the caller: it names
-    the offending reference and the candidates, and tells the caller how to
-    proceed (qualify the reference, or pass an explicit source). It is a terminal
-    outcome, not a strategy miss: the tier runner must let it propagate to the
-    client instead of falling through to the next strategy, exactly as it does for
+    namespace's sources cannot be attributed to one physical table, so the query
+    is refused rather than run against a guessed source. Like
+    :class:`NamespaceScopeDeniedError` this is a policy statement, so its message
+    (the reference, its candidates, and how to proceed) is surfaced. It is a
+    terminal outcome: the tier runner must let it propagate, as it does for
     :class:`AccessDeniedError`.
     """
 
@@ -127,23 +102,16 @@ class NoResultError(ServeError):
     """A pinned resolution tier produced no result — HTTP 404.
 
     A metric/tier miss is a normal "no data found" outcome, NOT a server fault.
-    When a caller pins a tier (``tierOverride``) and that tier — having exhausted
-    any permitted fall-through — yields nothing, the orchestrator raises this
-    instead of letting a bare error surface as ``InternalError`` (500). Clients
-    can then distinguish "nothing matched" from "server broke" and must not retry
-    a deterministic miss. Mirrors the ``AccessDeniedError`` (403) terminal-outcome
-    precedent; confirmed as the desired contract by the serve owners.
+    When a caller pins a tier (``tierOverride``) and that tier yields nothing, the
+    orchestrator raises this instead of an ``InternalError`` (500), so clients can
+    tell "nothing matched" from "server broke" and must not retry a deterministic
+    miss.
     """
 
     status_code = 404
     error_type = "NoResultError"
 
     def __init__(self, message: str = "No result for the requested tier", tier: int | None = None):
-        """Record which pinned tier produced no result.
-
-        Args:
-            message: Human-readable error description.
-            tier: The pinned resolution tier that yielded nothing, if known.
-        """
+        """Record which pinned tier produced no result."""
         self.tier = tier
         super().__init__(message)

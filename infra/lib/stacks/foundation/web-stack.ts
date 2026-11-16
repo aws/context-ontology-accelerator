@@ -120,9 +120,7 @@ export interface WebStackProps extends cdk.StackProps {
   /**
    * Fully custom Content-Security-Policy header value, replacing the derived
    * one. Wired from the `content_security_policy` CDK context key in
-   * `bin/app.ts` — the escape hatch existed on {@link PublicUIConstructProps}
-   * but reached nothing, so extending the policy meant patching CDK source
-   * (issue #130).
+   * `bin/app.ts`.
    */
   readonly contentSecurityPolicy?: string;
 }
@@ -192,7 +190,7 @@ export class WebStack extends SCLStack {
     // in bin/app.ts, but an explicit web.addDependency(mcp) there orders the
     // deploy so this parameter exists when runtime-config.json is written.
     // Surfaced to the frontend so the MCP console page can show the endpoint
-    // and a copy-paste client config for this deployment (#1166).
+    // and a copy-paste client config for this deployment.
     const mcpRuntimeArn = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/mcp/runtime-arn`,

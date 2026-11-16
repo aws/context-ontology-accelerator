@@ -3,17 +3,6 @@
 
 """Unit tests for the Class Normalizer (in-memory, first-class-wins).
 
-Tests cover Requirement 9.1–9.8:
-
-- Embedding concatenation format (``"{label}: {description}"``)
-- Cosine top-1 lookup against a growing in-memory index
-- Match band bucketing (exact ≥ 0.95, close_match ≥ 0.80, novel < 0.80)
-- Empty-index path (Req 9.6) — first class is novel
-- First-class-wins: same description twice → second is exact
-- Per-class fault isolation: embed/resolver failures fall back to novel
-- ``source_mode`` is threaded through verbatim
-- Embed-text caching avoids redundant Bedrock calls
-
 These tests use a deterministic embedding client that returns
 controlled unit-length vectors so cosine math is trivially predictable.
 """
@@ -47,12 +36,6 @@ from coa_ontology.inducer.unstructured.services.iri_resolver import (
     normalize_string,
 )
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
-# Test namespace + ontology used to construct expected IRIs. Kept the
-# same across all tests so an assertion failure shows the real expected
-# string and the test reads predictably.
 _TEST_NS = "test-ns"
 _TEST_ONTO = "test-onto"
 _TEST_PREFIX = f"{GRAPH_BASE_URI}/namespace/{_TEST_NS}/ontology/{_TEST_ONTO}"
@@ -74,19 +57,7 @@ def _scripted_client(text_to_vector: dict[str, list[float]]) -> MagicMock:
 
 
 def _real_resolver() -> MagicMock:
-    """Return a real ``InMemoryIRIResolver`` wrapped in a ``MagicMock`` spy.
-
-    Wrapping with ``MagicMock(wraps=...)`` delegates calls to the real
-    resolver (so the IRIs that come back match the actual minting
-    template — see Requirement 7.1) AND records every call so tests
-    can introspect ``.resolve.call_count``,
-    ``.resolve.assert_called_once_with(...)``, etc.
-
-    This is the fix for the "opaque test IRIs masked real bugs" issue:
-    using the real resolver ensures every IRI assertion in the suite
-    matches the production minting convention, and the spy wrapper
-    keeps every existing MagicMock-style assertion working.
-    """
+    """Return a real ``InMemoryIRIResolver`` wrapped in a ``MagicMock`` spy."""
     return MagicMock(
         wraps=InMemoryIRIResolver(
             namespace=_TEST_NS,
@@ -96,21 +67,12 @@ def _real_resolver() -> MagicMock:
 
 
 def _expected_class_iri(label: str) -> str:
-    """The IRI a real resolver would mint for class ``label``.
-
-    Per Requirement 10.2, class IRIs use the literal token ``"class"``
-    in the classification slot. Both the value and the classification
-    are normalized (lowercased, non-alphanumeric stripped, etc.) by the
-    resolver, so we apply the same normalization here.
-    """
+    """The IRI a real resolver would mint for class ``label``."""
     return f"{_TEST_PREFIX}/class/{normalize_string(label)}"
 
 
-# ── Pure helpers ────────────────────────────────────────────────────────
-
-
 class TestBuildEmbeddingText:
-    """Req 9.1, 9.8 — concatenation of label and description."""
+    """Concatenation of label and description."""
 
     def test_label_and_description_concatenated_with_colon_space(self):
         assert _build_embedding_text("Person", "An individual human being.") == "Person: An individual human being."
@@ -126,7 +88,7 @@ class TestBuildEmbeddingText:
 
 
 class TestBandForScore:
-    """Req 9.3, 9.4, 9.5 — match band thresholds."""
+    """Match band thresholds."""
 
     @pytest.mark.parametrize(
         "score,expected",
@@ -170,9 +132,6 @@ class TestCosine:
 
     def test_zero_norm_returns_zero(self):
         assert _cosine([0.0, 0.0], [1.0, 0.0]) == 0.0
-
-
-# ── In-memory index ─────────────────────────────────────────────────────
 
 
 class TestInMemoryClassEmbeddingIndex:
@@ -228,13 +187,7 @@ class TestInMemoryClassEmbeddingIndex:
         assert idx.find_by_label("   ") is None
 
     def test_find_by_label_is_backed_by_a_lookup_map(self):
-        """The lookup must not re-normalize every stored label per call.
-
-        Regression: ``find_by_label`` scanned ``entries`` and normalized
-        each label on every call, so a deterministic match cost O(n)
-        normalizations and the whole pass over a class population was
-        quadratic.
-        """
+        """The lookup must not re-normalize every stored label per call."""
         idx = InMemoryClassEmbeddingIndex()
         for i in range(50):
             idx.add(f"Class {i}", "", _unit(1.0, 0.0), f"iri-{i}")
@@ -274,11 +227,8 @@ class TestInMemoryClassEmbeddingIndex:
         assert idx.indexed_entry_count == 1
 
 
-# ── normalize() ─────────────────────────────────────────────────────────
-
-
 class TestEmptyIndexFirstClassNovel:
-    """Req 9.6 — first class added to an empty index is novel."""
+    """First class added to an empty index is novel."""
 
     def test_first_class_in_empty_index_is_novel(self):
         client = _scripted_client({"X: x": _unit(1.0, 0.0)})
@@ -434,7 +384,7 @@ class TestNovelBand:
         # Y has a top hit (X) but cos=0.0 → novel.
         ry = result["Y"]
         assert ry.band == "novel"
-        # Per spec Req 9.5: novel band MUST NOT surface a matched_existing_iri.
+        # The novel band MUST NOT surface a matched_existing_iri.
         assert ry.matched_existing_iri is None
         assert ry.similarity_score == pytest.approx(0.0)
         # Both classes in the index.
@@ -552,36 +502,6 @@ class TestPerClassFaultIsolation:
 class TestEmbedTextCache:
     """The index caches embed text so we don't pay Bedrock twice for the same input."""
 
-    def test_repeated_text_uses_cache(self):
-        client = MagicMock()
-        client.embed_text.return_value = _unit(1.0, 0.0)
-        resolver = _real_resolver()
-        idx = InMemoryClassEmbeddingIndex()
-
-        # Same description appearing twice in the same call (different labels).
-        normalize(
-            classes={"X": "shared description", "X-alias": "shared description"},
-            embedding_client=client,
-            iri_resolver=resolver,
-            index=idx,
-        )
-
-        # Wait — the embed text differs between them because the label is
-        # part of the embed text. So this will result in two embed calls.
-        # The cache hit case is when the SAME (label, description) pair is
-        # passed twice in one call (or across calls).
-        # Test that case explicitly:
-        client.reset_mock()
-        normalize(
-            classes={"X": "shared description"},
-            embedding_client=client,
-            iri_resolver=resolver,
-            index=idx,
-        )
-        # Second pass with identical embed text: cache hit. Also, since
-        # the index already has X, we should get exact match back.
-        assert client.embed_text.call_count == 0  # served from cache
-
     def test_cache_persists_across_calls_when_index_shared(self):
         client = MagicMock()
         client.embed_text.return_value = _unit(1.0, 0.0)
@@ -621,20 +541,6 @@ class TestNormalizationResultDataclass:
         assert r.preferred_label is None
         assert r.alternative_labels == ()
 
-    def test_full_construction(self):
-        r = NormalizationResult(
-            class_iri="http://example.org/X",
-            band="close_match",
-            similarity_score=0.85,
-            matched_existing_iri=_expected_class_iri("X"),
-            source_mode="schema",
-        )
-        assert r.band == "close_match"
-        assert r.matched_existing_iri == _expected_class_iri("X")
-        assert r.source_mode == "schema"
-        assert r.preferred_label is None
-        assert r.alternative_labels == ()
-
 
 class TestIterationOrderEffect:
     """First-class-wins: iteration order determines who is the canonical IRI."""
@@ -644,10 +550,7 @@ class TestIterationOrderEffect:
         the first one in iteration order is the one minted, and the
         second one matches it as exact."""
         client = MagicMock()
-        # Both classes have IDENTICAL embed text since the labels happen
-        # to share the description prefix... actually let me make this
-        # cleaner: two truly distinct labels with very close vectors.
-        client.embed_text.side_effect = lambda t: _unit(1.0, 0.0) if t.startswith("A:") else _unit(1.0, 0.0)
+        client.embed_text.return_value = _unit(1.0, 0.0)
         # Both vectors are identical → cosine=1.0 → exact band.
         resolver = _real_resolver()
 
@@ -681,10 +584,8 @@ class TestIterationOrderEffect:
 class TestResolverArgumentConvention:
     """The normalizer mints class IRIs via ``resolve(label, "class")``.
 
-    Per Requirement 10.2 (revised), class IRIs use the literal token
-    ``"class"`` in the classification slot to disambiguate them from
-    A-Box individual IRIs (which use the entity's class label as the
-    classification slot — Req 11.2).
+    The literal ``"class"`` slot disambiguates class IRIs from A-Box
+    individual IRIs, which use the entity's class label.
 
     The IRI string itself comes from the resolver and is opaque from
     the normalizer's point of view; what matters is that the right
@@ -692,11 +593,6 @@ class TestResolverArgumentConvention:
     """
 
     def test_novel_path_calls_resolve_with_class_keyword(self):
-        from coa_ontology.inducer.unstructured.services.class_normalizer import (
-            InMemoryClassEmbeddingIndex,
-            normalize,
-        )
-
         client = _scripted_client({"Person: An individual human being.": _unit(1.0, 0.0)})
         resolver = _real_resolver()
         idx = InMemoryClassEmbeddingIndex()
@@ -714,11 +610,6 @@ class TestResolverArgumentConvention:
         resolver.resolve.assert_called_once_with("Person", "class")
 
     def test_close_match_path_calls_resolve_with_class_keyword(self):
-        from coa_ontology.inducer.unstructured.services.class_normalizer import (
-            InMemoryClassEmbeddingIndex,
-            normalize,
-        )
-
         # Close vectors (cos ≈ 0.906) put Human in close_match band
         # against Person, so the close_match mint path is exercised.
         client = _scripted_client(

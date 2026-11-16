@@ -28,10 +28,7 @@ while IFS= read -r f; do
     *) continue ;;
   esac
   # Skip generated, vendored, and build output, plus MIT-0 workshop content.
-  # workshop/ is MIT No Attribution per workshop/LICENSE and workshop/NOTICE, which
-  # names these files explicitly; stamping Apache-2.0 on them would contradict the
-  # license shipped alongside them. They are also re-synced from Workshop Studio on
-  # every content refresh, which would silently revert any header added here.
+  # workshop/ is MIT No Attribution per workshop/LICENSE; an Apache-2.0 header would contradict it.
   case "$f" in
     smithy-generated/*|*/smithy-generated/*|infra/cdk.out/*|models/build/*|\
     */node_modules/*|*/dist/*|*/build/*|*/.venv/*|*/__pycache__/*|\

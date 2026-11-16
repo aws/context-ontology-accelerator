@@ -10,8 +10,9 @@ import json
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import boto3
 from botocore.config import Config
@@ -24,6 +25,13 @@ from coa_common.guardrail_metrics import (
     filter_type_from_assessments,
     redacted_actions,
 )
+
+if TYPE_CHECKING:
+    from mypy_boto3_bedrock_runtime.type_defs import (
+        ContentBlockOutputTypeDef,
+        ContentBlockTypeDef,
+        ConverseRequestTypeDef,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +82,7 @@ def _assessment_has_block(assessment: dict) -> bool:
         return False
 
 
-def extract_text_blocks(content_blocks: list[dict]) -> str:
+def extract_text_blocks(content_blocks: Sequence[ContentBlockOutputTypeDef]) -> str:
     """Join the text of every ``text`` ContentBlock in a Converse response.
 
     A reasoning model emits a ``reasoningContent`` block with no ``text`` key
@@ -187,7 +195,7 @@ class BedrockClient:
         )
 
     @staticmethod
-    def _check_guardrail_blocked(guardrail_trace: dict) -> bool:
+    def _check_guardrail_blocked(guardrail_trace: Mapping[str, Any]) -> bool:
         """Determine if a guardrail trace indicates BLOCK (not just ANONYMIZE)."""
         if not guardrail_trace:
             return True
@@ -203,7 +211,7 @@ class BedrockClient:
 
         return False
 
-    def _user_content(self, user_prompt: str | Sequence[PromptSegment]) -> list[dict]:
+    def _user_content(self, user_prompt: str | Sequence[PromptSegment]) -> list[ContentBlockTypeDef]:
         """Map the user prompt to Converse content blocks.
 
         A plain ``str`` is one ``text`` block, so the guardrail screens the whole
@@ -227,7 +235,7 @@ class BedrockClient:
             raise ValueError("user_prompt has no non-empty segments")
         if not self._guardrail_id or not any(s.guarded for s in segments):
             return [{"text": prompt_text(segments)}]
-        blocks: list[dict] = []
+        blocks: list[ContentBlockTypeDef] = []
         for guarded, group in itertools.groupby(segments, key=lambda s: s.guarded):
             text = "".join(s.text for s in group)
             blocks.append({"guardContent": {"text": {"text": text}}} if guarded else {"text": text})
@@ -249,7 +257,7 @@ class BedrockClient:
                 f"Combined prompt is {input_chars} chars, exceeds limit of {self._max_input_chars}"
             )
         start = time.monotonic()
-        kwargs = {
+        kwargs: ConverseRequestTypeDef = {
             "modelId": self._model_id,
             "messages": [{"role": "user", "content": self._user_content(user_prompt)}],
             "system": [{"text": system_prompt}],

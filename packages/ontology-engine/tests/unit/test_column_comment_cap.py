@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The class text keeps 255 characters of each column note for the SQL writer.
 
-A Glue column comment allows 255 characters. The old 100-character cut dropped
-the deciding clause of longer steward notes, so the SQL writer never saw it. The
-embedded text stays at 100: the embedding input is cut at 8000 characters, and
-longer notes would push a wide table's last columns out of the vector.
+A Glue column comment allows 255 characters. The embedded text stays at 100:
+the embedding input is cut at 8000 characters, and longer notes would push a
+wide table's last columns out of the vector.
 """
 
 from __future__ import annotations
@@ -13,7 +12,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
-from coa_ontology.catalog import ingest
 from coa_ontology.catalog.ingest import _accumulate_embeddings
 from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace
 
@@ -53,11 +51,6 @@ def _class_texts(note: str) -> tuple[str, str]:
     context_text = next(it["context_text"] for it in items if it["entity_uri"] == str(NS.Orders))
     embed_text = next(t for t in embedded if "Columns:" in t)
     return context_text, embed_text
-
-
-def test_caps_are_the_documented_values():
-    assert ingest._MAX_COLUMN_COMMENT_CHARS == 255
-    assert ingest._MAX_COLUMN_COMMENT_EMBED_CHARS == 100
 
 
 def test_230_character_note_is_whole_for_the_writer_and_cut_at_100_for_the_embedding():

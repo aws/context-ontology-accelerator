@@ -31,7 +31,7 @@ import {
 /**
  * Foundation stack: identity provider authentication infrastructure.
  *
- * Supports three deployment-time modes (LLD §2.2.5):
+ * Supports three deployment-time modes:
  *  - COGNITO  → provisions Cognito User Pool + Client + optional federation
  *  - SAML     → provisions Cognito User Pool + Client + SAML provider(s)
  *  - OIDC     → no Cognito; stores external issuer/clientId/jwksUri in SSM
@@ -142,7 +142,6 @@ export class IdpAuthenticationStack extends SCLStack {
       (this.node.tryGetContext(CTX_IDP_TYPE) as string as IdpType) ??
       IdpType.COGNITO;
 
-    // ── Initial user & claims ──────────────────────────────────────
     this.initialUserDetails = {
       username: props?.initialUserDetails?.username ?? DEFAULT_ADMIN_USERNAME,
       group: props?.initialUserDetails?.group ?? DEFAULT_ADMIN_GROUP,
@@ -157,7 +156,6 @@ export class IdpAuthenticationStack extends SCLStack {
       });
     }
 
-    // ── OIDC path: no Cognito resources ────────────────────────────
     if (idpType === IdpType.OIDC) {
       const oidc = props?.oidcSettings;
       if (!oidc)
@@ -168,9 +166,6 @@ export class IdpAuthenticationStack extends SCLStack {
         );
       }
       this.clientId = oidc.clientId;
-      // TODO: external OIDC uses same clientId for both web and MCP flows.
-      // If we need separate scopes/audience per client, register a second
-      // client in the external IdP and accept it via oidcSettings.mcpClientId.
       this.mcpClientId = oidc.clientId;
       this.issuerUrl = oidc.issuerUrl;
 
@@ -202,7 +197,6 @@ export class IdpAuthenticationStack extends SCLStack {
       return;
     }
 
-    // ── Cognito path (COGNITO or SAML) ─────────────────────────────
     const rawCallbackUrls =
       this.node.tryGetContext(CTX_CALLBACK_URLS) ?? DEFAULT_CALLBACK_URLS;
     const rawLogoutUrls =
@@ -258,7 +252,6 @@ export class IdpAuthenticationStack extends SCLStack {
       },
     });
 
-    // ── Register federated identity providers ──────────────────────
     const supportedIdPs: cognito.UserPoolClientIdentityProvider[] = [
       cognito.UserPoolClientIdentityProvider.COGNITO,
     ];
@@ -298,7 +291,6 @@ export class IdpAuthenticationStack extends SCLStack {
       );
     }
 
-    // ── User Pool Client ───────────────────────────────────────────
     // In dev, also enable USER_PASSWORD_AUTH to make local/CLI sign-in
     // (e.g. boto3 InitiateAuth USER_PASSWORD_AUTH) easier for testing.
     // Production deployments stay restricted to USER_SRP_AUTH only.
@@ -327,7 +319,6 @@ export class IdpAuthenticationStack extends SCLStack {
 
     this.clientId = this.userPoolClient.userPoolClientId;
 
-    // ── MCP/CLI Public Client (PKCE, localhost callbacks) ──────────
     // Separate client for IDE integrations (Kiro, Claude Desktop, Cursor).
     // Uses OAuth Authorization Code + PKCE with localhost redirect.
     // No client secret (public client per RFC 8252).
@@ -367,7 +358,6 @@ export class IdpAuthenticationStack extends SCLStack {
     }
     this.issuerUrl = `https://cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}`;
 
-    // ── SSM Parameters ─────────────────────────────────────────────
     new ssm.StringParameter(this, "SsmUserPoolId", {
       parameterName: `${ssmPrefix}/userpool-id`,
       stringValue: this.userPool.userPoolId,
@@ -384,18 +374,10 @@ export class IdpAuthenticationStack extends SCLStack {
       parameterName: `${ssmPrefix}/issuer`,
       stringValue: this.issuerUrl,
     });
-    // Hosted-UI domain PREFIX (not the full URL). The browser's OAuth token
-    // exchange, refresh-token revocation, and silent-renew iframe all go to
-    // `<prefix>.auth.<region>.amazoncognito.com`, which is a different host from
-    // the issuer above — so the web stack's Content-Security-Policy has to
-    // allowlist it or every sign-in is blocked by the browser (issue #130).
-    //
-    // Published here rather than re-derived in the web stack so the naming rule
-    // lives in exactly one place: a drifting copy would not fail a deploy, it
-    // would silently block login. The prefix rather than `domain.baseUrl()`
-    // because the consumer reads it with `valueForStringParameter` and gets a
-    // CFN dynamic reference — an unresolved token cannot be parsed into an
-    // origin at synth, but it can be interpolated into one.
+    // Hosted-UI domain prefix: the web stack's CSP must allowlist
+    // `<prefix>.auth.<region>.amazoncognito.com`. The prefix (not baseUrl())
+    // is published because the consumer reads it as a CFN dynamic reference,
+    // which can be interpolated into an origin but not parsed at synth.
     new ssm.StringParameter(this, "SsmCognitoDomainPrefix", {
       parameterName: `${ssmPrefix}/cognito-domain-prefix`,
       stringValue: cognitoDomainPrefix,
@@ -419,7 +401,6 @@ export class IdpAuthenticationStack extends SCLStack {
       description: "Cognito Hosted UI domain URL",
     });
 
-    // ── Provision initial admin user ───────────────────────────────
     new UserPoolUser(this, "AdminUser", {
       userPool: this.userPool,
       userDetails: this.initialUserDetails,
@@ -432,9 +413,7 @@ export class IdpAuthenticationStack extends SCLStack {
   ): cognito.AttributeMapping | undefined {
     if (!props?.attributeMapping) return undefined;
     return {
-      custom: Object.fromEntries(
-        Object.entries(props.attributeMapping).map(([k, v]) => [k, v]),
-      ),
+      custom: props.attributeMapping,
     };
   }
 }

@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the column-cardinality probe timeout bound (GitHub #131).
+"""Tests for the column-cardinality probe timeout bound, which keeps one wide column from consuming the Lambda.
 
 Verifies:
 - Postgres/Redshift dialects emit the SET statement_timeout statement; others don't.
@@ -54,7 +54,7 @@ class TestProbeTimeoutStatements:
         assert SqlServerDialect().probe_timeout_statements() == ()
 
     def test_snowflake_emits_session_timeout(self):
-        """GH-219: Snowflake now bounds the probe via STATEMENT_TIMEOUT_IN_SECONDS."""
+        """Snowflake bounds the probe via STATEMENT_TIMEOUT_IN_SECONDS."""
         from coa_sources.database.connectors.dialects import PROBE_TIMEOUT_MS, SnowflakeDialect
 
         stmts = SnowflakeDialect().probe_timeout_statements()
@@ -63,7 +63,6 @@ class TestProbeTimeoutStatements:
         secs = int(stmts[0].split("=")[1].strip())
         # Seconds, floored to at least 1 (Snowflake reads 0 as "no timeout").
         assert secs == max(1, PROBE_TIMEOUT_MS // 1000)
-        assert secs >= 1
 
     def test_snowflake_timeout_floors_to_one_second(self):
         """A sub-second PROBE_TIMEOUT_MS must not floor to 0 (Snowflake: 0 = no timeout)."""
@@ -193,11 +192,8 @@ class TestProbeTimeoutGracefulDegradation:
             Column(name="small_col", data_type="varchar", nullable=True, is_partition_key=False),
         ]
 
-        # Should NOT raise — timeout is swallowed inside the per-column try/except
-        # in fetch_distinct_values.
         JdbcConnector._safe_distinct_values(dialect, mock_conn, "public", "orders", cols)
 
-        # Neither column should have distinct_values set (since mock returns empty)
         for col in cols:
             assert not col.distinct_values
 
@@ -310,7 +306,7 @@ class TestProbeTimeoutFailsClosed:
     """When the timeout bound cannot be applied, sampling is skipped, not run unbounded."""
 
     def test_timeout_setup_failure_skips_sampling_entirely(self):
-        """GH-131 fail-closed: if `SET statement_timeout` raises, no COUNT probe runs.
+        """Fail-closed: if `SET statement_timeout` raises, no COUNT probe runs.
 
         A dialect that declares timeout statements is asserting its probe needs
         bounding. Proceeding without the bound would reintroduce the exact
