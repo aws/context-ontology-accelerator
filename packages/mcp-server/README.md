@@ -137,9 +137,44 @@ delete `~/.scl/tokens.json`.
 
 See `packages/mcp-proxy/README.md` for the proxy's full option/override reference.
 
+## Context Manager session affinity
+
+Execution tools invoke the Context Manager with an
+`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` derived from the caller and the
+MCP session (`Mcp-Session-Id`), so every tool call of one MCP session reuses one
+warm Context Manager microVM instead of cold-starting a new one per call. The id
+is a hash: two users never share a Context Manager session, and the MCP session
+id is not forwarded verbatim. It only routes the call; the Context Manager's
+conversation memory is keyed separately (payload `sessionId`, streaming path
+only), so tool calls stay independent requests.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SCL_CM_SESSION_SCOPE` | `mcp_session` | `mcp_session`: one Context Manager session per (caller, MCP session). `caller`: one per (caller, namespace), shared across that caller's MCP sessions — use it for clients that open a new MCP session per tool call. The MCP session is read from `Mcp-Session-Id`, else from the inbound `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`; a request with neither uses the `caller` key. |
+
+A Context Manager session keeps answering from the runtime version it started
+on until it goes idle (15 minutes by default) or reaches its maximum lifetime,
+so after a Context Manager deploy an active MCP session keeps using the previous
+version until then. Reconnect the MCP client (a new MCP session) to test a new
+version.
+
+A Context Manager session is one microVM, so the parallel tool calls of one MCP
+session (or, with `caller`, of every MCP session of that caller on a namespace)
+share its CPU and memory instead of each getting a microVM of its own. Warm
+calls are much faster than cold ones, but a burst of heavy parallel calls on one
+session runs slower than the same calls spread over separate sessions.
+
+Parallel calls on a new MCP session can reach AgentCore while it is still
+starting the session's microVM. AgentCore answers those with a
+`RetryableConflictException`, which the server retries with backoff (about 4 s in
+total) before it fails the tool call with `CM 409`. Retrying the call succeeds
+once the session is warm.
+
 ## Auth Model
 
-- **Inbound JWT**: Validated by AgentCore Runtime platform (not re-validated by this server)
+- **Inbound JWT**: Validated by AgentCore Runtime platform, and its signature is verified again here as defense in depth (`coa_mcp/auth/claims.py`).
+  Signing keys are cached for 5 minutes; while the IdP's key endpoint is unreachable, an expired key set is
+  used for up to an hour more (see "Token Validation" in `packages/control-plane/README.md`). No setting turns this off.
 - **Authorization**: Cedar policies evaluated against the **delegating user** (not the agent)
 - **Agent identity**: Logged for audit, never used for authorization decisions
 - **Profile resolution**: User's grant resolved to `InvokeRequest.profile` before execution

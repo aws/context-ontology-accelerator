@@ -73,7 +73,6 @@ omit = [
     # Analytics, Lambda runtime) — tested via integ tests, not unit tests.
     "*/catalog/na_store.py",
     "*/api_proxy_handler.py",
-    "*/inducer/routers/batch.py",
 ]
 
 [tool.uv.sources]

@@ -43,12 +43,9 @@ _MAX_METADATA_BYTES = 8_000
 _MAX_PERSISTED_VALUE_CHARS = 1_000
 _MAX_PERSISTED_VALUE_BYTES = 2_000
 
-# Up-front bounds on caller-supplied collections, applied BEFORE any size search.
-# Compaction keeps far fewer items than these, so the caps change no successful
-# outcome; they exist so an absurd input cannot drive the search loops at all.
-# Tier-2 lets a caller request 10,000 result rows (``tier2/strategy.py``
-# MAX_RESULT_ROWS) and graph context is unbounded upstream, and every search
-# iteration costs one full envelope serialization.
+# Up-front bounds on caller-supplied collections, applied BEFORE any size search:
+# Tier-2 allows 10,000 result rows and graph context is unbounded upstream, and
+# every search iteration costs one full envelope serialization.
 _MAX_PERSISTED_RESULT_ROWS = 200
 _MAX_PERSISTED_TRACE_STEPS = 100
 _MAX_PERSISTED_ENTITIES = 200
@@ -75,13 +72,8 @@ _UNRESTORABLE_ASSISTANT_TEXT = "This response could not be restored."
 def _json_default(obj: object) -> object:
     """json.dumps fallback for types the stdlib encoder can't handle.
 
-    Query result rows can carry non-JSON-native types sourced from the
-    underlying database (e.g. a ``numeric``/``DECIMAL`` column arrives as
-    Python ``Decimal`` via asyncpg). Without this, envelope serialization
-    raises ``TypeError: Object of type Decimal is not JSON serializable`` and
-    the turn is never persisted, the response is never delivered, and the
-    UI hangs on "Running query". Decimal → float (JSON number); date/datetime →
-    ISO-8601 string.
+    asyncpg returns ``Decimal`` for numeric columns. Decimal → float (JSON number);
+    date/datetime → ISO-8601 string.
     """
     if isinstance(obj, Decimal):
         return float(obj)
@@ -138,20 +130,9 @@ def _build_message_envelope(
 ) -> str:
     """Build a JSON envelope containing answer text plus metadata.
 
-    The envelope is stored as the assistant ConversationalMessage text.
-    On read, the parser detects it (object with "text" key) and splits
-    content from metadata.
-
-    ``result_metadata`` is expected to come pre-serialized (camelCase keys,
-    no None values) from QueryResult.model_dump(). This function applies
-    deterministic UTF-8 size guards to trace details and graph context without
-    mutating the caller's metadata.
-
-    CPU cost is bounded: every caller-supplied collection is capped up front and
-    each size-driven reduction binary-searches its keep count, so the number of
-    envelope serializations is logarithmic in the input size, not linear. Callers
-    on an event loop MUST still run this in an executor (see
-    :meth:`SessionManager.append_turn`) because the work is synchronous.
+    The envelope is stored as the assistant ConversationalMessage text. The work
+    is synchronous, so callers on an event loop must run this in an executor (see
+    :meth:`SessionManager.append_turn`).
     """
     envelope: dict = {"text": answer}
     if result_metadata:
@@ -205,12 +186,7 @@ def _build_message_envelope(
 def _cap_persisted_collections(envelope: dict) -> None:
     """Bound caller-supplied list sizes before any size-driven compaction runs.
 
-    Result rows and trace steps arrive unbounded from the caller's perspective,
-    and each compaction iteration costs a full envelope serialization. Capping the
-    input keeps the later searches cheap; the retained prefix is the same one
-    compaction would have kept anyway. Graph context is capped in
-    :func:`_normalize_graph_context`, where the statement budget is shared across
-    exactly the entities that survive the cap.
+    Graph context is capped in :func:`_normalize_graph_context`.
     """
     for key, limit in (
         ("resultRows", _MAX_PERSISTED_RESULT_ROWS),
@@ -711,20 +687,6 @@ def _fit_answer(envelope: dict, answer: str) -> str:
     return _serialize_envelope(envelope)
 
 
-def _normalize_restored_graph_context(metadata: dict) -> None:
-    """Normalize legacy top-level entity arrays and re-bound restored statements.
-
-    The documented statement bounds are a property of the CONTRACT, not only of the
-    write path: a record persisted before the bounds existed can still carry a
-    12,000-character statement, and returning it unbounded pushes an arbitrarily
-    large value at the client. Statements are therefore re-bounded on read with the
-    same helpers the write path uses, preserving each slot's canonical or legacy
-    key so old-record compatibility is unchanged.
-    """
-    if "graphContext" in metadata:
-        _normalize_graph_context(metadata)
-
-
 def _looks_like_assistant_envelope(raw_text: str) -> bool:
     """Return whether ``raw_text`` starts like an envelope emitted by this module.
 
@@ -783,7 +745,9 @@ def _parse_assistant_content(raw_text: str) -> tuple[str, dict | None]:
         )
         return _UNRESTORABLE_ASSISTANT_TEXT, None
 
-    _normalize_restored_graph_context(obj)
+    # Restored records are re-bounded on read with the write-path helpers.
+    if "graphContext" in obj:
+        _normalize_graph_context(obj)
     return text, (obj or None)
 
 
@@ -791,12 +755,7 @@ class SessionManager:
     """Manages conversation sessions backed by AgentCore Memory."""
 
     def __init__(self, memory_id: str, region: str | None = None):
-        """Wire up the AgentCore Memory session manager.
-
-        Args:
-            memory_id: AgentCore Memory resource id backing conversation storage.
-            region: AWS region for the Memory client; uses the default when None.
-        """
+        """Wire up the AgentCore Memory session manager."""
         self._manager = MemorySessionManager(
             memory_id=memory_id,
             region_name=region,
@@ -811,17 +770,11 @@ class SessionManager:
     def _memory_actor(user_id: str, namespace_id: str) -> str:
         """Compose the AgentCore Memory actor id, scoped by namespace.
 
-        Conversation turns are stored in AgentCore Memory keyed by
-        (actor_id, session_id). Keying the actor on ``user_id`` alone lets a
-        session id reused across namespaces (same user) share one history —
-        cross-namespace context leakage. Qualifying the actor with the namespace
-        isolates history per (user, namespace) so the same session id in a
-        different namespace resolves to a distinct, empty history.
-
-        The Memory API constrains actor_id to ``[a-zA-Z0-9][a-zA-Z0-9-_/]*`` —
-        ``/`` is permitted (``#`` is not), so we join with ``/``. An empty
-        ``namespace_id`` returns the bare ``user_id`` unchanged, preserving the
-        prior key for any caller that cannot supply a namespace.
+        Qualifying the actor with the namespace isolates history per
+        (user, namespace), so a session id reused across namespaces does not share
+        one history. The Memory API constrains actor_id to
+        ``[a-zA-Z0-9][a-zA-Z0-9-_/]*`` (``#`` is not allowed), so we join with
+        ``/``. An empty ``namespace_id`` returns the bare ``user_id``.
         """
         return f"{user_id}/{namespace_id}" if namespace_id else user_id
 
@@ -888,21 +841,9 @@ class SessionManager:
     ) -> tuple[list[dict], int, bool]:
         """Retrieve a page of session history (newest-first pagination).
 
-        Loads history up to max_turns, then slices to return the requested page.
-        Messages are ordered oldest-first in the returned list so the client
-        can prepend them naturally.
-
-        For initial restore, use a small max_turns (25) for fast response.
-        For deep scroll-back, callers can pass a larger max_turns (500).
-
-        Args:
-            user_id: Identifier of the user whose history is being read.
-            session_id: Conversation session to page through.
-            limit: Number of messages per page.
-            offset: How many messages from the end to skip (0 = most recent).
-            max_turns: Upper bound on turns to fetch from AgentCore Memory.
-            namespace_id: Namespace scoping the memory actor; isolates history
-                per (user, namespace).
+        Messages are ordered oldest-first in the returned list so the client can
+        prepend them. ``offset`` is how many messages from the end to skip
+        (0 = most recent).
 
         Returns:
             Tuple of (messages_page, total_count, has_more).
@@ -978,15 +919,11 @@ class SessionManager:
     ) -> None:
         """Store a conversation turn (user query + assistant response).
 
-        Stores plain text first (guaranteed to work), then optionally
-        attempts to store with JSON envelope for rich history.
-
         Envelope construction is CPU-bound synchronous work over caller-sized
         collections, so it runs on :data:`_EXECUTOR` rather than inline in this
         coroutine — inline it would block the whole event loop (every other
         in-flight request included), not just one worker.
         """
-        # Build the text to store. Try envelope, fall back to plain text.
         loop = asyncio.get_running_loop()
         assistant_text = answer_summary
         if result_metadata:
@@ -1018,5 +955,4 @@ class SessionManager:
             ConversationalMessage(assistant_text, MessageRole.ASSISTANT),
         ]
 
-        # Store the turn. No metadata param; keep it simple and reliable.
         await loop.run_in_executor(_EXECUTOR, lambda: session.add_turns(messages))

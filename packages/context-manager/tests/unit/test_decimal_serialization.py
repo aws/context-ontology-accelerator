@@ -3,11 +3,7 @@
 
 """Regression tests: numeric/Decimal query results must serialize.
 
-A query returning a Decimal (e.g. SUM over a numeric/DECIMAL column) previously
-hung the UI: the SSE ``done`` event and the session-history envelope both
-serialize result rows via stdlib json, which raises
-``TypeError: Object of type Decimal is not JSON serializable``. See serve bug
-"Serve: query with Decimal/numeric result hangs UI".
+The SSE ``done`` event and the session-history envelope serialize rows via stdlib json, which rejects Decimal.
 """
 
 from __future__ import annotations

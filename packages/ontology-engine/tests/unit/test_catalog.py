@@ -45,7 +45,6 @@ def test_ontology_update_partial():
     u = OntologyUpdate(description="Updated")
     dump = u.model_dump(exclude_unset=True)
     assert dump == {"description": "Updated"}
-    assert "title" not in dump
 
 
 def test_ontology_response_id_is_str():
@@ -66,7 +65,7 @@ def test_ontology_response_id_is_str():
         property_count=None,
         axiom_count=None,
     )
-    assert isinstance(r.ontology_id, str)
+    assert r.ontology_id == "https://schema.org/"
 
 
 def test_embedding_create():
@@ -79,7 +78,7 @@ def test_embedding_create():
         vector=[0.1, 0.2, 0.3],
         dimensions=3,
     )
-    assert isinstance(e.ontology_id, str)
+    assert e.ontology_id == "https://schema.org/"
 
 
 def test_embedding_query_defaults():

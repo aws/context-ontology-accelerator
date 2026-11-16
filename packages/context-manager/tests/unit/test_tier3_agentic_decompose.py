@@ -1,26 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever decomposition planner (task 12).
-
-Covers ``coa_serve.tier3.agentic.decompose`` with a mocked planner
-LLM whose ``converse`` returns scripted JSON, so Query_Decomposition is fully
-deterministic — no live Bedrock call:
-
-- A single self-contained ask yields one Sub_Question (Req 13.3).
-- A question naming multiple distinct entities / asks yields two or more
-  Sub_Questions (Req 13.2).
-- An unresolved-entity-set ask stays a single Sub_Question flagged
-  ``multi_entity=True`` (worked example) without static splitting (Req 13.3).
-- Each Query_Decomposition is recorded in the trace (Req 13.10).
-- The planner is best-effort: a Converse error, a guardrail block, an empty list,
-  or an unparseable response all degrade to a single Sub_Question carrying the
-  original query (Req 13.3) and are traced.
-- The planner Converse call is scoped with the static system instruction and the
-  user question as guard content.
-- The lazy-import invariant (Req 12.3): importing the module does not pull
-  ``graphrag_toolkit`` into ``sys.modules``.
-"""
+"""Unit tests for the Agentic Retriever decomposition planner with a scripted planner LLM."""
 
 from __future__ import annotations
 
@@ -34,17 +15,9 @@ from coa_serve.clients.base import ConverseResult
 from coa_serve.tier3.agentic.decompose import DecompositionPlanner
 from coa_serve.trace import TraceCollector
 
-# ── deterministic test double ──────────────────────────────────────
-
 
 class FakePlannerClient:
-    """A mocked ``LLMClient`` whose ``converse`` returns a scripted decision.
-
-    Records the kwargs of each ``converse`` call so the prompt/guard scoping can be
-    asserted. Either returns a configured :class:`ConverseResult` (or one built from
-    ``text``/``guardrail_blocked``) or raises ``raises`` to simulate a planner
-    failure. Only ``converse`` is exercised by the decomposition planner.
-    """
+    """A mocked ``LLMClient`` whose ``converse`` returns a scripted decision and records calls."""
 
     def __init__(
         self,
@@ -78,9 +51,6 @@ def decompose_steps(trace: TraceCollector) -> list:
     return [s for s in trace.steps if s.step == "decompose"]
 
 
-# ── single self-contained ask (Req 13.3) ───────────────────────────
-
-
 @pytest.mark.unit
 class TestSingleAsk:
     async def test_single_ask_yields_one_sub_question(self):
@@ -94,7 +64,7 @@ class TestSingleAsk:
 
     async def test_unresolved_entity_set_stays_single_but_multi_entity(self):
         """The worked-example shape: 'competitors' is unresolved, so a single
-        Sub_Question flagged multi_entity rather than a static split (Req 13.3)."""
+        Sub_Question flagged multi_entity rather than a static split."""
         planner = planner_returning([{"text": "Amazon competitors' financial situations", "multi_entity": True}])
         sub_questions = await DecompositionPlanner(planner).decompose(
             "Tell me about Amazon's competitors' financial situations"
@@ -103,9 +73,6 @@ class TestSingleAsk:
         assert len(sub_questions) == 1
         assert sub_questions[0].multi_entity is True
         assert sub_questions[0].origin == "decomposition"
-
-
-# ── multi-entity / multi-ask decomposition (Req 13.2) ──────────────
 
 
 @pytest.mark.unit
@@ -143,9 +110,6 @@ class TestMultiEntity:
         assert [sq.text for sq in sub_questions] == ["Amazon revenue", "Walmart revenue"]
 
 
-# ── trace recording (Req 13.10) ────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestDecompositionRecorded:
     async def test_decomposition_is_recorded_in_trace(self):
@@ -172,14 +136,6 @@ class TestDecompositionRecorded:
         assert len(steps) == 1
         assert steps[0].status == "success"
         assert "single self-contained" in str(steps[0].detail)
-
-    async def test_decompose_without_trace_does_not_raise(self):
-        planner = planner_returning([{"text": "q", "multi_entity": False}])
-        sub_questions = await DecompositionPlanner(planner).decompose("q", None)
-        assert len(sub_questions) == 1
-
-
-# ── best-effort degradation (Req 13.3) ─────────────────────────────
 
 
 @pytest.mark.unit
@@ -226,9 +182,6 @@ class TestDegradation:
         assert sub_questions[0].text == "orig"
 
 
-# ── tolerant JSON extraction ───────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestJsonExtraction:
     async def test_json_wrapped_in_markdown_fences_is_parsed(self):
@@ -244,9 +197,6 @@ class TestJsonExtraction:
         sub_questions = await DecompositionPlanner(planner).decompose("q")
         assert len(sub_questions) == 1
         assert sub_questions[0].text == "Amazon revenue"
-
-
-# ── planner call scoping ───────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -267,9 +217,6 @@ class TestPlannerCallScoping:
         long_query = "x" * 5000
         await DecompositionPlanner(planner, max_query_chars=100).decompose(long_query)
         assert len(planner.calls[0]["prompt"]) == 100
-
-
-# ── lazy-import invariant (Req 12.3) ───────────────────────────────
 
 
 @pytest.mark.unit

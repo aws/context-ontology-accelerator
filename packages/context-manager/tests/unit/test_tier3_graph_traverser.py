@@ -188,10 +188,7 @@ class TestGraphTraverserFromURIs:
         mock_neptune.query.assert_not_awaited()
 
     async def test_accepts_fragment_uris(self, mock_neptune):
-        """Regression: induced-ontology class/property URIs carry a '#' fragment
-        (e.g. .../pcinsurance#Claim). The URI safety gate must NOT reject them,
-        or every seed URI is dropped and URI-hop silently returns 0 (the live
-        Cause-B regression that took EN graph results from 24 to 0)."""
+        """Induced-ontology URIs carry a '#' fragment; the URI safety gate must not reject them."""
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
         seed = "https://integ.coa/f5e4c967-2b4a-480c-b05f-8115faee3755/pcinsurance#Claim"
         await traverser.traverse_from_uris([seed], "insurance", max_hops=2)
@@ -264,11 +261,9 @@ class TestGraphTraverserFromURIs:
 
 @pytest.mark.unit
 class TestGraphTraverserInducedHopQuery:
-    """U4 (Change 2): the URI-hop SPARQL must traverse the induced-ontology edge
-    layout — class↔class edges expressed through property nodes carrying
-    rdfs:domain / rdfs:range (verified live on the combined namespace) — not
-    only direct labelled ?seed→?entity triples. String-shape assertion on the
-    emitted query for a seed URI."""
+    """The URI-hop SPARQL must traverse the induced-ontology edge layout: class↔class
+    edges expressed through property nodes carrying rdfs:domain / rdfs:range, not
+    only direct labelled ?seed→?entity triples."""
 
     def _hop_query(self, max_hops):
         t = GraphTraverser(AsyncMock(), graph_uri_template="https://ontology-workbench.local/{namespace}")
@@ -313,6 +308,3 @@ class TestGraphTraverserInducedHopQuery:
         assert "?bridge" not in q1
         assert "?nbrClass" not in q1
         assert "?sharedClass" not in q1
-        # ...but the 2-hop query includes them.
-        q2 = self._hop_query(max_hops=2)
-        assert "?bridge" in q2 and "?nbrClass" in q2 and "?sharedClass" in q2

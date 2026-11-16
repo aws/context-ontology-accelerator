@@ -88,9 +88,6 @@ def _table(**table_biz) -> Table:
     )
 
 
-# ── Namespace language in the enrichment run ──────────────────────────
-
-
 class TestRunUsesNamespaceLanguage:
     # Pass 2 (relationship inference) has its own prompt; only Pass 1 is under test.
     @patch("coa_sources.database.enrichment.relationship_inferrer.infer_relationships", return_value=[])
@@ -119,9 +116,6 @@ class TestRunUsesNamespaceLanguage:
         user_prompt = "".join(seg.text for seg in calls[0].args[1])
         assert "Output language" not in user_prompt
         assert "model_no (string)  -- Model number, e.g. FR-A840" in user_prompt
-
-
-# ── Enrichment adds markers ───────────────────────────────────────────
 
 
 class TestEnrichmentMarksGeneratedFields:
@@ -181,9 +175,6 @@ class TestEnrichmentMarksGeneratedFields:
         assert table.business_metadata.generated_fields == ["description"]
 
 
-# ── Steward edits clear markers ───────────────────────────────────────
-
-
 class TestStewardEditClearsMarkers:
     def test_edited_field_loses_marker_others_keep_theirs(self) -> None:
         biz = BusinessMetadata(
@@ -206,9 +197,6 @@ class TestStewardEditClearsMarkers:
         biz = BusinessMetadata(synonyms=["注文"], generated_fields=["synonyms"])
         assert _apply_business_overrides(biz, {"synonyms": ["注文"]}) is False
         assert biz.generated_fields == ["synonyms"]
-
-
-# ── Re-scan keeps only unchanged values' markers ──────────────────────
 
 
 class TestRescanMarkers:
@@ -266,9 +254,6 @@ class TestRescanMarkers:
         )
         merged = merge_rescan_table(self._accepted(), fresh, changed_column_names=set())
         assert merged.columns[1].business_metadata.generated_fields == []
-
-
-# ── Persistence ───────────────────────────────────────────────────────
 
 
 class TestPersistence:

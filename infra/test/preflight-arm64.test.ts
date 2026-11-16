@@ -9,7 +9,7 @@ import * as path from "path";
 /**
  * The vkg, serve and mcp stacks build linux/arm64 image assets. On an x86_64
  * host with no arm64 emulation the deploy fails ~20 minutes in with
- * `exec format error`; preflight-deploy.sh §3b catches that up front. Run its
+ * `exec format error`; preflight-deploy.sh's arm64 check catches that up front. Run its
  * bash detection functions against fixture input.
  */
 

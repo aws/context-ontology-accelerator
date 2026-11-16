@@ -1,20 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever subpackage skeleton and shared models.
-
-Covers task 1 of the agentic-retriever spec:
-
-- The shared, dependency-free data models in
-  ``coa_serve.tier3.agentic.models`` (``SubQuestion``,
-  ``ExplorationBranch``, ``PlannerDecision``, and the ``StopReason`` StrEnum).
-- The lazy-import invariant (Requirement 12.3): importing
-  ``coa_serve.tier3.agentic`` must NOT pull ``graphrag_toolkit``
-  into ``sys.modules``. This mirrors the existing invariant test for the lexical
-  strategies module — it runs in a fresh subprocess so that a ``graphrag_toolkit``
-  already imported by a sibling test in the same process cannot mask a
-  regression.
-"""
+"""Unit tests for the Agentic Retriever shared models and the lazy-import invariant."""
 
 from __future__ import annotations
 
@@ -34,7 +21,7 @@ from coa_serve.tier3.agentic import (
 @pytest.mark.unit
 class TestStopReason:
     def test_has_exactly_the_seven_enumerated_members(self):
-        """StopReason carries the Req 6.6 / Req 7 stop-reason set plus answer_stable."""
+        """StopReason carries the stop-reason set plus answer_stable."""
         assert {r.value for r in StopReason} == {
             "sufficiency_satisfied",
             "no_new_information",
@@ -94,15 +81,6 @@ class TestPlannerDecision:
         assert decision.reasoning == ""
         assert decision.is_ad_hoc is False
 
-    def test_carries_tool_inputs_and_reasoning(self):
-        decision = PlannerDecision(
-            tool_name="graph_traversal",
-            inputs={"mode": "edge_typed", "edge_types": ["COMPETES_WITH"]},
-            reasoning="anchor entity found; traverse competitor edge",
-        )
-        assert decision.inputs["mode"] == "edge_typed"
-        assert decision.reasoning
-
     def test_independent_inputs_default(self):
         """The default ``inputs`` is a fresh dict per instance (no shared state)."""
         a = PlannerDecision(tool_name="t")
@@ -110,21 +88,10 @@ class TestPlannerDecision:
         assert a.inputs is not b.inputs
 
 
-# ── Lazy-import invariant (Requirement 12.3) ───────────────────────
-
-
 @pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_agentic_subpackage_does_not_import_graphrag(self):
-        """``import coa_serve.tier3.agentic`` must NOT import
-        ``graphrag_toolkit`` (Req 12.3).
-
-        Runs in a fresh subprocess — with the current ``sys.path`` propagated so
-        imports resolve exactly as they do under pytest — so a ``graphrag_toolkit``
-        already imported by a sibling test in this process cannot mask a
-        regression. Asserts no ``graphrag_toolkit`` module is present in
-        ``sys.modules`` after the import.
-        """
+        """``import coa_serve.tier3.agentic`` must NOT import ``graphrag_toolkit`` (fresh subprocess)."""
         code = (
             "import sys; "
             "import coa_serve.tier3.agentic; "

@@ -6,7 +6,7 @@
  * (route: /namespaces/:namespaceId/ontology/induced/class).
  *
  * Uses the same ``useOntologyOverview`` hook and client-side filters to scope
- * relationships and attributes to one class. No new backend needed.
+ * relationships and attributes to one class.
  */
 import { useMemo } from "react";
 import { useParams, useSearchParams } from "react-router-dom";

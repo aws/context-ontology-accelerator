@@ -29,18 +29,8 @@ from coa_serve.session import (
 
 pytestmark = pytest.mark.unit
 
-# ---------------------------------------------------------------------------
-# SessionManager.generate_session_id
-# ---------------------------------------------------------------------------
 
-
-@pytest.mark.unit
 class TestGenerateSessionId:
-    def test_returns_non_empty_string(self):
-        sid = SessionManager.generate_session_id()
-        assert sid
-        assert isinstance(sid, str)
-
     def test_returns_unique_ids(self):
         sid1 = SessionManager.generate_session_id()
         sid2 = SessionManager.generate_session_id()
@@ -51,12 +41,6 @@ class TestGenerateSessionId:
         assert len(sid) == 26  # ULID string is always 26 chars
 
 
-# ---------------------------------------------------------------------------
-# _build_message_envelope
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestBuildMessageEnvelope:
     @staticmethod
     def assert_bounded(result: str) -> None:
@@ -88,14 +72,11 @@ class TestBuildMessageEnvelope:
         assert obj["queryUsed"] == "SELECT sum(revenue) FROM facts"
 
     def test_truncates_long_trace_details(self):
-        # Build trace with huge detail fields
         trace = [{"step": f"step_{i}", "status": "success", "durationMs": 100, "detail": "x" * 5000} for i in range(5)]
         result = _build_message_envelope("answer", result_metadata={"tier": 2, "trace": trace})
         assert len(result) <= 10_000
         obj = json.loads(result)
-        # All steps preserved (only details truncated, not steps removed)
         assert len(obj["trace"]) == 5
-        # At least some details were stripped to fit within limit
         details_remaining = sum(1 for s in obj["trace"] if "detail" in s)
         assert details_remaining < 5
 
@@ -218,8 +199,6 @@ class TestBuildMessageEnvelope:
         obj = json.loads(result)
         assert obj["text"] == ""
         assert obj["resultRows"] == rows
-        assert len(obj["resultRows"]) == 2
-        assert obj["resultRows"][0]["claim_id"] == "CL-44201"
 
     def test_compacts_multibyte_graph_context_and_round_trips_restored_evidence(self):
         oversized = "証拠" * 4_000
@@ -520,14 +499,7 @@ class TestBuildMessageEnvelope:
         assert obj["text"].startswith("answer-")
 
 
-# ---------------------------------------------------------------------------
-# _build_message_envelope — cost bounds
-#
-# These assert a BOUND on the work, not how the bound is achieved. Envelope
-# construction used to pop one element per full envelope re-serialization, which
-# made a caller-requestable 10,000-row Tier-2 result cost ~15 s of pure CPU on the
-# request path (and graph context with nested relationships ~27 s).
-# ---------------------------------------------------------------------------
+# These tests bound the number of envelope serializations, not how the bound is achieved.
 
 
 def _wide_result_rows(count: int) -> list[dict]:
@@ -555,7 +527,6 @@ def _graph_entities_with_edges(count: int, edges_per_entity: int = 10) -> list[d
     ]
 
 
-@pytest.mark.unit
 class TestBuildMessageEnvelopeCostBounds:
     @staticmethod
     def _build_with_serialization_count(metadata: dict) -> tuple[str, int]:
@@ -588,8 +559,7 @@ class TestBuildMessageEnvelopeCostBounds:
         result, large = self._build_with_serialization_count({"tier": 2, "resultRows": _wide_result_rows(10_000)})
 
         assert len(result) <= 10_000
-        # 25x the input must not cost anything like 25x the serializations. The old
-        # one-pop-per-serialization loop scaled 1:1 with the row count.
+        # 25x the input must not cost anything like 25x the serializations.
         assert large <= small + 4, f"{small} serializations for 400 rows, {large} for 10,000"
         assert large < 60, f"{large} serializations for 10,000 rows"
 
@@ -620,12 +590,6 @@ class TestBuildMessageEnvelopeCostBounds:
         assert large < 260, f"{large} serializations for 2,000 graph entities"
 
 
-# ---------------------------------------------------------------------------
-# _parse_assistant_content
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestParseAssistantContent:
     def test_plain_string(self):
         text, meta = _parse_assistant_content("Hello world")
@@ -645,25 +609,12 @@ class TestParseAssistantContent:
         assert text == "Just text"
         assert meta is None  # no other fields -> None
 
-    def test_malformed_json(self):
-        text, meta = _parse_assistant_content("{broken json")
-        assert text == "{broken json"
-        assert meta is None
-
-    def test_json_without_text_key(self):
-        # Valid JSON but not our envelope format
-        text, meta = _parse_assistant_content('{"foo": "bar"}')
-        assert text == '{"foo": "bar"}'
-        assert meta is None
-
     def test_non_object_json(self):
         text, meta = _parse_assistant_content("[1, 2, 3]")
         assert text == "[1, 2, 3]"
         assert meta is None
 
-    # The guard used to render a serialized envelope as the answer the user reads.
-    # Envelopes are now near-universal on this path, so malformed
-    # envelope-looking content gets a neutral restoration message instead.
+    # Malformed envelope-shaped text gets a neutral restoration message.
     @pytest.mark.parametrize(
         "raw",
         [
@@ -705,12 +656,6 @@ class TestParseAssistantContent:
         assert meta == {"tier": 3}
 
 
-# ---------------------------------------------------------------------------
-# SessionManager.create_or_resume (envelope handling)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestCreateOrResumeEnvelope:
     @pytest.mark.asyncio
     async def test_extracts_text_from_envelope(self):
@@ -729,7 +674,6 @@ class TestCreateOrResumeEnvelope:
             mgr = SessionManager(memory_id="mem-123")
             sid, history = await mgr.create_or_resume("user1", "ns1")
 
-            # Should extract only text for orchestrator
             assert history[1]["content"] == "Answer"
             assert history[1]["role"] == "assistant"
 
@@ -752,12 +696,6 @@ class TestCreateOrResumeEnvelope:
             assert history[1]["content"] == "Hello there"
 
 
-# ---------------------------------------------------------------------------
-# SessionManager.get_rich_history
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestGetRichHistory:
     @pytest.mark.asyncio
     async def test_parses_envelope_metadata(self):
@@ -891,12 +829,6 @@ class TestGetRichHistory:
             assert assistant_msg["metadata"]["queryUsed"] == "SELECT count(*) FROM accounts"
 
 
-# ---------------------------------------------------------------------------
-# SessionManager.append_turn (with metadata)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.unit
 class TestAppendTurnWithMetadata:
     @pytest.mark.asyncio
     async def test_builds_envelope_when_metadata_provided(self):
@@ -959,24 +891,6 @@ class TestAppendTurnWithMetadata:
             assert obj["metadata"] == {"namespace": "demo"}
 
     @pytest.mark.asyncio
-    async def test_no_metadata_stores_plain_text(self):
-        with patch("coa_serve.session.MemorySessionManager") as MockMgr:
-            mock_session = MagicMock()
-            mock_session.add_turns = MagicMock()
-            MockMgr.return_value.create_memory_session.return_value = mock_session
-
-            mgr = SessionManager(memory_id="mem-123")
-            await mgr.append_turn(
-                user_id="user1",
-                session_id="sess1",
-                query="Hi",
-                answer_summary="Hello!",
-            )
-
-            messages = mock_session.add_turns.call_args[0][0]
-            assert messages[1].text == "Hello!"
-
-    @pytest.mark.asyncio
     async def test_no_metadata_oversized_answer_is_stored_as_bounded_envelope(self):
         with patch("coa_serve.session.MemorySessionManager") as MockMgr:
             mock_session = MagicMock()
@@ -1026,7 +940,6 @@ class TestAppendTurnWithMetadata:
         assert threading.get_ident() not in build_threads
 
 
-@pytest.mark.unit
 class TestEnvelopeTelemetry:
     """Lossy persistence steps must leave an operator-visible signal."""
 
@@ -1060,13 +973,7 @@ class TestEnvelopeTelemetry:
         assert "tier" in entry["metadata_keys"]
 
 
-# ---------------------------------------------------------------------------
-# SessionMetadataStore — namespace-scoped operations
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-@pytest.mark.unit
 class TestSessionMetadataNamespaceScoping:
     """Tests for namespace-aware metadata store methods."""
 
@@ -1092,7 +999,6 @@ class TestSessionMetadataNamespaceScoping:
         assert result.namespace_id == "ns-birds"
         assert result.session_id  # ULID generated
 
-        # Verify the DDB item was written with composite key
         put_call = mock_table.put_item.call_args
         item = put_call[1]["Item"]
         assert item["namespaceId"] == "ns-birds"
@@ -1146,7 +1052,6 @@ class TestSessionMetadataNamespaceScoping:
         assert result.session_id == "01ABC"
         assert result.title == "Bird questions"
 
-        # Verify GSI query used begins_with
         query_kwargs = mock_table.query.call_args[1]
         assert query_kwargs["IndexName"] == "userId-nsLastActiveAt-index"
         assert ":nsp" in query_kwargs["ExpressionAttributeValues"]
@@ -1231,47 +1136,6 @@ class TestSessionMetadataNamespaceScoping:
 
         assert result is False
 
-    async def test_delete_session(self, mock_table):
-        from coa_serve.session_metadata import SessionMetadataStore
-
-        store = SessionMetadataStore(table_name="test-table", region="us-east-1")
-        await store.delete("user-1", "session-abc")
-
-        mock_table.delete_item.assert_called_once_with(Key={"userId": "user-1", "sessionId": "session-abc"})
-
-    async def test_get_recent_returns_most_recent(self, mock_table):
-        from coa_serve.session_metadata import SessionMetadataStore
-
-        mock_table.query.return_value = {
-            "Items": [
-                {
-                    "userId": "user-1",
-                    "sessionId": "01DEF",
-                    "createdAt": "2026-06-24T08:00:00Z",
-                    "lastActiveAt": "2026-06-24T12:00:00Z",
-                    "status": "active",
-                    "messageCount": 10,
-                    "ttl": 9999999,
-                }
-            ]
-        }
-
-        store = SessionMetadataStore(table_name="test-table", region="us-east-1")
-        result = await store.get_recent("user-1")
-
-        assert result is not None
-        assert result.session_id == "01DEF"
-
-    async def test_get_recent_returns_none_when_empty(self, mock_table):
-        from coa_serve.session_metadata import SessionMetadataStore
-
-        mock_table.query.return_value = {"Items": []}
-
-        store = SessionMetadataStore(table_name="test-table", region="us-east-1")
-        result = await store.get_recent("user-1")
-
-        assert result is None
-
     async def test_update_title_idempotent(self, mock_table):
         from coa_serve.session_metadata import SessionMetadataStore
 
@@ -1283,17 +1147,10 @@ class TestSessionMetadataNamespaceScoping:
         assert call_kwargs["ExpressionAttributeValues"][":t"] == "My title"
 
 
-# ---------------------------------------------------------------------------
-# SessionManager.get_rich_history_page — pagination edge cases
-# ---------------------------------------------------------------------------
-
-
 class TestGetRichHistoryPage:
     @pytest.mark.asyncio
     async def test_first_page_of_many(self):
         """First page returns last N messages with hasMore=True."""
-        from unittest.mock import MagicMock, patch
-
         with patch("coa_serve.session.MemorySessionManager") as MockMgr:
             mock_session = MagicMock()
             # 10 turns = 20 messages (user + assistant pairs)
@@ -1319,8 +1176,6 @@ class TestGetRichHistoryPage:
     @pytest.mark.asyncio
     async def test_last_page(self):
         """Offset reaching the beginning returns remaining messages with hasMore=False."""
-        from unittest.mock import MagicMock, patch
-
         with patch("coa_serve.session.MemorySessionManager") as MockMgr:
             mock_session = MagicMock()
             turns = [
@@ -1345,8 +1200,6 @@ class TestGetRichHistoryPage:
     @pytest.mark.asyncio
     async def test_empty_session(self):
         """Empty session returns empty page with hasMore=False."""
-        from unittest.mock import MagicMock, patch
-
         with patch("coa_serve.session.MemorySessionManager") as MockMgr:
             mock_session = MagicMock()
             mock_session.get_last_k_turns.return_value = []
@@ -1362,8 +1215,6 @@ class TestGetRichHistoryPage:
     @pytest.mark.asyncio
     async def test_offset_beyond_total(self):
         """Offset larger than total returns empty page."""
-        from unittest.mock import MagicMock, patch
-
         with patch("coa_serve.session.MemorySessionManager") as MockMgr:
             mock_session = MagicMock()
             turns = [

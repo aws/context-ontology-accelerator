@@ -1,7 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { ConstraintPanel } from "./ConstraintPanel";
@@ -87,7 +86,7 @@ describe("ConstraintPanel — Export SHACL", () => {
   it("offers a SHACL info affordance that explains what constraints are on open", () => {
     renderPanel();
     // The circled-i trigger is present and labelled; its explanation is hidden
-    // until opened (info-button UX, follow-up).
+    // until opened.
     const trigger = screen.getByLabelText("About SHACL constraints");
     expect(trigger).toBeInTheDocument();
     expect(

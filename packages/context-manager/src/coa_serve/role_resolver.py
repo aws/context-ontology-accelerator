@@ -8,8 +8,7 @@ ResourceRoleMappings PrincipalIndex GSI for User:: and Group:: keys,
 returning globalRoles, resourceRoles, and the merged table/column restrictions
 for a specific namespace.
 
-Used by the invoke() entrypoint to populate
-the profile before orchestration. Keeps resolution logic in one place.
+Used by the invoke() entrypoint to populate the profile before orchestration.
 """
 
 from __future__ import annotations
@@ -22,11 +21,7 @@ import structlog
 from coa_common import build_principal_keys, resolve_region, sync_boto_config
 from coa_common.dao import DynamoDBDAO, QueryParams
 
-# Re-export for callers that historically imported this from coa_serve. The
-# canonical location is ``coa_common.principal_keys``; keeping the alias here
-# avoids churn in packages that already ``from coa_serve.role_resolver import
-# build_principal_keys``.
-__all__ = ["ResolvedProfile", "build_principal_keys", "resolve_profile"]
+__all__ = ["ResolvedProfile", "resolve_profile"]
 
 logger = structlog.get_logger(__name__)
 
@@ -84,8 +79,8 @@ def resolve_profile(
     grants were written against the user's email address (e.g. by namespace
     creation or manual bootstrap) while the JWT sub is a Cognito UUID.
 
-    For the target namespace, merges tableAllowlist (union) and columnDenylist
-    (intersection — a column is denied only if ALL matching grants deny it).
+    For the target namespace, merges tableAllowlist and columnDenylist deny-wins
+    (see :func:`_restrictive_merge`).
 
     If no namespace is provided, only roles are resolved (no table/column merge).
     If RRM_TABLE_NAME is not configured, returns a minimal profile with just userId/groups.
@@ -103,7 +98,7 @@ def resolve_profile(
 
     # Authorization is on the synchronous serve invoke() request path. Opt into
     # the fail-fast profile instead of inheriting the DAO's background
-    # 30-second/three-attempt default (matches the Cedar policy loader's #1092 fix).
+    # 30-second/three-attempt default (matches the Cedar policy loader).
     dao = DynamoDBDAO(_RRM_TABLE, region=_AWS_REGION, config=sync_boto_config())
 
     principal_keys = build_principal_keys(user_id=user_id, email=email, groups=groups)
@@ -116,11 +111,7 @@ def resolve_profile(
     # no restrictions at all, so the SQL firewall stops enforcing them — a PII
     # denylist silently disabled by a pagination boundary.
     #
-    # A failure here must NOT degrade to a partial read for the same reason: the
-    # restrictions computed from a subset are more permissive than the truth. Fail
-    # the resolution instead and let the caller reject the request, matching the
-    # control-plane authorizer's fail-closed posture (it re-raises in the
-    # equivalent spot).
+    # A failure here must not degrade to a partial read (see Raises above).
     all_items: list[dict[str, Any]] = []
     for pk in principal_keys:
         try:
@@ -197,16 +188,9 @@ def _restrictive_merge(grants: list[dict[str, Any]]) -> _Restrictions:
       removing every constraint. Access is unrestricted only when NO grant
       declares a list.
 
-    Why not the other way round. Permissions compose additively (Cedar does that,
-    correctly — holding two roles grants the union of their actions), but
-    restrictions are constraints and compose restrictively. Applying permission
-    semantics to constraints is what let one unrestricted grant on a namespace
-    erase a PII denylist attached to another: adding ``namespace-owner`` to an
-    analyst silently stopped their ``columnDenylist`` from being enforced. Every
-    mature system draws this line the same way — an explicit Deny beats any Allow
-    in IAM, ``forbid`` beats ``permit`` in Cedar, and ``default.cedar`` in this repo
-    already states that its ACTIVE-only invariant is "not a role-overridable
-    default" even for platform-admin.
+    Restrictions are constraints, so they compose restrictively (unlike Cedar
+    permissions): one unrestricted grant must not erase a PII denylist attached
+    to another.
 
     Union (not intersection) for the allowlists is deliberate: intersecting a grant
     allowing ``[a]`` with one allowing ``[b]`` would deny both, when the principal

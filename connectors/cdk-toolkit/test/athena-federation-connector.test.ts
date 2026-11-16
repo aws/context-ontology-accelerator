@@ -6,6 +6,7 @@ import * as path from "path";
 import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import {
   AthenaFederationConnector,
   AthenaFederationConnectorProps,
@@ -172,7 +173,8 @@ describe("connector-specific settings", () => {
 describe("spill bucket", () => {
   it("always creates one, for connector-to-connector isolation", () => {
     const template = synth();
-    template.resourceCountIs("AWS::S3::Bucket", 1);
+    // The spill bucket and its server-access-log target.
+    template.resourceCountIs("AWS::S3::Bucket", 2);
     template.hasResourceProperties("AWS::S3::Bucket", {
       BucketEncryption: Match.objectLike({
         ServerSideEncryptionConfiguration: Match.anyValue(),
@@ -287,6 +289,7 @@ describe("spill bucket", () => {
     // Legitimate for a source that cannot exceed 6 MB, and it fails on the first response
     // that would have spilled — so what matters is that nothing half-configured is left
     // behind: no bucket, no grant, and no spill_bucket pointing at nothing.
+    // Not even a log bucket: with no spill bucket there is nothing to log.
     const template = synth({ spill: Provisioning.NONE });
     template.resourceCountIs("AWS::S3::Bucket", 0);
     template.resourceCountIs("AWS::S3::BucketPolicy", 0);
@@ -296,6 +299,155 @@ describe("spill bucket", () => {
       .find((vars) => vars?.spill_prefix !== undefined);
     expect(variables?.spill_bucket).toBeUndefined();
     expect(variables?.disable_spill_encryption).toBe("false");
+  });
+
+  it("logs server access to a dedicated bucket, under a per-connector prefix", () => {
+    const template = synth();
+    const buckets = template.findResources("AWS::S3::Bucket");
+    const [logBucketId] = Object.keys(buckets).filter((id) => id.includes("SpillAccessLogsBucket"));
+    expect(logBucketId).toBeDefined();
+    template.hasResourceProperties("AWS::S3::Bucket", {
+      LifecycleConfiguration: {
+        Rules: Match.arrayWith([Match.objectLike({ Id: "expire-spill" })]),
+      },
+      LoggingConfiguration: {
+        DestinationBucketName: { Ref: logBucketId },
+        LogFilePrefix: "spill/example/",
+      },
+    });
+  });
+
+  it("hardens the log bucket and does not let it log to itself", () => {
+    const template = synth();
+    const [logBucket] = Object.entries(template.findResources("AWS::S3::Bucket"))
+      .filter(([id]) => id.includes("SpillAccessLogsBucket"))
+      .map(([, resource]) => resource.Properties);
+    expect(logBucket.PublicAccessBlockConfiguration).toEqual({
+      BlockPublicAcls: true,
+      BlockPublicPolicy: true,
+      IgnorePublicAcls: true,
+      RestrictPublicBuckets: true,
+    });
+    // Server access log delivery does not support SSE-KMS targets.
+    expect(
+      logBucket.BucketEncryption.ServerSideEncryptionConfiguration[0].ServerSideEncryptionByDefault
+        .SSEAlgorithm,
+    ).toBe("AES256");
+    expect(logBucket.LifecycleConfiguration.Rules).toEqual(
+      expect.arrayContaining([expect.objectContaining({ ExpirationInDays: 90 })]),
+    );
+    expect(logBucket.LoggingConfiguration).toBeUndefined();
+    // ACLs stay disabled, whatever the app's feature flags: delivery is granted by bucket policy.
+    expect(logBucket.AccessControl).toBeUndefined();
+  });
+
+  it("attaches TLS-only and a source-scoped delivery grant to the log bucket's own policy", () => {
+    const template = synth();
+    const ids = Object.keys(template.findResources("AWS::S3::Bucket"));
+    const logBucketId = ids.find((id) => id.includes("SpillAccessLogsBucket"));
+    const spillBucketId = ids.find((id) => id.includes("SpillBucket") && id !== logBucketId);
+    expect(logBucketId).toBeDefined();
+    expect(spillBucketId).toBeDefined();
+    template.hasResourceProperties("AWS::S3::BucketPolicy", {
+      Bucket: { Ref: logBucketId },
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Effect: "Deny",
+            Principal: { AWS: "*" },
+            Action: "s3:*",
+            Condition: { Bool: { "aws:SecureTransport": "false" } },
+          }),
+          Match.objectLike({
+            Effect: "Allow",
+            Principal: { Service: "logging.s3.amazonaws.com" },
+            Action: "s3:PutObject",
+            // Only under this connector's prefix...
+            Resource: {
+              "Fn::Join": ["", [{ "Fn::GetAtt": [logBucketId, "Arn"] }, "/spill/example/*"]],
+            },
+            // ...and only for logs about this connector's spill bucket, in this account.
+            Condition: {
+              ArnLike: { "aws:SourceArn": { "Fn::GetAtt": [spillBucketId, "Arn"] } },
+              StringEquals: { "aws:SourceAccount": "123456789012" },
+            },
+          }),
+        ]),
+      },
+    });
+  });
+
+  it("retains the log bucket with the spill bucket", () => {
+    const template = synth({ spillRemovalPolicy: cdk.RemovalPolicy.RETAIN });
+    const logBuckets = Object.entries(template.findResources("AWS::S3::Bucket")).filter(([id]) =>
+      id.includes("SpillAccessLogsBucket"),
+    );
+    expect(logBuckets).toHaveLength(1);
+    expect(logBuckets[0][1].DeletionPolicy).toBe("Retain");
+    expect(JSON.stringify(template.toJSON())).not.toContain("Custom::S3AutoDeleteObjects");
+  });
+
+  /** A connector logging to a bucket its stack defines, outside the connector's own subtree. */
+  function synthWithSharedLogs(context: Record<string, unknown> = {}) {
+    const app = new cdk.App({ context });
+    const stack = new cdk.Stack(app, "TestStack", {
+      env: { account: "123456789012", region: "eu-central-1" },
+    });
+    const shared = new s3.Bucket(stack, "SharedLogs");
+    const connector = new AthenaFederationConnector(stack, "Connector", {
+      connectorId: "example",
+      handler: "dev.coa.example.ExampleCompositeHandler",
+      jarPath: FAKE_JAR,
+      accessLogsBucket: shared,
+    });
+    return { stack, shared, connector, template: Template.fromStack(stack) };
+  }
+
+  it("logs to a caller-supplied bucket instead of creating one", () => {
+    const { stack, shared, connector, template } = synthWithSharedLogs();
+    expect(connector.accessLogsBucket).toBe(shared);
+    template.resourceCountIs("AWS::S3::Bucket", 2);
+    template.hasResourceProperties("AWS::S3::Bucket", {
+      LoggingConfiguration: {
+        DestinationBucketName: stack.resolve(shared.bucketName),
+        LogFilePrefix: "spill/example/",
+      },
+    });
+  });
+
+  // The construct's flag covers its own subtree only, so a supplied bucket is granted however the
+  // caller's app says. Both outcomes are pinned so a change to that contract fails here.
+  it("grants a supplied bucket delivery by legacy ACL when the app leaves the flag off", () => {
+    const { stack, shared, template } = synthWithSharedLogs();
+    template.hasResourceProperties("AWS::S3::Bucket", {
+      AccessControl: "LogDeliveryWrite",
+    });
+    const policies = Object.values(template.findResources("AWS::S3::BucketPolicy")).filter(
+      (policy) =>
+        JSON.stringify(policy.Properties?.Bucket) === JSON.stringify(stack.resolve(shared.bucketName)),
+    );
+    expect(JSON.stringify(policies)).not.toContain("logging.s3.amazonaws.com");
+  });
+
+  it("grants a supplied bucket delivery by bucket policy when the app enables the flag", () => {
+    const { stack, shared, template } = synthWithSharedLogs({
+      "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,
+    });
+    const sharedProps = Object.entries(template.findResources("AWS::S3::Bucket")).find(
+      ([id]) => id.startsWith("SharedLogs"),
+    )?.[1].Properties;
+    expect(sharedProps?.AccessControl).toBeUndefined();
+    template.hasResourceProperties("AWS::S3::BucketPolicy", {
+      Bucket: stack.resolve(shared.bucketName),
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Principal: { Service: "logging.s3.amazonaws.com" },
+            Action: "s3:PutObject",
+          }),
+        ]),
+      },
+    });
   });
 
   it("still lets the serve role invoke the connector under Provisioning.NONE", () => {

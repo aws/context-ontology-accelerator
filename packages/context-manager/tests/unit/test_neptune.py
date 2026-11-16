@@ -253,7 +253,7 @@ class TestNeptuneDataEndpointClient:
     async def test_a_read_with_a_keyword_outside_data_passes_only_when_the_guard_is_off(self):
         from coa_serve.clients.neptune import SPARQLValidationError
 
-        # MCM-2: a keyword inside a literal is blanked even with the guard on, so this witness uses a keyword-named
+        # A keyword inside a literal is blanked even with the guard on, so this witness uses a keyword-named
         # variable, which the guard refuses; only the opt-out lets this legitimate read through.
         sparql = "SELECT ?load WHERE { ?s <http://ex.org/p> ?load } LIMIT 10"
         with pytest.raises(SPARQLValidationError):

@@ -522,7 +522,7 @@ class TestQueryTool:
 class TestTranslateSparqlTool:
     @pytest.mark.asyncio
     async def test_returns_serialized_sparql(self, monkeypatch, _local_dev):
-        async def fake_delegate(cm, text, ns, profile, token):
+        async def fake_delegate(cm, text, ns, profile, token, **kwargs):
             return {"sparqlQuery": "SELECT ?x", "confidence": {"score": 0.9}}
 
         monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_delegate)
@@ -745,7 +745,7 @@ class TestSchemaBlindOutputSuppression:
     async def test_translate_sparql_withheld_without_view_ontology(self, monkeypatch):
         self._stub_auth(monkeypatch, can_view_ontology=False)
 
-        async def fake_delegate(cm, text, ns, profile, token):
+        async def fake_delegate(cm, text, ns, profile, token, **kwargs):
             return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
 
         monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_delegate)
@@ -758,7 +758,7 @@ class TestSchemaBlindOutputSuppression:
     async def test_translate_sparql_returned_with_view_ontology(self, monkeypatch):
         self._stub_auth(monkeypatch, can_view_ontology=True)
 
-        async def fake_delegate(cm, text, ns, profile, token):
+        async def fake_delegate(cm, text, ns, profile, token, **kwargs):
             return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
 
         monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_delegate)
@@ -808,7 +808,7 @@ class TestSchemaBlindOutputSuppression:
         probed: list[dict] = []
         monkeypatch.setattr(server, "_caller_can_view_ontology", lambda profile: probed.append(profile) or False)
 
-        async def fake_sparql(cm, text, ns, profile, token):
+        async def fake_sparql(cm, text, ns, profile, token, **kwargs):
             return {"sparqlQuery": "SELECT ?x WHERE { ?x a :Customer }", "confidence": {"score": 0.9}}
 
         async def fake_traverse(cm, start_uri, ns, profile, token, **kwargs):
@@ -821,3 +821,185 @@ class TestSchemaBlindOutputSuppression:
         assert sparql["sparqlQuery"] == "SELECT ?x WHERE { ?x a :Customer }"
         assert graph["entities"][0]["label"] == "Acme Corp" and graph["relationships"] == [{"p": 1}]
         assert probed == []
+
+
+# ── Context Manager runtime session affinity ──────────────────────────
+
+
+def _session_ctx(headers: dict[str, str]) -> _FakeCtx:
+    """Fake context carrying the given inbound request headers."""
+    ctx = _FakeCtx(None)
+    ctx.request_context = _FakeRequestContext(_FakeRequest(headers))
+    return ctx
+
+
+@pytest.mark.unit
+class TestCmRuntimeSessionId:
+    """Execution tools pin each MCP session to one Context Manager runtime session."""
+
+    @pytest.fixture
+    def captured(self, monkeypatch, _local_dev) -> list[str | None]:
+        seen: list[str | None] = []
+
+        async def fake_query(cm, query_text, ns, profile, token, **kwargs):
+            seen.append(kwargs.get("runtime_session_id"))
+            return {"result": {"tier": 1}}
+
+        async def fake_sparql(cm, text, ns, profile, token, **kwargs):
+            seen.append(kwargs.get("runtime_session_id"))
+            return {"sparqlQuery": "", "confidence": {}}
+
+        async def fake_rag(cm, text, ns, profile, token, **kwargs):
+            seen.append(kwargs.get("runtime_session_id"))
+            return {"chunks": []}
+
+        async def fake_traverse(cm, start_uri, ns, profile, token, **kwargs):
+            seen.append(kwargs.get("runtime_session_id"))
+            return {"entities": [], "relationships": [], "trace": []}
+
+        monkeypatch.setattr(server.execution, "execute_query", fake_query)
+        monkeypatch.setattr(server.execution, "execute_translate_sparql", fake_sparql)
+        monkeypatch.setattr(server.execution, "execute_rag_retrieval", fake_rag)
+        monkeypatch.setattr(server.execution, "execute_graph_traversal", fake_traverse)
+        return seen
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_stable_within_mcp_session(self, captured):
+        ctx = _session_ctx({"mcp-session-id": "mcp-session-aaaa"})
+        await server.query(ctx, "revenue?", "sales")
+        await server.query(ctx, "orders?", "sales")
+        await server.translate_sparql(ctx, "revenue?", "sales")
+        await server.rag_retrieval(ctx, "revenue?", "sales")
+        await server.graph_traversal(ctx, "urn:c:1", "sales")
+
+        assert len(set(captured)) == 1
+        session_id = captured[0]
+        assert session_id is not None and len(session_id) >= 33
+        # The MCP session id is hashed, not forwarded verbatim.
+        assert "mcp-session-aaaa" not in session_id
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_differs_across_mcp_sessions(self, captured):
+        await server.query(_session_ctx({"mcp-session-id": "mcp-session-aaaa"}), "q", "sales")
+        await server.query(_session_ctx({"mcp-session-id": "mcp-session-bbbb"}), "q", "sales")
+        assert captured[0] != captured[1]
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_same_mcp_session_ignores_namespace(self, captured):
+        ctx = _session_ctx({"mcp-session-id": "mcp-session-aaaa"})
+        await server.query(ctx, "q", "sales")
+        await server.query(ctx, "q", "hr")
+        assert captured[0] == captured[1]
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_reads_agentcore_runtime_header(self, captured):
+        await server.query(_session_ctx({"x-amzn-bedrock-agentcore-runtime-session-id": "rt-1"}), "q", "sales")
+        await server.query(_session_ctx({"mcp-session-id": "rt-1"}), "q", "sales")
+        assert captured[0] == captured[1]
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_without_mcp_session_falls_back_per_namespace(self, captured):
+        await server.query(None, "q", "sales")
+        await server.query(_session_ctx({}), "q", "sales")
+        await server.query(None, "q", "hr")
+        assert captured[0] is not None
+        assert captured[0] == captured[1]
+        assert captured[0] != captured[2]
+
+    @pytest.mark.asyncio
+    async def test_cm_runtime_session_id_caller_scope_ignores_mcp_session(self, monkeypatch, captured):
+        monkeypatch.setattr(server.config, "cm_session_scope", "caller")
+        await server.query(_session_ctx({"mcp-session-id": "mcp-session-aaaa"}), "q", "sales")
+        await server.query(_session_ctx({"mcp-session-id": "mcp-session-bbbb"}), "q", "sales")
+        assert captured[0] == captured[1]
+
+    def test_cm_runtime_session_id_never_shared_across_users(self):
+        ctx = _session_ctx({"mcp-session-id": "mcp-session-aaaa"})
+
+        def caller(user_id: str) -> server.CallerIdentity:
+            return server.CallerIdentity(user_id=user_id, agent_id=None, namespaces=[], roles=[], raw_claims={})
+
+        assert server._cm_runtime_session_id(ctx, caller("alice"), "sales") != server._cm_runtime_session_id(
+            ctx, caller("bob"), "sales"
+        )
+
+    def test_mcp_session_id_unreadable_context_returns_none(self):
+        assert server._mcp_session_id(_BadCtx()) is None
+        assert server._mcp_session_id(None) is None
+
+
+# ── CM transport failures surface through the tool error mapping ──────
+
+
+@pytest.mark.unit
+class TestCmTransportErrorsMapped:
+    """Client-side CM failures reach the caller as ``CM <code>: ...``, not a raw exception."""
+
+    @pytest.fixture
+    def cm_client(self, monkeypatch, _local_dev):
+        from unittest.mock import AsyncMock
+
+        from coa_mcp.clients import context_manager
+
+        monkeypatch.setattr(context_manager.asyncio, "sleep", AsyncMock())
+        client = context_manager.ContextManagerClient(
+            runtime_arn="arn:aws:bedrock-agentcore:us-east-1:123:runtime/cm-abc", region="us-east-1"
+        )
+        monkeypatch.setattr(server, "_get_cm_client", lambda: client)
+        return client
+
+    @staticmethod
+    def _patch_sse(monkeypatch, *, status_code: int = 200, body: bytes = b"", exc: Exception | None = None):
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock
+
+        @asynccontextmanager
+        async def fake_aconnect_sse(*args, **kwargs):
+            if exc is not None:
+                raise exc
+            event_source = MagicMock()
+            event_source.response.status_code = status_code
+            event_source.response.aread = AsyncMock(return_value=body)
+            yield event_source
+
+        monkeypatch.setattr("coa_mcp.clients.context_manager.aconnect_sse", fake_aconnect_sse)
+
+    @pytest.mark.asyncio
+    async def test_query_cm_http_error_maps_to_status_code(self, monkeypatch, cm_client):
+        self._patch_sse(monkeypatch, status_code=403, body=b"Forbidden")
+        with pytest.raises(ValueError, match=r"^CM 403: Context Manager returned 403: Forbidden"):
+            await server.query(None, "q", "sales")
+
+    @pytest.mark.asyncio
+    async def test_query_cm_timeout_maps_to_504(self, monkeypatch, cm_client):
+        import httpx
+
+        self._patch_sse(monkeypatch, exc=httpx.ReadTimeout("slow"))
+        with pytest.raises(ValueError, match=r"^CM 504: Context Manager request timed out"):
+            await server.query(None, "q", "sales")
+
+    @pytest.mark.asyncio
+    async def test_query_cm_transport_error_maps_to_502(self, monkeypatch, cm_client):
+        import httpx
+
+        self._patch_sse(monkeypatch, exc=httpx.ConnectError("no route"))
+        with pytest.raises(ValueError, match=r"^CM 502: HTTP error invoking Context Manager"):
+            await server.query(None, "q", "sales")
+
+    @pytest.mark.asyncio
+    async def test_query_cm_session_conflict_exhausted_maps_to_409(self, monkeypatch, cm_client):
+        self._patch_sse(monkeypatch, status_code=409, body=b'{"message":"Session operation in progress, please retry"}')
+        with pytest.raises(ValueError, match=r"^CM 409: Context Manager returned 409"):
+            await server.query(None, "q", "sales")
+
+    @pytest.mark.asyncio
+    async def test_other_execution_tools_map_cm_transport_errors(self, monkeypatch, cm_client):
+        import httpx
+
+        self._patch_sse(monkeypatch, exc=httpx.ReadTimeout("slow"))
+        with pytest.raises(ValueError, match=r"^CM 504: "):
+            await server.translate_sparql(None, "q", "sales")
+        with pytest.raises(ValueError, match=r"^CM 504: "):
+            await server.rag_retrieval(None, "q", "sales")
+        with pytest.raises(ValueError, match=r"^CM 504: "):
+            await server.graph_traversal(None, "urn:c:1", "sales")

@@ -19,7 +19,7 @@ carries the toolkit's opaque document id (``ChunkResult.source_doc``); the plann
 may pass that as ``doc_id`` and, when a resolver is wired (the graph tool's
 ``__Source__`` lookup), the tool resolves it to the key first.
 
-Namespace scoping (Req 1.5). A key is read ONLY when it falls under the bucket and
+Namespace scoping. A key is read ONLY when it falls under the bucket and
 one of the ``s3Prefixes`` of a DOCUMENTS source registered to the REQUEST
 namespace (looked up through the shared :class:`SourcesRegistry`). Anything else —
 a key outside every registered prefix, a bucket that is not a registered source
@@ -36,11 +36,11 @@ Only plain-text originals are read (see :data:`_TEXT_EXTENSIONS`): a PDF or offi
 document would need the ingest pipeline's preprocessing, which is not reproduced
 here, so it is refused with a clear detail instead of returning binary noise.
 
-Per-Tool failure tolerance (Req 9.1-9.2): ``invoke`` never raises for an expected
+Per-Tool failure tolerance: ``invoke`` never raises for an expected
 failure; refusals and S3 errors yield an empty :class:`ToolResult` whose ``detail``
 names the reason.
 
-Import discipline (Requirement 12.3): module load imports only the stdlib, the
+Import discipline: module load imports only the stdlib, the
 dependency-free ``.base`` contract, the ``ChunkResult`` data class and
 ``structlog``; ``boto3`` is imported lazily on first read.
 """
@@ -421,7 +421,7 @@ class ReadDocumentTool:
 
         Args:
             namespace: The originating request namespace; the read is authorized
-                against ITS registered DOCUMENTS sources only (Req 1.5).
+                against ITS registered DOCUMENTS sources only.
             source_key: The document's original S3 key (optionally ``s3://bucket/key``).
             doc_id: The toolkit document id, resolved to a key when no
                 ``source_key`` is given.
@@ -466,7 +466,7 @@ class ReadDocumentTool:
 
         try:
             sources = await self._registry.document_sources(namespace)
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning(
                 "read_document_sources_error",
                 namespace=namespace,
@@ -495,7 +495,7 @@ class ReadDocumentTool:
 
         try:
             text, truncated = await self._load(bucket, key)
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning(
                 "read_document_s3_error",
                 namespace=namespace,
@@ -518,7 +518,7 @@ class ReadDocumentTool:
             return ""
         try:
             return await self._resolve_key(namespace, doc_id) or ""
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning(
                 "read_document_doc_id_lookup_failed",
                 namespace=namespace,

@@ -10,7 +10,7 @@ here. Engine-agnostic — it works on the parsed query, not on transport — so 
 ``SPARQLValidator``, which checks correctness (syntax, URI existence,
 determinism), not safety.
 
-Rules (LLD §2.2.3):
+Rules:
 
 * **F1 read-only form** — the query must parse under the SPARQL *query* grammar as
   SELECT, ASK, CONSTRUCT or DESCRIBE. Every update form (INSERT, DELETE, DROP,
@@ -49,7 +49,7 @@ parse tree, and on the query text itself (a ``SERVICE`` keyword anywhere; a
 
 Cross-tenant isolation is NOT this module's job: it rests on each source having its
 own endpoint (one client per source). F2 confines a query within that endpoint.
-Class/predicate-level authorization is deferred (LLD §6).
+Class/predicate-level authorization is not done here.
 """
 
 from __future__ import annotations
@@ -398,7 +398,7 @@ def _is_the_graph(term: Any, named_graph: str) -> bool:
 
 
 class SPARQLFirewall:
-    """Applies F1–F5 to a generated SPARQL query and returns the text to execute."""
+    """Applies F1–F7 to a generated SPARQL query and returns the text to execute."""
 
     def __init__(self, *, default_max_results: int = DEFAULT_MAX_RESULTS):
         """Configure the result cap used when the caller asks for none."""

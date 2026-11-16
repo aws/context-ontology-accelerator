@@ -227,11 +227,8 @@ export function parseTurtleEntities(turtle: string): ParsedTurtle {
     "owl:ObjectProperty": 1,
     "owl:DatatypeProperty": 2,
   };
-  // Sort by kind (Classes → object properties → datatype properties), then
-  // alphabetically by name (case-insensitive) within each kind. The proposal
-  // entities panel and graph derive their ordering from this list, so this
-  // makes classes/properties read in a predictable lexicographic order instead
-  // of the inducer's raw emit order.
+  // Classes → object properties → datatype properties, then alphabetical; other
+  // panels depend on this order.
   entities.sort(
     (a, b) =>
       (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9) ||

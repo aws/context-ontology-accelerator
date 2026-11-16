@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Partial-load failure surfacing in the Explorer (#822).
+ * Partial-load failure surfacing in the Explorer.
  *
- * The Explorer renders a `partial` taxonomy vertex immediately (label +
- * description) and then fetches the full class to replace it. When that fetch
- * fails, the detail panel used to keep showing the truncated partial vertex with
- * no marker — the user read an incomplete class as complete. These tests drive
- * that path for real (rejecting `getClass`) and assert the warning + Retry
- * affordance appear, and that a successful Retry clears the warning.
+ * The Explorer renders a `partial` taxonomy vertex immediately and then fetches
+ * the full class. When that fetch fails, the detail panel shows a warning +
+ * Retry affordance, and a successful Retry clears the warning. These tests
+ * drive that path with a rejecting `getClass`.
  */
-import { render, waitFor, cleanup, within } from "@testing-library/react";
+import { render, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -86,9 +84,9 @@ vi.mock("@components/ontology/PendingReviewBanner", () => ({
 }));
 
 // Stub the graph but keep the onNodeSelect seam: clicking this button invokes
-// the page's real `handleNodeSelect`, which is the code path #822 is about (the
-// List-row path has always surfaced its errors via setError, so it would not
-// exercise the bug).
+// the page's real `handleNodeSelect` (graph node select runs its hydration;
+// the List-row path surfaces errors via setError, so it would not exercise
+// this).
 vi.mock("../../components/graph/OntologyGraphFlow", () => ({
   OntologyGraphFlow: ({
     onNodeSelect,
@@ -161,11 +159,6 @@ function renderPage() {
   return within(result.container);
 }
 
-/**
- * Open the detail panel for the Claim class from the List view. The List row is
- * the reliable seam: the graph is stubbed out, so clicking a node isn't
- * available, and the row click drives the same hydration path.
- */
 async function selectClaimNodeInGraph(view: ReturnType<typeof renderPage>) {
   const user = userEvent.setup();
   // Switch to the Graph view, then click the stubbed node so the page runs
@@ -175,9 +168,8 @@ async function selectClaimNodeInGraph(view: ReturnType<typeof renderPage>) {
   return user;
 }
 
-describe("Explorer — partial-load failure surfacing (#822)", () => {
+describe("Explorer — partial-load failure surfacing", () => {
   beforeEach(() => {
-    cleanup();
     vi.clearAllMocks();
     searchEntitiesPaged.mockResolvedValue(CLASS_PAGE);
     getOntologyOverview.mockResolvedValue(OVERVIEW);
@@ -219,9 +211,9 @@ describe("Explorer — partial-load failure surfacing (#822)", () => {
   });
 
   it("a slow success for a deselected node must not wipe the selected node's warning", async () => {
-    // Regression for the race noahpaig flagged on !744: an unguarded
-    // setHydrationFailedUri(null) in the .then() let A's late success clear B's
-    // legitimate warning, showing B's partial vertex as if it were complete.
+    // An unguarded setHydrationFailedUri(null) in the .then() would let A's late
+    // success clear B's legitimate warning, showing B's partial vertex as if it
+    // were complete.
     //   1. select A (Claim)  -> getClass hangs
     //   2. select B (Policy) -> getClass rejects fast, marker = B
     //   3. A resolves        -> must NOT clear B's marker

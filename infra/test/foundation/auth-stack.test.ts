@@ -13,9 +13,6 @@ const TEST_CONTEXT = {
   env: DEFAULT_ENV,
 };
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — Cognito mode (default)
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (Cognito)", () => {
   let template: Template;
 
@@ -90,9 +87,6 @@ describe("IdpAuthenticationStack (Cognito)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — OIDC mode
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (OIDC)", () => {
   let template: Template;
 
@@ -149,9 +143,6 @@ describe("IdpAuthenticationStack (OIDC)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — OIDC with jwksUri
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (OIDC with jwksUri)", () => {
   test("stores jwksUri in SSM when provided", () => {
     const app = new cdk.App({ context: TEST_CONTEXT });
@@ -190,9 +181,6 @@ describe("IdpAuthenticationStack (OIDC with jwksUri)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — OIDC missing settings
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (OIDC missing settings)", () => {
   test("throws when oidcSettings not provided", () => {
     const app = new cdk.App({ context: TEST_CONTEXT });
@@ -227,9 +215,6 @@ describe("IdpAuthenticationStack (OIDC missing settings)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — Callback / Logout URL validation
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (URL validation)", () => {
   test("throws when callbackUrls contains non-HTTPS URL", () => {
     const app = new cdk.App({
@@ -268,9 +253,6 @@ describe("IdpAuthenticationStack (URL validation)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — Cognito federation (SAML provider)
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (SAML federation)", () => {
   let template: Template;
 
@@ -404,9 +386,6 @@ describe("IdpAuthenticationStack (SAML + OIDC federation)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — Auth flows by environment
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (auth flows)", () => {
   test("enables USER_PASSWORD_AUTH in dev environment", () => {
     const app = new cdk.App({ context: { ...TEST_CONTEXT, env: "dev" } });
@@ -436,9 +415,6 @@ describe("IdpAuthenticationStack (auth flows)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — Custom refresh token validity
-// ═══════════════════════════════════════════════════════════════════
 describe("IdpAuthenticationStack (custom refresh token)", () => {
   test("uses custom refresh token validity", () => {
     const app = new cdk.App({ context: TEST_CONTEXT });
@@ -455,10 +431,7 @@ describe("IdpAuthenticationStack (custom refresh token)", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// IdpAuthenticationStack — hosted-UI domain prefix published for the CSP
-// ═══════════════════════════════════════════════════════════════════
-describe("IdpAuthenticationStack (hosted-UI domain prefix, issue #130)", () => {
+describe("IdpAuthenticationStack (hosted-UI domain prefix)", () => {
   test("publishes the hosted-UI domain prefix to SSM", () => {
     // The web stack's Content-Security-Policy needs this origin or the browser
     // blocks the OAuth token exchange and every sign-in fails. Published rather

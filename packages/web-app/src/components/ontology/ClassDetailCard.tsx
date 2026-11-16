@@ -14,7 +14,6 @@ import {
 import { useMemo } from "react";
 import {
   HAS_KEY_LIST_PRED,
-  OWL_CLASS,
   OWL_DATATYPE_PROPERTY,
   OWL_OBJECT_PROPERTY,
   RDF_TYPE,
@@ -27,7 +26,6 @@ import {
   SCL_SOURCE_SCHEMA,
   SCL_SUBCLASS_PROVENANCE,
   SCL_SUGGESTED_SUBCLASS_OF,
-  SCL_SUGGESTION_REASON,
   literalText,
   localName,
   parseTriples,
@@ -36,17 +34,11 @@ import { SuggestionPanel } from "./SuggestionPanel";
 import { useAppI18n } from "../../i18n/LocaleProvider";
 
 type ParsedOntology = {
-  classes: Set<string>;
   labels: Record<string, string>;
   parents: Record<string, string[]>;
   childrenOf: Record<string, string[]>;
-  // Phase-2 single-child PK-sharing emissions: the child has a
-  // suggestedSubClassOf annotation pointing at the parent. The card
-  // surfaces these so the steward can confirm or reject without
-  // hunting through the Turtle.
+  // Child classes carrying a suggestedSubClassOf annotation to the parent.
   suggestedParents: Record<string, string[]>;
-  suggestedChildrenOf: Record<string, string[]>;
-  suggestionReason: Record<string, string>;
   objectProps: {
     iri: string;
     domain: string;
@@ -58,8 +50,7 @@ type ParsedOntology = {
     domain: string;
     range: string;
   }[];
-  // Per-class COA annotations the inducer emits via _annotate_triples_map
-  // and the new MR-B / Phase-2 fkProvenance + subClassProvenance hooks.
+  // Per-class COA annotations emitted by the inducer.
   datasourceId: Record<string, string>;
   sourceSchema: Record<string, string>;
   subClassProvenance: Record<string, string>;
@@ -69,13 +60,10 @@ type ParsedOntology = {
 
 function parseOntology(turtle: string): ParsedOntology {
   const { triples } = parseTriples(turtle);
-  const classes = new Set<string>();
   const labels: Record<string, string> = {};
   const parents: Record<string, string[]> = {};
   const childrenOf: Record<string, string[]> = {};
   const suggestedParents: Record<string, string[]> = {};
-  const suggestedChildrenOf: Record<string, string[]> = {};
-  const suggestionReason: Record<string, string> = {};
   const propType: Record<string, "object" | "datatype"> = {};
   const propDomain: Record<string, string> = {};
   const propRange: Record<string, string> = {};
@@ -86,27 +74,16 @@ function parseOntology(turtle: string): ParsedOntology {
   const pkColumns: Record<string, string[]> = {};
 
   for (const { s, p, o } of triples) {
-    if (p === RDF_TYPE && o === OWL_CLASS) classes.add(s);
-    else if (p === RDF_TYPE && o === OWL_OBJECT_PROPERTY)
-      propType[s] = "object";
+    if (p === RDF_TYPE && o === OWL_OBJECT_PROPERTY) propType[s] = "object";
     else if (p === RDF_TYPE && o === OWL_DATATYPE_PROPERTY)
       propType[s] = "datatype";
     else if (p === RDFS_SUBCLASS_OF) {
-      classes.add(s);
-      classes.add(o);
       parents[s] = parents[s] ? [...parents[s], o] : [o];
       childrenOf[o] = childrenOf[o] ? [...childrenOf[o], s] : [s];
     } else if (p === SCL_SUGGESTED_SUBCLASS_OF) {
-      classes.add(s);
-      classes.add(o);
       suggestedParents[s] = suggestedParents[s]
         ? [...suggestedParents[s], o]
         : [o];
-      suggestedChildrenOf[o] = suggestedChildrenOf[o]
-        ? [...suggestedChildrenOf[o], s]
-        : [s];
-    } else if (p === SCL_SUGGESTION_REASON && o.startsWith('"')) {
-      suggestionReason[s] = literalText(o);
     } else if (p === RDFS_DOMAIN) propDomain[s] = o;
     else if (p === RDFS_RANGE) propRange[s] = o;
     else if (p === RDFS_LABEL && o.startsWith('"')) labels[s] = literalText(o);
@@ -142,13 +119,10 @@ function parseOntology(turtle: string): ParsedOntology {
   }
 
   return {
-    classes,
     labels,
     parents,
     childrenOf,
     suggestedParents,
-    suggestedChildrenOf,
-    suggestionReason,
     objectProps,
     datatypeProps,
     datasourceId,
@@ -198,11 +172,8 @@ type Props = {
   iri: string;
   turtle: string;
   onSelectClass: (iri: string) => void;
-  // Pass-through for the SuggestionPanel — when the user confirms /
-  // rejects a suggestion, we hand the rewritten Turtle back to the
-  // proposal page so its dirty-state + Save flow can persist it.
-  // Suggestions are skipped (and the panel doesn't render) when this
-  // is omitted (e.g. read-only contexts).
+  // Receives the rewritten Turtle when a suggestion is confirmed or rejected.
+  // The suggestion panel is hidden when omitted (e.g. read-only contexts).
   onTurtleEdit?: (turtle: string) => void;
   /** When provided, renders a close (✕) button in the card header. */
   onClose?: () => void;

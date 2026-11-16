@@ -1,46 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reasoning controller: drives one Sub_Question's Reasoning_Loop (Req 4, 5, 6).
+"""Reasoning controller: drives one Sub_Question's Reasoning_Loop.
 
-:class:`ReasoningController` owns the per-Sub_Question / per-Exploration_Branch
-loop that sits at the heart of the Agentic Retriever. One iteration of the loop is
-a single Reasoning_Step (Req 4.1): it consumes a step from the shared
-:class:`~coa_serve.tier3.agentic.budget.BudgetClock`, asks the planner
-for the next Tool + inputs, validates those inputs against the Tool's declared
-input contract, invokes the Tool under the per-Tool timeout, incorporates the
-result into the shared accumulated context, opens Exploration_Branches when a
-result surfaces multiple directions, and runs the boolean Sufficiency_Check
-(Req 4.2-4.3, 6.1-6.3).
+:class:`ReasoningController` runs the loop for one Sub_Question or
+Exploration_Branch: each Reasoning_Step consumes a step from the shared
+:class:`~coa_serve.tier3.agentic.budget.BudgetClock`, asks the planner for
+candidate decisions, selects by the hard preference ordering, validates inputs,
+invokes the Tool under its timeout, and incorporates the result. The budgets and
+the Sub_Question queue belong to the session, so the caps hold for the whole request.
 
-The controller does NOT own the session: the wall-clock Time_Budget, the
-aggregate step cap, and the fan-out cap all live on the single
-:class:`BudgetClock` the session shares across every Sub_Question and
-Exploration_Branch, and the queue of Sub_Questions is owned by the session too.
-The controller merely draws from those shared budgets and appends branches to the
-shared queue, which is what makes the caps aggregate for the whole request
-(Req 13.7-13.9). The terminal session stop reason and the final synthesis are the
-session's job (tasks 13-14); :meth:`ReasoningController.run_one_loop` returns the
-per-Sub_Question outcome so the session can derive the session-level stop.
-
-Tool preference (Req 5.1-5.3, 5.6). The planner proposes one or more candidate
-decisions; the controller enforces the hard preference ordering **itself**,
-deterministically, regardless of the order the planner returned them: a
-Retrieval_Strategy_Tool is preferred over a Query_Template, which is preferred over
-an Ad_Hoc_Query (strategy wins ties — Req 5.6). An Ad_Hoc_Query is therefore only
-ever selected when it is the sole candidate (Req 5.3); when one is used the
-controller records that no strategy tool / template fit (Req 5.4) and handles an
-ad-hoc execution failure distinctly (Req 5.7).
-
-Ontology-constrained traversal (Req 3.4, 3.9). When a selected decision traverses
-edge types and the ontology has already been resolved for the request, the
-controller filters the requested edge types down to the ontology's edge-type set,
-excluding any absent ones, before the Tool is invoked.
-
-Import discipline (Requirement 12.3): this module imports only the dependency-free
-sibling models / context and ``structlog``; it never imports ``graphrag_toolkit``
-nor any tool implementation (the registry and Tools are passed in at call time and
-used structurally), so importing it never pulls the toolkit into ``sys.modules``.
+Import discipline: this module never imports ``graphrag_toolkit`` nor any tool
+implementation (Tools are passed in and used structurally).
 """
 
 from __future__ import annotations
@@ -86,7 +57,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 # The hard preference ordering the controller enforces over the planner's
-# candidates (Req 5.1-5.3, 5.6). Lower rank = more preferred. A strategy tool
+# candidates. Lower rank = more preferred. A strategy tool
 # beats a Query_Template, which beats an Ad_Hoc_Query; an ad-hoc query is selected
 # only when it is the sole candidate. The sort is stable, so ties within a rank
 # preserve the planner's own ordering.
@@ -249,15 +220,14 @@ TOOL_PREFERENCE_INSTRUCTION = (
 class StepPlanner(Protocol):
     """The reasoning planner the controller consults each Reasoning_Step.
 
-    A separate Bedrock Converse concern from final synthesis (task 12 builds the
-    concrete LLM planner); the controller depends only on this narrow Protocol so
+    A separate Bedrock Converse concern from final synthesis; the controller depends only on this narrow Protocol so
     unit tests can drive the loop with a scripted, deterministic fake.
 
     ``propose_steps`` returns the candidate next-step decisions for the current
-    accumulated context (Req 4.3); the controller selects among them by the hard
-    preference ordering (Req 5). Returning an empty list signals that no Tool can
-    be selected (Req 4.7). ``check_sufficiency`` returns the explicit boolean
-    Sufficiency_Check decision after a step (Req 6.1-6.2).
+    accumulated context; the controller selects among them by the hard
+    preference ordering. Returning an empty list signals that no Tool can
+    be selected. ``check_sufficiency`` returns the explicit boolean
+    Sufficiency_Check decision after a step.
     """
 
     async def propose_steps(
@@ -303,7 +273,6 @@ def _schema_base_type(type_hint: str) -> type | tuple[type, ...] | None:
     if hint.startswith("bool"):
         return bool
     if hint.startswith("int"):
-        # bool is a subclass of int; exclude it so an int field rejects a bool.
         return int
     if hint.startswith("float"):
         return (int, float)
@@ -315,22 +284,15 @@ def _schema_base_type(type_hint: str) -> type | tuple[type, ...] | None:
 
 
 def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> list[str]:
-    """Return the ways ``inputs`` fail ``input_schema``'s declared contract (Req 2.5).
+    """Return the ways ``inputs`` fail ``input_schema``'s declared contract.
 
     Conformance here means: every supplied key is a field the Tool declares, and
     every supplied value matches the declared field type. A Tool may declare more
     fields than a given call supplies (most fields are optional / mode-specific),
     so missing declared fields are NOT a violation — only unknown fields and type
     mismatches are. A declared field sent as ``None`` counts as left out (the
-    planner sometimes sends ``null`` for an optional field). An empty ``input_schema`` (a Tool that accepts no planner
-    inputs, e.g. the ontology tool) therefore rejects any supplied field.
-
-    Args:
-        inputs: The keyword inputs the planner prepared for the Tool.
-        input_schema: The Tool's declared ``input_schema``.
-
-    Returns:
-        A list of human-readable violation strings; empty when ``inputs`` conform.
+    planner sometimes sends ``null`` for an optional field). An empty
+    ``input_schema`` (e.g. the ontology tool) therefore rejects any supplied field.
     """
     violations: list[str] = []
     for key, value in inputs.items():
@@ -355,7 +317,7 @@ def validate_inputs(inputs: dict[str, Any], input_schema: dict[str, Any]) -> lis
 
 
 class ReasoningController:
-    """Drives one Sub_Question's Reasoning_Loop (Req 4, 5, 6).
+    """Drives one Sub_Question's Reasoning_Loop.
 
     A single controller instance is reused across every Sub_Question and
     Exploration_Branch of a session; it is stateless between loops (all mutable
@@ -365,10 +327,9 @@ class ReasoningController:
     Args:
         planner: The :class:`StepPlanner` consulted for next-step selection and
             the Sufficiency_Check. Mocked with scripted decisions in unit tests.
-        per_tool_timeout_s: Per-Tool invocation timeout in seconds (Req 9.3-9.4,
-            default 30). A Tool whose ``invoke`` raises or does not return within
-            this window is recorded as a degraded source and the loop continues
-            (Req 9.1-9.2).
+        per_tool_timeout_s: Per-Tool invocation timeout in seconds (default 30). A Tool whose
+            ``invoke`` raises or does not return within this window is recorded as a
+            degraded source and the loop continues.
     """
 
     def __init__(
@@ -385,25 +346,12 @@ class ReasoningController:
         self._planner = planner
         self._per_tool_timeout_s = per_tool_timeout_s
         # How the resolved ontology constrains an edge-typed traversal's edge_types
-        # (Req 3.4/3.9). "soft_prior" (default): the ontology is a PREFERENCE —
-        # ontology-known edge types are ordered first, but edge types the planner
-        # proposes beyond the ontology are still traversed. The induced ontology is
-        # a heavily-pruned subset of the graph's ~1.7k predicates, so a hard
-        # allowlist strips the majority of real edges (and can starve the traversal
-        # to zero, tripping the tool's MIN_EDGE_TYPES bound). "strict": the legacy
-        # allowlist (ontology edges only), but guarded so it never removes the LAST
-        # edge type (an over-broad traversal is self-limiting; an empty one is a bug).
+        # (see _apply_ontology_edge_filter).
         self._ontology_edge_mode = (
             ontology_edge_mode if ontology_edge_mode in ("soft_prior", "strict") else "soft_prior"
         )
-        # Idea 4 (escalation): how many CONSECUTIVE no-progress steps (a step that
-        # adds no new chunks/entities and does not resolve the ontology) to tolerate
-        # before stopping the loop with ``no_new_information``. Instead of stopping
-        # on the FIRST fruitless step, the loop keeps going so the planner — which
-        # can see the attempt history — can escalate to a different tool, reframe the
-        # sub-question, or switch modality (e.g. semantic-search-empty → anchor the
-        # entity → traverse the graph). Still bounded by the aggregate step/time
-        # budgets. ``1`` reproduces the old stop-on-first-no-progress behavior.
+        # Consecutive no-progress steps tolerated before ``no_new_information``, so
+        # the planner can escalate to a different tool; bounded by the step/time budgets.
         self._max_no_progress_steps = max(1, max_no_progress_steps)
         # Early-stop signals (service-scoped, injected here rather than carried on the
         # per-request context, which sub-question forks do not copy). Answer
@@ -433,40 +381,10 @@ class ReasoningController:
     ) -> StopReason | None:
         """Run the Reasoning_Loop for ``sub_question`` until it stops.
 
-        Each iteration is one Reasoning_Step: consume a step from the shared clock
-        (Req 4.5/6.4), ask the planner for candidate next steps and select the
-        most-preferred (Req 5), validate its inputs against the Tool contract
-        (Req 2.5), constrain any traversal edge types to the resolved ontology
-        (Req 3.4/3.9), invoke the Tool under the per-Tool timeout (Req 9.1-9.2),
-        incorporate the result before the next selection (Req 4.2), open
-        Exploration_Branches under the fan-out cap (Req 13.4), then stop on no new
-        information (Req 6.3) or a positive Sufficiency_Check (Req 6.1-6.2).
-
-        Args:
-            sub_question: The Sub_Question this loop resolves.
-            ctx: The shared accumulated context (working memory) for the session.
-            registry: The Tool registry the planner selects from.
-            clock: The shared aggregate budget clock.
-            queue: The session's FIFO queue of pending Sub_Questions; opened
-                Exploration_Branches are appended here (Req 13.4).
-            trace: The :class:`TraceCollector` (used structurally via ``record``).
-            namespace: The originating request namespace; every Tool invocation in
-                this loop is scoped to it (Req 1.5).
-            excluded_tools: Tool names withheld from the planner for this request
-                (source-composition gating); ``None`` exposes the full registry.
-            tool_context: Out-of-band per-request context (e.g. profile, options,
-                model_id) merged into every Tool invocation's inputs.
-            sq_index: Index of the sub-question this loop serves (stop-signal telemetry).
-            loop_index: 0 for the sub-question's own loop, ``n`` for its n-th
-                exploration branch (stop-signal telemetry).
-
-        Returns:
-            The per-Sub_Question stop reason — ``max_steps_reached`` (Req 4.5/6.4),
-            ``time_budget_expired`` (Req 7.4), ``no_new_information`` (Req 6.3),
-            ``sufficiency_satisfied`` (Req 6.1-6.2), or ``answer_stable`` (the
-            single-call answer-stability stop) — or ``None`` when the loop
-            ended because no Tool could be selected (Req 4.7). The session
-            aggregates these into the terminal stop reason.
+        ``queue`` is the session's FIFO queue; opened Exploration_Branches are
+        appended to it. ``loop_index`` is 0 for the sub-question's own loop and ``n``
+        for its n-th exploration branch. Returns the per-Sub_Question stop reason, or
+        ``None`` when the loop ended because no Tool could be selected.
         """
         state = _LoopSignals(sq=sq_index, loop=loop_index)
         stop: StopReason | None = None
@@ -536,12 +454,12 @@ class ReasoningController:
         single_call = getattr(ctx, "single_call_steps", False) is True
 
         while True:
-            # Time_Budget bounds the loop in aggregate (Req 7.4): stop before a new
+            # Time_Budget bounds the loop in aggregate: stop before a new
             # step once the wall clock is spent.
             if clock.expired():
                 return StopReason.time_budget_expired
 
-            # Aggregate max-step cap (Req 4.5, 6.4).
+            # Aggregate max-step cap.
             if not clock.try_consume_step():
                 return StopReason.max_steps_reached
 
@@ -555,7 +473,7 @@ class ReasoningController:
                 trace.record("budget_spent", "success", clock.elapsed_ms(), detail="no time left for another step")
                 return StopReason.time_budget_expired
 
-            # Next-step selection over the accumulated context (Req 4.3). The
+            # Next-step selection over the accumulated context. The
             # stop-signal carrier is cleared first, so any exit that writes nothing
             # (a failed call, a fake planner, no tools) reads as "no signal".
             ctx.last_stop_signals = None
@@ -658,7 +576,7 @@ class ReasoningController:
                     )
                     return StopReason.answer_stable
             if decision is None:
-                # No Tool can be selected — stop initiating steps (Req 4.7).
+                # No Tool can be selected — stop initiating steps.
                 trace.record("next_step_select", "success", clock.elapsed_ms(), detail="no_tool_selectable")
                 return None
 
@@ -676,7 +594,7 @@ class ReasoningController:
                 )
                 continue
 
-            # Constrain traversal edge types to the resolved ontology (Req 3.4/3.9)
+            # Constrain traversal edge types to the resolved ontology
             # BEFORE validating/invoking, so an absent edge type is never traversed.
             decision = self._apply_ontology_edge_filter(decision, ctx, clock, trace)
 
@@ -689,7 +607,7 @@ class ReasoningController:
             )
 
             # An Ad_Hoc_Query was selected only because no strategy tool / template
-            # fit (the preference sort guarantees this) — record that (Req 5.4).
+            # fit (the preference sort guarantees this) — record that.
             if decision.is_ad_hoc:
                 trace.record(
                     "ad_hoc_query",
@@ -701,7 +619,7 @@ class ReasoningController:
                     tool_used=decision.tool_name,
                 )
 
-            # Input-contract validation (Req 2.5): do NOT invoke a non-conforming
+            # Input-contract validation: do NOT invoke a non-conforming
             # Tool; record the violation and continue the loop.
             violations = validate_inputs(decision.inputs, tool.input_schema)
             if violations and loop_fixes:
@@ -741,9 +659,6 @@ class ReasoningController:
                 )
                 return StopReason.time_budget_expired
 
-            # Invoke under the deadline-aware per-Tool timeout (Req 9.1-9.2): the
-            # effective timeout is clamped to the wall-clock time left minus the
-            # synthesis reserve, so a late tool cannot overrun the Time_Budget.
             # A tool that declares ``wants_context`` (the anchored document reader)
             # also receives the accumulated context and the sub-question, out of
             # band, so it can anchor on what the loop already retrieved. No other
@@ -770,8 +685,8 @@ class ReasoningController:
 
             if status != "success":
                 # Tool raised or timed out: record the degraded source and continue
-                # without terminating retrieval (Req 9.1-9.2). An ad-hoc execution
-                # failure additionally retains no partial results (Req 5.7) — which
+                # without terminating retrieval. An ad-hoc execution
+                # failure additionally retains no partial results — which
                 # holds naturally since a failed invoke yields no result to add.
                 ctx.record_degraded(decision.tool_name, status)
                 ctx.record_attempt(decision.tool_name, decision.inputs, 0, status, decision.reasoning)
@@ -783,7 +698,7 @@ class ReasoningController:
 
             assert result is not None  # status == "success" guarantees a result
 
-            # Incorporate the result BEFORE selecting the next step (Req 4.2).
+            # Incorporate the result BEFORE selecting the next step.
             new_count = ctx.add(result)
             result_degraded_reason = result.degraded_reason
             if result_degraded_reason:
@@ -795,18 +710,18 @@ class ReasoningController:
                 ctx.add_document_matches(matches)
             # If the result carried the determined ontology (an Ontology_Lookup_Tool
             # success), cache it on the shared context so the ontology-constrained
-            # edge filter (Req 3.4/3.9) and the planner's context summary can use it
-            # on later steps this request (Req 3.8). Resolving a not-yet-known
+            # edge filter and the planner's context summary can use it
+            # on later steps this request. Resolving a not-yet-known
             # ontology is preparatory progress, not "no new information".
             ontology_resolved = self._maybe_cache_ontology(result, ctx, clock, trace)
             # Similarly, a graph ``edge_types`` discovery probe surfaces the real
-            # predicates present on the anchored entities (idea 5 soft-prior). It
+            # predicates present on the anchored entities (soft-prior). It
             # gathers no chunks/entities (new_count==0) but learning traversable
             # predicates the pruned ontology omits is preparatory PROGRESS, not
             # "no new information" — cache them for the planner's next step.
             edges_discovered = self._maybe_cache_present_edges(result, ctx, clock, trace)
             # Record the attempt so the planner can see what it tried and whether it
-            # produced anything (idea 3/4 — informs escalation / avoids repeats).
+            # produced anything (informs escalation / avoids repeats).
             attempt_status = "degraded" if result_degraded_reason else "succeeded"
             ctx.record_attempt(decision.tool_name, decision.inputs, new_count, attempt_status, decision.reasoning)
             trace.record(
@@ -818,14 +733,9 @@ class ReasoningController:
             )
 
             # Open Exploration_Branches when the result surfaces multiple directions,
-            # subject to the aggregate fan-out cap (Req 13.4, 13.7-13.8).
+            # subject to the aggregate fan-out cap.
             self._enqueue_branches(result, sub_question, queue, clock, trace)
 
-            # Escalation instead of immediate stop: a no-progress step (no new info,
-            # no ontology resolution) does not end the loop on its own. Count
-            # consecutive no-progress steps and stop only once the tolerance is spent,
-            # so the planner can escalate to a different tool / reframe / switch
-            # modality in between. Bounded by the aggregate step/time budgets.
             if (
                 loop_fixes
                 and new_count == 0
@@ -873,7 +783,7 @@ class ReasoningController:
             no_progress = 0
 
             # Boolean Sufficiency_Check + the agent's running grounded best-guess
-            # answer (Req 6.1-6.2; idea 2). ``_assess`` returns both in one planner
+            # answer. ``_assess`` returns both in one planner
             # call; the working answer (grounded ONLY in gathered context) is stored
             # so it carries across steps and is handed to the synthesizer.
             if single_call:
@@ -926,8 +836,8 @@ class ReasoningController:
                 return StopReason.sufficiency_satisfied
             if self._stability_reached(state, stability):
                 # The working answer sat still for ``stability_steps`` compared steps
-                # in a row: the loop pulls redundant content. The assess path keeps
-                # !1345's stop reason for this.
+                # in a row: the loop pulls redundant content. The assess path reports
+                # ``no_new_information`` for this.
                 trace.record(
                     "answer_stability",
                     "success",
@@ -935,8 +845,6 @@ class ReasoningController:
                     detail=f"working answer stable for {state.streak} compared step(s); stopping",
                 )
                 return StopReason.no_new_information
-
-    # ── early-stop signals ──────────────────────────────────────────────
 
     def _confidence_ok(self, signals: Any) -> bool:
         """Whether a reply's reported confidence clears the configured bar.
@@ -1078,12 +986,10 @@ class ReasoningController:
         except TimeoutError:
             logger.warning("answer_stability_embed_timeout", timeout_s=timeout_s)
             return None
-        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - controller must never raise
             logger.warning("answer_stability_embed_failed", error=str(exc), error_type=type(exc).__name__)
             return None
         return vector if vector else None
-
-    # ── selection & preference (Req 5) ─────────────────────────────────
 
     async def assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
         """Public form of :meth:`_assess`, for the session's evidence prefetch."""
@@ -1152,12 +1058,12 @@ class ReasoningController:
                 )
                 or ""
             )
-        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - controller must never raise
             logger.warning("planner_sql_check_error", error=str(exc), error_type=type(exc).__name__)
             return ""
 
     async def _assess(self, sub_question: SubQuestion, ctx: AccumulatedContext) -> tuple[bool, str]:
-        """Run the Sufficiency_Check and obtain the agent's grounded best-guess (idea 2).
+        """Run the Sufficiency_Check and obtain the agent's grounded best-guess.
 
         Prefers the planner's richer ``assess`` method, which returns
         ``(sufficient, working_answer)`` in one call — the working answer is the
@@ -1175,24 +1081,24 @@ class ReasoningController:
             try:
                 sufficient, working_answer = await assess(sub_question=sub_question, context=ctx)
                 return bool(sufficient), working_answer or ""
-            except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+            except Exception as exc:  # noqa: BLE001 - controller must never raise
                 logger.warning("planner_assess_error", error=str(exc), error_type=type(exc).__name__)
                 return False, ""
         try:
             return bool(await planner.check_sufficiency(sub_question=sub_question, context=ctx)), ""
-        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - controller must never raise
             logger.warning("planner_sufficiency_error", error=str(exc), error_type=type(exc).__name__)
             return False, ""
 
     def _select_decision(self, candidates: list[PlannerDecision]) -> PlannerDecision | None:
-        """Select the most-preferred candidate, enforcing the Req 5 ordering.
+        """Select the most-preferred candidate, enforcing the hard preference ordering.
 
-        Returns ``None`` when the planner proposed nothing (no Tool selectable,
-        Req 4.7). Otherwise sorts the candidates by the hard preference rank
+        Returns ``None`` when the planner proposed nothing (no Tool selectable).
+        Otherwise sorts the candidates by the hard preference rank
         (strategy < template < ad-hoc) with a STABLE sort so ties preserve the
         planner's own ordering, and returns the first. Because the sort is the
         controller's own, the preference holds regardless of the order the planner
-        returned the candidates (Req 5.1-5.3, 5.6).
+        returned the candidates.
         """
         if not candidates:
             return None
@@ -1225,12 +1131,10 @@ class ReasoningController:
             return _RANK_STRATEGY
         return _RANK_TEMPLATE
 
-    # ── ontology-constrained traversal (Req 3.4, 3.9) ──────────────────
-
     def _apply_ontology_edge_filter(
         self, decision: PlannerDecision, ctx: AccumulatedContext, clock: BudgetClock, trace: Any
     ) -> PlannerDecision:
-        """Constrain a decision's traversal edge types by the resolved ontology (Req 3.4/3.9).
+        """Constrain a decision's traversal edge types by the resolved ontology.
 
         When the ontology is resolved (cached on ``ctx``) and the decision carries a
         non-empty ``edge_types`` list, apply the configured mode:
@@ -1305,16 +1209,14 @@ class ReasoningController:
         )
         return replace(decision, inputs={**decision.inputs, "edge_types": reordered})
 
-    # ── ontology caching (Req 3.8) ─────────────────────────────────────
-
     def _maybe_cache_ontology(
         self, result: ToolResult, ctx: AccumulatedContext, clock: BudgetClock, trace: Any
     ) -> bool:
-        """Cache a freshly-resolved ontology on the context (Req 3.8); return newly-set.
+        """Cache a freshly-resolved ontology on the context; return newly-set.
 
         When ``result`` carries the determined ontology (an Ontology_Lookup_Tool
         success) and the request's ontology has not yet been resolved, store it on
-        the shared context so the ontology-constrained edge filter (Req 3.4/3.9)
+        the shared context so the ontology-constrained edge filter
         and the planner's context summary can use it for the rest of the request,
         and record an ``ontology_resolved`` trace step. Returns ``True`` only when
         this call set a not-yet-known ontology, so the controller can treat that as
@@ -1338,8 +1240,6 @@ class ReasoningController:
             detail=f"{len(ontology.node_types)} node types, {len(ontology.edge_types)} edge types",
         )
         return True
-
-    # ── discovered-predicate caching (idea 5 soft-prior) ───────────────
 
     def _maybe_cache_present_edges(
         self, result: ToolResult, ctx: AccumulatedContext, clock: BudgetClock, trace: Any
@@ -1374,7 +1274,6 @@ class ReasoningController:
         )
         return True
 
-    # ── branching (Req 13.4) ───────────────────────────────────────────
     def _enqueue_branches(
         self,
         result: ToolResult,
@@ -1390,13 +1289,13 @@ class ReasoningController:
         for each, appending the derived Sub_Question to the shared session queue,
         but only while the aggregate fan-out cap has budget — ``try_open_branch``
         returns ``False`` once the cap is reached, at which point no further
-        branches are opened this step (Req 13.4, 13.7-13.8).
+        branches are opened this step.
         """
         for direction in result.produced_directions:
             if not direction:
                 continue
             if not clock.try_open_branch():
-                # Fan-out cap reached — stop opening branches (Req 13.7-13.8).
+                # Fan-out cap reached — stop opening branches.
                 trace.record(
                     "exploration_branch",
                     "skipped",
@@ -1412,8 +1311,6 @@ class ReasoningController:
             queue.append(branch.to_sub_question())
             trace.record("exploration_branch", "success", clock.elapsed_ms(), detail=direction[:120])
 
-    # ── tool invocation (Req 9.1-9.2) ──────────────────────────────────
-
     async def _invoke_with_timeout(
         self,
         tool: Tool,
@@ -1423,17 +1320,13 @@ class ReasoningController:
         *,
         tool_context: dict | None = None,
     ) -> tuple[ToolResult | None, str, int]:
-        """Invoke ``tool`` under the deadline-aware per-Tool timeout, never raising (Req 9.1-9.2).
+        """Invoke ``tool`` under the deadline-aware per-Tool timeout, never raising.
 
-        The effective timeout is ``clock.tool_deadline_s()`` — the configured
-        per-tool timeout clamped to the wall-clock time left minus the synthesis
-        reserve — so a tool started late in the session cannot overrun the
-        Time_Budget by a full ``per_tool_timeout_s`` nor eat the slice reserved for
-        final synthesis. Returns ``(result, status, duration_ms)`` where ``status``
+        Returns ``(result, status, duration_ms)`` where ``status``
         is ``"success"`` with a :class:`ToolResult`, ``"timeout"`` when the
         invocation did not return within that window, or ``"error"`` when it raised.
         A non-success status yields a ``None`` result; the caller records the
-        degraded source and continues the loop. Scoped to ``namespace`` (Req 1.5).
+        degraded source and continues the loop. Scoped to ``namespace``.
         """
         start = time.perf_counter()
         timeout_s = clock.tool_deadline_s(self._per_tool_timeout_s)
@@ -1451,13 +1344,13 @@ class ReasoningController:
             logger.warning("tool_invocation_timeout", tool=tool.name, timeout_s=timeout_s)
             return None, "timeout", ms
         except AccessDeniedError:
-            # The ONE exception to "the controller never raises" (Req 9.1): an
+            # The ONE exception to "the controller never raises": an
             # authorization denial is not a retrieval failure. Degrading a 403 into a
             # degraded-source "error" would let the session answer 200 with an empty
             # result, hiding a misconfigured grant behind a plausible "no data found".
             # Every other consumer of the same engine propagates it, so we do too.
             raise
-        except Exception as exc:  # noqa: BLE001 - controller must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - controller must never raise
             ms = int((time.perf_counter() - start) * 1000)
             logger.warning(
                 "tool_invocation_error",

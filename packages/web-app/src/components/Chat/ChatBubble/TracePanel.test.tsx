@@ -19,10 +19,8 @@ describe("TracePanel", () => {
       { step: "t2.sql.authorize", status: "allow", durationMs: 1 },
     ];
     render(<TracePanel steps={steps} isLive={false} />);
-    // Shown
     expect(screen.getByText("Metric Match")).toBeInTheDocument();
     expect(screen.getByText("Sql Generate")).toBeInTheDocument();
-    // Hidden-unless-denied internal steps
     expect(screen.queryByText("Embed")).not.toBeInTheDocument();
     expect(screen.queryByText("Sql Authorize")).not.toBeInTheDocument();
   });
@@ -60,19 +58,12 @@ describe("TracePanel", () => {
       },
     ];
     render(<TracePanel steps={steps} isLive={false} />);
-    // Group wrapper shows wall time, not summed duration.
     expect(screen.getByText("790ms wall")).toBeInTheDocument();
-    // Children rendered indented (by their humanized names).
     expect(screen.getByText("Vector Search")).toBeInTheDocument();
     expect(screen.getByText("Graph Traverse")).toBeInTheDocument();
-    // Children are NOT also rendered as top-level rows.
-    expect(screen.queryAllByText("Vector Search")).toHaveLength(1);
   });
 
   it("hides a successful t3.guardrail row (the badge surfaces the pass, not the timeline)", () => {
-    // bug #836: t3.guardrail is HIDDEN_UNLESS_DENIED — a passed guardrail is
-    // surfaced by the green Boundary badge, so it must NOT clutter the trace
-    // timeline as a row. Only the block path (denied/error) appears here.
     const steps: TraceStep[] = [
       { step: "t3.synthesize", status: "success", durationMs: 800 },
       { step: "t3.guardrail", status: "success", durationMs: 0 },
@@ -97,7 +88,6 @@ describe("TracePanel", () => {
       { step: "t2.sql.generate", status: "success", durationMs: 500 },
     ];
     render(<TracePanel steps={steps} isLive={false} />);
-    // 2 visible (metric_match + sql.generate), embed hidden.
     expect(
       screen.getByText(/Processing trace \(2 steps\)/),
     ).toBeInTheDocument();

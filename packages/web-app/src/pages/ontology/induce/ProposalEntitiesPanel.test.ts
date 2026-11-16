@@ -16,9 +16,8 @@ const procedureCls: TurtleEntity = {
     `    rdfs:label "BankingProcedure"^^xsd:string .`,
 };
 
-// The close-match is authored ONLY on Banking-Process, and its target is a
-// full IRI containing dots (coa.amazon.com...). This is the exact shape that
-// previously truncated at the first dot and produced 0 matches on both sides.
+// The close-match is authored only on Banking-Process, and its target is a
+// full IRI containing dots (coa.amazon.com...).
 const processCls: TurtleEntity = {
   subject: "Banking-Process",
   fullSubject: `<${NS}/class/Banking-Process>`,
@@ -71,11 +70,9 @@ describe("groupByClass", () => {
   });
 
   it("records sibling close-match bidirectionally, resolving full IRIs with dots", () => {
-    // Banking-Process authors skos:closeMatch → Banking-Procedure (a SIBLING
-    // proposal class — the pattern the unstructured/RIGOR normalizer emits via
-    // its per-run dedup index). Both sides get a ``matches`` entry (the target
-    // side too), and the dotted class IRI resolves. This feeds the main-table
-    // "Matches" column + the card's "Matches" tab.
+    // Banking-Process authors skos:closeMatch → Banking-Procedure (a sibling
+    // proposal class). Both sides get a ``matches`` entry and the dotted class
+    // IRI resolves.
     expect(processG.matches?.map((m) => m.classUri)).toEqual([
       "Banking-Procedure",
     ]);
@@ -92,8 +89,7 @@ describe("groupByClass", () => {
   });
 });
 
-// ── Item 8: grounding re-keyed to skos:*; Item 2: PK + inheritance ──
-describe("groupByClass grounding + inheritance (Item 2 + 8)", () => {
+describe("groupByClass grounding, keys and inheritance", () => {
   const groundedCls: TurtleEntity = {
     subject: "ClinicalTrial",
     fullSubject: "ind:ClinicalTrial",
@@ -143,7 +139,6 @@ describe("groupByClass grounding + inheritance (Item 2 + 8)", () => {
   });
 });
 
-// ── Substring class-name collision: Claim must not absorb ClaimAmount ──
 describe("groupByClass domain matching (word-boundary, not substring)", () => {
   const claimCls: TurtleEntity = {
     subject: "Claim",
@@ -157,9 +152,8 @@ describe("groupByClass domain matching (word-boundary, not substring)", () => {
     kind: "owl:Class",
     body: `ind:ClaimAmount a owl:Class ;\n    rdfs:label "Claim Amount" .`,
   };
-  // A datatype property whose domain is ClaimAmount. ``rdfs:domain ind:Claim``
-  // is a substring of ``rdfs:domain ind:ClaimAmount`` — the old ``includes``
-  // test wrongly claimed this under ``Claim`` too.
+  // ``rdfs:domain ind:Claim`` is a substring of ``rdfs:domain ind:ClaimAmount``;
+  // the property must not be claimed under ``Claim`` too.
   const amountProp: TurtleEntity = {
     subject: "claimAmount_value",
     fullSubject: "ind:claimAmount_value",
@@ -206,8 +200,7 @@ describe("groupByClass domain matching (word-boundary, not substring)", () => {
   });
 });
 
-// ── Bug #910: ambiguous match (skos:relatedMatch) renders consistently ──
-describe("groupByClass ambiguous grounding (bug #910)", () => {
+describe("groupByClass ambiguous grounding (skos:relatedMatch)", () => {
   const ambiguousCls: TurtleEntity = {
     subject: "FinancialInstrument",
     fullSubject: "ind:FinancialInstrument",
@@ -256,7 +249,7 @@ describe("groupByClass ambiguous grounding (bug #910)", () => {
 // foundational grounding: it must leave both groundedTo AND matchType null so
 // every origin surface renders "Novel". Otherwise the origin gates (which key
 // off matchType) render "Grounded"/"Ambiguous" with a blank target.
-describe("groupByClass sibling-only skos match is not grounding (bug #910 follow-up)", () => {
+describe("groupByClass sibling-only skos match is not grounding", () => {
   const siblingTarget: TurtleEntity = {
     subject: "Party",
     fullSubject: "ind:Party",

@@ -37,7 +37,7 @@ export interface DynamoDBTableProps {
  *   - PAY_PER_REQUEST billing
  *   - AWS-managed encryption at rest
  *   - Point-in-time recovery enabled
- *   - RETAIN removal policy (overridable)
+ *   - RETAIN removal policy in prod, DESTROY elsewhere (overridable)
  */
 export class DynamoDBTable extends Construct {
   public readonly table: dynamodb.Table;

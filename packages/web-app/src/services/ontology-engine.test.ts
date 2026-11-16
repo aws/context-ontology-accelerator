@@ -48,7 +48,6 @@ describe("uploadOntologyFile", () => {
       "turtle",
     );
 
-    // Step 1: get presigned URL
     expect(mockApiClient.post).toHaveBeenCalledWith(
       "/namespaces/ns/ontologies/upload-url",
       expect.objectContaining({
@@ -57,7 +56,6 @@ describe("uploadOntologyFile", () => {
       }),
     );
 
-    // Step 2: PUT to S3 with File object
     expect(fetchSpy).toHaveBeenCalledWith(
       "https://s3.amazonaws.com/presigned-put",
       expect.objectContaining({
@@ -67,7 +65,6 @@ describe("uploadOntologyFile", () => {
       }),
     );
 
-    // Step 3: ingest-from-s3
     expect(mockApiClient.post).toHaveBeenCalledWith(
       "/namespaces/ns/ontologies/http%3A%2F%2Fexample.org%2Fo/ingest-from-s3",
       expect.objectContaining({
@@ -145,11 +142,9 @@ describe("downloadOntology", () => {
 
     const ttl = await downloadOntology(mockApiClient, "ns", "http://ex.org/o#");
 
-    // Fetches the (JSON) download endpoint for a presigned URL — no inline body.
     expect(get).toHaveBeenCalledWith(
       "/namespaces/ns/ontologies/http%3A%2F%2Fex.org%2Fo%23/download",
     );
-    // Then downloads the Turtle directly from the presigned URL.
     expect(fetchSpy).toHaveBeenCalledWith("https://s3.example/presigned");
     expect(ttl).toContain("@prefix");
 
@@ -253,7 +248,6 @@ describe("foundational load (async 202 + ingest-status poll)", () => {
       "/namespaces/ns/ontology/foundational/schema-org/load",
       {},
     );
-    // The service unwraps ``result`` so the caller gets the job directly.
     expect(job.jobId).toBe("job-9");
     expect(job.ontologyId).toBe("https://schema.org/");
     expect(job.status).toBe("pending");

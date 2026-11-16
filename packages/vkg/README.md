@@ -10,6 +10,29 @@ Translation-only service wrapping Ontop 5.x. Translates SPARQL queries into SQL 
 
 At startup, the entrypoint downloads ontology + mappings from S3, loads the schema into H2, and starts both services.
 
+### Schema loading and its privilege split
+
+The entrypoint loads exactly one file: `<artifact dir>/schema.sql`. The name is
+fixed, not a `*.sql` glob — globbing would also pick up any other `.sql` object
+that can be landed in the namespace prefix, and pick it non-deterministically.
+Any other filename is ignored.
+
+The load goes through `load-schema.sh`, which splits the file in two:
+
+- lines matching `CREATE SCHEMA IF NOT EXISTS <identifier>;` exactly run as the
+  H2 admin (`sa`) — H2 does not delegate `CREATE SCHEMA`;
+- **everything else** runs as `VKG_LOADER`, a per-task user created with a
+  random password and granted only `ALTER ANY SCHEMA` — enough for
+  `CREATE TABLE` in any schema, not enough for the admin-only surface.
+
+So `CREATE ALIAS` (which compiles and runs Java, i.e. command execution in this
+container), `FILE_READ` and `RUNSCRIPT` are **refused**, and anything unexpected
+lands in the unprivileged half and fails closed rather than running as `sa`.
+`schema.sql` is machine-generated from namespace-supplied metadata, so it is
+treated as untrusted here; the first line of defence is in the ontology engine,
+which refuses to emit an `rr:tableName` literal that is not a SQL identifier
+path.
+
 ### Patched Ontop dependencies
 
 Ontop 5.5.0 (`ARG ONTOP_VERSION` in the Dockerfile) bundles Tomcat, Spring Framework, Thymeleaf, Jackson, commons-beanutils and Guava releases with known CVEs. At build time `ontop-lib-overrides.sh` replaces them in `/opt/ontop/lib` with the versions pinned in `ontop-lib-overrides.txt`, and removes `thymeleaf-extras-java8time`, which Thymeleaf 3.1 absorbed. The pins follow the versions Ontop's own `version5` branch uses on the same Spring Boot 2.7 line.
@@ -94,6 +117,35 @@ If all 3 attempts fail, the container enters **degraded mode** (503 on all `/spa
 - Confirm the bucket name matches the CDK-deployed bucket
 
 **Recovery:** Fix the S3 artifacts, then restart the task. The health check will replace degraded containers automatically (see below).
+
+### Schema load failure
+
+A `schema.sql` that cannot be loaded also puts the container into degraded mode,
+with the failing SQL in the log:
+
+```
+[VKG] WARN: Cannot load schema file /app/ontology/schema.sql — starting in degraded mode
+[VKG] Schema error details:
+...
+[VKG] Fix the file in s3://.../ontologies/<namespace>/<version>/ and restart the task
+```
+
+The usual causes, in order:
+
+- **An admin-only statement.** `CREATE ALIAS`, `CALL FILE_READ(...)`,
+  `RUNSCRIPT`, or a `CREATE SCHEMA` that is not the exact
+  `CREATE SCHEMA IF NOT EXISTS <identifier>;` shape, all run as the
+  unprivileged `VKG_LOADER` and fail with "Admin rights are required". This is
+  intended — see the privilege split above — and the fix is to remove the
+  statement, not to grant it.
+- **The wrong filename.** Only `schema.sql` is loaded. A file uploaded as, say,
+  `tables.sql` is silently not loaded at all, and Ontop then validates the
+  mapping against an empty database.
+- **Ordinary SQL errors** — a qualified `CREATE TABLE` whose schema is never
+  declared, or a type H2 does not know.
+
+A missing `schema.sql` is **not** a failure: the file is optional, and the
+container starts normally without it.
 
 ## Task Sizing and Environment Variables
 

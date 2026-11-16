@@ -7,12 +7,7 @@ Validates the request-side Pydantic model declared in
 ``coa_ontology.inducer.unstructured.schemas``. The
 ``UnstructuredInductionConfig`` and ``UnstructuredInductionReport``
 models are exercised by other tests (the orchestrator and the router
-suites) — this file scopes to the HTTP-input model since that's the
-one Requirements 4.1 / 4.2 enumerate field-by-field.
-
-References:
-    Requirements 4.1, 4.2 of
-    ``.kiro/specs/unstructured-ontology-induction-api/requirements.md``.
+suites) — this file scopes to the HTTP-input model.
 """
 
 from __future__ import annotations
@@ -37,9 +32,6 @@ _VALID_KWARGS: dict = {
 }
 
 
-# ── Required-field enforcement (Requirement 4.2) ────────────────────────
-
-
 @pytest.mark.parametrize("missing_field", ["name", "graph_arn", "ontology_uri_prefix"])
 def test_required_fields_enforced(missing_field: str):
     """Each of ``name``, ``graph_arn``, ``ontology_uri_prefix`` is required.
@@ -61,9 +53,6 @@ def test_required_fields_enforced(missing_field: str):
     )
 
 
-# ── Defaults applied to a minimal valid request (Requirement 4.2) ───────
-
-
 def test_minimal_request_applies_defaults():
     """A request with only the three required fields fills in every default."""
     req = UnstructuredInductionRequest(**_VALID_KWARGS)
@@ -73,7 +62,6 @@ def test_minimal_request_applies_defaults():
     assert req.graph_arn == _VALID_KWARGS["graph_arn"]
     assert req.ontology_uri_prefix == _VALID_KWARGS["ontology_uri_prefix"]
 
-    # Documented defaults from Requirement 4.2.
     assert req.namespace == "default"
     assert req.label is None
     assert req.confidence_threshold == 0.80
@@ -83,9 +71,6 @@ def test_minimal_request_applies_defaults():
     assert req.description_mode == "schema"
     assert req.include_individuals is False
     assert req.entailment_enabled is False
-
-
-# ── ``sampling`` coercion (Requirement 4.2) ─────────────────────────────
 
 
 def test_sampling_coercion_from_dict():
@@ -106,9 +91,6 @@ def test_sampling_coercion_from_instance():
     assert isinstance(req.sampling, SamplingParams)
     assert req.sampling.k_min == 10
     assert req.sampling.floor == 4
-
-
-# ── ``description_mode`` Literal validation (Requirement 4.2) ───────────
 
 
 @pytest.mark.parametrize("mode", ["label_only", "instance", "schema"])

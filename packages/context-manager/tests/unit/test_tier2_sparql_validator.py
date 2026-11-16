@@ -108,7 +108,6 @@ class TestSPARQLValidatorURIs:
             "demo",
         )
         assert result.valid is True
-        # Query should not be called (no URIs to check)
         client.query.assert_not_called()
 
     async def test_governed_metric_for_predicate_is_valid(self):

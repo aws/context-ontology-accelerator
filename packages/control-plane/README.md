@@ -280,6 +280,16 @@ The authorizer supports two IdP configurations, auto-detected from the `JWKS_ISS
 
 Both produce a `TokenValidationResult` containing `principal_id` (email), `sub`, `groups`, and `token_type`.
 
+The token signing keys (JWKS) are cached for 5 minutes. When a refresh fails, the
+authorizer keeps verifying with the expired key set for up to an hour past that,
+and tries the fetch again, at most once per 5 s, when a request arrives. So while
+the IdP's JWKS endpoint is unreachable, a key the IdP has retired can stay valid
+for up to about 65 minutes after the last successful fetch. No setting turns this
+window off or changes its length. With no cached key set, or one older than that,
+token checks fail. Each failed refetch logs `JWKS fetch failed; serving the
+expired key set` with the set's age. The same library backs every service that
+verifies a caller token, including the workflow-agents and MCP servers.
+
 ### Role Resolution
 
 After token validation, the handler queries the `ResourceRoleMappings` table's `PrincipalIndex` GSI for all grants matching the principal and their IdP groups:

@@ -8,10 +8,6 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { SourceType } from "@coa/control-plane-client";
 import { useListSources } from "./use-list-sources";
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
-
 const mockSend = vi.fn();
 
 vi.mock("@components/ControlPlaneClientProvider", () => ({
@@ -25,10 +21,6 @@ vi.mock("@coa/control-plane-client", () => ({
   SourceType: { DATABASE: "DATABASE", DOCUMENTS: "DOCUMENTS" },
 }));
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 const NS_ID = "550e8400-e29b-41d4-a716-446655440000";
 
 function makeWrapper() {
@@ -38,10 +30,6 @@ function makeWrapper() {
   return ({ children }: { children: React.ReactNode }) =>
     React.createElement(QueryClientProvider, { client }, children);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("useListSources", () => {
   beforeEach(() => {

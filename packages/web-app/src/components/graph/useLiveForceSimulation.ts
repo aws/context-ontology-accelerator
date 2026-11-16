@@ -117,10 +117,7 @@ export function useLiveForceSimulation<T extends Node>(
     const byId = new Map(simNodes.map((n) => [n.id, n]));
     byIdRef.current = byId;
 
-    // Per-connected-component spacing scale: a subgraph with a popular hub
-    // gets its own larger linkDistance; a 3-node side cluster stays at the
-    // baseline. Shared helper so static homes (layout.ts) and this live link
-    // force never disagree about preferred edge length.
+    // Per-connected-component spacing scale (see `componentScale` in layout.ts).
     const linkScaleByNode = new Map<string, number>();
     for (const component of connectedComponents(ids, edges)) {
       const compSet = new Set(component);
@@ -189,8 +186,8 @@ export function useLiveForceSimulation<T extends Node>(
           (n) => (nodeRadius?.(n.id) ?? half) + 16,
         ).iterations(2),
       )
-      .force("x", forceX<SimNode>((n) => n.homeX).strength(0.06))
-      .force("y", forceY<SimNode>((n) => n.homeY).strength(0.06))
+      .force("x", forceX<SimNode>((n) => n.homeX).strength(HOME_STRENGTH_REST))
+      .force("y", forceY<SimNode>((n) => n.homeY).strength(HOME_STRENGTH_REST))
       .alpha(1)
       .alphaDecay(0.035)
       .velocityDecay(0.4)
@@ -271,13 +268,7 @@ export function useLiveForceSimulation<T extends Node>(
     collide.radius(collide.radius());
   }, []);
 
-  /**
-   * Pin a node at its current simulation position (`fx`/`fy`), so forces
-   * cannot move it. The parent uses this on hover so the hovered node stays
-   * under the pointer while neighbours drift outward around it — otherwise
-   * the sim's one-shot alpha kick jiggles the hovered node and the pointer
-   * keeps losing it, flipping the hover on and off.
-   */
+  /** Pin a node at its current simulation position (`fx`/`fy`) so forces cannot move it. */
   const pinNode = useCallback((nodeId: string) => {
     const s = byIdRef.current.get(nodeId);
     if (!s) return;
@@ -293,13 +284,7 @@ export function useLiveForceSimulation<T extends Node>(
     s.fy = null;
   }, []);
 
-  /**
-   * One-shot alpha boost — gives the sim a burst of energy that decays
-   * naturally (via `alphaDecay`), without holding `alphaTarget` above
-   * `alphaMin`. The caller (hover enter / leave) uses this to let a radius
-   * change actually move neighbours out, without a continuous 60fps warm.
-   * Does not touch `alphaTarget`, so a parallel drag keeps ownership of it.
-   */
+  /** One-shot alpha boost; does not touch `alphaTarget`, so a parallel drag keeps ownership of it. */
   const kickAlpha = useCallback((value: number) => {
     const sim = simRef.current;
     if (!sim) return;

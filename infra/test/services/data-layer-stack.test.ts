@@ -33,9 +33,7 @@ const TEST_CONTEXT = {
 //      handler can dispatch to the correct FunctionName.
 //   2. Its execution role must hold ``lambda:InvokeFunction`` on both ARNs;
 //      otherwise the invoke returns 502.
-// These assertions pin both. A regression that drops either would silently
-// break discovery in production — and the code review on MR !939 caught it
-// once already.
+// These assertions pin both; dropping either would silently break discovery.
 describe("DataLayerStack", () => {
   let template: Template;
 
@@ -62,9 +60,8 @@ describe("DataLayerStack", () => {
     // runs its package __init__, which eagerly imports pydantic (authnz_types),
     // pydantic-settings (config) and structlog. If the bundle omits them the
     // Lambda raises Runtime.ImportModuleError at cold start and API Gateway
-    // returns 502 on EVERY route — the exact regression the MCP/data-layer
-    // parity refactor introduced by adding coa_common imports to a Lambda whose
-    // bundle previously shipped zero pip deps.
+    // returns 502 on EVERY route; the Lambda imports coa_common, so the
+    // bundle must ship its pip deps.
     expect(mockBundlePython).toHaveBeenCalled();
     const opts = mockBundlePython.mock.calls[0][0] as {
       requirementsFile?: string;

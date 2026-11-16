@@ -13,9 +13,7 @@ pytestmark = pytest.mark.unit
 
 class TestDialectHint:
     def test_athena_gets_trino_hint(self):
-        """ATHENA is not a valid SqlDialect (and per team decision
-        will NOT be added as one — Athena's engine roadmap may drop Trino).
-        The hint must point the caller at TRINO instead."""
+        """ATHENA is not a valid SqlDialect; the hint points the caller at TRINO."""
         hint = dialect_hint("ATHENA")
         assert hint is not None
         assert "TRINO" in hint
@@ -39,10 +37,7 @@ class TestInvalidDialectMessage:
         msg = invalid_dialect_message("ORACLE")
         # The caller's value is not reflected back.
         assert "ORACLE" not in msg
-        # Assert on the absence of the HINT, not of the word "TRINO": the base
-        # message always lists every valid dialect (see
-        # test_base_message_lists_valid_dialects), TRINO among them, so
-        # `"TRINO" not in msg` can never hold and contradicted that test.
+        # The base message always lists TRINO, so assert on the hint instead.
         assert dialect_hint("ORACLE") is None
         assert "use TRINO" not in msg
         assert "(" not in msg, f"expected no hint suffix, got: {msg}"

@@ -70,6 +70,7 @@ All stacks use context-driven configuration via `CoaStack` base class:
 | `lambda_reserved_concurrency` | `5`             | Reserved concurrency for the VKG-reload and doc-preprocessing Lambdas; `0` disables reserving (needed on reduced Lambda-quota accounts) |
 | `serve_nl2sql_graph_expand` | (unset — on)    | Tier-2 flat NL→SQL ontology foreign-key expansion; `false` turns it off. See [Deploying](deploying.md#tier-2-nlsql-ontology-foreign-key-expansion) |
 | `serve_nl2sql_graph_expand_max_tables` | (unset — `8`) | How many walked tables the expansion may append to the NL→SQL prompt; `0` appends none |
+| `prefer_ipv4`              | `true`             | Python service images prefer IPv4 over IPv6; `false` keeps the IPv6-first order. See [Deploying](deploying.md#ipv4-preference-in-the-service-images) |
 
 Resource naming follows `{prefix}-{env}-{name}` (e.g. `coa-dev-neptune`). OpenSearch Serverless collection and policy names are limited to 32 characters, so when `{prefix}-{env}-{name}` is longer, the name keeps its leading characters and ends in a short hash of the full name (for example `coa-demo-dev-src-ingestio-3989de`).
 

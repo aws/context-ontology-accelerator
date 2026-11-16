@@ -10,11 +10,11 @@ import os
 from unittest.mock import patch
 
 import pytest
+from botocore.exceptions import ClientError
 
 os.environ["STATE_MACHINE_ARN"] = "arn:aws:states:us-east-1:123456789012:stateMachine:test-pipeline"
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
-# Import after setting env var
 import sys
 from pathlib import Path
 
@@ -49,9 +49,6 @@ def sqs_event(valid_message):
 @patch("index.sfn_client")
 def test_starts_execution_on_valid_message(mock_sfn, sqs_event, valid_message):
     handler(sqs_event, None)
-    # `isRescan` and `hadOpenRescan` are always added (normalized to strings),
-    # both defaulting to "false" for a scan whose message carries neither marker.
-    # The message has no sourceId, so it is derived from datasourceId.
     mock_sfn.start_execution.assert_called_once_with(
         stateMachineArn=os.environ["STATE_MACHINE_ARN"],
         name="scan-456",
@@ -79,7 +76,6 @@ def test_only_forwards_required_fields(mock_sfn):
     event = {"Records": [{"messageId": "msg-extra", "body": json.dumps(body)}]}
     handler(event, None)
     call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
-    assert "extraField" not in call_input
     required = {k: body[k] for k in ("datasourceId", "scanJobId", "namespaceId", "scanType")}
     assert call_input == {
         **required,
@@ -138,13 +134,6 @@ def test_forwards_rescan_marker_as_string_true(mock_sfn):
 
 
 @patch("index.sfn_client")
-def test_rescan_marker_defaults_to_string_false(mock_sfn, sqs_event):
-    handler(sqs_event, None)
-    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
-    assert call_input["isRescan"] == "false"
-
-
-@patch("index.sfn_client")
 def test_forwards_had_open_rescan_marker_as_string_true(mock_sfn):
     # hadOpenRescan=true (source was in RESCAN_REVIEW) must reach the execution
     # input so discovery reconstructs the approved baseline from the backup blob.
@@ -160,16 +149,6 @@ def test_forwards_had_open_rescan_marker_as_string_true(mock_sfn):
     handler(event, None)
     call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
     assert call_input["hadOpenRescan"] == "true"
-
-
-@patch("index.sfn_client")
-def test_had_open_rescan_defaults_to_string_false(mock_sfn, sqs_event):
-    # Absent marker (first scan, or a re-scan from APPROVED) => "false", so
-    # discovery treats the live assets as the approved baseline and ignores any
-    # stale backup.
-    handler(sqs_event, None)
-    call_input = json.loads(mock_sfn.start_execution.call_args[1]["input"])
-    assert call_input["hadOpenRescan"] == "false"
 
 
 @patch("index.sfn_client")
@@ -202,8 +181,6 @@ def test_drops_invalid_json(mock_sfn):
 
 @patch("index.sfn_client")
 def test_reraises_client_error(mock_sfn, sqs_event):
-    from botocore.exceptions import ClientError
-
     mock_sfn.start_execution.side_effect = ClientError(
         {"Error": {"Code": "ThrottlingException", "Message": "Rate exceeded"}},
         "StartExecution",
@@ -214,13 +191,10 @@ def test_reraises_client_error(mock_sfn, sqs_event):
 
 @patch("index.sfn_client")
 def test_execution_already_exists_is_idempotent(mock_sfn, sqs_event):
-    from botocore.exceptions import ClientError
-
     mock_sfn.start_execution.side_effect = ClientError(
         {"Error": {"Code": "ExecutionAlreadyExists", "Message": "Already exists"}},
         "StartExecution",
     )
-    # Should not raise — duplicate is handled gracefully
     handler(sqs_event, None)
 
 

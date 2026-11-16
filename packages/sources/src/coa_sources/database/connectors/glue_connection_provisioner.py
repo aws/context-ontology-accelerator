@@ -37,10 +37,11 @@ import time
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.aws_config import is_throttling_error
 
 from coa_sources.database.connectors.dialects import DISCOVERY_ENGINES
+from coa_sources.database.glue_ownership import catalog_account, nested_catalog_name
 from coa_sources.database.metrics import emit_metric
 
 logger = logging.getLogger(__name__)
@@ -56,45 +57,14 @@ _RETRY_CONFIG = Config(retries={"mode": "standard"})
 # collision-resistant. Connection name == catalog name == identifier.
 _CATALOG_NAME_MAX = 41
 
-# Glue's CreateConnection validates ConnectionProperties per connection type.
-# The managed Redshift connector rejects CATALOG_CASING_FILTER ("...are not
-# allowed in the request object") — it already folds identifiers to lowercase,
-# matching what discovery records. For lowercase-native engines (PostgreSQL,
-# MySQL) the filter normalizes schema/table names to lowercase so federated DB
-# names line up with the discovered schemas.
-#
-# Snowflake must also be excluded, for a subtler reason than Redshift's: Glue
-# ACCEPTS the property, the connection reaches READY, and the catalog is created
-# — it just silently exposes NOTHING. Snowflake stores unquoted identifiers in
-# UPPERCASE (TPCH_SF1, CUSTOMER), so LOWERCASE_ONLY filters out every object.
-# Measured on one Snowflake account, two catalogs differing only in this
-# property:
-#   with LOWERCASE_ONLY  -> GetDatabases returns 0 databases
-#   without it           -> tpch_sf1, tpch_sf10, ... and all 8 TPC-H tables
-# The property is a SELECTOR on source-side casing, not a transform: it picks
-# which objects to expose, then names are normalized to lowercase for Athena
-# either way. Snowflake has no natively-lowercase objects, so LOWERCASE_ONLY
-# selects none of them.
-#
-# Omitting it does not mean "no filter" — Glue substitutes an engine-appropriate
-# default. Verified on the recreated connection: GetConnection reports
-# CATALOG_CASING_FILTER=UPPERCASE_ONLY, which we never sent, and the catalog then
-# exposes all 8 TPC-H tables (reported lowercase: tpch_sf1, customer). So the
-# correct action is to stay out of Glue's way rather than to pick a value here;
-# hardcoding UPPERCASE_ONLY would re-break the moment an engine disagrees.
-#
-# Oracle is excluded for exactly the same reason, confirmed the same way:
-# onboarding a real Oracle Database Free instance produced a READY connection
-# and a catalog with 0 databases, because Oracle also folds unquoted identifiers
-# to UPPERCASE. So the rule is not "Snowflake is special" but "the filter is
-# only safe on lowercase-native engines" — PostgreSQL and MySQL, verified
-# unaffected (byte-identical table lists with and without it).
-#
-# This failure mode is expensive to diagnose because it surfaces far downstream:
-# scan succeeds, source is marked queryable, and serve fails at query time with
-# Athena TABLE_NOT_FOUND on a catalog that resolves but is empty. The property
-# is also NON-UPDATABLE, so a connection created with it cannot be repaired —
-# it has to be deleted and recreated.
+# CATALOG_CASING_FILTER=LOWERCASE_ONLY is only safe on lowercase-native engines
+# (PostgreSQL, MySQL). The managed Redshift connector rejects the property.
+# Snowflake and Oracle fold unquoted identifiers to UPPERCASE, so the filter
+# (a selector on source-side casing, not a transform) exposes nothing: the
+# connection reaches READY but the catalog is empty and serve fails with
+# TABLE_NOT_FOUND. Omitting it lets Glue pick its own default (UPPERCASE_ONLY
+# for those engines). The property is non-updatable, so a wrong value means
+# deleting and recreating the connection.
 _CASING_FILTER_UNSUPPORTED_ENGINES = frozenset({"REDSHIFT", "SNOWFLAKE", "ORACLE"})
 
 _DNS_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -119,6 +89,52 @@ def _count_if_throttle(exc: ClientError, api: str) -> None:
     """
     if is_throttling_error(exc):
         emit_metric("GlueApiThrottles", 1, "Count", Api=api)
+
+
+# Message fragments Lake Formation uses when the permission being revoked was
+# never held. It answers ``InvalidInputException`` both for that and for a
+# malformed request, so the code alone is not success; an unmatched message
+# reports False and logs ``lf_native_revoke_incomplete``.
+_LF_NOTHING_TO_REVOKE_HINTS = ("no permissions", "not granted", "does not have")
+
+
+def _lf_revoke(
+    lf_client, principal: dict, resource: dict, permissions: list[str], *, database_name: str, resource_type: str
+) -> bool:
+    """Make a single LF revoke_permissions call. A grant that is already gone is success.
+
+    ``EntityNotFoundException``, or an ``InvalidInputException`` saying nothing
+    was held, already satisfies "the principal holds nothing here"; failing on
+    it would make a delete retry forever. Every swallowed error is logged.
+    """
+    try:
+        lf_client.revoke_permissions(Principal=principal, Resource=resource, Permissions=permissions)
+        return True
+    except ClientError as exc:
+        error = exc.response.get("Error", {})
+        code = error.get("Code")
+        message = error.get("Message", "") or ""
+        nothing_held = code == "EntityNotFoundException" or (
+            code == "InvalidInputException" and any(hint in message.lower() for hint in _LF_NOTHING_TO_REVOKE_HINTS)
+        )
+        if nothing_held:
+            logger.info(
+                "lf_native_revoke_nothing_to_revoke",
+                extra={
+                    "database": database_name,
+                    "resource_type": resource_type,
+                    "code": code,
+                    "detail": message,
+                },
+            )
+            return True
+        _count_if_throttle(exc, "RevokePermissions")
+        logger.warning(
+            "lf_native_revoke_failed",
+            extra={"database": database_name, "resource_type": resource_type},
+            exc_info=True,
+        )
+        return False
 
 
 def _lf_grant(
@@ -261,7 +277,6 @@ def provision_federated_catalog(
     conn_arn = f"arn:{_partition(AWS_REGION)}:glue:{AWS_REGION}:{_get_account_id()}:connection/{name}"
     glue = _get_glue()
 
-    # ── Step 1: Glue connection (managed connector — no Lambda) ─────────────
     connection_properties: dict = {
         "HOST": host,
         "PORT": str(port),
@@ -270,29 +285,16 @@ def provision_federated_catalog(
     }
     if engine.upper() not in _CASING_FILTER_UNSUPPORTED_ENGINES:
         connection_properties["CATALOG_CASING_FILTER"] = "LOWERCASE_ONLY"
-    # Snowflake cannot execute anything without an active warehouse, and Glue
-    # enforces this at CreateConnection time rather than at query time:
-    # omitting it fails the whole call with
+    # Glue's CreateConnection rejects a Snowflake connection without a warehouse:
     #   InvalidInputException: [WAREHOUSE are missing in the request object]
-    # Because federation failure is fatal for JDBC sources, that surfaced as a
-    # SCAN_FAILED even though discovery had already found every table. Engine-
-    # specific properties therefore have to be threaded through here — the rest
-    # of this function is deliberately engine-agnostic, so keep additions keyed
-    # on the engine rather than set unconditionally.
     if engine.upper() == "SNOWFLAKE":
         if not warehouse:
             raise RuntimeError(
                 "Snowflake federation requires a warehouse: set jdbcConfiguration.warehouse on the source."
             )
         connection_properties["WAREHOUSE"] = warehouse
-        # Deliberately NOT setting ROLE. Glue's managed Snowflake connector
-        # rejects it outright:
-        #   InvalidInputException: [ROLE are not allowed in the request object.]
-        # The connector session therefore runs as the secret user's DEFAULT_ROLE,
-        # which is why that user is created with
-        # DEFAULT_ROLE = <least-privilege role> rather than relying on a
-        # per-connection override. Discovery still honours jdbcConfiguration.role
-        # because the Python driver accepts it — only federation cannot.
+        # ROLE is not set: the managed Snowflake connector rejects it, so the
+        # session runs as the secret user's DEFAULT_ROLE.
     connection_input: dict = {
         "Name": name,
         "ConnectionType": engine.upper(),
@@ -333,20 +335,9 @@ def provision_federated_catalog(
         _count_if_throttle(exc, "CreateConnection")
         raise RuntimeError(f"Failed to create Glue connection {name}: {exc}") from exc
 
-    # ── Step 1b: Poll the managed connection to READY and surface the real error ──
-    # create_connection returns immediately; the managed connector then validates
-    # asynchronously (it provisions an ENI in the connection's VPC using ROLE_ARN).
-    # Poll here and log the concrete StatusReason so the failure is diagnosable in
-    # this account's Lambda logs (the managed connector runs in AWS's service
-    # account, so its own error is otherwise invisible to us).
-    #
-    # NON-FATAL, deliberately. Making this fatal was tried and reverted: a
-    # not-READY connection is an ENVIRONMENT defect (VPC/SG/IAM), and failing the
-    # scan on it takes down every JDBC source in the account — discovery has
-    # already succeeded at this point and its results are worth keeping. The
-    # catalog-emptiness integ assertion (`assert_federated_catalog_not_empty`) is
-    # what fails loudly on a broken connection; this log line is what tells you
-    # why. Search `glue_connection_not_ready` in the federation-provisioner logs.
+    # The managed connector validates asynchronously in AWS's service account, so
+    # poll and log its StatusReason here. Non-fatal: a not-READY connection is an
+    # environment defect and must not fail a scan whose discovery succeeded.
     try:
         conn_status = ""
         status_reason = ""
@@ -379,7 +370,6 @@ def provision_federated_catalog(
             extra={"connection_name": name, "error": str(exc)},
         )
 
-    # ── Step 2: Register the connection with Lake Formation federation ──────
     try:
         _get_lakeformation().register_resource(ResourceArn=conn_arn, RoleArn=role_arn, WithFederation=True)
         logger.info("lf_resource_registered", extra={"connection_name": name})
@@ -391,7 +381,6 @@ def provision_federated_catalog(
             _rollback(name, conn_arn, drop_catalog=False, drop_lf=False)
             raise RuntimeError(f"Failed to register LF resource for {name}: {exc}") from exc
 
-    # ── Step 3: Create the Glue federated catalog ───────────────────────────
     try:
         glue.create_catalog(
             Name=name,
@@ -409,7 +398,6 @@ def provision_federated_catalog(
         _rollback(name, conn_arn, drop_catalog=False, drop_lf=True)
         raise RuntimeError(f"Failed to create federated catalog {name}: {exc}") from exc
 
-    # ── Step 4: Grant IAM_ALLOWED_PRINCIPALS on the schema database ────────
     # Federated catalogs don't support CreateTableDefaultPermissions; tables
     # inherit access from a database-level IAM_ALLOWED_PRINCIPALS grant.
     try:
@@ -438,20 +426,10 @@ def grant_iam_allowed_principals(*, catalog_name: str, schemas: list[str]) -> bo
     intent as the ``public_schema_name`` grant in ``provision_federated_catalog``,
     but applied to the schemas that actually exist.
 
-    That single hardcoded grant defaulted to ``"public"``, a database only
-    PostgreSQL and Redshift have. Lake Formation accepts a grant naming a database
-    that doesn't exist (no error, nothing granted), so on MySQL / SQL Server /
-    Oracle no real database ended up governed. The failure is invisible to an LF
-    data lake admin — admins bypass filtering and see every database — and shows up
-    for every other principal as ``GetDatabases`` returning an EMPTY LIST on a
-    catalog that resolves fine. Measured on one account, same engine and connection,
-    differing only in this grant:
-
-        granted on the real database -> GetDatabases -> ["integration_test"]
-        granted on "public" only     -> GetDatabases -> []
-
-    Idempotent. Best-effort: returns False on any error without raising, so a
-    transient LF failure defers governance rather than failing the scan.
+    Lake Formation accepts a grant on a database that does not exist (nothing is
+    granted), so the grant must name the discovered schemas. Idempotent.
+    Best-effort: returns False on any error without raising, so a transient LF
+    failure defers governance rather than failing the scan.
     """
     if not schemas:
         return False
@@ -522,7 +500,50 @@ def grant_consumer_select(*, catalog_name: str, schemas: list[str], principal_ar
     return all_granted
 
 
-def grant_consumer_select_native(*, database_name: str, principal_arn: str) -> bool:
+def native_grant_target_error(catalog_id: str) -> str | None:
+    """Why no native LF grant may be made for ``catalog_id``, or ``None`` if it may.
+
+    :func:`grant_consumer_select_native` always grants on the database of that
+    name in THIS account's ROOT Data Catalog, while the ownership check clears
+    the catalog the source declared. They must be the same catalog (CWE-863), so
+    this refuses:
+
+    * another account: ``assert_namespace_may_catalog`` exempts it, and the grant
+      would land on an unchecked local database that shares the name;
+    * a nested catalog (``account:catalogName``): the check clears the nested
+      catalog or ``database/{catalog}/{db}``, not the root-catalog database
+      the grant lands on;
+    * an unresolvable local account, which cannot be shown to match.
+    """
+    nested = nested_catalog_name(catalog_id)
+    target = catalog_account(catalog_id)
+    # Neither half of the id says anything, i.e. the caller named no catalog at
+    # all. Glue reads that as the caller's own root catalog — the ordinary
+    # same-account source, which is exactly what the grant targets.
+    if not nested and not target:
+        return None
+    # Account first, so an id that is malformed in both halves (an ARN, say)
+    # reports the account it resolved to rather than a bogus catalog name.
+    if target:
+        try:
+            local = _get_account_id()
+        except (ClientError, BotoCoreError, RuntimeError):
+            logger.warning("lf_native_grant_account_unresolved", exc_info=True)
+            return "this deployment's AWS account could not be resolved"
+        if target != local:
+            return (
+                f"the Glue catalog is in account {target}, and a native Lake Formation "
+                f"grant can only be made in {local}"
+            )
+    if nested:
+        return (
+            f"the source declares the nested Glue catalog {nested}, and a native Lake Formation "
+            "grant can only be made on the root Data Catalog"
+        )
+    return None
+
+
+def grant_consumer_select_native(*, database_name: str, principal_arn: str, catalog_id: str = "") -> bool:
     """Grant the consumer query principal LF SELECT/DESCRIBE on a native Glue database.
 
     Used for GLUE_DATABASE (S3/Iceberg) sources in accounts with strict Lake
@@ -533,7 +554,18 @@ def grant_consumer_select_native(*, database_name: str, principal_arn: str) -> b
     Targets the account's own Data Catalog (catalog_id = account_id), which is
     how AwsDataCatalog tables are governed. Idempotent — safe to call on re-scan.
     Returns True on success, False on any error (caller gates queryable on it).
+
+    ``catalog_id`` is the source's declared catalog; anything but this account's
+    root catalog is refused (:func:`native_grant_target_error`). ``""`` is the
+    root catalog.
     """
+    target_error = native_grant_target_error(catalog_id)
+    if target_error:
+        logger.warning(
+            "lf_native_grant_skipped",
+            extra={"database": database_name, "reason": "catalog_not_local", "detail": target_error},
+        )
+        return False
     if not database_name or not _DATABASE_RE.match(database_name):
         logger.warning(
             "lf_native_grant_skipped",
@@ -580,6 +612,62 @@ def grant_consumer_select_native(*, database_name: str, principal_arn: str) -> b
     return all_granted
 
 
+def revoke_consumer_select_native(*, database_name: str, principal_arn: str, session: boto3.Session) -> bool:
+    """Take back what :func:`grant_consumer_select_native` gave. Returns success.
+
+    Revokes in THIS account's Data Catalog, the only place the grant can have
+    been made, so there is no ``catalog_id``: a row with a foreign ``catalogId``
+    that was granted before the gate holds its grant on the local database.
+
+    Whether to revoke is the caller's decision: the grant is keyed on
+    (principal, database), so sources in two namespaces can share one.
+
+    ``session`` must be the federation provisioner's (a Lake Formation admin);
+    the one caller, the sources API, is not one itself.
+    """
+    if not database_name or not _DATABASE_RE.match(database_name):
+        logger.warning(
+            "lf_native_revoke_skipped",
+            extra={"reason": "invalid_database_name", "has_principal": bool(principal_arn)},
+        )
+        return False
+    if not principal_arn or not _IAM_ROLE_ARN_RE.match(principal_arn):
+        logger.warning(
+            "lf_native_revoke_skipped",
+            extra={"database": database_name, "reason": "invalid_principal_arn"},
+        )
+        return False
+    lf = session.client("lakeformation", region_name=AWS_REGION)
+    account_id = _get_account_id()
+    principal = {"DataLakePrincipalIdentifier": principal_arn}
+
+    # Tables first, then the database. The reverse order would leave table
+    # permissions behind a database the principal can no longer DESCRIBE, which
+    # reads as "revoked" in the console while SELECT still resolves.
+    table_revoked = _lf_revoke(
+        lf,
+        principal,
+        {"Table": {"CatalogId": account_id, "DatabaseName": database_name, "TableWildcard": {}}},
+        ["SELECT", "DESCRIBE"],
+        database_name=database_name,
+        resource_type="table",
+    )
+    db_revoked = _lf_revoke(
+        lf,
+        principal,
+        {"Database": {"CatalogId": account_id, "Name": database_name}},
+        ["DESCRIBE"],
+        database_name=database_name,
+        resource_type="database",
+    )
+    all_revoked = table_revoked and db_revoked
+    logger.info(
+        "lf_native_revoke_applied" if all_revoked else "lf_native_revoke_incomplete",
+        extra={"database": database_name, "db_revoked": db_revoked, "table_revoked": table_revoked},
+    )
+    return all_revoked
+
+
 def cleanup_federated_resources(
     *,
     glue_connection_name: str | None = None,
@@ -587,10 +675,6 @@ def cleanup_federated_resources(
     session=None,
 ) -> None:
     """Tear down federated resources: catalog, LF registration, Glue connection.
-
-    Deletes the federated catalog, deregisters the Lake Formation resource, and
-    deletes the Glue connection. Best-effort: individual failures are logged, not
-    raised.
 
     Pass ``session`` (e.g. an assumed Lake Formation admin role) to run the
     teardown with credentials that hold DROP on the catalog; otherwise the
@@ -615,8 +699,6 @@ def _rollback(
     lf=None,
 ) -> None:
     """Best-effort teardown of catalog / LF registration / connection."""
-    from coa_sources.database.metrics import emit_metric  # noqa: PLC0415
-
     glue = glue or _get_glue()
     lf = lf or _get_lakeformation()
     if drop_catalog:

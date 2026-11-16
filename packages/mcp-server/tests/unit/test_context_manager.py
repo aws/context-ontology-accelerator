@@ -15,9 +15,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from coa_mcp.clients import context_manager
 from coa_mcp.clients.context_manager import (
+    RUNTIME_SESSION_HEADER,
     ContextManagerClient,
     ContextManagerError,
+    derive_runtime_session_id,
 )
 
 
@@ -158,3 +161,187 @@ class TestContextManagerInvoke:
         client._client.aclose = AsyncMock()
         await client.close()
         client._client.aclose.assert_awaited_once()
+
+
+def _mock_sse_sequence(responses: list[tuple[int, bytes, list[dict]]]):
+    """aconnect_sse mock answering each call with the next (status, body, events).
+
+    Returns ``(mock, calls)``; ``calls`` collects each call's kwargs.
+    """
+    calls: list[dict] = []
+
+    @asynccontextmanager
+    async def _aconnect_sse(*args, **kwargs):
+        status_code, body, events = responses[len(calls)]
+        calls.append(kwargs)
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.aread = AsyncMock(return_value=body)
+        event_source = MagicMock()
+        event_source.response = mock_response
+
+        async def _aiter_sse():
+            for event_data in events:
+                sse_event = MagicMock()
+                sse_event.json.return_value = event_data
+                yield sse_event
+
+        event_source.aiter_sse = _aiter_sse
+        yield event_source
+
+    return _aconnect_sse, calls
+
+
+_RETRYABLE_CONFLICT_BODY = b'{"message":"Session operation in progress, please retry"}'
+
+
+@pytest.mark.unit
+class TestRuntimeSessionHeader:
+    @pytest.mark.asyncio
+    async def test_invoke_sends_runtime_session_header_when_given(self):
+        client = _make_client()
+        mock_sse = _mock_sse_response(200, events=[{}])
+        session_id = derive_runtime_session_id("alice", mcp_session_id="mcp-1", namespace_id="sales")
+
+        with patch("coa_mcp.clients.context_manager.aconnect_sse", mock_sse):
+            await client.invoke({"query": "q"}, "tok", runtime_session_id=session_id)
+
+        assert mock_sse.last_call_kwargs["headers"][RUNTIME_SESSION_HEADER] == session_id
+
+    @pytest.mark.asyncio
+    async def test_invoke_omits_runtime_session_header_by_default(self):
+        client = _make_client()
+        mock_sse = _mock_sse_response(200, events=[{}])
+
+        with patch("coa_mcp.clients.context_manager.aconnect_sse", mock_sse):
+            await client.invoke({"query": "q"}, "tok")
+
+        assert RUNTIME_SESSION_HEADER not in mock_sse.last_call_kwargs["headers"]
+
+
+@pytest.mark.unit
+class TestDeriveRuntimeSessionId:
+    def test_derive_runtime_session_id_deterministic_and_long_enough(self):
+        first = derive_runtime_session_id("alice", mcp_session_id="mcp-1", namespace_id="sales")
+        second = derive_runtime_session_id("alice", mcp_session_id="mcp-1", namespace_id="hr")
+        assert first == second
+        assert len(first) >= 33
+        assert first.replace("-", "").isalnum()
+
+    def test_derive_runtime_session_id_short_inputs_meet_agentcore_minimum(self):
+        assert len(derive_runtime_session_id("a", mcp_session_id=None, namespace_id="")) >= 33
+
+    def test_derive_runtime_session_id_distinct_users_and_scopes(self):
+        ids = {
+            derive_runtime_session_id("alice", mcp_session_id="mcp-1", namespace_id="sales"),
+            derive_runtime_session_id("bob", mcp_session_id="mcp-1", namespace_id="sales"),
+            derive_runtime_session_id("alice", mcp_session_id="mcp-2", namespace_id="sales"),
+            derive_runtime_session_id("alice", mcp_session_id=None, namespace_id="sales"),
+            derive_runtime_session_id("alice", mcp_session_id=None, namespace_id="hr"),
+            # A namespace equal to an MCP session id must not collide with that session.
+            derive_runtime_session_id("alice", mcp_session_id=None, namespace_id="mcp-1"),
+        }
+        assert len(ids) == 6
+
+
+@pytest.mark.unit
+class TestSessionConflictRetry:
+    @pytest.fixture(autouse=True)
+    def _no_sleep(self, monkeypatch):
+        monkeypatch.setattr(context_manager.asyncio, "sleep", AsyncMock())
+
+    @pytest.mark.asyncio
+    async def test_invoke_retries_retryable_conflict_then_succeeds(self):
+        client = _make_client()
+        mock_sse, calls = _mock_sse_sequence(
+            [(409, _RETRYABLE_CONFLICT_BODY, []), (409, _RETRYABLE_CONFLICT_BODY, []), (200, b"", [{"ok": True}])]
+        )
+
+        with patch("coa_mcp.clients.context_manager.aconnect_sse", mock_sse):
+            result = await client.invoke({"query": "q"}, "tok", runtime_session_id="s" * 40)
+
+        assert result == {"ok": True}
+        assert len(calls) == 3
+        assert all(call["headers"][RUNTIME_SESSION_HEADER] == "s" * 40 for call in calls)
+
+    @pytest.mark.asyncio
+    async def test_invoke_retryable_conflict_exhausted_raises(self):
+        client = _make_client()
+        attempts = len(context_manager._CONFLICT_RETRY_DELAYS_S) + 1
+        mock_sse, calls = _mock_sse_sequence([(409, _RETRYABLE_CONFLICT_BODY, [])] * attempts)
+
+        with (
+            patch("coa_mcp.clients.context_manager.aconnect_sse", mock_sse),
+            pytest.raises(ContextManagerError, match="409"),
+        ):
+            await client.invoke({}, "tok")
+
+        assert len(calls) == attempts
+
+    @pytest.mark.asyncio
+    async def test_invoke_non_retryable_conflict_not_retried(self):
+        client = _make_client()
+        mock_sse, calls = _mock_sse_sequence([(409, b'{"message":"Resource already exists"}', [])])
+
+        with (
+            patch("coa_mcp.clients.context_manager.aconnect_sse", mock_sse),
+            pytest.raises(ContextManagerError, match="returned 409"),
+        ):
+            await client.invoke({}, "tok")
+
+        assert len(calls) == 1
+
+
+@pytest.mark.unit
+class TestContextManagerErrorStatus:
+    def test_one_error_type_across_client_and_tool_layers(self):
+        from coa_mcp.tools import execution
+
+        assert execution.ContextManagerError is ContextManagerError
+
+    @pytest.mark.asyncio
+    async def test_http_error_carries_response_status(self):
+        client = _make_client()
+        with (
+            patch("coa_mcp.clients.context_manager.aconnect_sse", _mock_sse_response(403, body=b"Forbidden")),
+            pytest.raises(ContextManagerError) as info,
+        ):
+            await client.invoke({}, "tok")
+        assert info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_invoke_non_utf8_error_body_keeps_response_status(self):
+        client = _make_client()
+        with (
+            patch("coa_mcp.clients.context_manager.aconnect_sse", _mock_sse_response(502, body=b"\xff\xfe gateway")),
+            pytest.raises(ContextManagerError) as info,
+        ):
+            await client.invoke({}, "tok")
+        assert info.value.status_code == 502
+
+    @pytest.mark.asyncio
+    async def test_timeout_carries_504_and_transport_error_502(self):
+        client = _make_client()
+
+        @asynccontextmanager
+        async def _raise(exc):
+            raise exc
+            yield  # noqa: RUF027 — unreachable but needed for generator syntax
+
+        for exc, code in ((httpx.ReadTimeout("slow"), 504), (httpx.ConnectError("no route"), 502)):
+            with (
+                patch("coa_mcp.clients.context_manager.aconnect_sse", lambda *a, _e=exc, **k: _raise(_e)),
+                pytest.raises(ContextManagerError) as info,
+            ):
+                await client.invoke({}, "tok")
+            assert info.value.status_code == code
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_carries_502(self):
+        client = _make_client()
+        with (
+            patch("coa_mcp.clients.context_manager.aconnect_sse", _mock_sse_response(200, events=[])),
+            pytest.raises(ContextManagerError) as info,
+        ):
+            await client.invoke({}, "tok")
+        assert info.value.status_code == 502

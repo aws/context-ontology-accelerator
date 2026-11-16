@@ -109,9 +109,8 @@ def test_accepts_valid_namespace_scoped_key(monkeypatch):
         "update_ontology_registry",
         lambda ns, oid, **fields: stub.update({"ns": ns, "oid": oid, **fields}),
     )
-    # Don't actually run the background ingest.
-    monkeypatch.setattr(mod, "Thread", None, raising=False)
 
+    # Don't actually run the background ingest.
     class _NoopThread:
         def __init__(self, *a, **k):
             pass

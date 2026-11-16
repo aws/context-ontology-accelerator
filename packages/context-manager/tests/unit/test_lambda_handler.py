@@ -23,13 +23,11 @@ def mock_env(monkeypatch):
 @pytest.fixture
 def handler():
     """Import handler with mocked OpenSearch client."""
-    # Remove cached module if previously imported
     sys.modules.pop("index", None)
     with patch("boto3.Session") as mock_session:
         mock_creds = MagicMock()
         mock_session.return_value.get_credentials.return_value = mock_creds
         mock_creds.get_frozen_credentials.return_value = mock_creds
-        # Import the handler
         sys.path.insert(0, _LAMBDA_DIR)
         import index
 
@@ -63,7 +61,6 @@ class TestLambdaValidation:
         assert "Only knn, bool, or match_all queries allowed" in result["error"]
 
     def test_knn_query_allowed(self, handler):
-        # This will fail at the OpenSearch client level (mocked), but should pass validation
         result = handler(
             {
                 "action": "search",
@@ -72,18 +69,17 @@ class TestLambdaValidation:
             },
             None,
         )
-        # Should not be 400 (validation passed, will be 500 from mock client)
         assert result["statusCode"] != 400
 
     def test_size_capped_at_50(self, handler):
-        result = handler(
-            {"action": "search", "index": "test-index", "body": {"query": {"match_all": {}}, "size": 999}}, None
-        )
-        # Even if it errors, validation should have capped size
-        assert result["statusCode"] != 400
+        client = MagicMock()
+        with patch.object(sys.modules[handler.__module__], "_get_client", return_value=client):
+            handler(
+                {"action": "search", "index": "test-index", "body": {"query": {"match_all": {}}, "size": 999}}, None
+            )
+        assert client.search.call_args.kwargs["body"]["size"] == 50
 
     def test_health_check_action(self, handler):
-        # Will fail at client level but shouldn't be 400
         result = handler({"action": "health_check"}, None)
         assert result["statusCode"] != 400
 

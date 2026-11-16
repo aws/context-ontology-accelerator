@@ -13,11 +13,8 @@ lookup and must agree:
 * the RIGOR mapping's subject token (``rigor_ontology``)
 * the SHACL shape's ``sh:class`` (``validation.shapes.config``)
 
-Each spelled the three-probe lookup out by hand, so the order could drift between
-them — and a drift is not a cosmetic inconsistency: the shape then asserts a
-class-typed reference (``sh:nodeKind sh:IRI`` + ``sh:class``) against a column the
-mapping emits as an ``rr:datatype`` literal, which violates on every row of the
-child table. These tests pin the shared resolution and the agreement it buys.
+If they disagree, the shape asserts a class-typed reference against a column the
+mapping emits as an ``rr:datatype`` literal, which violates on every row.
 """
 
 from __future__ import annotations
@@ -107,11 +104,7 @@ class TestResolveFkTargetIdentity:
         assert resolve_fk_target_identity(child, "customers", index) == table_identity(target)
 
     def test_schema_probe_works_without_source_schema(self):
-        """``_generate_schema_sql`` and ``_catalog_to_tables`` build tables carrying
-        only a ``fullyQualifiedName``. Reading ``sourceSchema`` directly skipped the
-        schema probe for those, so a resolvable target fell through to the bare
-        probe — which is deliberately absent for an ambiguous name, so the FK was
-        degraded to a literal purely because the referrer lacked a field."""
+        """The schema probe uses ``fullyQualifiedName`` when ``sourceSchema`` is absent."""
         target = _parent("customers", "public", "src-b")
         decoy = _parent("customers", "crm", "src-c")
         child = _child("orders", "public", "src-a", "customers", source_schema=False)

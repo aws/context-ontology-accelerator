@@ -76,9 +76,7 @@ class TestScreenChunks:
         screener = MagicMock(spec=GuardrailScreener)
 
         async def slow_screen(texts):
-
-            await asyncio.sleep(10)  # Will exceed timeout
-            return [ScreeningResult(text_index=0, passed=True, action="NONE")]
+            await asyncio.Event().wait()
 
         screener.ascreen_texts = slow_screen
 
@@ -101,44 +99,22 @@ class TestScreenChunks:
         assert outcomes[0].reason == "error"
 
     async def test_mixed_outcomes(self):
-        screener = MagicMock(spec=GuardrailScreener)
-        call_count = 0
-
-        async def mock_screen(texts):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return [ScreeningResult(text_index=0, passed=True, action="NONE")]
-            else:
-                return [
-                    ScreeningResult(
-                        text_index=0, passed=False, action="GUARDRAIL_INTERVENED", intervention_reason="blocked"
-                    )
-                ]
-
-        screener.ascreen_texts = mock_screen
+        screener, _ = _blocking_screener({"bad"})
 
         chunks = [_chunk("safe", "c1"), _chunk("bad", "c2")]
         outcomes = await screen_chunks(screener, chunks)
 
-        allowed = [o for o in outcomes if o.allowed]
-        excluded = [o for o in outcomes if not o.allowed]
-        assert len(allowed) == 1
-        assert len(excluded) == 1
+        assert [o.chunk.chunk_id for o in outcomes if o.allowed] == ["c1"]
+        assert [o.chunk.chunk_id for o in outcomes if not o.allowed] == ["c2"]
 
     async def test_no_screener_in_synthesizer_passes_all_chunks(self):
-        """When chunk_screener is None, synthesis passes all chunks through unchanged."""
-        from coa_serve.clients.base import ConverseResult
-        from coa_serve.tier3.synthesizer import Synthesizer
-
         mock_bedrock = MagicMock()
         mock_bedrock.converse = AsyncMock(return_value=ConverseResult(text="Answer [CONFIDENCE: 0.8]"))
 
-        synth = Synthesizer(mock_bedrock, guardrail_id="gr-1")  # No chunk_screener
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-1")
         chunks = [_chunk("content", "c1")]
         result = await synth.synthesize("question", chunks, [])
 
-        # Should reach the LLM (not be blocked by screening)
         mock_bedrock.converse.assert_called_once()
         assert result.answer == "Answer"
 

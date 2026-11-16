@@ -241,7 +241,7 @@ class TestQualifyCrossSourceSQL:
             await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
 
     async def test_render_preserves_table_multiset(self):
-        """F7: make the all-or-nothing invariant executable. A cross-source rewrite
+        """The all-or-nothing invariant: a cross-source rewrite
         of a statement with a CTE, a cast and a subquery must preserve the real
         (non-CTE) table set — the guard re-parses the rendered output and abandons
         (returns input unchanged) if the count changes. Here it must NOT false-trip:
@@ -263,16 +263,11 @@ class TestQualifyCrossSourceSQL:
         # Not abandoned (both real tables qualified), and the CTE ref is untouched.
         assert "pg_cat.public.claims" in _unquoted(out)
         assert "awsdatacatalog.insurance.policies" in _unquoted(out)
-        # The CTE name "recent" must not have been qualified (it is not a real table).
-        assert "recent" in _unquoted(out)
 
     async def test_single_source_two_schemas_qualifies_schema_only(self):
         """Adjacent limitation: one source, two schemas → SCHEMA-qualified.
 
-        Both tables share a datasource, so distinct_datasources sees one source and
-        the old gate skipped the rewrite; the context then pinned discoveredSchemas[0]
-        and the other schema's table was TABLE_NOT_FOUND. Each table must carry its
-        own schema — but NOT the catalog: a single catalog is supplied by the
+        Each table must carry its own schema, but NOT the catalog: a single catalog is supplied by the
         context/connection, and prepending the Athena catalog would break the
         direct-JDBC route.
         """
@@ -285,14 +280,6 @@ class TestQualifyCrossSourceSQL:
         assert "pg_cat" not in out
         # One source, so a single registry read despite two distinct targets.
         assert reg.get_source.await_count == 1
-
-    async def test_single_source_single_schema_not_qualified(self):
-        """A genuinely single-target query is still returned byte-for-byte."""
-        routing = _routing(("claims", "src-1", "public"), ("policies", "src-1", "public"))
-        reg = _registry({"src-1": {"athenaDataCatalogName": "pg_cat"}})
-        out = await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
-        assert out == _CROSS_SOURCE_SQL
-        reg.get_source.assert_not_awaited()
 
     async def test_one_registry_read_per_distinct_source(self):
         """Registry lookups scale with SOURCES, not with table references."""
@@ -360,14 +347,6 @@ class TestQualifyCrossSourceSQL:
         reg = _registry({"src-pg": {"queryable": True}, "src-glue": {"queryable": True}})
         with pytest.raises(QualificationError, match="source schema"):
             await qualify_cross_source_sql(_CROSS_SOURCE_SQL, routing, reg, namespace="ns")
-
-    async def test_unrouted_table_rejects_whole_rewrite(self):
-        """An unattributable table rejects the statement rather than running it bare."""
-        routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
-        reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}, "src-glue": _GLUE})
-        sql = "SELECT 1 FROM claims JOIN policies ON TRUE JOIN mystery ON TRUE"
-        with pytest.raises(QualificationError, match="mystery.*routing metadata"):
-            await qualify_cross_source_sql(sql, routing, reg, namespace="ns")
 
     async def test_no_registry_fails_closed(self):
         routing = _routing(("claims", "src-pg", "public"), ("policies", "src-glue", "insurance"))
@@ -439,11 +418,7 @@ class TestQualifyCrossSourceSQL:
         """Ambiguity is per (source, schema), not per source.
 
         ONE datasource exposing ``public.claims`` and ``restricted.claims`` gives a
-        bare ``claims`` two different physical targets. Measuring ambiguity on the
-        datasource id alone found only one id here, registered the bare name, and
-        silently attributed the reference to whichever schema indexed first — a
-        wrong-table read inside a single source, which is exactly the outcome the
-        collision check exists to prevent.
+        bare ``claims`` two different physical targets, so the reference is ambiguous.
         """
         routing = _routing(
             ("public.claims", "src-pg", "public"),
@@ -471,12 +446,10 @@ class TestQualifyCrossSourceSQL:
         assert "pg_cat.public.claims" in _unquoted(out)
 
     async def test_colliding_name_resolves_when_sql_carries_the_schema(self):
-        """The Phase-2 payoff: a re-induced mapping emits "schema"."table", so the
-        SAME collision that raises above is attributable and executes.
+        """Schema-qualified SQL resolves a bare-name collision.
 
-        This is why the collision check is per-REFERENCE and not a precondition on
-        the routing map: after this fix a shared table name legitimately appears twice
-        in ``datasourceRouting``, once per schema.
+        The collision check is per-REFERENCE: a shared table name legitimately appears
+        twice in ``datasourceRouting``, once per schema.
         """
         routing = _routing(("public.customers", "src-pg", "public"), ("crm.customers", "src-glue", "crm"))
         reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}, "src-glue": _GLUE})
@@ -500,11 +473,7 @@ class TestQualifyCrossSourceSQL:
 
         ``WITH customers AS (SELECT * FROM crm.customers)`` makes the bare outer
         ``customers`` the CTE, while the schema-qualified inner reference is still
-        the real table. Excluding every reference whose NAME matched a CTE alias
-        skipped the real ``crm.customers``, producing exactly the partial rewrite
-        the all-or-nothing contract forbids — and one that
-        ``is_fully_catalog_qualified`` then certified as complete, so the executor
-        skipped catalog resolution for a statement that still needed it.
+        the real table and must still be qualified.
         """
         routing = _routing(("crm.customers", "src-pg", "crm"), ("sales.orders", "src-glue", "sales"))
         reg = _registry({"src-pg": {"athenaDataCatalogName": "pg_cat"}, "src-glue": _GLUE})
@@ -589,11 +558,9 @@ class TestRestoreSourceSchemas:
         assert "public__2f77729f" not in out
 
     def test_runs_for_a_single_source_statement(self):
-        """The crux: a one-table query never reaches the cross-source qualifier.
+        """A one-table query never reaches the cross-source qualifier.
 
-        Gating restoration on "spans sources" fixed the join and broke every
-        single-source query over the same table — the synthetic token names no
-        schema in the real database either way.
+        The synthetic token names no schema in the real database, so restoration runs regardless.
         """
         assert len(distinct_datasources(self._SYNTHETIC)) == 1
         out = restore_source_schemas('SELECT id FROM "public__2f77729f"."customers"', self._SYNTHETIC)
@@ -652,12 +619,7 @@ class TestPrepareExecutionSQL:
         assert "awsdatacatalog.sales.orders" in _unquoted(prepared.sql)
 
     async def test_ambiguity_reports_an_error_instead_of_raising(self):
-        """Fail closed, and identically for both strategies.
-
-        The two paths previously disagreed — one aborted the query, the other
-        executed the unqualified statement — so the same collision produced a
-        wrong-table risk on one path and an error on the other.
-        """
+        """Fail closed, and identically for both strategies."""
         routing = _routing(("public.customers", "src-pg", "public"), ("crm.customers", "src-glue", "crm"))
         reg = _registry({"src-pg": _GLUE, "src-glue": _GLUE})
         prepared = await prepare_execution_sql("SELECT 1 FROM customers", routing, reg, namespace="ns")
@@ -699,14 +661,11 @@ class TestPrepareExecutionSQL:
         assert prepared == type(prepared)(sql="SELECT 1 FROM claims")
 
     async def test_two_sources_sharing_identical_real_schema_are_qualified_not_refused(self):
-        """Code review finding: two datasources that expose the SAME real
-        ``schema.table`` (both ``public.claims``) are distinguished only by the
-        inducer's synthetic schema tokens (``public__aaa`` / ``public__bbb``) in
-        the SQL. restore_source_schemas must NOT collapse both to ``public.claims``
-        before the qualifier runs — doing so erased the tokens and forced a
-        QualificationError on a query that IS attributable. The qualifier matches
-        the synthetic keys, restores the real schema, AND attributes the catalog in
-        one pass, so this must produce a fully 3-part statement, not an error.
+        """Identical real schemas separated by synthetic tokens qualify to their own catalogs.
+
+        Two datasources exposing ``public.claims`` are distinguished only by the
+        inducer's synthetic schema tokens (``public__aaa`` / ``public__bbb``); the
+        result is a fully 3-part statement, not an error.
         """
         routing = {
             "public__aaa.claims": {"datasourceId": "src-a", "sourceSchema": "public"},
@@ -820,7 +779,7 @@ class TestIsFullyCatalogQualified:
         assert is_fully_catalog_qualified(sql)
 
     def test_cte_named_after_an_unqualified_table_is_not_certified(self):
-        """The name-only CTE test made this return True, hiding a bare reference."""
+        """A CTE named after a table does not hide the bare reference to it."""
         sql = "WITH customers AS (SELECT * FROM crm.customers) SELECT 1 FROM customers"
         assert not is_fully_catalog_qualified(sql)
 

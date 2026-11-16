@@ -24,6 +24,7 @@ members = [
     "coa-serve",
     "coa-sources",
     "coa-vkg",
+    "coa-workflow-agents",
 ]
 constraints = [
     { name = "aiohttp", specifier = ">=3.14.4" },
@@ -443,6 +444,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/89/94/88a55e6c5d8235f8aea03ab8413481112ba01895009a49916ee293bfd76f/boto3_stubs-1.43.37-py3-none-any.whl", hash = "sha256:cb6884fe31cf4e2f7ac8c7bbbe66674de42a54b3df02f446987ebf901e937b04", size = 71048, upload-time = "2026-06-29T21:57:16.414Z" },
 ]
 
+[package.optional-dependencies]
+bedrock-runtime = [
+    { name = "mypy-boto3-bedrock-runtime" },
+]
+
 [[package]]
 name = "botocore"
 version = "1.43.117"
@@ -670,7 +676,7 @@ source = { virtual = "." }
 
 [package.dev-dependencies]
 dev = [
-    { name = "boto3-stubs" },
+    { name = "boto3-stubs", extra = ["bedrock-runtime"] },
     { name = "moto", extra = ["dynamodb"] },
     { name = "mypy" },
     { name = "pillow" },
@@ -688,7 +694,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3-stubs", specifier = ">=1.35" },
+    { name = "boto3-stubs", extras = ["bedrock-runtime"], specifier = ">=1.35" },
     { name = "moto", extras = ["dynamodb", "sqs"], specifier = ">=5.0" },
     { name = "mypy", specifier = "==1.20.1" },
     { name = "pillow", specifier = ">=13.0.0" },
@@ -970,6 +976,7 @@ dependencies = [
     { name = "coa-common" },
     { name = "graphrag-lexical-graph" },
     { name = "httpx" },
+    { name = "llama-index-llms-bedrock-converse" },
     { name = "llama-index-vector-stores-opensearch" },
     { name = "opensearch-py" },
     { name = "pydantic" },
@@ -1000,6 +1007,7 @@ requires-dist = [
     { name = "coa-common", editable = "libs/common" },
     { name = "graphrag-lexical-graph", specifier = "==3.20.0" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "llama-index-llms-bedrock-converse", specifier = ">=0.15.4,<0.16" },
     { name = "llama-index-vector-stores-opensearch", specifier = ">=0.5" },
     { name = "opensearch-py", specifier = ">=2.5" },
     { name = "pydantic", specifier = ">=2.13.4" },
@@ -1076,6 +1084,39 @@ requires-dist = [
     { name = "coa-common", editable = "libs/common" },
     { name = "rdflib", specifier = ">=7.0.0" },
     { name = "sqlglot", specifier = ">=20.0.0" },
+]
+
+[[package]]
+name = "coa-workflow-agents"
+version = "0.3.10"
+source = { editable = "coa-ai/workflow-agents" }
+dependencies = [
+    { name = "botocore" },
+    { name = "coa-common" },
+    { name = "coa-control-plane-server" },
+    { name = "mcp" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "requests" },
+    { name = "starlette" },
+    { name = "strands-agents" },
+    { name = "structlog" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "botocore", specifier = ">=1.35.0" },
+    { name = "coa-common", editable = "libs/common" },
+    { name = "coa-control-plane-server", editable = "smithy-generated/control-plane-python-server" },
+    { name = "mcp", specifier = ">=1.30.0,<2" },
+    { name = "pydantic", specifier = ">=2.13.4" },
+    { name = "pydantic-settings", specifier = ">=2.15.0" },
+    { name = "requests", specifier = ">=2.34.2" },
+    { name = "starlette", specifier = ">=1.4.1" },
+    { name = "strands-agents", specifier = ">=1.48.0" },
+    { name = "structlog", specifier = ">=24.0" },
+    { name = "uvicorn", specifier = ">=0.48.0" },
 ]
 
 [[package]]
@@ -2547,6 +2588,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1a/76/e0dee71035316e75a69d73aec2f03c39c21c967b97e277fd0ef8fd6aec66/mypy-1.20.1-cp314-cp314t-win_amd64.whl", hash = "sha256:a0c17fbd746d38c70cbc42647cfd884f845a9708a4b160a8b4f7e70d41f4d7fa", size = 12575567, upload-time = "2026-04-13T02:45:34.795Z" },
     { url = "https://files.pythonhosted.org/packages/22/a8/7ed43c9d9c3d1468f86605e323a5d97e411a448790a00f07e779f3211a46/mypy-1.20.1-cp314-cp314t-win_arm64.whl", hash = "sha256:db2cb89654626a912efda69c0d5c1d22d948265e2069010d3dde3abf751c7d08", size = 10378823, upload-time = "2026-04-13T02:45:13.35Z" },
     { url = "https://files.pythonhosted.org/packages/d8/28/926bd972388e65a39ee98e188ccf67e81beb3aacfd5d6b310051772d974b/mypy-1.20.1-py3-none-any.whl", hash = "sha256:1aae28507f253fe82d883790d1c0a0d35798a810117c88184097fe8881052f06", size = 2636553, upload-time = "2026-04-13T02:46:30.45Z" },
+]
+
+[[package]]
+name = "mypy-boto3-bedrock-runtime"
+version = "1.43.62"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/78/542f5804cf0f9e3c1ccbf30917eaa3b4b6002b91965de02d065d7441fc93/mypy_boto3_bedrock_runtime-1.43.62.tar.gz", hash = "sha256:beb70b08ef72cdfd5036bcd3270f2fbac0a2ce5e40f70dfc1d87c4f139d4d7ff", size = 31492, upload-time = "2026-07-31T19:54:15.291Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d9/b2/e3bff20acd290b909f1c28856d6d8d7984f7f7d5bda299d5957f64e97bb3/mypy_boto3_bedrock_runtime-1.43.62-py3-none-any.whl", hash = "sha256:603d9df54da5029fc0d0e3c09b6db33733af53182bee030c0c7af99e88ed3b39", size = 37865, upload-time = "2026-07-31T19:54:13.959Z" },
 ]
 
 [[package]]

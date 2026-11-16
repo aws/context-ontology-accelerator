@@ -41,6 +41,7 @@ from coa_sources.database.connectors.glue_connection_provisioner import (
     grant_consumer_select,
     grant_consumer_select_native,
     grant_iam_allowed_principals,
+    native_grant_target_error,
     provision_federated_catalog,
 )
 from coa_sources.database.glue_ownership import (
@@ -185,7 +186,6 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
     sm = boto3.client("secretsmanager", region_name=secret_region, config=async_boto_config())
 
     try:
-        # Fetch existing policy (if any)
         try:
             existing = sm.get_resource_policy(SecretId=secret_arn)
             policy = json.loads(existing.get("ResourcePolicy") or "{}")
@@ -200,7 +200,6 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
         except (json.JSONDecodeError, TypeError):
             policy = {}
 
-        # Build/merge the statement
         sid = "SCLRuntimeSecretRead"
         statements = policy.get("Statement", [])
         if not isinstance(statements, list):
@@ -240,11 +239,12 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
 
 
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
-    """Provision a managed Glue federated catalog for a JDBC source, then grant LF.
+    """Make a scanned source queryable, dispatching on its ``sourceSubType``.
 
     Input (from Step Functions): {datasourceId, sourceId, namespaceId, ...}.
-    Glue (S3/Iceberg) sources are skipped — they query natively via
-    AwsDataCatalog and need no provisioning.
+    JDBC sources get a managed Glue federated catalog plus LF grants; Glue,
+    connector-backed and graph sources take their own branches; an absent
+    sub-type is a no-op.
     """
     datasource_id = event["datasourceId"]
     source_id = event.get("sourceId") or datasource_id.removeprefix("DS#")
@@ -304,24 +304,50 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
                 "queryable": False,
             }
 
+        catalog_id = glue_config.get("catalogId", "")
+
+        def _record_queryable(granted: bool) -> None:
+            try:
+                _get_dao().update(
+                    key=source_key,
+                    update_fields={"queryable": granted},
+                    condition="attribute_exists(PK)",
+                )
+            except Exception:
+                # A lost write (e.g. racing a concurrent delete) is redone by the
+                # next scan, which runs this step again.
+                logger.warning(
+                    "glue_native_queryable_update_failed",
+                    extra={"datasource_id": datasource_id},
+                    exc_info=True,
+                )
+
+        # The grant lands on this database name in the ROOT catalog of THIS
+        # account, but the ownership check above cleared the catalog the source
+        # DECLARED (a foreign catalogId is exempt; a nested one is checked as
+        # `database/{catalog}/{db}`). Anything but the local root catalog would
+        # grant the shared serve runtime role an unchecked same-named local
+        # database, so it gets no grant and `queryable: false`, which also keeps
+        # it out of serve's SQL scope (`sql_namespace_scope` skips it).
+        target_error = native_grant_target_error(catalog_id)
+        if target_error:
+            logger.info(
+                "glue_native_lf_grant_skipped_declared_catalog",
+                extra={"datasource_id": datasource_id, "database": database_name, "reason": target_error},
+            )
+            _record_queryable(False)
+            return {
+                "provisioned": False,
+                "reason": f"declared-catalog-not-grantable: {target_error}",
+                "queryable": False,
+            }
+
         granted = grant_consumer_select_native(
             database_name=database_name,
             principal_arn=_consumer_role_arn(),
+            catalog_id=catalog_id,
         )
-        try:
-            _get_dao().update(
-                key=source_key,
-                update_fields={"queryable": granted},
-                condition="attribute_exists(PK)",
-            )
-        except Exception:
-            # The LF grant is idempotent — even if the DDB write races with a
-            # concurrent delete, the permission persists and a re-scan will retry.
-            logger.warning(
-                "glue_native_queryable_update_failed",
-                extra={"datasource_id": datasource_id},
-                exc_info=True,
-            )
+        _record_queryable(granted)
         logger.info(
             "glue_native_lf_grant",
             extra={"datasource_id": datasource_id, "granted": granted},
@@ -368,15 +394,8 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         return {"provisioned": False, "reason": "connector-backed", "queryable": True}
 
     if sub_type != SourceSubType.JDBC_DATABASE:
-        # An ABSENT sub-type is the benign case and must stay a no-op: a source
-        # deleted concurrently with its scan reads back as an empty dict, and a
-        # legacy row may predate the attribute. Turning either into a pipeline
-        # failure would convert a race into an alarm.
-        #
-        # A sub-type the enum RECOGNISES but this handler does not is different —
-        # it means a new DATABASE sub-type shipped without its branch here, and
-        # every source of that type would silently stay queryable=False, scanning
-        # cleanly and then answering nothing. That has to be loud.
+        # Absent stays a no-op; a recognised but unhandled sub-type raises (see
+        # _UNHANDLED_DATABASE_SUB_TYPES).
         if sub_type in _UNHANDLED_DATABASE_SUB_TYPES:
             raise RuntimeError(
                 f"No federation branch for sourceSubType {sub_type!r} ({datasource_id}); "

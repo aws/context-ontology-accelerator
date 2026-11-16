@@ -18,34 +18,10 @@ table matched by ``table_id`` (``database.name``):
   * per column matched by name: added / removed, and for a match — data type,
     nullability, partition flag, and source description/comment.
 
-Only *source-owned* fields are compared. Synonyms / glossary / tags are
-AI- or steward-authored and never appear in a scan, so a re-scan cannot change
-them — they are preserved by the writer, never diffed here. A description is
-compared only when the accepted value is *source-derived* — a DB comment or a
-3rd-party catalog (``enrichment_source`` DETERMINISTIC / CATALOG_EXISTING). An
-AI- or steward-authored description is not re-derivable from a scan, so the
-fresh scan value (usually empty) is not evidence of drift and is left alone;
-diffing it would flag every enriched table as modified on a no-op re-scan.
-Primary and foreign keys are gated the same way — only keys the source reported
-(DETERMINISTIC / catalog) are compared; ``AI_INFERRED`` keys are guesses a scan
-cannot reproduce, so they are not diffed.
-``distinct_values`` is a sampled data value (not schema) that drifts as rows
-change; it is refreshed on merge but deliberately NOT diffed, so sampled-data
-churn does not drown — or manufacture — real schema/description/constraint
-changes.
+Only *source-owned* fields are compared (see ``_SOURCE_DERIVED_PROVENANCE``);
+synonyms, glossary and tags never appear in a scan and are never diffed.
 
-This module is pure — it never touches DataZone, DynamoDB, or the network. Its
-only imports beyond the domain models are
-:func:`coa_common.datazone_forms.deserialize_form`, itself a pure form-payload
-parser, and two Smithy-generated enums, which are plain value types carrying no
-behaviour. It reports what differs (:func:`diff_tables`),
-produces the merged table a re-scan should write (:func:`merge_rescan_table`),
-picks the approved tables that have no metadata to enrich again
-(:func:`needs_enrichment_backfill`, :func:`mark_for_enrichment_backfill`),
-and reconstructs the last-approved baseline the diff must run against
-(:func:`reconstruct_approved_baseline`). The actual I/O (reading the live
-assets and the backup blob, writing the merged one, deleting removed assets on
-approve) happens in the write path, not here.
+This module is pure: it never touches DataZone, DynamoDB, or the network.
 """
 
 from __future__ import annotations
@@ -68,11 +44,6 @@ from coa_common.domain_models import (
 from coa_control_plane_server.models.rescan_change_kind import RescanChangeKind
 from coa_control_plane_server.models.rescan_column_change_status import RescanColumnChangeStatus
 
-# ``RescanChangeKind`` and ``RescanColumnChangeStatus`` are imported above rather
-# than restated here: both are returned on the wire by the table-diff endpoint, so
-# a local copy would be two sources of truth for one contract. They are used under
-# their generated names throughout, so a reader always knows where they come from.
-#
 # RescanChangeKind members: SCHEMA (data type, nullability, partition flag, format,
 # location, partition keys), DESCRIPTION (table or column source comment,
 # source-derived only), CONSTRAINT (primary key / foreign keys), and SAMPLED_VALUES.
@@ -172,22 +143,10 @@ def _source_derived_fks(fks: list[ForeignKey]) -> list[ForeignKey]:
 
 
 def _diff_description(stored: BusinessMetadata, fresh: BusinessMetadata) -> bool:
-    """Whether a description is worth diffing, from either side's provenance.
+    """Whether a description is worth diffing: either side is source-derived.
 
-    Two directions matter, and gating on ``stored`` alone only catches the first:
-
-    * **stored is source-derived** — the accepted value came from the DB comment or
-      catalog, so a differing fresh value is real drift in the source.
-    * **fresh is source-derived** — the source has *gained* a comment since the last
-      scan, on a table whose accepted description is AI- or steward-authored. Gating
-      on stored alone skipped this forever: stored provenance never changes by
-      itself, so the real comment could never surface on any later re-scan either.
-
-    Neither side source-derived means neither value came from the source, so a
-    difference is not drift — that is the no-op re-scan flood the gate prevents, and
-    it stays prevented: a connector only sets a source-derived provenance when the
-    source actually supplied a comment, so a fresh scan with no comment is not
-    source-derived and does not open this branch.
+    A source-derived fresh value catches a comment the source gained since the last
+    scan; neither side source-derived means the difference is not source drift.
     """
     return (
         stored.enrichment_source in _SOURCE_DERIVED_PROVENANCE or fresh.enrichment_source in _SOURCE_DERIVED_PROVENANCE
@@ -376,13 +335,7 @@ def merge_rescan_table(accepted: Table, fresh: Table, *, changed_column_names: s
     carry the curation over, and reset review status only for the items that
     actually changed — never dropping curated text, only clearing its approval
     until the steward re-confirms it against the new shape.
-
-    Args:
-        accepted: the table reconstructed from the current (approved) asset.
-        fresh: the table the re-scan just discovered.
-        changed_column_names: names of columns flagged ``modified`` by
-            :func:`diff_tables` (added/removed are derived here from the two
-            column sets, so only the *modified* set is needed).
+    ``changed_column_names`` is the *modified* set from :func:`diff_tables`.
 
     Rules:
       * table technical metadata and ``database_description`` come from ``fresh``;
@@ -545,16 +498,9 @@ def mark_for_enrichment_backfill(table: Table) -> Table:
 def reconstruct_approved_baseline(live: list[Table], backup: dict[str, Any] | None, *, source_id: str) -> list[Table]:
     """Reconstruct the last-APPROVED table set from the live assets + backup blob.
 
-    WHY: a re-scan review must show "changes since the last APPROVED scan", not
-    since the last *scan*. The live DataZone assets equal the approved state only
-    when the source is APPROVED. While a prior re-scan sits un-approved in
-    RESCAN_REVIEW, the live assets are that interim merge, so diffing a fresh scan
-    against them hides every change the prior (still un-approved) re-scan
-    introduced. The re-scan backup blob is the durable record of the approved
-    pre-image (written by discovery before it overwrites anything, cleared by the
-    worker on approve/reject), so its PRESENCE means an un-approved re-scan is
-    open. This overlays that pre-image back onto the live set to recover the
-    approved baseline the diff/merge/new-backup must all run against.
+    A re-scan review shows changes since the last approval. While a prior re-scan
+    sits un-approved in RESCAN_REVIEW the live assets are that interim merge, so
+    the backup blob's approved pre-image is overlaid back onto them.
 
     Overlay rules:
       * ``modified_backup`` — restore each table to its approved (pre-rescan)
@@ -567,17 +513,7 @@ def reconstruct_approved_baseline(live: list[Table], backup: dict[str, Any] | No
 
     Interim un-approved edits made during the open review are intentionally NOT
     preserved: the baseline is the last approval, and a fresh re-scan re-derives
-    the change-set from there.
-
-    Args:
-        live: tables reconstructed from the source's current live DataZone assets.
-        backup: the current re-scan backup blob (see ``rescan_backup``), or
-            None/empty when the source is APPROVED (no open re-scan) — then
-            ``live`` already IS the approved baseline and is returned unchanged.
-        source_id: owning source id, threaded into ``deserialize_form``.
-
-    Returns:
-        The tables as they stood at the last approval. Pure — no I/O.
+    the change-set from there. An empty ``backup`` returns ``live`` unchanged.
     """
     if not backup:
         return list(live)

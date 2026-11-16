@@ -23,12 +23,9 @@ logger = structlog.get_logger(__name__)
 
 
 # Modules that bind ``get_request_body`` and must all be re-pointed at the
-# no-temp wrapper. The two batch extractors do
-# ``from ...batch_inference_utils import get_request_body`` and then call that
-# module-local name in their ``_get_json``, so patching only the utils module
-# leaves the extractors — the actual batch-serialization consumers — on the
-# original. Spelled out as import paths (not module objects) so the worker-init
-# path can re-resolve them in a freshly spawned interpreter.
+# no-temp wrapper: the two batch extractors import it by name, so patching only
+# the utils module misses them. Import paths, not module objects, so a spawned
+# worker can re-resolve them.
 _GET_REQUEST_BODY_MODULES = (
     "graphrag_toolkit.lexical_graph.indexing.utils.batch_inference_utils",
     "graphrag_toolkit.lexical_graph.indexing.extract.batch_topic_extractor_sync",
@@ -61,27 +58,15 @@ def _make_no_temp_serializer(original, no_temp_models):
 def _patch_graphrag_batch_request_body() -> None:
     """Keep batch serialization from failing on models that forbid ``temperature``.
 
-    graphrag's ``batch_inference_utils.get_request_body`` reads
-    ``inference_parameters['temperature']`` unconditionally for every model
-    family. But llama_index's ``BedrockConverse._get_all_kwargs`` DROPS
-    ``temperature`` for the models in ``BEDROCK_NO_TEMP_MODELS`` (Opus 4.7/4.8,
-    Fable 5, Sonnet 5), because Bedrock rejects the field outright for them. The
-    default extraction model (``claude-sonnet-5``) is one of these, so once an
-    extraction worker reaches the Bedrock batch minimum (100 records) the
-    serializer raises ``KeyError('temperature')`` and the build hits SCAN_FAILED
-    before a job is ever submitted.
+    graphrag's ``get_request_body`` reads ``inference_parameters['temperature']``
+    unconditionally, but llama_index drops ``temperature`` for the models in
+    ``BEDROCK_NO_TEMP_MODELS`` because Bedrock rejects it, so batch serialization
+    raises ``KeyError('temperature')`` for them. For a no-temp model, wrap
+    ``get_request_body`` to build the body with a placeholder temperature and strip
+    the key back out.
 
-    Mirror the real-time path, which simply omits the field: wrap
-    ``get_request_body`` so that, for a no-temp model, it builds the body with a
-    placeholder temperature (to clear the unconditional read) and then strips the
-    key back out wherever the family put it. Inserting a real temperature instead
-    would re-introduce the field Bedrock refuses, so it must be removed, not
-    defaulted.
-
-    Rebinds the name in EVERY module that holds it (``_GET_REQUEST_BODY_MODULES``)
-    — the two extractors import it directly, so patching the utils module alone
-    misses the real consumers. Idempotent per module via a sentinel attribute, so
-    it is safe to re-run (the spawn-worker initializer does exactly that).
+    Rebinds the name in every module in ``_GET_REQUEST_BODY_MODULES``. Idempotent
+    per module via a sentinel attribute, so it is safe to re-run.
     """
     try:
         import importlib
@@ -100,39 +85,24 @@ def _patch_graphrag_batch_request_body() -> None:
         current = getattr(module, "get_request_body", None)
         if current is None or getattr(current, "_coa_no_temp_wrapped", False):
             continue
-        # mypy: a dynamically imported ModuleType has no statically-known
-        # ``get_request_body`` attribute; rebinding it is the whole point here.
         module.get_request_body = _make_no_temp_serializer(current, BEDROCK_NO_TEMP_MODELS)  # type: ignore[attr-defined]
 
 
-# Captured in the parent at patch time so ``_batch_worker_init`` can DELEGATE to
-# the toolkit's own initializer instead of re-implementing it (and silently
-# drifting if the toolkit's ``_init_worker`` grows logic beyond the config
-# snapshot). None until the parent patches; a spawned worker re-imports this
-# module fresh and re-resolves the original itself (see ``_batch_worker_init``).
+# The toolkit's own initializer, captured in the parent at patch time so
+# ``_batch_worker_init`` can delegate to it. None until the parent patches.
 _toolkit_init_worker: Callable[..., None] | None = None
 
 
 def _batch_worker_init(config_snapshot) -> None:
     """Spawn-worker initializer: run the toolkit's init AND the serializer patch.
 
-    ``pipeline_utils.run_pipeline`` runs the extraction transforms in a
-    ProcessPoolExecutor started with ``mp_context="spawn"``, whose initializer
-    (``_init_worker``) re-applies the GraphRAGConfig snapshot. spawn re-imports
-    the toolkit fresh in every worker, so the parent's ``get_request_body`` patch
-    is absent there and the no-temp KeyError resurfaces per worker. Replace the
-    toolkit initializer with this one (see ``_patch_graphrag_worker_init``) so each
-    worker runs the toolkit's own init AND re-applies the serializer patch.
+    ``run_pipeline`` starts its ProcessPoolExecutor with ``mp_context="spawn"``,
+    which re-imports the toolkit fresh in every worker, so the parent's
+    ``get_request_body`` patch is absent there. This initializer delegates to the
+    original ``_init_worker`` (captured in ``_toolkit_init_worker``, or re-resolved
+    from ``pipeline_utils`` in a spawned worker) and re-applies the patch.
 
-    Delegates to the ORIGINAL ``_init_worker`` rather than reimplementing it, so a
-    future toolkit version that does more than apply the snapshot is not silently
-    lost in workers. In the parent the original is captured in
-    ``_toolkit_init_worker``; in a spawned worker (fresh import, global unset, or
-    pointing back at us) it is re-resolved from the freshly-imported, unpatched
-    ``pipeline_utils``.
-
-    MUST be a module-level function: spawn pickles the initializer by reference,
-    so a closure would not survive the hop.
+    MUST be a module-level function: spawn pickles the initializer by reference.
     """
     init = _toolkit_init_worker
     if init is None or init is _batch_worker_init:

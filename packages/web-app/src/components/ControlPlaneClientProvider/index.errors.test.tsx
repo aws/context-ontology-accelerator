@@ -1,10 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * The sources service answers a refusal as `{error}`, while the generated client reads
- * `message`, so a refused Re-verify showed "UnknownError". The console's client reads both; the server is unchanged.
- */
+/** The service answers a refusal as `{error}`; the generated client reads `message`. */
 
 import React from "react";
 import { render } from "@testing-library/react";

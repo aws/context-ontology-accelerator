@@ -11,7 +11,7 @@ import type { AppTranslate, SupportedLocale } from "../../i18n/LocaleProvider";
  * the English summary, so for the fixed-text types it is the very sentence the
  * server sends.
  */
-export const PLAYGROUND_ERROR_MESSAGES: Readonly<Record<string, AppMessage>> = {
+const PLAYGROUND_ERROR_MESSAGES: Readonly<Record<string, AppMessage>> = {
   AccessDenied: "Access denied",
   AccessDeniedError: "Access denied",
   TimeoutError: "Query resolution timed out",

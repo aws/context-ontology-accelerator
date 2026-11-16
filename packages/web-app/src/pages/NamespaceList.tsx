@@ -88,42 +88,25 @@ const STATUS_ACTIONS: { id: NamespaceStatus; text: AppMessage }[] = [
   { id: NamespaceStatus.DELETED, text: "Delete" },
 ];
 
-// Allowed target statuses keyed by the namespace's current status.
-// "DELETED" here is a UI sentinel for the delete action (see onItemClick
-// below) — clicking it actually starts the async deletion pipeline, which
-// transitions ARCHIVED/DELETE_FAILED -> DELETING -> DELETED/DELETE_FAILED.
-// DELETING itself is system-managed and intentionally not a selectable
-// target (no user-initiated transition leads into or out of it directly).
+// Allowed target statuses keyed by the namespace's current status. "DELETED"
+// is the delete action's sentinel (it starts the async deletion pipeline);
+// DELETING is system-managed and never a selectable target.
 const VALID_TRANSITIONS: Partial<Record<NamespaceStatus, NamespaceStatus[]>> = {
   [NamespaceStatus.ACTIVE]: [NamespaceStatus.ARCHIVED],
   [NamespaceStatus.ARCHIVED]: [NamespaceStatus.ACTIVE, NamespaceStatus.DELETED],
   [NamespaceStatus.DELETE_FAILED]: [NamespaceStatus.DELETED],
 };
 
-/**
- * Builds the "Change status" dropdown items for a namespace's current status.
- * Every action is always returned; transitions that are not valid from the
- * current status are disabled (greyed out) with an explanatory reason rather
- * than hidden.
- */
+/** Builds the "Change status" dropdown items for a namespace's current status. */
 export function getStatusActionItems(status: NamespaceStatus | undefined) {
   const allowed = new Set(status ? (VALID_TRANSITIONS[status] ?? []) : []);
-  return STATUS_ACTIONS.map((action) => {
-    const enabled = allowed.has(action.id);
-    return {
-      ...action,
-      disabled: !enabled,
-      disabledReason: enabled
-        ? undefined
-        : `Cannot ${action.text.toLowerCase()} a namespace in ${status ?? "this"} status.`,
-    };
-  });
+  return STATUS_ACTIONS.map((action) => ({
+    ...action,
+    disabled: !allowed.has(action.id),
+  }));
 }
 
-/**
- * Header counter text for the namespace table. Shows the total count, and when
- * rows are selected, renders "selected/total selected" (e.g. "(1/2 selected)").
- */
+/** Header counter text for the namespace table. */
 export function getHeaderCounterText(total: number, selected: number): string {
   return selected ? `(${selected}/${total} selected)` : `(${total})`;
 }
@@ -319,7 +302,6 @@ export const NamespaceList: React.FC = () => {
     selection: {},
   });
 
-  // Fetch next page when approaching the end
   const pagesCount = paginationProps.pagesCount ?? 1;
   React.useEffect(() => {
     if (
@@ -339,7 +321,6 @@ export const NamespaceList: React.FC = () => {
 
   const selected = collectionProps.selectedItems ?? [];
 
-  // Inject Link navigation into the name column
   const columnDefinitions = useMemo<
     TableProps.ColumnDefinition<NamespaceSummary>[]
   >(

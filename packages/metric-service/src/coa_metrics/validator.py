@@ -4,19 +4,6 @@
 """Metric validation module.
 
 Validates metric definitions against data source metadata and SQL syntax.
-
-Checks (per Metric Onboarding Service LLD §5.1):
-  1. SQL parses without syntax errors in declared dialect (sqlglot) → ERROR (blocks)
-  2. All table references exist in OMS for the metric's dataSourceId → WARNING
-  3. All column references exist and match expected types → WARNING
-  4. Dimension columns exist in referenced tables → WARNING
-  5. Filter columns exist and type matches operator → WARNING
-  6. :governedMetricFor references a valid ontology class → WARNING
-
-Philosophy: "Author early, validate continuously"
-- SQL syntax, read-only semantics, and executable statement shape block writes
-- Checks 2-6 produce soft warnings — metric is still published
-- Re-scan impact detection triggers re-validation when schema changes
 """
 
 from __future__ import annotations
@@ -40,9 +27,6 @@ from coa_common.sql_safety import (
 logger = structlog.get_logger(__name__)
 
 
-# ── Result types ────────────────────────────────────────────────────────
-
-
 class Severity(Enum):
     """Validation check severity."""
 
@@ -51,13 +35,9 @@ class Severity(Enum):
 
 
 # Onboarding-blocking checks (CreateMetric/UpdateMetric return 400 on these).
-# Scoped by check NAME rather than by ERROR severity: the SQL syntax + shape
-# checks (1/1b) mirror the serve-time SQL firewall's SELECT-only rule, so a
-# metric that fails them would persist only to fail at query time (#617/#1050).
-# Other checks can also be ERROR-severity — e.g. `table_reference` on provable
-# sourceTable absence (see below) — but those have their own dedicated gate
-# (check_source_table_exists) and must NOT block here, or create/update would
-# 400 in a case the contract says should publish (Kun's review, !1133).
+# Scoped by check name, not ERROR severity: only the SQL syntax and shape checks
+# block. `table_reference` can also be ERROR, but it has its own gate
+# (check_source_table_exists) and must not block here.
 BLOCKING_CHECKS = frozenset({"sql_syntax", "sql_shape"})
 
 
@@ -105,10 +85,6 @@ class ValidationResult:
         )
 
 
-# ── Data source lookup interface ────────────────────────────────────────
-# Base classes and implementations live in lookups.py (per review — keeps
-# validator.py focused on check orchestration).
-
 from coa_metrics.lookups import (  # noqa: E402, F401
     ColumnMetadata,
     DataSourceLookup,
@@ -118,12 +94,6 @@ from coa_metrics.lookups import (  # noqa: E402, F401
     declared_source_table_exists,
     source_table_rejection,
 )
-
-# Backward compat alias — new code should use SmusCatalogDataSourceLookup.
-DynamoDBDataSourceLookup = None  # type: ignore[assignment]
-
-
-# ── Main validation function ────────────────────────────────────────────
 
 _DIALECT_MAP: dict[str, str] = {
     "trino": "trino",
@@ -165,10 +135,9 @@ _COMMENT_PATTERN = re.compile(r"/\*.*?\*/|--[^\n]*", re.DOTALL)
 # ``DELETE FROM orders WHERE (((``) is still caught, plus the admin/DML verbs
 # the firewall covers via its allowlist stage. Keep the two in sync.
 #
-# Anchored at ``^\s*`` — it only ever sees the FIRST statement. Stacked forms
-# (``SELECT 1; TRUNCATE TABLE x``) are the AST walk's job when the SQL parses;
-# when it does not, ``_blocked_statement_segment`` re-applies this pattern to
-# each ``;``-segment so the stacked payload is still caught.
+# Anchored at ``^\s*``, so it only sees the first statement. Stacked forms are
+# the AST walk's job; on a parse failure ``_blocked_statement_segment`` re-applies
+# this pattern per ``;``-segment.
 _BLOCKED_STATEMENTS = re.compile(
     r"^\s*("
     r"MSCK\s+REPAIR|CREATE|DROP|ALTER|INSERT|DELETE|UPDATE|MERGE|UNLOAD|PREPARE|EXECUTE|EXPLAIN"
@@ -183,19 +152,10 @@ _DATA_MODIFYING_MESSAGE = (
     "expressions must be read-only."
 )
 
-# AST denylist, by sqlglot node name. This is the load-bearing half of the DML
-# block: unlike the ``^\s*``-anchored regex it walks EVERY parsed statement, so
-# it is what catches stacked forms (``SELECT 1; TRUNCATE TABLE x``) and DML
-# nested in a CTE (``WITH d AS (DELETE ...) SELECT * FROM d``).
-#
-# ``Command`` is the high-leverage entry: sqlglot funnels every verb it has no
-# dedicated node for (CALL, VACUUM, OPTIMIZE, RENAME TABLE, ALTER SESSION, …)
-# into it, so one name covers an open-ended set of admin statements. It cannot
-# over-reach onto metric SQL — a read-only SELECT never parses to a Command.
-#
-# Aggregate fragments are deliberately absent: ``COUNT(*)``/``SUM(x)`` parse to
-# ``exp.Count``/``exp.Sum``, which are expressions, not data-modifying
-# statements. ``check_select_shape`` rejects them separately.
+# AST denylist, by sqlglot node name; see ``check_data_modifying``. ``Command``
+# covers every verb sqlglot has no dedicated node for (CALL, VACUUM, OPTIMIZE,
+# RENAME TABLE, ...). Aggregate fragments such as ``COUNT(*)`` are absent on
+# purpose: ``check_select_shape`` rejects them separately.
 _DATA_MODIFYING_NODE_NAMES: tuple[str, ...] = (
     "Command",
     "Insert",
@@ -227,9 +187,6 @@ def _data_modifying_nodes() -> tuple[type, ...]:
     cold-start reasons. Names absent from the installed sqlglot are skipped
     rather than raising, so a version bump that renames a node degrades to a
     narrower denylist instead of breaking every metric write.
-
-    Returns:
-        The tuple of node classes to use with ``isinstance``.
     """
     import sqlglot
 
@@ -239,29 +196,20 @@ def _data_modifying_nodes() -> tuple[type, ...]:
 def _blocked_statement_segment(sql: str) -> bool:
     r"""Check every ``;``-separated segment against ``_BLOCKED_STATEMENTS``.
 
-    Used only when ``sqlglot.parse`` FAILS. The AST walk is the authority for
-    parseable SQL, but an unparseable string gets no walk at all — and a
-    stacked payload is unparseable precisely because of its second statement
-    (``SELECT 1; MSCK REPAIR TABLE t`` → ParseError, ``'; DROP TABLE users; --``
-    → TokenError). Scanning each segment restores the block those cases would
-    otherwise slip past, since the ``^\s*`` anchor only ever sees the leading
-    SELECT.
+    Used only when ``sqlglot.parse`` fails: a stacked payload is unparseable
+    precisely because of its second statement (``SELECT 1; MSCK REPAIR TABLE t``
+    raises ParseError, ``'; DROP TABLE users; --`` raises TokenError), and the
+    ``^\s*`` anchor only sees the leading SELECT.
 
-    Deliberately not applied on the parse-SUCCESS path: a segment scan cannot
-    tell a statement separator from a ``;`` inside a string literal, so running
-    it there would hard-block read-only SQL the AST walk correctly accepts.
-
-    Args:
-        sql: The metric SQL expression.
-
-    Returns:
-        True if any segment begins with a data-modifying verb.
+    Not applied on the parse-success path: a segment scan cannot tell a
+    separator from a ``;`` inside a string literal, so it would block read-only
+    SQL the AST walk correctly accepts.
     """
     return any(_BLOCKED_STATEMENTS.match(segment) for segment in _COMMENT_PATTERN.sub(" ", sql).split(";"))
 
 
 def check_data_modifying(sql: str, dialect: str = "") -> str | None:
-    """Reject a metric expression that modifies data (issue #161).
+    """Reject a metric expression that modifies data.
 
     DML/DDL is a hard block because it is a security boundary. Statement
     syntax and executable SELECT shape are validated separately by
@@ -269,24 +217,17 @@ def check_data_modifying(sql: str, dialect: str = "") -> str | None:
     neither path alone has to be complete:
 
     1. A pre-parse regex (``_BLOCKED_STATEMENTS``, comments stripped first) —
-       catches DML that sqlglot cannot parse. Anchored at statement start, so
-       it only sees the first statement; when the parse FAILS it is re-run per
-       ``;``-segment (``_blocked_statement_segment``), which is what catches a
-       stacked payload whose second statement is what broke the parser.
+       catches DML that sqlglot cannot parse. It only sees the first statement;
+       when the parse fails it is re-run per ``;``-segment
+       (``_blocked_statement_segment``).
     2. A full-AST walk over every parsed statement against
        ``_DATA_MODIFYING_NODE_NAMES`` — catches DML nested in a CTE
-       (``WITH d AS (DELETE ...) SELECT * FROM d``), trailing a safe one
-       (``SELECT 1; DROP TABLE x``), or using a verb the regex omits, none of
-       which the regex can see. This is the authoritative half.
+       (``WITH d AS (DELETE ...) SELECT * FROM d``), trailing a safe statement
+       (``SELECT 1; DROP TABLE x``), or using a verb the regex omits. This is the
+       authoritative half.
 
-    Args:
-        sql: The metric SQL expression.
-        dialect: The metric dialect (e.g. POSTGRESQL); used for parsing.
-
-    Returns:
-        None if the expression contains no recognized data-modifying
-        operation, otherwise a human-actionable error message. Callers must
-        also run ``check_select_shape`` before persistence.
+    Returns None when nothing data-modifying is found, otherwise an error
+    message. Callers must also run ``check_select_shape`` before persistence.
     """
     import sqlglot
 
@@ -296,19 +237,11 @@ def check_data_modifying(sql: str, dialect: str = "") -> str | None:
     try:
         statements = sqlglot.parse(sql, read=_resolve_dialect(dialect))
     except (sqlglot.errors.SqlglotError, RecursionError):
-        # No AST to walk, so the regex is the only line of defence left — and
-        # the leading-statement anchor is blind to exactly the payloads that
-        # broke the parse. Re-run it per ``;``-segment before conceding.
+        # SqlglotError, not ParseError: TokenError is a sibling of ParseError.
+        # RecursionError comes from deeply nested parens.
         if _blocked_statement_segment(sql):
             return _DATA_MODIFYING_MESSAGE.format(detail="statement type")
-        # Unparseable AND no segment looks data-modifying → not provably
-        # data-modifying. ``check_select_shape`` is responsible for rejecting
-        # the parser failure before persistence.
-        #
-        # SqlglotError (not just ParseError) because TokenError is a SIBLING of
-        # ParseError, not a subclass — ``'; DROP TABLE users; --`` raises it.
-        # RecursionError comes from the recursive-descent parser on deeply
-        # nested parens.
+        # ``check_select_shape`` rejects the parser failure.
         return None
 
     data_modifying_nodes = _data_modifying_nodes()
@@ -344,13 +277,7 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
     source. Constants and aggregates such as ``SELECT 1`` and
     ``SELECT COUNT(*)`` remain valid without FROM.
 
-    Args:
-        sql: The metric SQL expression.
-        dialect: The metric dialect (e.g. POSTGRESQL); used for parsing.
-
-    Returns:
-        None if the expression is a full SELECT statement, otherwise a
-        human-actionable error message.
+    Returns None for a full SELECT statement, otherwise an error message.
     """
     import sqlglot
 
@@ -368,10 +295,7 @@ def check_select_shape(sql: str, dialect: str = "") -> str | None:
     try:
         parsed = sqlglot.parse_one(sql, read=resolved_dialect)
     except (sqlglot.errors.SqlglotError, RecursionError) as exc:
-        # SqlglotError, not ParseError: TokenError is a sibling of ParseError,
-        # and RecursionError comes from deeply nested parens. Normalize every
-        # parser failure into a human-actionable message for both persistence
-        # handlers and the explicit validate endpoint.
+        # Same exception set as check_data_modifying.
         return f"SQL expression could not be parsed ({dialect}): {exc}"
 
     if not isinstance(parsed, safe_statement_types):
@@ -440,14 +364,7 @@ def validate_metric(
 ) -> ValidationResult:
     """Validate a metric definition against OMS metadata and ontology.
 
-    Args:
-        metric_body: The metric definition (API format or internal dict).
-        data_sources_lookup: Lookup for data source/table/column validation (Checks 2-5).
-        ontology_lookup: Lookup for ontology class validation (Check 6).
-        namespace: The namespace context for ontology lookups.
-
-    Returns:
-        ValidationResult with errors (block creation) and warnings (non-blocking).
+    Returns a ValidationResult with errors (block creation) and warnings (non-blocking).
     """
     import sqlglot
     from sqlglot.errors import ParseError
@@ -460,7 +377,6 @@ def validate_metric(
     dialects = expression.get("dialects", [])
     ontology_concepts = metric_body.get("ontologyConcepts", [])
 
-    # ── Parse SQL once — reuse ASTs across all checks ───────────────────
     # Each entry: (dialect_name, list of parsed statements)
     parsed_dialects: list[tuple[str, list[Any]]] = []
 
@@ -495,10 +411,8 @@ def validate_metric(
                 )
                 parsed_dialects.append((dialect, [s for s in stmts if s is not None]))
 
-                # ── Check 1b: statement shape (serve-firewall parity, #617) ─
                 # A syntactically-valid fragment (e.g. COUNT(*)) is rejected by
-                # the serve-time SQL firewall — flag it here so validation
-                # predicts serve-time acceptance.
+                # the serve-time SQL firewall, so flag it here too.
                 shape_error = check_select_shape(sql_expr, dialect)
                 checks.append(
                     ValidationCheck(
@@ -549,8 +463,7 @@ def validate_metric(
             )
         )
 
-    # ── Checks 2-5: OMS metadata validation (WARNING) ───────────────────
-    # Only run if we have a lookup AND at least one successfully parsed SQL.
+    # Metadata checks need a lookup and at least one parsed SQL expression.
     if data_sources_lookup and data_source_id and parsed_dialects:
         checks.extend(_check_table_references(parsed_dialects, data_source_id, source_table, data_sources_lookup))
         checks.extend(_check_column_references(parsed_dialects, data_source_id, source_table, data_sources_lookup))
@@ -574,14 +487,10 @@ def validate_metric(
             )
         )
 
-    # ── Check 6: Ontology class linkage (WARNING) ───────────────────────
     if ontology_lookup and ontology_concepts:
         checks.extend(_check_ontology_linkage(ontology_concepts, ontology_lookup, namespace))
 
     return ValidationResult.from_checks(checks)
-
-
-# ── Check 2: Table References ───────────────────────────────────────────
 
 
 def _check_table_references(
@@ -652,13 +561,9 @@ def _check_table_references(
                     )
                 )
 
-    # Also verify the declared sourceTable exists. Its absence is an ERROR only
-    # when provable (#161): the catalog was read AND enumerates tables for this
-    # source. Otherwise "missing" is indistinguishable from an unreadable or
-    # not-yet-approved catalog, so it stays advisory. The loop above always stays
-    # WARNING — find_all(exp.Table) also matches CTE/subquery aliases, which are
-    # not catalog tables. The exact table that also equals the declared
-    # sourceTable is promoted above, because it is not an alias ambiguity.
+    # The declared sourceTable's absence is an ERROR only when provable: the
+    # catalog was read AND enumerates tables for this source. Other references
+    # stay WARNING because find_all(exp.Table) also matches CTE/subquery aliases.
     if source_table and source_table.lower() not in tables_checked:
         exists = declared_source_table_exists(lookup, data_source_id, source_table, known_tables)
         provable_absence = not exists and catalog_available and bool(known_tables) and not declared_source_known
@@ -697,9 +602,6 @@ def _declared_source_rejection(
     if catalog_available and known_tables:
         return source_table_rejection(lookup, data_source_id, source_table, known_tables)
     return f"Source table '{source_table}' not found in data source '{data_source_id}'"
-
-
-# ── Check 3: Column References ──────────────────────────────────────────
 
 
 def _check_column_references(
@@ -745,9 +647,6 @@ def _check_column_references(
                     )
 
     return checks
-
-
-# ── Check 4: Dimension Columns ──────────────────────────────────────────
 
 
 def _check_dimension_columns(
@@ -798,17 +697,8 @@ def _check_dimension_columns(
     return checks
 
 
-# ── Check 5: Filter Type Compatibility ──────────────────────────────────
-
-# Operators that require numeric/date types
-_NUMERIC_OPS = {"GT", "LT", "GTE", "LTE", "BETWEEN"}
-# Operators that require string types
-_STRING_OPS = {"LIKE", "ILIKE"}
-# Numeric-compatible types
 _NUMERIC_TYPES = {"integer", "int", "bigint", "smallint", "decimal", "numeric", "float", "double", "real", "number"}
-# Date-compatible types
 _DATE_TYPES = {"date", "timestamp", "timestamptz", "datetime", "timestamp_ntz", "timestamp_ltz"}
-# String types
 _STRING_TYPES = {"varchar", "text", "char", "string", "character varying", "nvarchar"}
 
 
@@ -880,18 +770,14 @@ def _is_type_compatible(col_type: str, operator: str) -> bool:
     """Check if a column type is compatible with a comparison operator."""
     col_type_lower = col_type.lower()
 
-    # LIKE/ILIKE only makes sense on string types
+    # LIKE/ILIKE accept string and date types
     if operator in ("LIKE", "ILIKE"):
         return col_type_lower in _STRING_TYPES or col_type_lower in _DATE_TYPES
 
-    # Numeric comparisons (GT, LT, GTE, LTE, BETWEEN) work on numeric and date types
     if operator in ("GT", "LT", "GTE", "LTE", "BETWEEN"):
         return col_type_lower in _NUMERIC_TYPES or col_type_lower in _DATE_TYPES
 
     return True  # Unknown operator — don't flag
-
-
-# ── Check 6: Ontology Class Linkage ────────────────────────────────────
 
 
 def _check_ontology_linkage(

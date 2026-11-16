@@ -142,7 +142,7 @@ class TestResolveGroundingIds:
         assert out == ["https://ex/good/"]
 
     def test_incomplete_load_is_not_appended(self):
-        """#1: if the SYNC loader returns False (load did not COMPLETE — e.g.
+        """If the SYNC loader returns False (load did not COMPLETE — e.g.
         embeddings not searchable), the URI must NOT be appended to the grounding
         pool — otherwise grounding recall runs against an empty index (silent
         0-hit grounding)."""

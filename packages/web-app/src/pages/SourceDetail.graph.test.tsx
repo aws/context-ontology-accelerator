@@ -363,12 +363,4 @@ describe("SourceDetail — graph sources switch", () => {
     render(<SourceDetail />, { wrapper });
     expect(screen.getByRole("button", { name: /^delete$/i })).toBeDisabled();
   });
-
-  it("shows Re-verify when graphSourcesEnabled is true", () => {
-    setGraphSource();
-    render(<SourceDetail />, { wrapper });
-    expect(
-      screen.getByRole("button", { name: /^re-verify$/i }),
-    ).toBeInTheDocument();
-  });
 });

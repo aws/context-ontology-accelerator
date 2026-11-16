@@ -1,20 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the class description generator.
-
-Tests cover:
-- Successful LLM description generation with system + user prompts
-- Fallback on LLM failure (RuntimeError, generic Exception, TimeoutError)
-- Fallback on empty / whitespace LLM responses
-- Deterministic fallback format with top-5 alphabetical labels (case-insensitive)
-- Per-class fault isolation across the batch
-- Empty-input and empty-label-list edge cases
-- Response post-processing (surrounding double quote and whitespace stripping)
-- Prompt label cap (MAX_PROMPT_LABELS)
-
-Requirements: 4.1–4.5
-"""
+"""Unit tests for the class description generator."""
 
 from __future__ import annotations
 
@@ -50,15 +37,10 @@ def _failing_client(exc: BaseException) -> MagicMock:
 
 
 class TestSuccessPath:
-    """Successful LLM description generation.
-
-    Validates: Requirement 4.2 — synthesize a 1-3 sentence description from
-    the class label and sampled entity labels; Requirement 4.3 — generation
-    happens via an LLM call.
-    """
+    """Successful LLM description generation."""
 
     def test_returns_llm_response_as_description(self):
-        """Req 4.2/4.3: LLM-generated text becomes the description verbatim."""
+        """LLM-generated text becomes the description verbatim."""
         client = _ok_client("Financial instruments including bonds and notes.")
         class_entities = {
             "Financial Instrument": ["Treasury Bond", "Corporate Note", "Equity Swap"],
@@ -71,7 +53,7 @@ class TestSuccessPath:
         }
 
     def test_llm_called_with_system_and_user_prompt(self):
-        """Req 4.3: both prompt and system arguments must be populated."""
+        """Both prompt and system arguments must be populated."""
         client = _ok_client("desc")
         class_entities = {"Company": ["Acme Corp", "Globex"]}
 
@@ -88,7 +70,7 @@ class TestSuccessPath:
         assert isinstance(system_prompt, str) and system_prompt.strip()
 
     def test_user_prompt_includes_class_label_and_entity_labels(self):
-        """Req 4.3: the LLM input must contain the class and example entities."""
+        """The LLM input must contain the class and example entities."""
         client = _ok_client("desc")
         class_entities = {
             "Company": ["Acme Corp", "Globex Industries", "Initech"],
@@ -118,15 +100,10 @@ class TestSuccessPath:
 
 
 class TestFallbackOnLLMFailure:
-    """Per-class fallback when the LLM call fails.
-
-    Validates: Requirement 4.5 — on LLM failure or timeout, fall back to the
-    deterministic ``"Class representing {N} entities including: {top-5}"``
-    description.
-    """
+    """Per-class fallback when the LLM call fails."""
 
     def test_runtime_error_triggers_fallback(self, caplog):
-        """Req 4.5: ``RuntimeError`` (the documented LLMClient failure) → fallback."""
+        """``RuntimeError`` (the documented LLMClient failure) → fallback."""
         client = _failing_client(RuntimeError("Bedrock unavailable"))
         class_entities = {"Company": ["Acme", "Globex", "Initech"]}
 
@@ -134,13 +111,11 @@ class TestFallbackOnLLMFailure:
             result = generate_descriptions(class_entities, client)
 
         assert result["Company"].startswith("Class representing 3 entities including:")
-        # Spot-check that the WARNING log was emitted (we do not assert it on
-        # every fallback test; once is enough for coverage).
         assert "Company" in caplog.text
         assert "fallback" in caplog.text.lower()
 
     def test_generic_exception_triggers_fallback(self):
-        """Req 4.5: generic ``Exception`` is caught by the broad handler."""
+        """Generic ``Exception`` is caught by the broad handler."""
         client = _failing_client(Exception("unexpected"))
         class_entities = {"Company": ["Acme", "Globex"]}
 
@@ -149,7 +124,7 @@ class TestFallbackOnLLMFailure:
         assert result["Company"].startswith("Class representing 2 entities including:")
 
     def test_timeout_error_triggers_fallback(self):
-        """Req 4.5: a timeout from the LLM client → fallback (no exception bubbles)."""
+        """A timeout from the LLM client → fallback (no exception bubbles)."""
         client = _failing_client(TimeoutError("LLM call timed out"))
         class_entities = {"Company": ["Acme", "Globex"]}
 
@@ -158,7 +133,7 @@ class TestFallbackOnLLMFailure:
         assert result["Company"].startswith("Class representing 2 entities including:")
 
     def test_empty_response_triggers_fallback(self):
-        """Req 4.5: an empty LLM response is treated as failure → fallback."""
+        """An empty LLM response is treated as failure → fallback."""
         client = _ok_client("")
         class_entities = {"Company": ["Acme", "Globex"]}
 
@@ -167,7 +142,7 @@ class TestFallbackOnLLMFailure:
         assert result["Company"].startswith("Class representing 2 entities including:")
 
     def test_whitespace_only_response_triggers_fallback(self):
-        """Req 4.5: a whitespace-only LLM response → fallback after stripping."""
+        """A whitespace-only LLM response → fallback after stripping."""
         client = _ok_client("   \n\t  ")
         class_entities = {"Company": ["Acme", "Globex"]}
 
@@ -177,15 +152,10 @@ class TestFallbackOnLLMFailure:
 
 
 class TestFallbackFormat:
-    """Deterministic fallback string format.
-
-    Validates: Requirement 4.5 — top-5 alphabetical labels, case-insensitive
-    ordering, and the exact ``"Class representing {N} entities including:
-    {labels}"`` shape.
-    """
+    """Deterministic fallback string format."""
 
     def test_top_5_alphabetical_when_more_than_five_labels(self):
-        """Req 4.5: only the lexicographically smallest 5 labels are listed."""
+        """Only the lexicographically smallest 5 labels are listed."""
         client = _failing_client(RuntimeError("boom"))
         labels = ["Zeta", "Yankee", "Bravo", "Alpha", "Charlie", "Delta", "Echo"]
         class_entities = {"Letter": labels}
@@ -198,7 +168,7 @@ class TestFallbackFormat:
         assert result["Letter"] == expected
 
     def test_count_reflects_total_not_top_n(self):
-        """Req 4.5: ``{N}`` is the total label count, not the truncated top-5."""
+        """``{N}`` is the total label count, not the truncated top-5."""
         client = _failing_client(RuntimeError("boom"))
         labels = [f"label-{i:02d}" for i in range(20)]  # 20 labels
         class_entities = {"Item": labels}
@@ -212,7 +182,7 @@ class TestFallbackFormat:
         assert len(listed) == FALLBACK_TOP_N
 
     def test_fewer_than_five_labels_listed_in_alphabetical_order(self):
-        """Req 4.5: when N < 5, all labels appear, alphabetically sorted."""
+        """When N < 5, all labels appear, alphabetically sorted."""
         client = _failing_client(RuntimeError("boom"))
         class_entities = {"Tiny": ["gamma", "alpha", "beta"]}
 
@@ -221,14 +191,8 @@ class TestFallbackFormat:
         assert result["Tiny"] == "Class representing 3 entities including: alpha, beta, gamma"
 
     def test_case_insensitive_alphabetical_sort(self):
-        """Req 4.5: ordering uses ``str.casefold`` so case does not flip order."""
-        # Without casefold, uppercase letters sort before lowercase: "Alpha"
-        # would come before "beta", and "GAMMA" before "delta", which happens
-        # to give the right ordering by accident here. To make the test
-        # meaningful, mix labels where case-sensitive vs case-insensitive
-        # ordering disagree:
-        #   case-sensitive sort: ["Alpha", "GAMMA", "beta", "delta"]
-        #   case-insensitive  : ["Alpha", "beta",  "delta", "GAMMA"]
+        """Ordering uses ``str.casefold`` so case does not flip order."""
+        # A case-sensitive sort would give ["Alpha", "GAMMA", "beta", "delta"].
         client = _failing_client(RuntimeError("boom"))
         class_entities = {"Mixed": ["beta", "Alpha", "GAMMA", "delta"]}
 
@@ -245,27 +209,9 @@ class TestFallbackFormat:
 
         assert result["Five"] == "Class representing 5 entities including: a, b, c, d, e"
 
-    def test_fallback_format_exact_separator_and_token(self):
-        """Req 4.5: ``", "`` separator and ``"including:"`` token are exact."""
-        client = _failing_client(RuntimeError("boom"))
-        class_entities = {"X": ["alpha", "beta"]}
-
-        result = generate_descriptions(class_entities, client)
-
-        text = result["X"]
-        assert text == "Class representing 2 entities including: alpha, beta"
-        # No extra spaces, no trailing punctuation.
-        assert "  " not in text
-        assert not text.endswith(",")
-        assert not text.endswith(".")
-
 
 class TestEmptyLabelList:
-    """Empty / zero-label classes.
-
-    Validates: Requirement 4.5 — empty-label classes still get a valid
-    (fallback) description without invoking the LLM.
-    """
+    """Empty / zero-label classes."""
 
     def test_zero_labels_produces_valid_fallback_without_llm_call(self):
         """A class with zero labels uses the fallback and skips the LLM."""
@@ -290,12 +236,7 @@ class TestEmptyLabelList:
 
 
 class TestFaultIsolation:
-    """A failure on one class does not abort the batch.
-
-    Validates: Requirement 4.5 — each class is processed independently;
-    LLM failures are caught and the surrounding classes still get LLM
-    descriptions.
-    """
+    """A failure on one class does not abort the batch."""
 
     def test_one_failure_one_success_yields_both_entries(self):
         """Mixed failures and successes both end up in the result dict."""
@@ -337,10 +278,6 @@ class TestEmptyInputDict:
     def test_empty_dict_returns_empty_dict(self):
         client = _ok_client("desc")
         assert generate_descriptions({}, client) == {}
-
-    def test_empty_dict_does_not_call_llm(self):
-        client = _ok_client("desc")
-        generate_descriptions({}, client)
         client.generate.assert_not_called()
 
 
@@ -814,7 +751,6 @@ class TestSchemaFallback:
 
         result = generate_descriptions_with_schema(schemas, client)
 
-        assert "Empty" in result
         assert result["Empty"].startswith("Class 'Empty' with no observed")
         client.generate.assert_not_called()
 

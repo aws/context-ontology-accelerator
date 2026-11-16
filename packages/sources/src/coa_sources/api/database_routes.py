@@ -13,9 +13,6 @@ Handles all DATABASE source operations:
   PATCH  /namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/metadata — edit column meta
   GET    /namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}           — get scan job
   PUT    /namespaces/{namespaceId}/sources/{sourceId}/metadata               — update source-level metadata
-
-Bulk approve/reject (ApproveSource, RejectSource) live in approve_reject_routes.py
-because they are async via SQS.
 """
 
 from __future__ import annotations
@@ -92,7 +89,7 @@ from coa_sources.database.glue_ownership import (
 from coa_sources.database.graph_verify import REACHABILITY_SCAN_TYPE, verify_message
 from coa_sources.database.metrics import emit_metric
 from coa_sources.database.rescan_backup import S3_ABSENT_CODES, backup_s3_key
-from coa_sources.database.secret_binding import NAMESPACE_TAG_KEY, check_secret_namespace_binding
+from coa_sources.database.secret_binding import check_secret_namespace_binding
 
 from .contract import (
     LIST_SOURCE_SCAN_JOBS_MAX_RESULTS,
@@ -119,11 +116,6 @@ from .sources_handler import (
 logger = structlog.get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# SMUS helpers
-# ---------------------------------------------------------------------------
-
-
 def _get_smus_client() -> SMUSClient:
     return SMUSClient(
         domain_id=_SMUS_DOMAIN_ID,
@@ -143,10 +135,6 @@ def _resolve_project_id(namespace_id: str) -> str | None:
         return None
     return item["dataZoneProjectId"]
 
-
-# ---------------------------------------------------------------------------
-# CREATE DATABASE SOURCE
-# ---------------------------------------------------------------------------
 
 # Athena's account-default Glue Data Catalog name.
 _DEFAULT_ATHENA_CATALOG = "AwsDataCatalog"
@@ -222,40 +210,10 @@ def _arn_region(arn: str) -> str:
     return parts[3] if len(parts) > 5 else ""
 
 
-def _arn_account(arn: str) -> str:
-    """Account-id segment of an ARN, or ``""`` when it has no parsable one."""
-    parts = (arn or "").split(":")
-    return parts[4] if len(parts) > 5 else ""
-
-
-# ---------------------------------------------------------------------------
-# Credential-secret → namespace binding
-# ---------------------------------------------------------------------------
-#
-# A credential secret is scoped to the namespaces entitled to it: the secret must
-# be tagged ``<prefix>:namespace = "<namespaceId> [<namespaceId> ...]"`` and the
-# namespace the source is created under must be one of the listed entries. This
-# keeps a namespace from registering a source that reads a credential secret it
-# was not onboarded for, while still allowing one shared credential to serve
-# several namespaces without a per-namespace copy of the secret.
-#
-# We enforce it here, at the one point the caller supplies the ARN — an ARN that
-# is not bound to this namespace is never persisted, so neither scan-time
-# discovery nor serve-time query can read it. The tag is verified with
-# DescribeSecret (metadata only — never GetSecretValue on this path). The IAM
-# ``aws:ResourceTag`` conditions on the discovery/federation/serve roles enforce
-# the same binding at the platform layer; this check is the fail-fast front door
-# and guarantees the tag exists, and is well-formed, so those conditions can
-# match. See ``coa_common.constants`` for the tag format and why it is strict.
-# The rule itself lives in `coa_sources.database.secret_binding`, shared with the
-# scan-pipeline re-check so the front door and that re-check cannot drift apart.
-# This is the API-facing adapter: it turns a verdict into a status code.
-#
-# Enforcing it here means an ARN not bound to this namespace is never persisted.
-# That is necessary but not sufficient — a row written before this rule existed, or
-# a secret whose tag list changed after registration, is only caught by the
-# scan-time re-check in the pipeline handlers.
-_NAMESPACE_TAG_KEY = NAMESPACE_TAG_KEY
+# The credential secret must carry a ``<prefix>:namespace`` tag listing the
+# registering namespace (see ``coa_sources.database.secret_binding``). Checking
+# here keeps an unbound ARN from being persisted; the scan-time re-check in the
+# pipeline handlers catches rows that predate the rule or tags changed since.
 
 
 def _validate_credential_secret_binding(jdbc_config: Any, namespace_id: str) -> dict[str, Any] | None:
@@ -278,19 +236,10 @@ def _validate_credential_secret_binding(jdbc_config: Any, namespace_id: str) -> 
     return api_response(503 if verdict.retryable else 400, {"error": verdict.message})
 
 
-# Fields a JDBC source cannot re-point after creation. Each one decides which
-# machine the platform hands the source's database credentials to, and the
-# credential secret is bound to the namespace, not to the person editing the
-# source. Without this, `manageSource` on a namespace is enough to redirect a
-# source another steward registered at an attacker-controlled host and have
-# discovery deliver that namespace's database credentials to it — the binding
-# check still passes, because the secret is unchanged and it is the *destination*
-# that moved.
-#
-# Rejected rather than re-provisioned: the discovered tables, their approved
-# metadata and the induced ontology all describe the database at the current host,
-# and this update re-discovers none of them. Delete and re-create is the honest
-# path to a different server.
+# Fields a JDBC source cannot re-point after creation: each decides which host
+# receives the source's database credentials, so allowing edits would let
+# `manageSource` redirect them to an attacker-controlled host. Delete and
+# re-create to change them.
 _JDBC_IMMUTABLE_FIELDS = ("host", "port", "engine", "credentialSecretArn")
 
 
@@ -371,11 +320,6 @@ def _validate_custom_connector_configuration(custom_connector_config: Any) -> di
                 },
             )
     return None
-
-
-# ---------------------------------------------------------------------------
-# Databricks SQL Warehouse registration
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -699,7 +643,7 @@ def _create_sparql_source(sparql_config: Any, name: str, namespace_id: str) -> d
     ``REGISTERED`` and not ``queryable``; the graph-verify Lambda probes the endpoint
     and moves it to ``APPROVED``/``queryable`` or ``SCAN_FAILED``.
 
-    The stored ``configuration`` is the normalised §4.3 contract
+    The stored ``configuration`` is the normalised ``SparqlSourceConfig`` contract
     (:class:`coa_common.sparql_config.SparqlSourceConfig`), with the store, auth mode
     and signing region defaults filled in, so serve and the verify Lambda never have
     to re-derive them. Refused before anything is written while graph sources are off.
@@ -972,25 +916,14 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
         "sourceSubType": sub_type,
         "status": SourceStatus.REGISTERED,
         "configuration": json.dumps(config_dict),
-        # Query-layer metadata (read by serve to build the Athena request).
-        # Catalog: native Glue resolves from catalogId (AwsDataCatalog for the
-        # account-root catalog, else the nested catalog name); JDBC federated
-        # catalogs are nested under AwsDataCatalog. A custom connector is neither
-        # — its catalog is a top-level Lambda-backed catalog, so it names itself.
-        # region is where Athena/the catalog live (Glue: source region; JDBC and
-        # custom connector: deployment region).
-        # queryable flips true once the source is actually queryable
-        # (Glue: after first scan; JDBC and custom connector: after the
-        # post-discovery federation step).
+        # A custom connector's catalog is a top-level Lambda-backed catalog, so it
+        # names itself; Glue catalogs resolve from catalogId and JDBC federated
+        # catalogs nest under AwsDataCatalog.
         "athenaCatalog": (
             athena_catalog_name
             if connector_backed
             else (_resolve_glue_athena_catalog(glue_config) if glue_config else _DEFAULT_ATHENA_CATALOG)
         ),
-        # Preferred single-source execution engine. Direct JDBC only when a
-        # direct dialect exists for the engine (PostgreSQL, Redshift, MySQL, and
-        # SQL Server today — connectors/jdbc.py:DIRECT_QUERY_ENGINES), otherwise
-        # Athena.
         "queryEngine": _resolve_query_engine(glue_config, jdbc_config),
         "region": (glue_config.region if glue_config else _AWS_REGION),
         "queryable": False,
@@ -1004,81 +937,38 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
     # JDBC federated sources resolve schema per-table, so no single database.
     if glue_config:
         item["athenaDatabase"] = glue_config.database_name
-    # A custom-connector source is scoped to exactly ONE database inside its
-    # catalog (`databaseName` is required), and serve pins the query Database to a
-    # single value, so record it up front rather than waiting for discovery to
-    # report it. That also gives serve the right namespace when a scan discovers
-    # zero tables — otherwise it would fall back to a hardcoded default that has
-    # nothing to do with this connector.
+    # A custom-connector source is scoped to exactly one database inside its
+    # catalog; record it up front so serve has it even if a scan finds no tables.
     if connector_backed:
         item["athenaDatabase"] = (
             databricks_schema if databricks_config is not None else custom_connector_config.database_name
         )
-        # Serve routes on the PRESENCE of this attribute, so it is what makes the
-        # source addressable at all. Written before the scan because `queryable`
-        # is False until discovery succeeds, and serve skips a not-queryable
-        # source's catalog — note it retargets the query at its default catalog
-        # rather than refusing it, which is pre-existing behaviour shared by every
-        # sub-type, so this attribute is not what gates the pre-scan window.
+        # Serve routes on the presence of this attribute.
         item["athenaDataCatalogName"] = athena_catalog_name
     if databricks_config is not None:
-        # NEITHER of these is optional for this sub-type: the namespace-qualifier check
-        # builds `federated_catalog_schemas` from `discoveredSchemas`, so a record carrying
-        # a catalog but no schemas has every qualified query against it DENIED rather than
-        # merely unresolved. Written at create because a source is exactly one Unity Catalog
-        # schema and that is known now; discovery overwrites it with the same value.
+        # Required for this sub-type: the namespace-qualifier check builds its
+        # schema allowlist from `discoveredSchemas`, so an empty list denies queries.
         item["discoveredSchemas"] = [databricks_schema]
-    # Persist the metadata enrichment toggle whenever the caller specifies it
-    # (true or false). Records that omit the field — legacy records, or
-    # programmatic callers that don't set it — fall back to "enabled" at read
-    # time in the enrichment handler.
+    # Persist the metadata enrichment toggle whenever the caller specifies it;
+    # records that omit it fall back to "enabled" in the enrichment handler.
     if db_req.metadata_enrichment_enabled is not None:
         item["metadataEnrichmentEnabled"] = db_req.metadata_enrichment_enabled
     # A Glue source's caller-declared nested catalog is NOT written to
-    # `athenaDataCatalogName`, even though that is the attribute named after it.
-    # That attribute is system-managed — DELETE derives the name it expects there
-    # and runs a Lake-Formation-admin teardown (glue.delete_catalog,
-    # lf.deregister_resource, glue.delete_connection) against it, under IAM scoped
-    # to the deployment-wide `{prefix}ds_*` window rather than to one namespace. A
-    # caller-supplied value in that field is therefore a request to tear down a
-    # named catalog, which is not what declaring one's own catalog should mean.
+    # `athenaDataCatalogName`: DELETE runs a Lake-Formation-admin teardown against
+    # whatever name is stored there, so a caller-supplied value would be a request
+    # to tear down a named catalog. `athenaCatalog` carries it for serve.
     #
-    # The value is not lost: `athenaCatalog` above carries it for serve (which
-    # reads it to address the nested catalog), and the `configuration` blob
-    # round-trips it back as `glueConfiguration.athenaDataCatalogName` on
-    # GetSource. This also matches the Smithy contract, which documents the
-    # top-level member as read-only, system-managed and populated for JDBC
-    # sub-types only.
-    #
-    # Persist redshiftWorkgroup at top level ONLY for Glue sources that actually
-    # execute via Redshift (queryEngine=REDSHIFT). Read by serve's Redshift
-    # executor the way athenaCatalog/athenaDatabase are read by the Athena
-    # executor. A workgroup on an ATHENA source is meaningless, so it is
-    # not persisted — keeps the record honest and avoids a dead column.
+    # Persist redshiftWorkgroup only for Glue sources executing via Redshift.
     if glue_config and item["queryEngine"] == QueryEngine.REDSHIFT and getattr(glue_config, "redshift_workgroup", None):
         item["redshiftWorkgroup"] = glue_config.redshift_workgroup
 
-    # Ownership-verified marker for a native Glue source sitting in a DISTINCT
-    # Ownership-verified marker for a native Glue source sitting in a DISTINCT
-    # (non-root) Athena catalog. `athenaCatalog` is derived from the caller's
-    # `catalogId`, which is a caller-supplied, form-only-validated value; the
-    # binding that makes it trustworthy is `assert_namespace_may_catalog` above,
-    # which ran (and 403'd on failure) before we got here, keyed on `catalogId`.
-    # Serve's `sql_namespace_scope` promotes `(athenaCatalog, database)` into its
-    # authorization oracle, so it must authorize the nested catalog ONLY when that
-    # ownership check actually covered the value being authorized.
-    #
-    # Gate the marker to the catalog the ownership check SAW: `athenaCatalog` is
-    # `_resolve_glue_athena_catalog(glue_config)`, which returns
-    # `athena_data_catalog_name` FIRST when the caller set it — a SEPARATE field
-    # `assert_namespace_may_catalog` (keyed on `catalog_id`/`database_name`) never
-    # validated. Trusting that branch would let a caller who owns `catalogId` A but
-    # declares `athenaDataCatalogName = "B"` get the marker recorded for B. So only
-    # set the marker when `athenaCatalog` was DERIVED FROM the checked `catalog_id`
-    # (i.e. `athenaDataCatalogName` was not supplied). A caller-declared
-    # `athenaDataCatalogName` gets no marker and is not authorized 3-part until it,
-    # too, is ownership-checked — the fail-closed direction. Root `AwsDataCatalog`
-    # needs no marker (never a nested catalog).
+    # Ownership-verified marker for a native Glue source in a DISTINCT (non-root)
+    # Athena catalog. Serve's `sql_namespace_scope` authorizes the nested catalog
+    # only when `assert_namespace_may_catalog` (keyed on `catalogId`) covered it.
+    # `athenaCatalog` is taken from a caller-declared `athenaDataCatalogName` when
+    # set, a value that check never saw, so the marker is set only when
+    # `athenaCatalog` was derived from `catalog_id`. Root `AwsDataCatalog` needs
+    # no marker.
     _declared_catalog_name = getattr(glue_config, "athena_data_catalog_name", None) if glue_config else None
     if (
         glue_config
@@ -1206,29 +1096,14 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
                 source_id=source_id,
                 catalog_name=athena_catalog_name,
             )
-            # The row is about to go, so the catalog must come down too or it is orphaned
-            # with nothing able to find it. Unlike the registration failure above there is
-            # no conflict case: the parameter write never touches the catalog.
             with contextlib.suppress(AthenaCatalogError):
                 delete_lambda_catalog(catalog_name=athena_catalog_name)
-            # A COLLISION means the parameter belongs to something else, so this call wrote
-            # nothing and deleting it would remove a parameter this create did not write.
+            # A collision means this create wrote nothing; do not delete the other source's parameter.
             collided = isinstance(exc, DatabricksConfigExistsError)
-            # The name is derived here rather than read from `databricks_parameter_name`,
-            # which is still empty: that assignment is the statement that raised.
-            # `PutParameter` can commit server-side and then have its response time out, so
-            # a parameter holding the role and secret ARNs can outlive a create that
-            # reported failure, and nothing else would ever remove it.
-            #
-            # NOT on a collision, for the same reason a conflicting catalog is not deleted:
-            # `DatabricksConfigExistsError` means this create did not write that parameter,
-            # so deleting it would destroy another source's live credential pointer.
+            # `PutParameter` can commit and then time out, leaving a parameter holding
+            # the role and secret ARNs that nothing else would remove.
             rollback_parameter_name = ""
             if not collided:
-                # `config_parameter_name` raises only when the path prefix is unset, and in
-                # that case `write_config_parameter` raised before reaching `PutParameter`,
-                # so "" is correct. Letting it escape would skip the rollback entirely and
-                # leave the record and the catalog behind.
                 with contextlib.suppress(DatabricksConfigError):
                     rollback_parameter_name = config_parameter_name(athena_catalog_name)
             _rollback_unscanned_source(
@@ -1340,11 +1215,6 @@ def _create_database_source(db_req: Any, namespace_id: str, *, namespace_languag
     )
 
 
-# ---------------------------------------------------------------------------
-# LIST TABLES
-# ---------------------------------------------------------------------------
-
-
 def _read_rescan_backup(source_id: str) -> dict[str, Any] | None:
     """Load a source's re-scan backup blob, or ``None`` when there is none.
 
@@ -1357,13 +1227,6 @@ def _read_rescan_backup(source_id: str) -> dict[str, Any] | None:
     hid pending deletions from the review page while approve still deleted them
     (the worker reads this same blob itself), so a steward could approve removals
     they were never shown. Failing loudly is the safe direction here.
-
-    Note on the ``_BUCKET_NAME`` guard: each caller checks it separately rather
-    than once at module load, because the right answer differs per call site —
-    the two read helpers degrade (empty set / no diff) while the keep endpoint
-    answers 500. Collapsing them into one top-level check would force a single
-    behaviour on all three, and raising at import time would break any caller
-    that does not need the bucket at all.
     """
     try:
         raw = read_file_bytes(get_s3_client(), _BUCKET_NAME, backup_s3_key(source_id))
@@ -1420,16 +1283,9 @@ def _effective_review_status(stored: str | None, *, pending_deletion: bool) -> s
     time only — the stored asset is never mutated, so a reject still reverts by
     doing nothing.
 
-    Why PENDING_REVIEW rather than a dedicated PENDING_DELETION status: review
-    status answers "has a steward settled this item", and a pending deletion has
-    not been settled, so it belongs in the existing not-settled state. That also
-    makes it fall out of the pending-review filter and count for free. *What* is
-    unsettled is carried separately by the ``pendingDeletion`` flag on the table
-    and column, which is what drives the badge and the Keep button. A fourth
-    ReviewStatus member would be an API-breaking change (the enum is
-    PENDING_REVIEW / APPROVED / REJECTED) and would force every existing client
-    that switches on it to learn a value that means "still pending, but for a
-    different reason".
+    Pending deletion is reported as PENDING_REVIEW rather than a new status,
+    because a fourth ReviewStatus member would break clients that switch on the
+    enum; the ``pendingDeletion`` flag carries what is unsettled.
     """
     from coa_control_plane_server.models.review_status import ReviewStatus
 
@@ -1814,11 +1670,6 @@ def _handle_list_tables(event: dict[str, Any], namespace_id: str, source_id: str
     return api_response(200, response)
 
 
-# ---------------------------------------------------------------------------
-# GET TABLE
-# ---------------------------------------------------------------------------
-
-
 def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}."""
     from coa_common.datazone_forms import FORM_TYPE_NAME, deserialize_form
@@ -1915,12 +1766,6 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
                     dataType=col.data_type,
                     nullable=col.nullable,
                     isPartitionKey=col.is_partition_key or None,
-                    # Source / curated description has a single home now
-                    # (business_metadata.description). The Smithy
-                    # ColumnMetadata type still exposes a top-level
-                    # ``description`` for backward-compat with web UI; map
-                    # it from business_metadata so callers that read either
-                    # field see the same value.
                     description=col.business_metadata.description or None,
                     businessMetadata=col_biz,
                     distinctValues=col.distinct_values or None,
@@ -1966,31 +1811,10 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
     return api_response(404, {"error": f"Table {table_id} not found"})
 
 
-# ---------------------------------------------------------------------------
-# REVIEW — Resource-oriented endpoints
-# ---------------------------------------------------------------------------
-#
-# Replaces the former bulk POST /review god endpoint. Each handler operates on
-# a single asset (one search + one get_asset_forms = ~400ms) and writes a
-# DataZone revision only when the resulting state actually changes. This
-# eliminates the N+1 pattern that caused the 29s API Gateway timeout for
-# sources with 75+ tables.
-#
-# Cascade rules (match the legacy bulk semantics):
-#   - APPROVE on a table cascades to PENDING columns; never overrides REJECTED.
-#   - REJECT on a table sets all non-REJECTED columns to REJECTED.
-#   - Edit endpoints (PATCH .../metadata) never change reviewStatus — they only
-#     set business metadata fields and mark enrichmentSource = STEWARD_EDITED.
-#
-# Idempotency:
-#   - Every review/edit is idempotent. If the resulting reviewStatus equals the
-#     existing reviewStatus and no metadata changed, no DataZone revision is
-#     written and the counter is not adjusted.
-#
-# Counter tracking:
-#   - tablesApproved is bumped via DynamoDB ADD (atomic) only when a table
-#     transitions in or out of APPROVED. Column-level review does not touch it.
-#     Counter drift is logged but not raised — the DataZone asset is the canon.
+# REVIEW: single-asset endpoints. Approving a table cascades to its PENDING
+# columns (never overriding REJECTED); rejecting sets all non-REJECTED columns to
+# REJECTED. Edit endpoints never change reviewStatus. A review that changes
+# nothing writes no DataZone revision and leaves the counter alone.
 
 
 def _smus_or_500() -> tuple[SMUSClient | None, dict[str, Any] | None]:
@@ -2281,17 +2105,9 @@ def _parse_decision(body: dict[str, Any]) -> tuple[str | None, dict[str, Any] | 
 # decisions or recover from a failed bulk run.
 _REVIEWABLE_STATES: frozenset[str] = frozenset(
     {
-        # NOTE: REJECTED is intentionally absent. A successful bulk reject now
-        # makes the source terminal-REJECTED (see worker _lifecycle); from
-        # there no per-asset review/edit or bulk approve/reject is allowed —
-        # the steward must re-onboard a new source. APPROVAL_FAILED /
-        # REJECTION_FAILED remain reviewable so a failed bulk run can be retried.
+        # REJECTED is absent: a rejected source is terminal.
         "PENDING_REVIEW",
-        # A re-scan of an approved source lands in RESCAN_REVIEW. The steward
-        # must be able to edit/touch-up and review its new + changed items
-        # exactly as on a first scan (which sits in PENDING_REVIEW), so
-        # RESCAN_REVIEW is reviewable too. Without this, per-item edit/review
-        # 409s on a rescan and the steward can only bulk approve/reject.
+        # RESCAN_REVIEW is reviewable like PENDING_REVIEW on a first scan.
         "RESCAN_REVIEW",
         "APPROVED",
         "APPROVAL_FAILED",
@@ -2459,13 +2275,6 @@ def _handle_keep_rescan_removal(
     ``pendingDeletion`` marker clears on the next read. Only valid while the
     source is in RESCAN_REVIEW. Idempotent — keeping an item that is not in the
     removal set is a 200 no-op.
-
-    On a 5xx no source or asset status is changed, deliberately. Nothing here is
-    a long-running operation with an in-progress state to unwind: either the
-    backup blob was rewritten or it was not. The source stays in RESCAN_REVIEW
-    and the review is exactly as it was, so the caller can just retry. Flipping a
-    row to a failed state would be worse — it would then need clearing before the
-    steward could carry on, turning a transient S3 blip into a stuck review.
     """
     try:
         body: dict[str, Any] = json.loads(event.get("body") or "{}")
@@ -2529,17 +2338,6 @@ def _handle_keep_rescan_removal(
             changed = True
 
     if changed:
-        # Size note (for the next security review): this write cannot grow the
-        # object. Keep only ever *removes* one entry from `removed_tables` or
-        # `removed_columns` — both branches above rebuild the list by filtering
-        # an item out — so the blob shrinks or stays identical, and no
-        # caller-supplied data enters it. The request body contributes a single
-        # column name, which is used to look up an existing entry, never stored.
-        #
-        # The blob's size is set when discovery writes it, bounded by the
-        # source's table and column counts; the discovery cap is
-        # MAX_TABLES_PER_SOURCE (10000 in the deployed stack). So there is no
-        # unbounded, attacker-influenced growth path here to check against.
         try:
             upload_json(s3, _BUCKET_NAME, key, blob)
         except Exception:
@@ -2692,12 +2490,8 @@ def _handle_update_table_keys(
             if target_column is not None and not isinstance(target_column, str):
                 return api_response(400, {"error": "foreignKeys.targetColumn must be a string"})
             tcol = target_column or ""
-            # Optional steward review decision on an inferred relationship (#1088):
-            # APPROVED / REJECTED (or "" to leave unchanged). Approving flips the
-            # gate so the relationship reaches the ontology; rejecting withholds it.
-            # PENDING_REVIEW is deliberately NOT settable here: it is the state the
-            # inference pipeline assigns when it proposes a relationship, not a
-            # decision a steward makes — a steward can only decide (approve/reject).
+            # Optional steward decision on an inferred relationship: APPROVED or
+            # REJECTED ("" leaves it unchanged). PENDING_REVIEW is not settable.
             review_status = fk.get("reviewStatus") or "" if isinstance(fk, dict) else ""
             if review_status and review_status not in (ReviewStatus.APPROVED, ReviewStatus.REJECTED):
                 return api_response(
@@ -2753,9 +2547,8 @@ def _handle_update_table_keys(
         for col, target, tcol, review_status in parsed_fks:
             existing = existing_fk_by_key.get((col, target, tcol))
             if existing is not None:
-                # Review action (#1088): a steward APPROVE/REJECT flips review_status
-                # on the existing inferred relationship while preserving its source,
-                # target_datasource_id and provenance. No status change -> untouched.
+                # Review action: APPROVE/REJECT flips review_status on the existing
+                # inferred relationship, preserving source, target and provenance.
                 if review_status and review_status != existing.review_status:
                     if review_status == ReviewStatus.APPROVED:
                         target_source_id = source_id
@@ -2968,34 +2761,9 @@ def _handle_update_column_metadata(
     )
 
 
-# ---------------------------------------------------------------------------
-# BULK APPROVE / REJECT — async via SQS worker
-# ---------------------------------------------------------------------------
-#
-# Bulk operations cannot run inline within the 29s API Gateway timeout for
-# sources with 75+ tables (each table requires search + get_asset_forms +
-# create_asset_revision = 3 DataZone API calls). Instead the request is
-# enqueued and a worker Lambda processes it asynchronously.
-#
-# The status transition (PENDING_REVIEW or *_FAILED) → APPROVING/REJECTING
-# happens via a conditional DynamoDB update, which gives us idempotency: a
-# duplicate API call (or replayed SQS message at the worker layer) finds the
-# source already in the transient state and is rejected as a 409, preventing
-# two workers from racing on the same source.
-#
-# Frontend polls GetSource for the source's `status` field. Terminal states:
-#   - APPROVE flow:  APPROVED        (or APPROVAL_FAILED on worker error)
-#   - REJECT flow:   REJECTED        (a first-scan reject is terminal; tables
-#                                     marked REJECTED retain that status —
-#                                     REJECTION_FAILED on error)
-#   - RE-SCAN (source was RESCAN_REVIEW before the action): approve → APPROVED
-#                                     (the re-scan's removed items are deleted);
-#                                     reject → APPROVED (the pre-rescan state is
-#                                     restored and the fresh scan discarded).
+# Bulk approve/reject run asynchronously via the SQS worker.
 
 
-# Per-decision lifecycle: maps a ReviewDecision value to the
-# (transient_status, failure_status, allowed_entry_states) triple.
 def _bulk_lifecycle(decision: str) -> tuple[str, str, tuple[str, ...]]:
     """Return (transient, failed, allowed_entry_states) for a decision.
 
@@ -3038,9 +2806,6 @@ def _enqueue_bulk_review(
         _get_sqs().send_message(
             QueueUrl=_REVIEW_QUEUE_URL,
             MessageBody=json.dumps(payload),
-            # Best-effort dedup: SQS Standard doesn't enforce it, but the conditional
-            # status transition above is the real guard. The MessageGroupId is unused
-            # for Standard queues; for FIFO we'd set it to source_id.
         )
     except ClientError:
         logger.exception("enqueue_bulk_review_failed", source_id=source_id)
@@ -3179,11 +2944,6 @@ def _handle_reject_source(event: dict[str, Any], namespace_id: str, source_id: s
     return _handle_bulk_review(event, namespace_id, source_id, ReviewDecision.REJECTED)
 
 
-# ---------------------------------------------------------------------------
-# GET SCAN JOB
-# ---------------------------------------------------------------------------
-
-
 def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict[str, Any]:
     """GET /namespaces/{namespaceId}/sources/{sourceId}/scan/{jobId}.
 
@@ -3215,15 +2975,6 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         "sourceId": source_id,
         "status": scan_item.get("status"),
         "scanType": scan_item.get("scanType"),
-        # Coerced to int, because this response is assembled as a raw dict with no
-        # Smithy model in the path to do it for us. The DAO reads through boto3's
-        # resource interface, so a DynamoDB number arrives as a Decimal, and
-        # api_response serialises with `json.dumps(..., default=str)` — which turns
-        # Decimal("2") into the JSON STRING "2". A typed client then deserialises a
-        # numeric member from a string and hands the consumer something that fails
-        # `typeof x === "number"`. Every other numeric field on this response has
-        # always had that defect; it was invisible only because nothing type-checked
-        # them. See _item_to_summary, which gets this right via the same int() call.
         "tablesDiscovered": _optional_int(scan_item.get("tablesDiscovered")),
         "columnsDiscovered": _optional_int(scan_item.get("columnsDiscovered")),
         "tablesProcessed": _optional_int(scan_item.get("tablesProcessed")),
@@ -3233,24 +2984,13 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         # Redacted on read too, so rows written before the write side stored
         # client-safe text do not return raw exception text.
         "errorMessage": _client_error_text(scan_item),
-        # A scan can SUCCEED while individual tables were unreadable, leaving those
-        # tables with no columns, no comments, and no declared keys — and enrichment
-        # then generates descriptions over the gap. Unsurfaced, the result is
-        # indistinguishable from a complete one, so a reviewer would approve a
-        # silently incomplete ontology. Both keys drop out below when absent, so a
-        # clean scan's response is unchanged.
+        # Absent on a clean scan.
         "tablesFailed": _optional_int(scan_item.get("tablesFailed")),
         "failedTables": scan_item.get("failedTables"),
         # Filters that looked like a regex and matched nothing (filters are globs),
         # so the scan succeeded without the intended filtering. Absent when none.
         "filterWarnings": scan_item.get("filterWarnings"),
-        # Enrichment can partially fail independently of discovery: individual
-        # tables that error (guardrail block, parse/timeout) are written back
-        # without enrichment while the scan still completes. These fields name
-        # those tables so the partial failure is visible at review; both are
-        # absent (dropped below) on a clean scan. Written by the enrichment
-        # handler onto this scan-job row. Distinct from the discovery failures
-        # above — a table can be read fine and still fail to enrich.
+        # Enrichment can fail per table while the scan completes; absent on a clean scan.
         "enrichmentPartialFailure": scan_item.get("enrichmentPartialFailure"),
         "enrichmentFailedTables": scan_item.get("enrichmentFailedTables"),
     }
@@ -3377,10 +3117,6 @@ def _handle_list_scan_jobs(event: dict[str, Any], namespace_id: str, source_id: 
         body["nextToken"] = _encode_scan_jobs_token(page.last_evaluated_key)
     return api_response(200, body)
 
-
-# ---------------------------------------------------------------------------
-# RESCAN SCHEDULE (recurring rescan via EventBridge Scheduler)
-# ---------------------------------------------------------------------------
 
 # EventBridge Scheduler wiring, injected by the sources stack. The schedule
 # targets the Sources API Lambda itself with a synthetic {"scheduledRescan":
@@ -3575,10 +3311,6 @@ def _handle_put_rescan_schedule(event: dict[str, Any], namespace_id: str, source
 
     return api_response(200, {"sourceId": source_id, "rescanSchedule": schedule})
 
-
-# ---------------------------------------------------------------------------
-# EVENT-DRIVEN RESCAN (Glue Data Catalog changes via EventBridge)
-# ---------------------------------------------------------------------------
 
 # Per-source EventBridge rules match the source's Glue Data Catalog changes and
 # route them to the Glue-event SQS queue (queue policy allows EventBridge), which
@@ -3815,11 +3547,6 @@ def _handle_put_event_rescan(event: dict[str, Any], namespace_id: str, source_id
     return api_response(200, {"sourceId": source_id, "eventRescan": config})
 
 
-# ---------------------------------------------------------------------------
-# UPDATE METADATA
-# ---------------------------------------------------------------------------
-
-
 def _validate_configuration_blob(config_key: str, blob: Any) -> dict[str, Any] | None:
     """Validate a configuration blob against its Smithy model.
 
@@ -3851,39 +3578,20 @@ def _apply_custom_connector_configuration_update(
     new_config: dict[str, Any],
     update_fields: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Guard and extend an ``customConnectorConfiguration`` update.
+    """Guard and extend a ``customConnectorConfiguration`` update.
 
-    Two things in this blob are not free to change, because the stored blob is not
-    the only place their value lives:
+    The connector Lambda ARNs and ``databaseName`` cannot change, and a change is
+    rejected:
 
-    * **The connector Lambda ARNs.** They are baked into the Athena data catalog's
-      ``Parameters`` at source-create, and nothing re-registers it afterwards — the
-      post-discovery step only flips ``queryable``. Accepting a new ARN would
-      return 200, report the new ARN on every read path, and leave the catalog
-      still invoking the OLD Lambda. Discovery and serve would then keep answering
-      from the previous connector with no error anywhere, which is the worst shape
-      a wrong answer can take: every surface agrees, and all of them are wrong.
-      Rejected rather than re-bound, because re-binding is delete-then-create with
-      no transaction around it — a failure between the two would leave the source
-      with no catalog at all, which is worse than refusing the edit.
-    * **``databaseName``.** Serve does not read ``athenaDatabase`` first — it prefers
-      ``discoveredSchemas[0]`` and falls back to ``athenaDatabase`` only when that
-      list is empty (``coa_serve.clients.athena._resolve_catalog_and_database``).
-      Discovery writes ``discoveredSchemas`` on every successful scan, so for a
-      scanned source the fallback is dead and writing ``athenaDatabase`` retargets
-      nothing: the update returns 200 while serve keeps querying the old database.
-      A re-scan cannot reconcile it either — ``_handle_rescan`` 409s any ``DATABASE``
-      source that is not ``SCAN_FAILED``.
-      Rejected rather than made to work, because the stored tables, their approved
-      metadata and the induced ontology all describe the OLD database. Retargeting
-      the query would leave every one of them describing something this source no
-      longer points at.
+    * The ARNs are baked into the Athena data catalog's ``Parameters`` at create
+      and nothing re-registers it, so a new ARN would be reported on reads while
+      the catalog still invoked the old Lambda.
+    * Serve prefers ``discoveredSchemas[0]`` over ``athenaDatabase``, and the
+      stored tables and ontology describe the old database, so retargeting
+      would leave the source describing something it no longer points at.
 
-    Both are rejected only when the value CHANGES; an update echoing the stored value
-    is allowed, so a client may PUT the whole configuration back to edit another field
-    in it. The members stay in the request shape because ``CustomConnectorConfiguration`` is
-    shared with create, where they are required — a member cannot be dropped for one
-    operation only.
+    An update echoing the stored value is allowed, so a client may PUT the whole
+    configuration back to edit another field.
 
     Returns an error response, or ``None`` when the update may proceed.
     """
@@ -3938,17 +3646,9 @@ def _apply_glue_configuration_update(
     """Guard a ``glueConfiguration`` update: the target database is not re-bindable.
 
     ``catalogId`` and ``databaseName`` are what source-create checked the caller's
-    namespace against, and the stored blob — not the checked request — is what
-    discovery reads on the next scan. Accepting a change here would let a steward
-    create a source against a database their namespace owns and then repoint it at
-    one it does not, which is the create-time ownership check with an extra step.
-
-    Re-running the ownership check on the new pair would close that, but it would
-    still be the wrong answer: the discovered tables, their approved metadata and
-    the induced ontology all describe the OLD database, so a source that survives
-    the change describes something it no longer points at — the same reason
-    ``customConnectorConfiguration.databaseName`` is frozen. Delete and re-create
-    is the honest path, and it re-runs the ownership check by construction.
+    namespace against, and discovery reads the stored blob on the next scan.
+    Accepting a change would let a steward repoint a source at a database their
+    namespace does not own. Delete and re-create re-runs the ownership check.
 
     Only a CHANGE is rejected; echoing the stored value is allowed, so a client can
     PUT the whole configuration back to edit another member of it.
@@ -4020,21 +3720,12 @@ def _handle_update_metadata(event: dict[str, Any], namespace_id: str, source_id:
     if "metadataEnrichmentEnabled" in body and body["metadataEnrichmentEnabled"] is not None:
         update_fields["metadataEnrichmentEnabled"] = bool(body["metadataEnrichmentEnabled"])
 
-    # The stored `configuration` blob is untyped, so sourceSubType is the only
-    # thing that says which shape it holds — which means an update must write the
-    # shape the row's own sub-type declares. Writing a Glue config onto an
-    # CUSTOM_CONNECTOR row (or vice versa) leaves a record whose blob and sub-type
-    # disagree, and GET then 500s on the mismatched required members rather than
-    # mislabelling anything.
+    # The stored `configuration` blob is untyped, so an update must write the
+    # shape the row's own sub-type declares, or GET 500s on the mismatch.
     #
-    # DATABRICKS_SQL_WAREHOUSE is deliberately ABSENT, so it falls into the
-    # recognised-but-unmapped arm below and returns a 400. Its connection facts are
-    # written TWICE at create — once on this record and once into the connector's SSM
-    # parameter, which is what the connector actually reads — and write-once is what makes
-    # that duplication safe. An update path that does not write both transactionally
-    # leaves the two able to disagree, with the parameter's copy silently winning every
-    # query. Correcting a wrong HTTP path or a rotated secret ARN means delete and
-    # re-create.
+    # DATABRICKS_SQL_WAREHOUSE is absent on purpose (400): its connection facts
+    # also live in the connector's SSM parameter, so an update that does not
+    # write both could leave the two disagreeing.
     config_key_for_sub_type = {
         SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
         SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",

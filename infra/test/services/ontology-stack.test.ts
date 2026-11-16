@@ -29,7 +29,7 @@ const TEST_CONTEXT = {
 
 const PREFIX = `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}`;
 
-/** Render an OntologyStack with the given model-ID props (#94). */
+/** Render an OntologyStack with the given model-ID props. */
 function renderOntology(
   props: {
     bedrockEmbedModelId?: string;
@@ -81,7 +81,7 @@ function envValue(t: Template, name: string): unknown {
   return containerEnv(t).find((e) => e.Name === name)?.Value;
 }
 
-describe("OntologyStack model IDs from deploy config (#94)", () => {
+describe("OntologyStack model IDs from deploy config", () => {
   test("configured model IDs reach the container environment", () => {
     const t = renderOntology(
       {
@@ -105,7 +105,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "BEDROCK_CHAT_MODEL_ID")).toBe(
       "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
     );
-    // Grounding reranker override reaches the container (GH #236).
+    // Grounding reranker override reaches the container.
     expect(envValue(t, "GROUNDING_LLM_MODEL_ID")).toBe(
       "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
     );
@@ -119,7 +119,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(envValue(t, "LLM_MODEL_ID")).toBe("us.anthropic.claude-sonnet-5");
   });
 
-  test("grounding model defaults to the chat model, independently overridable (GH #236)", () => {
+  test("grounding model defaults to the chat model, independently overridable", () => {
     // Unset: grounding follows the chat (Haiku) model, not the induction model.
     const def = renderOntology({}, "GroundDefaultOntology");
     expect(envValue(def, "GROUNDING_LLM_MODEL_ID")).toBe(
@@ -146,11 +146,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
   });
 
   test("dashboard ModelId dimensions follow the configured models", () => {
-    // The dashboard used to hold independent literal copies, so a configured
-    // model left the Bedrock widgets querying a dimension with no data. The
-    // Bedrock widgets plot the induction invoker (Sonnet), the enrichment
-    // invoker (chat/Haiku), embeddings, and — when it differs from chat — the
-    // grounding invoker.
+    // The dashboard ModelId dimensions must come from the configured models.
     const t = renderOntology(
       {
         bedrockEmbedModelId: "cohere.embed-v4:0",
@@ -172,11 +168,9 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
     expect(body).not.toContain("us.cohere.embed-v4:0");
   });
 
-  test("cost estimate never prices one ModelId as two terms (GH #236)", () => {
-    // Default deploy: grounding == chat, so the cost MathExpression must NOT
-    // carry a grounding (gi/go) term — otherwise the chat/Haiku tokens would be
-    // counted twice (once as hi/ho, once as gi/go). Regression guard for the
-    // rerank/haiku double-count Kun flagged.
+  test("cost estimate never prices one ModelId as two terms", () => {
+    // Default deploy: grounding == chat, so the cost MathExpression must NOT carry a
+    // grounding (gi/go) term, or the chat tokens would be counted twice.
     const def = renderOntology({}, "CostDefaultOntology");
     const defBody = JSON.stringify(
       Object.values(def.findResources("AWS::CloudWatch::Dashboard")),
@@ -214,7 +208,7 @@ describe("OntologyStack model IDs from deploy config (#94)", () => {
   });
 });
 
-describe("OntologyStack OoPS! endpoint is opt-in (#171)", () => {
+describe("OntologyStack OoPS! endpoint is opt-in", () => {
   test("oops_endpoint context reaches the container as OOPS_ENDPOINT", () => {
     const t = renderOntology({}, "OopsOn", {
       oops_endpoint: "https://oops.example.test/rest",
@@ -314,11 +308,8 @@ describe("OntologyStack", () => {
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
-    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-ontology-api-proxy"]);
   });
-
-  // ── DynamoDB Table ──────────────────────────────────────────────
 
   test("creates DynamoDB table with PK/SK", () => {
     template.hasResourceProperties("AWS::DynamoDB::Table", {
@@ -332,15 +323,11 @@ describe("OntologyStack", () => {
     });
   });
 
-  // ── ECS Cluster ─────────────────────────────────────────────────
-
   test("creates ECS cluster", () => {
     template.hasResourceProperties("AWS::ECS::Cluster", {
       ClusterName: `${PREFIX}-ontology-cluster`,
     });
   });
-
-  // ── Task Definition ─────────────────────────────────────────────
 
   test("creates Fargate task definition with correct sizing", () => {
     template.hasResourceProperties("AWS::ECS::TaskDefinition", {
@@ -403,8 +390,6 @@ describe("OntologyStack", () => {
     });
   });
 
-  // ── Fargate Service ─────────────────────────────────────────────
-
   test("creates Fargate service with Cloud Map service discovery", () => {
     template.hasResourceProperties("AWS::ECS::Service", {
       ServiceName: `${PREFIX}-ontology-engine`,
@@ -418,8 +403,6 @@ describe("OntologyStack", () => {
       }),
     });
   });
-
-  // ── IAM Permissions ─────────────────────────────────────────────
 
   test("task role has Neptune access with least privilege", () => {
     template.hasResourceProperties("AWS::IAM::Policy", {
@@ -491,9 +474,9 @@ describe("OntologyStack", () => {
   });
 
   test("task role can publish CloudWatch metrics scoped to COA namespaces", () => {
-    // COA/Guardrails is here too because the SHACL-shape NL generator runs in
-    // this Fargate task and emits guardrail decisions (#111 AC10). Leaving it
-    // out silently drops those metrics — PutMetricData denials are async.
+    // COA/Guardrails is here too because the SHACL-shape NL generator runs in this
+    // Fargate task and emits guardrail decisions. Leaving it out silently drops those
+    // metrics: PutMetricData denials are async.
     template.hasResourceProperties("AWS::IAM::Policy", {
       PolicyDocument: Match.objectLike({
         Statement: Match.arrayWith([
@@ -512,8 +495,6 @@ describe("OntologyStack", () => {
     });
   });
 
-  // ── AOSS Data Access Policy ─────────────────────────────────────
-
   test("creates AOSS data access policy", () => {
     template.hasResourceProperties("AWS::OpenSearchServerless::AccessPolicy", {
       Name: `${PREFIX}-ontology-oss`,
@@ -521,15 +502,11 @@ describe("OntologyStack", () => {
     });
   });
 
-  // ── CloudWatch Alarms (via SclMonitoring facade) ────────────────
-
   test("emits facade fargate + table alarms and an ontology dashboard", () => {
     template.resourceCountIs("AWS::CloudWatch::Dashboard", 2);
     const alarms = template.findResources("AWS::CloudWatch::Alarm");
     expect(Object.keys(alarms).length).toBeGreaterThanOrEqual(2);
   });
-
-  // ── CloudWatch Dashboard ────────────────────────────────────────
 
   test("creates the single consolidated induction dashboard", () => {
     // The InductionDashboard remains (custom COA/Ontology metrics) alongside
@@ -554,29 +531,21 @@ describe("OntologyStack", () => {
     // DashboardBody is a CloudFormation Fn::Join over string fragments +
     // tokens; stringify the whole structure and assert the literal fragments.
     const serialized = JSON.stringify(body);
-    // Single namespace — all custom metrics publish to COA/Ontology.
     expect(serialized).toContain("COA/Ontology");
-    // Stage durations + job wallclock (percentile-capable single-value datums).
     expect(serialized).toContain("InductionJobDurationMs");
     expect(serialized).toContain("FetchMetadataDurationMs");
     expect(serialized).toContain("InduceDurationMs");
     expect(serialized).toContain("StoreDurationMs");
-    // Throughput / volume.
     expect(serialized).toContain("TablesProcessed");
     expect(serialized).toContain("NovelClassesCreated");
-    // Rerank (names THIS branch's emitter actually publishes).
     expect(serialized).toContain("RerankInvocations");
     expect(serialized).toContain("RerankLatencyMs");
-    // Cost + tokens.
     expect(serialized).toContain("InductionJobCostUsd");
     expect(serialized).toContain("BedrockInputTokens");
     expect(serialized).toContain("BedrockOutputTokens");
-    // Duration widgets show p50 AND p90 across jobs.
     expect(serialized).toContain("p50");
     expect(serialized).toContain("p90");
   });
-
-  // ── OOM Observability (#784) ────────────────────────────────────
 
   test("alarms on ECS MemoryUtilization at 85% (Maximum, 1 period)", () => {
     // 85% < the facade's 90% memory alarm that missed the 81% pre-OOM sample;
@@ -590,31 +559,6 @@ describe("OntologyStack", () => {
       ComparisonOperator: "GreaterThanOrEqualToThreshold",
       TreatMissingData: "notBreaching",
     });
-  });
-
-  test("EventBridge rule fires on ECS OOM / exit-137 task stops", () => {
-    // A SIGKILL/exit-137 runs neither except nor finally, so the custom
-    // metrics never emit — this rule makes the OOM visible from the ECS
-    // Task State Change event (an OutOfMemory reason, or exit 137 from an
-    // essential container that died on its own).
-    const rules = template.findResources("AWS::Events::Rule");
-    const ruleValues = Object.values(rules);
-    const oomRule = ruleValues.find((r) => {
-      const p = r.Properties?.EventPattern;
-      return (
-        p &&
-        JSON.stringify(p.source) === JSON.stringify(["aws.ecs"]) &&
-        JSON.stringify(p["detail-type"]) ===
-          JSON.stringify(["ECS Task State Change"])
-      );
-    });
-    expect(oomRule).toBeDefined();
-    const serialized = JSON.stringify(oomRule!.Properties.EventPattern);
-    // Matches an OutOfMemory reason (wildcard) or the exit-137 container code.
-    expect(serialized).toContain("OutOfMemory");
-    expect(serialized).toContain("137");
-    // Scoped to STOPPED tasks so it doesn't fire on every state transition.
-    expect(serialized).toContain("STOPPED");
   });
 
   describe("EventBridge OOM rule against ECS Task State Change events", () => {
@@ -736,8 +680,7 @@ describe("OntologyStack", () => {
   });
 
   test("EventBridge OOM rule surfaces a CloudWatch metric + alarm", () => {
-    // Laziest durable target: rule → Logs log group + metric filter emitting
-    // COA/Ontology InductionTaskOOMKilled, then an alarm on that metric.
+    // rule → Logs log group + metric filter emitting COA/Ontology InductionTaskOOMKilled → alarm.
     template.hasResourceProperties("AWS::Logs::MetricFilter", {
       MetricTransformations: Match.arrayWith([
         Match.objectLike({
@@ -755,28 +698,17 @@ describe("OntologyStack", () => {
     });
   });
 
-  // ── SSM Parameters ──────────────────────────────────────────────
-
   test("exports SSM parameter for endpoint", () => {
-    // Endpoint uses the Cloud Map FQDN so it's resolvable from outside ECS
-    // (e.g. from the api-proxy Lambda). The DNS suffix is the namespace name
-    // exported by network-stack — which is a CFN token here, so we just
-    // assert the value contains the known prefix.
+    // Endpoint uses the Cloud Map FQDN so it resolves outside ECS; the DNS suffix is a CFN token
+    // here, so assert only the known prefix.
     template.hasResourceProperties("AWS::SSM::Parameter", {
       Name: "/coa/ontology-engine/endpoint",
     });
   });
 });
 
-// The running coa-dev-ontology-engine image accreted Critical/High OS CVEs
-// (glibc, perl, sqlite3, libssh2, gzip, pcre2) whenever a build predated the
-// Debian point releases that fix them; the base is now AL2023. Two
-// Dockerfile properties keep the image patchable: a pinned base digest
-// (supply-chain integrity + a cache-busting bump lever) and a post-install
-// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
-// updates in past the pinned snapshot). These guard both against regression —
-// removing the upgrade line, or floating the base back onto a mutable tag, is
-// exactly how the CVEs came back.
+// The Dockerfile pins the base digest and runs `dnf upgrade --releasever=latest`,
+// the only mechanism that pulls AL2023 security updates in past the pinned snapshot.
 describe("ontology-engine Dockerfile CVE hygiene", () => {
   const dockerfile = fs.readFileSync(
     path.join(

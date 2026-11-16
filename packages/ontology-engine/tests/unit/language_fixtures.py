@@ -11,11 +11,7 @@ language argument, against the BASE engine: the ``packages/ontology-engine/src``
 tree of ``main`` at ``d65d9b397``, exported with
 ``git archive d65d9b397 packages/ontology-engine/src libs/common/src`` and put
 first on ``PYTHONPATH``. The written files are the UTF-8 encoding of the returned
-Turtle. An ``en`` namespace must still produce them byte for byte. (Regenerated
-when main was merged into the feature branch: #1167 joins a foreign-key column's
-description into the FK note, which changed the structured file; !922 keeps
-non-ASCII letters in predicate keys and drops the class name from the
-datatype-property observation comment, which changed the unstructured file.)
+Turtle. An ``en`` namespace must still produce them byte for byte.
 
 The structured fixture covers a primary key (``owl:hasKey``), NOT NULL and
 PRIMARY KEY cardinality restrictions, sampled values on two columns, an FK, a
@@ -24,8 +20,8 @@ serialized inline by rdflib; each class carries at most one cardinality
 restriction, because rdflib orders two inline blank nodes on the same subject by
 their random IDs. With that, the output is stable across runs and hash seeds.
 The unstructured fixture includes a predicate with non-ASCII Latin letters
-(``café owner``) to pin the predicate normalization, which since !922 keeps
-those letters in every namespace language.
+(``café owner``) to pin the predicate normalization, which keeps those letters
+in every namespace language.
 """
 
 from __future__ import annotations

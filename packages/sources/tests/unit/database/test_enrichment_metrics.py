@@ -19,8 +19,6 @@ from coa_sources.database.pipeline.enrichment_metrics import (
     _resolve_engine,
 )
 
-# ── _resolve_engine ────────────────────────────────────────────────────────
-
 
 class TestResolveEngine:
     def test_jdbc_source_extracts_engine_lowercase(self) -> None:
@@ -56,9 +54,6 @@ class TestResolveEngine:
         assert _resolve_engine(source_item) == "glue"
 
 
-# ── EnrichmentContext ──────────────────────────────────────────────────────
-
-
 class TestEnrichmentContext:
     def test_derives_engine_from_jdbc_source(self) -> None:
         source_item = {"configuration": json.dumps({"engine": "ORACLE"})}
@@ -72,9 +67,6 @@ class TestEnrichmentContext:
         ctx = EnrichmentContext(source_item=source_item, namespace_id="ns-xyz")
 
         assert ctx.engine == "glue"
-
-
-# ── BedrockTokenUsageCounter ──────────────────────────────────────────────
 
 
 class TestBedrockTokenUsageCounter:
@@ -105,9 +97,6 @@ class TestBedrockTokenUsageCounter:
 
         # 1000 * 1.00/1M + 500 * 5.00/1M = 0.001 + 0.0025 = 0.0035
         assert counter.estimated_calls_cost_usd == pytest.approx(0.0035)
-
-
-# ── _classify_bedrock_error ────────────────────────────────────────────────
 
 
 class TestClassifyBedrockError:
@@ -150,9 +139,6 @@ class TestClassifyBedrockError:
     def test_runtime_error(self) -> None:
         exc = RuntimeError("timeout")
         assert _classify_bedrock_error(exc) == "Other"
-
-
-# ── EnrichmentMetricEmitter ────────────────────────────────────────────────
 
 
 class TestEnrichmentMetricEmitter:

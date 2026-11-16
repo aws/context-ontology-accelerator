@@ -2,32 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * SuggestionPanel — renders inside ClassDetailCard when the selected
- * class has any ``coa:suggestedSubClassOf`` annotations from the
- * inducer's single-child PK-sharing detection.
+ * Suggested-subclass panel shown by ClassDetailCard and ClassDetailPanel.
+ * Confirm promotes ``coa:suggestedSubClassOf`` to ``rdfs:subClassOf``, Reject
+ * drops it, Defer dismisses the panel for this session.
  *
- * For each suggested parent the panel shows the proposed inheritance,
- * the suggestion's reason, and three actions:
- *
- *   * Confirm — promotes the suggestion to a real ``rdfs:subClassOf``,
- *     drops the ``coa:suggestedSubClassOf`` + ``coa:suggestionReason``
- *     annotations, and tags the new edge with
- *     ``coa:subClassProvenance "USER_CONFIRMED"``. Marks the proposal
- *     dirty so the existing Save flow persists it via updateProposal.
- *   * Reject — drops the soft annotations, leaving the FK
- *     ObjectProperty (the relation stays as has-a).
- *   * Defer — dismisses the panel for this session without rewriting
- *     the proposal Turtle.
- *
- * The Turtle rewrite is intentionally text-based: parse-rewrite-
- * serialise via rdflib in the browser would mean shipping rdflib.js
- * to clients, and the proposal Turtle is small enough (<200 KB) that
- * a line-oriented edit is fine. Each triple the inducer emits looks
- * like ``<child> coa:suggestedSubClassOf <parent>`` (sometimes inside
- * a multi-predicate block on the child); we strip the predicate-
- * object pair and append the replacement triples as a separate
- * statement at the bottom of the file. rdflib normalises on the next
- * Save round-trip.
+ * The Turtle is edited as text (statement splicing) because shipping rdflib.js
+ * to the browser is not an option.
  */
 import {
   Alert,
@@ -43,7 +23,6 @@ import {
   SCL_NS,
   SCL_SUGGESTED_SUBCLASS_OF,
   SCL_SUGGESTION_REASON,
-  SCL_SUBCLASS_PROVENANCE,
   expandIri,
   literalText,
   localName,
@@ -66,12 +45,9 @@ interface Props {
   iri: string;
   /** Current proposal Turtle, possibly with unsaved edits. */
   turtle: string;
-  /** Called when the user confirms or rejects a suggestion — passes
-   *  the new Turtle back to the parent so the existing dirty-state
-   *  + Save flow can persist it. */
+  /** Receives the rewritten Turtle after a confirm or reject. */
   onTurtleEdit: (turtle: string) => void;
-  /** Map a class IRI to a human label (passes through ``localName``
-   *  when the proposal has no rdfs:label). */
+  /** Maps a class IRI to a display label. */
   labelOf: (iri: string) => string;
 }
 
@@ -83,8 +59,6 @@ export function SuggestionPanel({ iri, turtle, onTurtleEdit, labelOf }: Props) {
     pairs: SuggestedPair[];
   } | null>(null);
 
-  // Parse out the suggestions for this class. Memoised on turtle so a
-  // confirm/reject re-runs the parser with the rewritten Turtle.
   const suggestions = useMemo<SuggestedPair[]>(() => {
     const { triples } = parseTriples(turtle);
     const pairs: SuggestedPair[] = [];
@@ -249,29 +223,17 @@ export function findSuggestionsWithParent(
 }
 
 /**
- * Promote a suggestion to a real ``rdfs:subClassOf`` edge.
- *
- *   1. Drop the ``coa:suggestedSubClassOf <parent>`` predicate from the
- *      child's predicate-object block.
- *   2. Drop the ``coa:suggestionReason "..."`` predicate from the
- *      child's predicate-object block.
- *   3. Append a fresh statement: ``<child> rdfs:subClassOf <parent> ;
- *      coa:subClassProvenance "USER_CONFIRMED" .``
- *
- * The text edit is line-oriented and idempotent — applying the same
- * pair twice no-ops the first round (nothing left to drop) but still
- * appends the new triple. Save → re-load via rdflib normalises that.
+ * Promote a suggestion to a real ``rdfs:subClassOf`` edge tagged
+ * ``coa:subClassProvenance "USER_CONFIRMED"``. Applying the same pair twice
+ * appends a duplicate ``rdfs:subClassOf`` statement.
  */
 export function applyConfirm(turtle: string, pairs: SuggestedPair[]): string {
   let out = turtle;
   for (const { child, parent } of pairs) {
     out = stripSuggestion(out, child, parent);
   }
-  // Append the confirmed-edge statements.
+  // Reuse the proposal's COA prefix, else declare one.
   const prefixes = parsePrefixes(out);
-  // Use the COA prefix the proposal already declares — fallback to
-  // adding our own if the proposal doesn't have one (rare; the
-  // inducer always emits it).
   const sclPrefix =
     Object.entries(prefixes).find(([, base]) => base === SCL_NS)?.[0] ?? "coa";
   const ensurePrefixDecl = !prefixes[sclPrefix]
@@ -305,15 +267,9 @@ export function applyReject(turtle: string, pairs: SuggestedPair[]): string {
  * ``coa:suggestionReason`` predicate-object pairs from the child's
  * statement, leaving every other byte of the document untouched.
  *
- * Why surgical instead of parse-rebuild: the previous implementation
- * round-tripped through ``parseTriples`` then re-emitted one triple
- * per line. That destroyed ``owl:hasKey`` lists (the lexer flattens
- * them via a synthetic ``__hasKeyList__`` predicate that re-emit
- * cannot represent), normalised whitespace, dropped multi-predicate
- * blocks, and made every confirm/reject change the file in ways the
- * user didn't ask for. Surgical splice on the original bytes keeps
- * everything else byte-identical.
- *
+ * Why surgical instead of parse-rebuild: the lexer flattens ``owl:hasKey``
+ * lists, so a parse-and-re-emit would lose them. Splicing the original bytes
+ * keeps everything else identical.
  * Only the ``coa:suggestionReason`` paired with the targeted parent
  * is removed — a child with multiple suggested parents (rare today
  * but supported by the schema) keeps its other reasons intact.
@@ -326,9 +282,6 @@ function stripSuggestion(
   const prefixes = parsePrefixes(turtle);
   const stmts = splitStatements(turtle);
 
-  // Locate the statement whose subject is the child class. Match by
-  // expanding the leading token through the document's prefix table
-  // so both ``ind:Child`` and ``<...child>`` shapes are recognised.
   for (const stmt of stmts) {
     const trimmed = stmt.text.trimStart();
     if (!trimmed || trimmed.startsWith("@")) continue;
@@ -337,13 +290,9 @@ function stripSuggestion(
     const subjectIri = expandIri(trimmed.slice(0, subjEnd), prefixes);
     if (subjectIri !== child) continue;
 
-    // Found the child's statement. Walk its predicate-object pairs
-    // and drop the ones we need to remove. Splice the rewritten
-    // statement back into the original document at its byte offset.
     const rewritten = stripPredicatesFromStatement(
       turtle.slice(stmt.startOffset, stmt.endOffset),
       prefixes,
-      child,
       parent,
     );
     if (rewritten === null) continue;
@@ -357,46 +306,27 @@ function stripSuggestion(
 }
 
 /**
- * Take a single statement's source text (subject + ``;``-separated
- * predicate-object pairs + trailing ``.``) and remove just the
- * ``coa:suggestedSubClassOf <parent>`` predicate-object pair plus any
- * ``coa:suggestionReason`` paired with it.
- *
- * "Paired with" here means: the reason triple sits next to the
- * suggestion triple in the same multi-predicate block. We're
- * conservative — when the child has multiple suggested parents we
- * remove only the suggestion + the *one* reason adjacent to it.
- *
- * Returns null when the statement has no targeted predicate to drop
- * (which means the caller can keep walking).
+ * Remove the ``coa:suggestedSubClassOf <parent>`` pair from one statement, plus
+ * the ``coa:suggestionReason`` pair directly after it. Returns null when
+ * nothing matched.
  */
 function stripPredicatesFromStatement(
   source: string,
   prefixes: Record<string, string>,
-  child: string,
   parent: string,
 ): string | null {
-  // Split off the trailing ``.`` so we can rewrite the body and put
-  // the terminator back. The terminator might have whitespace before
-  // it; preserve that exactly.
   const dotIdx = source.lastIndexOf(".");
   if (dotIdx < 0) return null;
   const head = source.slice(0, dotIdx);
   const tail = source.slice(dotIdx); // includes the dot + any trailing whitespace
 
-  // Re-locate the subject token within head.
   const trimmed = head.trimStart();
   const leadingWs = head.slice(0, head.length - trimmed.length);
   const subjEnd = nextTokenEnd(trimmed, 0);
   if (subjEnd <= 0) return null;
-  const subjectIri = expandIri(trimmed.slice(0, subjEnd), prefixes);
-  if (subjectIri !== child) return null;
   const subjectText = trimmed.slice(0, subjEnd);
   const restAfterSubject = trimmed.slice(subjEnd);
 
-  // Walk the predicate-object pairs. We track which pair (by index)
-  // is the suggestion targeting this parent and which (if any)
-  // immediately-following reason pair needs to come out with it.
   const pairs = splitOnSemicolons(restAfterSubject);
   const dropFlags = pairs.map(() => false);
   let droppedSomething = false;
@@ -436,15 +366,7 @@ function stripPredicatesFromStatement(
 
   if (!droppedSomething) return null;
 
-  // Reassemble. Keep only pairs that survived the filter.
   const surviving = pairs.filter((_, i) => !dropFlags[i]);
-  // splitOnSemicolons returns the head pair without a leading
-  // separator; joining with ` ;` reproduces the original shape, but
-  // we need to be careful when the surviving body starts empty
-  // (every predicate dropped — extremely rare for this codepath
-  // because the child class would have to consist solely of
-  // suggestion + reason, which the inducer never emits — but handle
-  // it gracefully by removing the whole statement).
   if (surviving.length === 0) {
     return ""; // caller's surrounding whitespace covers the gap
   }
@@ -453,6 +375,3 @@ function stripPredicatesFromStatement(
   const body = surviving.join(";").trimEnd();
   return leadingWs + subjectText + body + tail;
 }
-
-// Re-export the lexer constant so the test file can use it.
-export { SCL_SUBCLASS_PROVENANCE };

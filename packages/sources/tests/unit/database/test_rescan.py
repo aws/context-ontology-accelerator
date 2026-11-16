@@ -184,9 +184,7 @@ def test_ai_table_description_change_is_not_flagged():
 
 def test_source_comment_added_since_approval_is_flagged_on_a_column():
     # The other direction of the gate: the accepted description is AI-authored,
-    # and the source has now GAINED a real comment. Gating on the accepted
-    # provenance alone hid this forever — accepted provenance never changes by
-    # itself, so no later re-scan could ever surface the comment either.
+    # and the source has now GAINED a real comment.
     stored = [_tbl(columns=[_col("id", description="AI text", enrichment_source=EnrichmentSource.AI_GENERATED)])]
     fresh = [
         _tbl(columns=[_col("id", description="Order identifier", enrichment_source=EnrichmentSource.DETERMINISTIC)])
@@ -292,9 +290,6 @@ def test_ai_and_steward_only_fields_are_not_diffed():
     diff = diff_tables(stored, fresh)
     assert diff.unchanged == ["db.orders"]
     assert not diff.has_changes
-
-
-# ── merge_rescan_table (re-scan merge onto the accepted/curated version) ──────
 
 
 def test_merge_preserves_steward_description_and_refreshes_type():
@@ -510,9 +505,6 @@ def test_merge_takes_fresh_primary_key_when_present_else_keeps_accepted():
     assert [fk.column for fk in merged.foreign_keys] == ["cust_id"]  # fresh empty -> keep accepted (curated)
 
 
-# ── merged_write_set (diff → the tables a re-scan writes) ─────────────────────
-
-
 def test_merged_write_set_writes_merged_modified_and_fresh_added_only():
     accepted = [
         _tbl(
@@ -549,7 +541,6 @@ def test_merged_write_set_empty_when_nothing_changed():
     assert merged_write_set(diff_tables(accepted, fresh), accepted, fresh) == []
 
 
-# ── reconstruct_approved_baseline (baseline = last APPROVED, not last scan) ────
 # A re-scan while a prior re-scan is still un-approved (RESCAN_REVIEW) must diff
 # against the APPROVED state, not the interim live assets. The backup blob holds
 # the approved pre-image; these tests build it with the REAL build_rescan_backup
@@ -638,14 +629,7 @@ def test_reconstruct_baseline_end_to_end_diffs_against_approved_not_interim():
     assert fixed_added == {"promo_code", "region"}
 
 
-# ── diff over REAL GlueCatalogConnector output ────────────────────────────────
-# The generic diff (data-type change, add/remove column, add/remove table,
-# unchanged, PK/FK gating, nullability) is already covered above with hand-built
-# _tbl/_col. These two add the missing wiring proof: the tables the *actual*
-# GlueCatalogConnector emits (via its Glue→Table mapping) flow through
-# diff_tables and produce the right added/removed/modified/unchanged partition —
-# so a Glue re-scan genuinely detects drift and does not manufacture false
-# "modified" from Glue's absent PK/FK or its constant hardcoded nullability.
+# These tests run diff_tables over real GlueCatalogConnector output.
 
 
 def _glue_scan(table_list: list[dict]) -> list[Table]:

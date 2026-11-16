@@ -1,10 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Validates and normalizes raw backend responses into a well-typed
- * PlaygroundResponse with safe defaults for all required fields.
- */
 import type {
   PlaygroundResponse,
   TraceStep,
