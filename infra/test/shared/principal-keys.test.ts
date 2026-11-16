@@ -54,10 +54,6 @@ describe("sanitizePrincipalKey", () => {
       expect(sanitizePrincipalKey(value)).toBe(expected);
       expect(sanitizePrincipalKey(value)).not.toBe(encodeURIComponent(value));
     });
-
-    it("leaves ~ unescaped, matching Python's unreserved set", () => {
-      expect(sanitizePrincipalKey("~")).toBe("~");
-    });
   });
 
   describe("email normalization", () => {

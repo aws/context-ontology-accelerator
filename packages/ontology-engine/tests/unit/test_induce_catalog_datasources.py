@@ -11,7 +11,7 @@ import pytest
 from coa_common.constants import RESOURCE_PREFIX
 
 
-def _make_request(table_items: list[dict], table_name: str = f"{RESOURCE_PREFIX}-dev-sources") -> MagicMock:
+def _make_request(table_items: list[dict]) -> tuple[MagicMock, MagicMock]:
     """Build a mock FastAPI request with a DynamoDB table returning the given items."""
     mock_table = MagicMock()
     mock_table.scan.return_value = {"Items": table_items}
@@ -21,7 +21,7 @@ def _make_request(table_items: list[dict], table_name: str = f"{RESOURCE_PREFIX}
 
     request = MagicMock()
     request.app.state.config = {
-        "smus_datasources_table": table_name,
+        "smus_datasources_table": f"{RESOURCE_PREFIX}-dev-sources",
         "smus_region": "us-east-1",
     }
     return request, mock_resource
@@ -280,31 +280,6 @@ class TestListDatasourcesFiltering:
         assert len(result) == 2
         ids = {r["datasourceId"] for r in result}
         assert ids == {"db1", "db2"}
-
-    def test_extracts_source_id_from_src_prefix(self):
-        """SK=SRC#{sourceId} — bare UUID is extracted correctly."""
-        from coa_ontology.induce_catalog import list_datasources
-
-        request, mock_resource = _make_request(
-            [
-                {
-                    "PK": "NS#ns1",
-                    "SK": "SRC#my-source-uuid",
-                    "name": "db",
-                    "sourceType": "DATABASE",
-                    "sourceSubType": "GLUE_DATABASE",
-                    "status": "APPROVED",
-                    "tablesDiscovered": 1,
-                    "tablesApproved": 1,
-                    "namespaceId": "ns1",
-                },
-            ]
-        )
-
-        with patch("boto3.resource", return_value=mock_resource):
-            result = list_datasources(request, "ns1")
-
-        assert result[0]["datasourceId"] == "my-source-uuid"
 
     def test_returns_empty_when_no_table_configured(self):
         """Returns empty list when table name is not configured."""

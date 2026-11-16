@@ -51,10 +51,7 @@ describe("useListSourceTables — progressive page loading", () => {
   });
 
   it("exposes the first page before later pages have arrived", async () => {
-    // The regression this guards: the hook used to drain every page inside one
-    // queryFn, so `data` stayed undefined — and the UI stayed on a spinner —
-    // until the LAST page landed. Page 2 never resolves here, so a hook that
-    // still waits for completion would never expose items at all.
+    // Page 2 never resolves, so items must show from page 1.
     let releasePage2: (v: unknown) => void = () => {};
     const page2 = new Promise((resolve) => {
       releasePage2 = resolve;
@@ -124,11 +121,6 @@ describe("useListSourceTables — progressive page loading", () => {
   });
 
   it("surfaces a mid-drain page failure and stops loading instead of stalling", async () => {
-    // Regression guard: on a page-2 rejection React Query leaves hasNextPage
-    // true (page 1's cursor) but stops fetching, and the drain effect will not
-    // retry. Without the isError guards, isLoadingMore stayed true forever — a
-    // perpetual spinner that never resolves and never errors. The partial
-    // page-1 prefix must remain visible and the error must be exposed.
     sendMock
       .mockResolvedValueOnce(page(2, 0, "cursor-1"))
       .mockRejectedValueOnce(new Error("page 2 boom"));

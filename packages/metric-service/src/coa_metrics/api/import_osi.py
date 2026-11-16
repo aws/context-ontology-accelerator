@@ -5,16 +5,9 @@
 
 POST /namespaces/{namespaceId}/import-osi → 200 OK (sync) or 202 Accepted (async)
 
-Flow:
-1. Read content from S3 (always — UI uploads to S3 first)
-2. Parse OSI YAML, count metrics
-3. If ≤ SYNC_THRESHOLD (0 — i.e. an empty import, or no queue configured):
-   process synchronously, return 200
-4. Otherwise: create import job, enqueue to SQS, return 202 with jobId
-
-Every import carrying at least one metric therefore returns 202 + jobId; poll
-GET /namespaces/{namespaceId}/import-jobs/{jobId} for completion. See the
-SYNC_THRESHOLD comment for why this is not count-tunable.
+An import with at least one metric returns 202 + jobId (poll
+GET /namespaces/{namespaceId}/import-jobs/{jobId}); an empty import, or one with
+no queue configured, is processed synchronously and returns 200.
 """
 
 from __future__ import annotations
@@ -43,10 +36,6 @@ from coa_metrics.api.import_s3_key import IMPORT_S3_KEY_SCOPE_ERROR, is_import_s
 from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 from coa_metrics.dataset_resolver import resolve_datasets
 from coa_metrics.lookups import ColumnMetadata, DataSourceLookup
-from coa_metrics.metadata_reconciler import (
-    MetadataStore,
-    reconcile_metadata,
-)
 from coa_metrics.neptune_client import (
     MetricAiContext,
     MetricDefinition,
@@ -71,26 +60,16 @@ from coa_metrics.validator import check_data_modifying, check_select_shape, chec
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-# Imports above this threshold are processed asynchronously via SQS.
-#
-# 0 == every non-empty import goes async. This is deliberate, not a tuning
-# choice: the inline path embeds each metric, and the FIRST embed on a cold
-# container costs ~25s (observed: metric #0 created→embedded 24.8s, metric #1
-# 0.9s — AOSS IngestionRequestLatency averages ~200ms but tails to 15-51s).
-# API Gateway's integration timeout is ~29s, so the fixed cost alone consumed
-# almost the whole budget and a 3-metric import 504'd. Because the cost is
-# per-container rather than per-metric, ANY non-zero threshold — even 1 — leaves
-# the timeout reachable, so the count-based guard cannot bound it.
-#
-# Single-metric creates stay synchronous: they go through create_metric.py,
-# which never consults this threshold.
+# Imports above this threshold are processed asynchronously via SQS. 0 sends every
+# non-empty import async: the first embed on a cold container can take ~25s, close
+# to the ~29s API Gateway integration timeout, and the cost is per container rather
+# than per metric, so no non-zero count threshold bounds it.
 SYNC_THRESHOLD = 0
 
 # Client-facing text for failures whose underlying cause (a DynamoDB, Neptune,
 # OpenSearch or catalog error) is logged but never returned: exception messages
 # carry ARNs, endpoints, account IDs and table names.
 SOURCE_LOOKUP_UNAVAILABLE_MESSAGE = "data source lookup unavailable"
-_WARN_RECONCILIATION_SKIPPED = "Metadata reconciliation skipped: metadata store unavailable"
 _WARN_LOOKUP_FAILED = "Metric '{name}': lookup failed — internal error, retry the import"
 _WARN_WRITE_FAILED = "Metric '{name}': write failed — internal error, retry the import"
 _WARN_INDEXING_DELAYED = "Metric '{name}': search indexing delayed — saved, but may not appear in search yet"
@@ -104,8 +83,6 @@ def _get_sqs() -> Any:
         _sqs_client = boto3.client("sqs", region_name=os.environ.get("AWS_REGION", "us-east-1"))
     return _sqs_client
 
-
-# ── Singleton clients ───────────────────────────────────────────────────
 
 _neptune: MetricNeptuneClient | None = None
 _opensearch: MetricOpenSearchClient | None = None
@@ -175,8 +152,6 @@ class _PermissiveLookup(DataSourceLookup):
         return None
 
 
-# ── S3 helpers ──────────────────────────────────────────────────────────
-
 _s3_client: Any = None
 
 
@@ -222,9 +197,6 @@ def _write_to_s3(content: str, namespace: str) -> StagedImportSource:
     return StagedImportSource(key=s3_key, version_id=version_id)
 
 
-# ── Handler ─────────────────────────────────────────────────────────────
-
-
 @idempotent(operation="ImportOsi")
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/import-osi.
@@ -237,7 +209,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     caller = get_caller_identity(event)
     logger.info("import_osi_start", namespace=namespace, caller=caller)
 
-    # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
     except (json.JSONDecodeError, TypeError):
@@ -246,7 +217,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if body is None or not isinstance(body, dict):
         return api_response(400, {"message": "Request body is required"})
 
-    # Resolve content: either inline or from S3
     content = body.get("content", "")
     raw_s3_key: object = body.get("s3Key", "")
     has_s3_key = "s3Key" in body and raw_s3_key != ""
@@ -265,7 +235,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         if not is_import_s3_key_for_namespace(raw_s3_key, namespace):
             return api_response(400, {"message": IMPORT_S3_KEY_SCOPE_ERROR})
         s3_key = raw_s3_key
-        # Read content from S3
         try:
             content = _read_from_s3(s3_key)
         except ClientError as exc:
@@ -279,11 +248,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return api_response(500, {"message": "Failed to read OSI YAML from S3"})
     elif content:
         s3_key = ""
-        # Enforce inline size limit (5MB)
         # The model bounds content at IMPORT_CONTENT_MAX_LENGTH characters; the
         # same number as a byte limit is never looser.
-        max_inline_bytes = IMPORT_CONTENT_MAX_LENGTH
-        if len(content.encode("utf-8")) > max_inline_bytes:
+        if len(content.encode("utf-8")) > IMPORT_CONTENT_MAX_LENGTH:
             return api_response(
                 413,
                 {"message": "Inline content exceeds 5MB limit. Use GetOsiUploadUrl for large files."},
@@ -291,7 +258,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     else:
         return api_response(400, {"message": "Either 'content' or 's3Key' is required"})
 
-    # Step 1: Parse OSI YAML
     parse_result = parse_osi_yaml(content)
     if not parse_result.success:
         error_messages = [f"{e.path}: {e.message}" for e in parse_result.errors]
@@ -363,9 +329,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # response so an author sees why a metric landed without its COA metadata.
     warnings: list[str] = [f"{w.path}: {w.message}" for w in parse_result.warnings]
 
-    # Step 2: Resolve datasets (fail-closed when the lookup is unavailable, #564).
-    # The lookup is only needed when a datasets block is present — documents
-    # relying solely on per-metric custom_extensions skip resolution entirely.
+    # Fail closed when the lookup is unavailable. The lookup is only needed when a
+    # datasets block is present.
     if document.datasets:
         try:
             lookup = _get_lookup(namespace)
@@ -380,20 +345,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 {"message": "Dataset resolution failed — all datasets must be onboarded", "errors": error_messages},
             )
         datasets_resolved = len(resolution.resolved)
-
-        # Step 3: Reconcile metadata (best-effort — don't fail import)
-        try:
-            metadata_store = _get_metadata_store()
-            if metadata_store:
-                reconciliation = reconcile_metadata(resolution.resolved, metadata_store)
-                warnings.extend(reconciliation.warnings)
-        except Exception as exc:
-            logger.warning("metadata_reconciliation_failed", error=str(exc), exc_info=True)
-            warnings.append(_WARN_RECONCILIATION_SKIPPED)
     else:
         datasets_resolved = 0
 
-    # Step 4: Create/update metrics
     metrics_created = 0
     metrics_updated = 0
     neptune = _get_neptune()
@@ -412,15 +366,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 f"defaulted to the metric name '{metric_def.source_table}'"
             )
 
-        # Enforce an APPROVED source (#564) and the declared sourceTable (#161)
-        # — create/update enforce both, so import must too or it is a bypass.
-        # Approval is checked first, matching create_metric: a metric bound to a
-        # PENDING/REJECTED/FAILED source must not land regardless of whether its
-        # table happens to exist. Note import defaults source_table to the
-        # metric NAME when custom_extensions omit it, which is exactly the path
-        # that carried unchecked tables. Per-metric skip-with-warning matches how
-        # the DML block above is handled; a validation outage is batch-level
-        # (503) since it affects every metric.
+        # Like create/update: the source must be approved (checked first) and the
+        # declared sourceTable must exist. A rejected metric is skipped with a
+        # warning; a validation outage fails the whole batch with 503.
         try:
             source_error = check_source_approved(namespace, metric_def.data_source_id)
             if source_error is None:
@@ -469,7 +417,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             logger.warning("opensearch_embed_failed", name=metric_def.name, error=str(exc), exc_info=True)
             warnings.append(_WARN_INDEXING_DELAYED.format(name=metric_def.name))
 
-    # Build response
     response_body: dict[str, Any] = {
         "datasetsResolved": datasets_resolved,
         "metricsCreated": metrics_created,
@@ -491,17 +438,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     return api_response(200, response_body)
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
 def _overwrite_warning(metric_name: str, existing: MetricDefinition, replacement: MetricDefinition) -> str:
-    """Return the warning for an import that overwrites an existing metric.
-
-    Shared by the sync handler and the async import worker's plan. Import is a
-    full replace, so re-importing a document without ``label`` clears an
-    existing one: say so rather than dropping it silently (the label is never
-    quoted).
-    """
+    """Return the warning for an import that overwrites an existing metric (never quotes the label)."""
     author = (existing.defined_by or "").strip()
     author_detail = f" authored by {author}" if author else ""
     label_detail = label_cleared_detail(existing, replacement)
@@ -515,12 +453,6 @@ def label_cleared_detail(existing: MetricDefinition, replacement: MetricDefiniti
     return ""
 
 
-def _get_metadata_store() -> MetadataStore | None:
-    """Get metadata store if configured. Returns None if not available."""
-    # TODO: Implement DynamoDB-backed MetadataStore when catalog integration is ready
-    return None
-
-
 def _osi_metric_to_definition(
     osi_metric: OsiMetric,
     document: Any,
@@ -530,7 +462,6 @@ def _osi_metric_to_definition(
 
     Maps OSI dialects to internal dialects and extracts custom extension data.
     """
-    # Map dialects
     dialects: list[MetricDialect] = []
     for expr in osi_metric.expression:
         if len(expr.expression) > MAX_SQL_EXPRESSION_LENGTH:
@@ -558,7 +489,6 @@ def _osi_metric_to_definition(
     if tier1_error:
         raise ValueError(tier1_error)
 
-    # Extract data source and table from custom extensions or dataset resolution
     data_source_id = ""
     source_table = ""
     unit = ""
@@ -592,7 +522,6 @@ def _osi_metric_to_definition(
         source_table = osi_metric.name
         logger.warning("osi_source_table_defaulted", metric=osi_metric.name, source_table=source_table)
 
-    # Map ai_context directly — OSI ai_context is a structured object matching our MetricAiContext
     ai_context = None
     if osi_metric.ai_context:
         ai_context = MetricAiContext(
@@ -601,7 +530,6 @@ def _osi_metric_to_definition(
             examples=osi_metric.ai_context.examples,
         )
 
-    # Map time_dimension to TimeGrain enum values
     default_time_grain = _map_time_dimension(time_grain) if time_grain else None
 
     definition = MetricDefinition(

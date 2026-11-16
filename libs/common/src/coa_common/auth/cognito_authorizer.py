@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from coa_common.auth.token_authorizer import TokenAuthorizer
@@ -22,7 +23,9 @@ class CognitoTokenAuthorizer(TokenAuthorizer):
     region:
         AWS region where the user pool is deployed. **Required**.
     client_id:
-        Optional app client ID for audience validation.
+        Optional app client ID, or collection of IDs, for audience validation.
+    require_id_token:
+        Accept only ID tokens (see ``TokenAuthorizer``).
     """
 
     def __init__(
@@ -30,12 +33,13 @@ class CognitoTokenAuthorizer(TokenAuthorizer):
         *,
         user_pool_id: str,
         region: str,
-        client_id: str | None = None,
+        client_id: str | Collection[str] | None = None,
+        require_id_token: bool = False,
     ) -> None:
         """Derive the Cognito issuer and JWKS URI from the pool coordinates."""
         issuer = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}"
         jwks_uri = f"{issuer}/.well-known/jwks.json"
-        super().__init__(issuer=issuer, audience=client_id, jwks_uri=jwks_uri)
+        super().__init__(issuer=issuer, audience=client_id, jwks_uri=jwks_uri, require_id_token=require_id_token)
 
     def _extract_email(self, claims: dict[str, Any]) -> str:
         """Extract email — falls back to username for access tokens."""

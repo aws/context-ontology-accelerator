@@ -3,13 +3,8 @@
 
 import { UserManager, WebStorageStateStore, User } from "oidc-client-ts";
 
-/**
- * Refresh a token this many seconds BEFORE its own expiry. A proactive buffer:
- * the token is renewed ahead of lapsing rather than after, so a request never
- * goes out with an about-to-expire token. Firing early is cheap and harmless;
- * firing late means a spurious 401/403. Two minutes comfortably covers a
- * request round-trip plus client/server clock skew.
- */
+/** Renew a token this many seconds before its expiry, to cover a request
+ *  round-trip plus client/server clock skew. */
 const TOKEN_REFRESH_BUFFER_SECONDS = 120;
 
 /** OIDC provider configuration for the Authorization Code flow with PKCE. */
@@ -60,10 +55,7 @@ export class OIDCProvider {
       stateStore: new WebStorageStateStore(),
     });
 
-    // Keep in-memory cache in sync with background silent renew.
-    // When automaticSilentRenew refreshes the token, this fires immediately
-    // with the fresh User, so subsequent getIdToken/getAccessToken calls
-    // always return the latest tokens without hitting storage.
+    // Keep the in-memory cache in sync with background silent renew.
     this.userManager.events.addUserLoaded((user) => {
       this.cachedUser = user;
     });
@@ -98,13 +90,10 @@ export class OIDCProvider {
    * Returns the current ID token, silently refreshing it once it is at (or
    * within {@link TOKEN_REFRESH_BUFFER_SECONDS} of) its own expiry.
    *
-   * The renewal decision keys off the ID token's own `exp` claim
-   * (`user.profile.exp`) — NOT `user.expires_at`, which oidc-client-ts derives
-   * from the OAuth `expires_in` (the ACCESS token lifetime). This is the token
-   * this method returns and the one the API sends as the bearer, so when a
-   * deployment sets the ID-token TTL shorter than the access-token TTL, gating
-   * on `expires_at` would let an already-expired ID token through with no
-   * renewal attempt (403s, no refresh request) — see the tab-switch report.
+   * Gates on the ID token's own `exp` claim (`user.profile.exp`), not
+   * `user.expires_at`, which oidc-client-ts derives from the access-token
+   * `expires_in`. When the ID-token TTL is shorter than the access-token TTL,
+   * gating on `expires_at` would send an expired ID token as the bearer.
    */
   async getIdToken(): Promise<string> {
     // Prefer in-memory cache (kept fresh by UserLoaded event) over storage.
@@ -121,13 +110,9 @@ export class OIDCProvider {
         user = await this.userManager.signinSilent();
         this.cachedUser = user;
       } catch {
-        // This ad-hoc renewal path is separate from oidc-client-ts's
-        // background `automaticSilentRenew` timer, so a failure here does NOT
-        // raise `silentRenewError`/`accessTokenExpired`. Drop the user so
-        // `UserUnloaded` fires and the Auth gate flips to unauthenticated —
-        // otherwise the UI keeps showing "signed in" while every token-bearing
-        // call throws individually (issue #136). Best-effort: never let a
-        // removeUser() failure mask the sign-in-again error.
+        // Ad-hoc renewal does not raise `silentRenewError`, so drop the user to
+        // fire `UserUnloaded` and flip the Auth gate to unauthenticated.
+        // Never let a removeUser() failure mask the sign-in-again error.
         await this.userManager.removeUser().catch(() => {});
         throw new Error("Token refresh failed. Please sign in again.");
       }
@@ -157,8 +142,7 @@ export class OIDCProvider {
         user = await this.userManager.signinSilent();
         this.cachedUser = user;
       } catch {
-        // See getIdToken: drop the user so `UserUnloaded` fires and the Auth
-        // gate flips to unauthenticated (issue #136). Best-effort.
+        // See getIdToken: drop the user so `UserUnloaded` fires.
         await this.userManager.removeUser().catch(() => {});
         throw new Error("Token refresh failed. Please sign in again.");
       }
@@ -170,18 +154,12 @@ export class OIDCProvider {
   }
 
   /**
-   * Revokes the current refresh token at the identity provider so it can no
-   * longer be used to mint new access/ID tokens after logout. This closes the
-   * gap where a stolen refresh token (via XSS, storage compromise, or device
-   * access) stays usable until natural expiry despite the user logging out.
+   * Revokes the current refresh token at the identity provider so it cannot
+   * mint new tokens after logout. Best-effort: failures are logged without
+   * token material and never block the local sign-out.
    *
-   * Best-effort: revocation failures are logged (without token material) and
-   * do not block the logout redirect, so the user is always signed out locally.
-   *
-   * Cognito does not advertise a `revocation_endpoint` in its OIDC discovery
-   * document; the revoke endpoint lives on the same Hosted-UI domain as the
-   * token endpoint (`/oauth2/revoke`), so we derive it as a fallback. Revoking
-   * a refresh token also invalidates the access tokens issued from it.
+   * Cognito does not advertise a `revocation_endpoint` in its discovery
+   * document, so it is derived from the token endpoint (`/oauth2/revoke`).
    */
   private async revokeRefreshToken(): Promise<void> {
     const user = this.cachedUser ?? (await this.userManager.getUser());
@@ -226,26 +204,11 @@ export class OIDCProvider {
   /**
    * Signs the user out and redirects to the post-logout URI.
    *
-   * Not every OIDC-compliant IdP advertises an `end_session_endpoint` in its
-   * discovery document — some enterprise SSO providers do not expose one:
-   * there is no IdP-hosted logout page to redirect through when session state
-   * lives at the browser/network layer, not as a per-relying-app IdP session to
-   * explicitly end). `signoutRedirect()` needs that endpoint to build its
-   * redirect URL and throws `Error("No end session endpoint")` when it's
-   * absent — uncaught, that leaves local state cleared (tokens removed) but
-   * the browser never navigates anywhere, so sign-out silently appears to do
-   * nothing instead of returning the user to the app.
-   *
-   * Checking `getEndSessionEndpoint()` first (the same optional-metadata
-   * helper `revokeRefreshToken()` already uses for the revocation endpoint)
-   * lets this fall back to a plain local redirect when the IdP has no
-   * end-session endpoint, while still using the standard IdP-redirect flow
-   * for any IdP that does advertise one (e.g. Cognito's hosted-UI logout).
+   * `signoutRedirect()` throws when the IdP advertises no
+   * `end_session_endpoint`, so fall back to a local redirect in that case.
    */
   async signOut(): Promise<void> {
-    // Revoke the refresh token at the IdP BEFORE clearing local state so a
-    // stolen token cannot mint new tokens after logout. Best-effort — never
-    // block the local sign-out on a revocation error.
+    // Revoke before clearing local state; best-effort.
     try {
       await this.revokeRefreshToken();
     } catch (error) {
@@ -259,8 +222,8 @@ export class OIDCProvider {
       .catch(() => undefined);
 
     if (!endSessionEndpoint) {
-      // No IdP-hosted logout page to redirect through (e.g. Federate) — local
-      // state is already cleared above, so go straight to the post-logout URI.
+      // An IdP without an end-session endpoint: local state is already
+      // cleared, so go straight to the post-logout URI.
       window.location.href = this.logoutRedirectUri;
       return;
     }

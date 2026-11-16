@@ -55,7 +55,6 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
       return scrollParent;
     };
 
-    // Initial scroll to bottom
     setTimeout(() => {
       const sp = getScrollParentCached();
       if (sp) {

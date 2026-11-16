@@ -1,18 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for MetricResolver SPARQL graph-naming fix.
-
-Verifies that _metric_list_sparql():
-1. Uses STRSTARTS with the correct graph URI prefix
-2. Returns the raw graph URI (?g); namespace is extracted client-side in
-   _namespace_from_graph_uri, NOT with a per-row SPARQL REPLACE() regex (the
-   regex was the Neptune OOM memory sink under concurrent refreshes).
-3. Produces valid SPARQL (single braces)
-4. Reflects custom graph URI templates
-5. Extracts the namespace correctly even when the prefix contains regex
-   metacharacters (the client-side split needs no escaping).
-"""
+"""Unit tests for the graph naming in MetricResolver._metric_list_sparql()."""
 
 from __future__ import annotations
 

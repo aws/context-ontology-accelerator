@@ -5,9 +5,6 @@
  * MetricForm's breadcrumb trail is create/edit-aware: in edit mode (route
  * param is an existing metric name) it links the metric and appends an
  * `Edit` crumb; in create mode it appends a plain `Create` crumb instead.
- * These are different-length, different-shaped crumb arrays produced by the
- * same `isEdit` branch, the same hazard class the Explorer/Induction branch
- * on OntologyClassDetail has a dedicated test for, so it gets one here too.
  */
 import { render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";

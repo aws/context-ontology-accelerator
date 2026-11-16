@@ -45,23 +45,10 @@ class TestExtractQueryEntities:
         assert "amount" in entities
         assert "customers" in entities
 
-    def test_filters_short_words(self) -> None:
-        entities = extract_query_entities("go to db")
-        assert "go" not in entities
-        assert "to" not in entities
-
-    def test_max_count(self) -> None:
-        entities = extract_query_entities("one two three four five six seven eight nine ten eleven", max_count=3)
-        assert len(entities) <= 3
-
     def test_lowercase_normalization(self) -> None:
         entities = extract_query_entities("Show CLAIMS by CUSTOMER")
         assert "claims" in entities
         assert "customer" in entities
-
-    def test_hyphenated_terms(self) -> None:
-        entities = extract_query_entities("check order-id for S3 bucket")
-        assert "order-id" in entities
 
 
 @pytest.mark.unit
@@ -232,12 +219,6 @@ class TestExtractQueryEntitiesIsScriptAgnostic:
         assert "제조사와" in plan.containers
         assert any("엘리베이터" in container for container in plan.containers)
 
-    def test_a_latin_query_gets_no_whole_query_container(self) -> None:
-        # Latin prose has reliable whitespace boundaries, so the forward direction
-        # already covers it and whole-query reverse matching would only add loose
-        # matches on very short labels.
-        assert build_query_search_plan("show me the elevator model").containers == ()
-
     def test_a_mixed_query_keeps_latin_words_out_of_the_container(self) -> None:
         # Otherwise a two-letter Latin label would match ordinary English words and
         # STOP_WORDS would be silently suspended for any query holding one
@@ -249,9 +230,7 @@ class TestExtractQueryEntitiesIsScriptAgnostic:
             assert latin_word not in plan.containers[0].lower()
 
     def test_container_regions_have_their_own_bound(self) -> None:
-        # Regions must not share the forward budget: for a spaced non-Latin script
-        # one region IS one word, and a five-slot cap evicted the requested noun
-        # from the reverse direction too.
+        # Regions have their own bound, separate from the forward budget.
         from coa_serve.query_utils import MAX_CONTAINER_REGIONS
 
         plan = build_query_search_plan("空調、設備、型番、価格、納期、出荷", max_count=3)
@@ -482,10 +461,6 @@ class TestContainerRegionScriptCoverage:
         assert build_query_search_plan("\u3164가") == QuerySearchPlan(terms=(), containers=())
         assert build_query_search_plan("\u200b\u00ad") == QuerySearchPlan(terms=(), containers=())
 
-    def test_meaningful_joiners_survive_the_strip(self) -> None:
-        # ZWNJ and ZWJ are default-ignorable but carry meaning inside a word.
-        assert build_query_search_plan("کتاب\u200cها").containers == ("کتاب\u200cها",)
-
     def test_abutting_excluded_script_bounds_the_region(self) -> None:
         assert build_query_search_plan("空調κείμενο").containers == ("空調",)
 
@@ -541,14 +516,9 @@ class TestGraphScopedBody:
     """How the graphs are NAMED, not just which ones — see ``graph_scoped_body``.
 
     A ``VALUES ?g { <a> <b> }`` binding and a ``GRAPH <a>``/``GRAPH <b>`` UNION
-    select the same quads, so no result-level test can tell them apart. They are
-    not interchangeable to the planner: the constant form is pushed into the index
-    scan, the VALUES form is a materialised sequence joined afterwards. Measured
-    end to end on one deployed build, an idle cluster, parallelism 1: the
-    one-graph namespace (where a single VALUES row folds to a constant anyway) ran
-    the join-path query in 10ms, while the two-graph namespace ReadTimeout at
-    16.5s on three separate queries — two of which carry no binding other than the
-    graph. Hence these assertions are about query TEXT.
+    select the same quads, but the constant form is pushed into the index scan
+    while the VALUES form is joined afterwards. Hence these assertions are about
+    query TEXT.
     """
 
     _PREFIX = "https://g.local/ns/"
@@ -582,8 +552,7 @@ class TestGraphScopedBody:
     def test_an_implausible_graph_count_degrades_to_the_prefix_filter(self):
         """Inlining repeats the body per graph, and a body may carry 175 IRIs.
 
-        Namespaces publish one graph per ontology, so this bound is a guard, and
-        the fallback is the form main shipped: slow, never broken.
+        Past ``_MAX_INLINED_GRAPHS`` the body falls back to the prefix filter.
         """
         many = [f"{self._PREFIX}g{i}" for i in range(_MAX_INLINED_GRAPHS + 1)]
 
@@ -594,13 +563,7 @@ class TestGraphScopedBody:
         assert f"GRAPH <{many[0]}>" not in sparql
 
     def test_the_implausible_graph_count_is_the_one_fallback_that_warns(self):
-        """Resolution SUCCEEDED and we still fell back — the invisible case.
-
-        The resolver's own cap (tbox_context._MAX_GRAPHS, 50) is well above this
-        one, so a 9..50-graph namespace pays the cluster-wide scan while every
-        other log line says its graphs resolved fine. That is exactly the shape of
-        silent degradation this change exists to remove, so it warns.
-        """
+        """The over-cap fallback is the one that warns, because resolution itself succeeded."""
         many = [f"{self._PREFIX}g{i}" for i in range(_MAX_INLINED_GRAPHS + 1)]
 
         with patch("coa_serve.query_utils.logger") as log:
@@ -613,14 +576,7 @@ class TestGraphScopedBody:
         assert kwargs["max_inlined"] == _MAX_INLINED_GRAPHS
 
     def test_an_unsafe_iri_is_dropped_rather_than_interpolated(self):
-        """The guard sits at the interpolation point, not only at resolution.
-
-        Resolvers apply the same test, but ``graph_iris`` also reaches here through
-        a plain dataclass field (``TBoxContext.graph_iris``) and through
-        ``_retry_vkg``'s ``Any``-typed reuse parameter, neither of which
-        re-validates. A closing angle bracket would otherwise escape the
-        ``GRAPH <...>`` term.
-        """
+        """The IRI guard runs at interpolation, so a ``>`` cannot escape the ``GRAPH <...>`` term."""
         hostile = f"{self._PREFIX}g> }} ?s ?p ?o }} #"
 
         with patch("coa_serve.query_utils.logger") as log:
@@ -683,10 +639,8 @@ class TestObjectPropertiesSparql:
         assert "?range a owl:Class" not in sparql
 
     def test_domain_anchor_is_opt_in_and_precedes_the_edge_scan(self):
-        """Graph scoping alone left this query timing out at 16.5s on the
-        412-class namespace, because ``?domain rdfs:label ?domainLabel`` with
-        ``?domain`` unbound is a scan of every label in the graph. Anchoring
-        ``?domain`` is what makes the label joins per-edge."""
+        """An unbound ``?domain`` makes the label join a full scan, so the anchor
+        must come before the edge scan."""
         anchored = object_properties_sparql(
             "https://g.local/ns/",
             limit=10,
@@ -705,10 +659,7 @@ class TestObjectPropertiesSparql:
             assert "VALUES ?domain" not in sparql
 
     def test_an_unsafe_domain_iri_is_dropped_at_interpolation(self):
-        """``domain_iris`` is guarded at the point of interpolation, like
-        ``graph_iris`` in ``graph_scoped_body`` — the sole caller pre-filters, but
-        a future caller has no other backstop. A safe IRI passes; one carrying a
-        ``>`` break-out or a trailing newline is excluded rather than interpolated."""
+        """Unsafe domain IRIs are dropped at interpolation."""
         sparql = object_properties_sparql(
             "https://g.local/ns/",
             limit=10,

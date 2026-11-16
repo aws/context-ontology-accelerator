@@ -128,15 +128,8 @@ def _source_deletes(mock_dao) -> list[dict]:
 
 
 def _wired_assume(session) -> list:
-    """``assume_datasource_session`` side effect for a CORRECTLY wired role.
-
-    Two calls, not one: the positive assume returns ``session``, and the
-    negative-ExternalId probe that follows is denied.
-
-    The denial is a ``DatasourceAssumeError`` carrying the STS code as an attribute,
-    which is what the wiring check reads. A bare ``ValueError`` spelling the code into its
-    message would not be recognised, which is the point of the typed exception.
-    """
+    """``assume_datasource_session`` side effect for a correctly wired role: the
+    positive assume succeeds and the negative-ExternalId probe is denied."""
     return [session, DatasourceAssumeError("AccessDenied")]
 
 
@@ -216,16 +209,8 @@ def harness() -> _Harness:
 
 
 class _CommittingSsm:
-    """Parameter Store double that really stores what it is given.
-
-    A ``MagicMock`` can record a ``put_parameter`` call; it cannot show that the value is
-    still there afterwards. This one can, which is what a rollback assertion needs:
-    ``committed`` lists every name the store ever accepted and ``store`` holds the ones
-    still present, so "the write landed" and "the delete removed it" are separate claims.
-
-    ``time_out_after_commit`` reproduces the failure the best-effort delete exists for:
-    ``PutParameter`` commits and the response never arrives.
-    """
+    """Parameter Store double that really stores what it is given (``committed`` lists
+    every accepted name, ``store`` the ones still present)."""
 
     def __init__(self, *, time_out_after_commit: bool = False) -> None:
         self.store: dict[str, str] = {}
@@ -249,11 +234,6 @@ class _CommittingSsm:
         if Name not in self.store:
             raise ClientError({"Error": {"Code": "ParameterNotFound"}}, "DeleteParameter")
         del self.store[Name]
-
-
-# ===================================================================
-# Registration — what it refuses
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -331,7 +311,6 @@ class TestEveryWriteMatchesTheRealDaoSignature:
     def test_a_create_reaches_202_rather_than_an_internal_server_error(self, harness):
         status, body = harness.create(_make_databricks_db_req())
         assert status == 202, body
-        assert body.get("error") != "Internal server error"
 
     def test_every_put_the_create_makes_matches_the_real_dao_signature(self, harness):
         """Every call the create path makes has to be one the real DAO accepts."""
@@ -395,14 +374,8 @@ class TestRolePathIsPartOfThePrefixRule:
 
 @pytest.mark.unit
 class TestRoleArnMustMatchTheConnectorsOwnPattern:
-    """The connector's own role-ARN pattern is narrower than the shared
-    ``IamRoleArn``, which permits an IAM path containing ``;``, ``%`` and quotes.
-
-    Such an ARN clears the reserved-prefix check (the offending characters are in the
-    path, after a correct prefix) and the IAM wildcard, then fails every query on the
-    connector's re-validation. Refused BEFORE the prefix rule so the message names the
-    actual problem.
-    """
+    """The connector's own role-ARN pattern is narrower than the shared ``IamRoleArn``
+    and is checked before the prefix rule, so the message names the actual problem."""
 
     def test_a_role_path_outside_the_connectors_charset_is_refused(self, harness):
         arn = f"arn:aws:iam::{_DEPLOYMENT_ACCOUNT}:role/coa-dev-datasource-access-a/x;y/name"
@@ -425,14 +398,7 @@ class TestRoleArnMustMatchTheConnectorsOwnPattern:
         ],
     )
     def test_a_role_outside_the_commercial_partition_is_refused_at_submit(self, harness, partition, expected):
-        """This deployment's assume grant is written ``arn:aws:iam::*:role/…``, so a role in
-        another partition would register and then have every assume denied by our own policy
-        — with an AccessDenied whose message sends the customer to a trust policy that is
-        already correct.
-
-        The message has to say WHY: the only readable difference from a working ARN is a few
-        characters in the partition segment, and nothing else names them.
-        """
+        """A role in another partition is refused at submit, with a message saying why."""
         arn = f"arn:{partition}:iam::{_DEPLOYMENT_ACCOUNT}:role/coa-dev-datasource-access-dbx"
         status, body = harness.create(_make_databricks_db_req(crossAccountRoleArn=arn))
         assert status == 400, body
@@ -477,10 +443,6 @@ class TestDatabricksWiringFailuresAreDistinguishable:
     ``AccessDenied`` whether the trust policy omits our principal or requires a different
     ExternalId, so the message names both and prints the exact ExternalId sent.
     """
-
-    def _messages(self, harness) -> str:
-        _, body = harness.create(_make_databricks_db_req())
-        return body["error"]
 
     def test_trust_policy_and_external_id_are_reported_together_with_the_value(self):
         with patch(f"{_DBX}.assume_datasource_session", side_effect=DatasourceAssumeError("AccessDenied")):
@@ -795,11 +757,6 @@ class TestTheStsCodeTravelsOnTheException:
         assert verdict.reason == "probe-inconclusive"
 
 
-# ===================================================================
-# Registration — what it deliberately accepts
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestDatabricksRegistrationDoesNotConstrainAccounts:
     """The assume scope is ``arn:aws:iam::*:role/…`` on purpose: COA is deployed INTO the
@@ -819,11 +776,6 @@ class TestDatabricksRegistrationDoesNotConstrainAccounts:
     def test_a_role_in_another_account_is_equally_accepted(self, harness):
         status, _ = harness.create(_make_databricks_db_req(crossAccountRoleArn=_FOREIGN_ACCOUNT_ROLE))
         assert status == 202
-
-
-# ===================================================================
-# Registration — the record and the parameter
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -931,11 +883,6 @@ class TestDatabricksConnectorParameter:
             assert _dbx.config_parameter_name("coadevds_abc") == f"{_CONFIG_SSM_PREFIX}/coadevds_abc"
 
 
-# ===================================================================
-# Registration — rollback
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestDatabricksCreateRollback:
     def test_a_catalog_failure_removes_the_record_and_the_claim(self, harness):
@@ -1035,24 +982,14 @@ class TestDatabricksCreateRollback:
         assert harness.dao.update.call_args.kwargs["update_fields"]["status"] == "SCAN_FAILED"
 
     def test_a_write_that_commits_and_then_times_out_leaves_no_orphan(self, harness):
-        """The case the best-effort delete exists for, against a store that really holds the
-        value rather than a mock that records the call.
-
-        ``PutParameter`` commits server-side and the response never arrives, so the caller
-        sees a failure over a parameter that IS there. Nothing else in the system would ever
-        find it: the source record is the only handle on its name, and the rollback deletes
-        the record. The write and the delete both run for real here, so the assertion is on
-        the store's contents and not on a call having been made.
-        """
+        """``PutParameter`` commits and then times out: the rollback still removes it."""
         ssm = _CommittingSsm(time_out_after_commit=True)
         harness.write_param.side_effect = lambda **kw: _dbx.write_config_parameter(client=ssm, **kw)
         harness.delete_param.side_effect = lambda **kw: _dbx.delete_config_parameter(client=ssm, **kw)
         status, _ = harness.create(_make_databricks_db_req())
         assert status == 500
         name = f"{_CONFIG_SSM_PREFIX}/{derive_catalog_name(_source_put(harness.dao)['sourceId'])}"
-        # The write did land, so there was something to clean up.
         assert ssm.committed == [name]
-        # And a read now finds nothing, which is the whole claim.
         assert ssm.store == {}
         with pytest.raises(ClientError):
             ssm.get_parameter(Name=name)
@@ -1069,11 +1006,6 @@ class TestDatabricksCreateRollback:
         harness.register.assert_not_called()
         harness.write_param.assert_not_called()
         assert _source_deletes(harness.dao) == []
-
-
-# ===================================================================
-# The four-way mutual-exclusivity guard
-# ===================================================================
 
 
 @pytest.mark.unit
@@ -1101,21 +1033,10 @@ class TestFourWayConfigurationGuard:
             assert member in body["error"]
 
 
-# ===================================================================
-# Configuration update — a deliberate refusal
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestDatabricksConfigurationUpdateIsRefused:
-    """DELIBERATELY unmapped, and this test exists so nobody "fixes" it by accident.
-
-    A Databricks source's connection facts are written TWICE at create — once on the
-    record and once into the connector's SSM parameter, which is what the connector
-    actually reads — and write-once is what makes that duplication safe. Do not add
-    ``DATABRICKS_SQL_WAREHOUSE`` to ``config_key_for_sub_type`` to make these pass; make
-    the two writes transactional first, then delete these tests on purpose.
-    """
+    """Databricks configuration updates are refused on purpose: the connection facts
+    also live in the connector's SSM parameter, and the two writes are not transactional."""
 
     def _update(self, item, body):
         mock_dao = MagicMock()
@@ -1168,11 +1089,6 @@ class TestDatabricksConfigurationUpdateIsRefused:
         with patch(f"{_DR}._get_dao", return_value=mock_dao):
             status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, "src-1"))
         assert status == 200
-
-
-# ===================================================================
-# Delete
-# ===================================================================
 
 
 def _databricks_source_row(source_id: str, *, role_arn: str = _GOOD_ROLE, status: str = "APPROVED") -> dict:

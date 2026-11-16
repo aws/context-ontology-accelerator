@@ -16,15 +16,9 @@ export interface InfoPopoverProps {
 }
 
 /**
- * A small circled-"i" information affordance: a `status-info` icon that opens a
- * Popover explaining a concept in plain language. Generalizes the inline
- * `AiEnrichedHint` pattern (see `TableDetail.tsx`) so every surface uses one
- * consistent explain-this control.
- *
- * Drop it into a Cloudscape `Header` / `FormField` `info` slot or an
- * `ExpandableSection` `headerInfo` slot; or render it as a sibling next to a
- * label / button / column header (wrap both in a horizontal `SpaceBetween`) for
- * hosts that have no info slot (KeyValuePairs, Button, table headers).
+ * A `status-info` icon that opens a Popover explaining a concept. Use it in a
+ * Cloudscape `info` / `headerInfo` slot, or as a sibling in a horizontal
+ * `SpaceBetween` for hosts that have no info slot.
  */
 export function InfoPopover({ header, children, ariaLabel }: InfoPopoverProps) {
   const { t } = useAppI18n();

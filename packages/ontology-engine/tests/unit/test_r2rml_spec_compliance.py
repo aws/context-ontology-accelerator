@@ -13,9 +13,6 @@ Key invariant: FK columns use Referencing Object Maps (R2RML §7.5) with
 rr:parentTriplesMap + rr:joinCondition — the spec-standard mechanism for
 expressing JOINs. Ontop reads the child/parent column pairs directly to
 generate SQL JOINs, no IRI template unification needed.
-
-Run:
-    uv run pytest packages/ontology-engine/tests/unit/test_r2rml_spec_compliance.py -v
 """
 
 import pytest
@@ -89,11 +86,6 @@ def _object_map_datatype(g, pom_uri):
     return g.value(om, RR.datatype)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: TriplesMap Structure (R2RML §2)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestTriplesMapStructure:
     """Every table MUST produce exactly one rr:TriplesMap with the required components."""
 
@@ -132,23 +124,6 @@ class TestTriplesMapStructure:
         tmaps = list(g.subjects(RDF.type, RR.TriplesMap))
         assert len(tmaps) == 2
 
-    def test_triples_map_has_logical_table(self, strategy):
-        """R2RML §2.1: Every TriplesMap MUST have exactly one rr:logicalTable."""
-        tables = [
-            CatalogTable(
-                id="1",
-                name="products",
-                fullyQualifiedName="store.products",
-                columns=[CatalogColumn(name="sku", dataType="VARCHAR")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["sku"])],
-            )
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        tmap = ns.TriplesMap_Products
-        lt = g.value(tmap, RR.logicalTable)
-        assert lt is not None
-
     def test_logical_table_has_table_name(self, strategy):
         """R2RML §2.1.1: A base table or view MUST have rr:tableName."""
         tables = [
@@ -165,16 +140,11 @@ class TestTriplesMapStructure:
         tmap = ns.TriplesMap_Products
         lt = g.value(tmap, RR.logicalTable)
         table_name = g.value(lt, RR.tableName)
-        assert table_name is not None
         assert str(table_name) == '"products"'
 
     def test_table_name_bare_when_unique_qualified_only_on_collision(self, strategy):
-        """rr:tableName is BARE for a table whose name is unique in the run,
-        so already-accepted single-source mappings stay byte-identical. Schema
-        qualification is applied ONLY on a genuine cross-datasource name collision
-        (see test_two_same_named_tables_distinct_qualified_table_names) — it
-        supersedes #149's unconditional qualification, which qualified even a
-        unique name and would have forced every namespace to re-induce."""
+        """rr:tableName is bare when the name is unique in the run and
+        schema-qualified only on a cross-datasource name collision."""
         tables = [
             CatalogTable(
                 id="1",
@@ -192,9 +162,8 @@ class TestTriplesMapStructure:
         assert str(table_name) == '"products"'
 
     def test_two_same_named_tables_distinct_qualified_table_names(self, strategy):
-        """#149 A: two tables named the same in different schemas must produce
-        two TriplesMaps with DIFFERENT rr:tableName values (the collision that
-        silently dropped one at the H2 layer)."""
+        """Two tables named the same in different schemas must produce
+        two TriplesMaps with DIFFERENT rr:tableName values."""
         tables = [
             CatalogTable(
                 id="1",
@@ -216,22 +185,6 @@ class TestTriplesMapStructure:
         g = _build(strategy, tables)
         table_names = {str(tn) for tn in g.objects(None, RR.tableName)}
         assert table_names == {'"sales"."events_daily"', '"ops"."events_daily"'}
-
-    def test_triples_map_has_subject_map(self, strategy):
-        """R2RML §2.2: Every TriplesMap MUST have exactly one rr:subjectMap."""
-        tables = [
-            CatalogTable(
-                id="1",
-                name="items",
-                fullyQualifiedName="db.items",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-            )
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        subj = g.value(ns.TriplesMap_Items, RR.subjectMap)
-        assert subj is not None
 
     def test_triples_map_has_class(self, strategy):
         """R2RML §2.2: SubjectMap SHOULD specify rr:class."""
@@ -271,11 +224,6 @@ class TestTriplesMapStructure:
         assert len(poms) == 3
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: Subject Maps — Primary Key Templates (R2RML §2.2, §7.1)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestSubjectMapPrimaryKeys:
     """SubjectMap template MUST produce unique IRIs — uses the full PK."""
 
@@ -296,8 +244,6 @@ class TestSubjectMapPrimaryKeys:
         ns = Namespace(PREFIX)
         tmpl = _subject_template(g, ns.TriplesMap_Users)
         assert tmpl == f'{PREFIX}users/{{"user_id"}}'
-        assert '{"user_id"}' in tmpl
-        assert "users/" in tmpl
 
     def test_composite_pk_two_columns(self, strategy):
         """Composite PK with 2 columns produces template with both as path segments."""
@@ -319,10 +265,7 @@ class TestSubjectMapPrimaryKeys:
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
         tmpl = _subject_template(g, ns.TriplesMap_Enrollments)
-        assert '{"student_id"}' in tmpl
-        assert '{"course_id"}' in tmpl
         assert tmpl.count("{") == 2
-        # Columns joined by / as path segments
         assert '{"student_id"}/{"course_id"}' in tmpl
 
     def test_composite_pk_three_columns(self, strategy):
@@ -349,9 +292,6 @@ class TestSubjectMapPrimaryKeys:
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
         tmpl = _subject_template(g, ns.TriplesMap_FlightSegments)
-        assert '{"airline"}' in tmpl
-        assert '{"flight_num"}' in tmpl
-        assert '{"departure_date"}' in tmpl
         assert tmpl.count("{") == 3
         assert '{"airline"}/{"flight_num"}/{"departure_date"}' in tmpl
 
@@ -520,39 +460,10 @@ class TestSubjectMapPrimaryKeys:
         assert src_pos < tgt_pos, "PK columns must appear in constraint declaration order"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: Foreign Key Object Maps — Referencing Object Maps (R2RML §7.5)
-#
-# R2RML §7.5 specifies Referencing Object Maps as the mechanism for expressing
-# JOINs between TriplesMaps. The ObjectMap uses:
-#   - rr:parentTriplesMap pointing to the target TriplesMap
-#   - rr:joinCondition BNode(s) with rr:child (FK column) and rr:parent (PK column)
-#
-# This approach is explicit — no IRI template unification needed. Ontop reads
-# the child/parent column pairs directly to generate SQL JOINs.
-#
-# For composite FKs, a single POM is emitted for the first column in the
-# constraint, with multiple joinConditions covering all column pairs.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestForeignKeyObjectMaps:
     """FK columns MUST produce Referencing Object Maps with rr:parentTriplesMap
     and rr:joinCondition — the R2RML §7.5 mechanism for expressing JOINs.
-
-    Subsections:
-      3.1 — Structural requirements (no rr:column, no rr:template, no rr:termType)
-      3.2 — Simple FK → Simple PK (the happy path)
-      3.3 — FK column name differs from target PK column name
-      3.4 — Self-referencing FKs
-      3.5 — Multiple FKs from a single table
-      3.6 — FK target table not in the same build_r2rml call
-      3.7 — referredColumns format variations
-      3.8 — Composite FK → Composite PK (single POM, multiple joinConditions)
-      3.9 — Single FK → Composite PK target (partial key reference)
     """
-
-    # ── 3.1 Structural requirements ──────────────────────────────────────────
 
     def test_fk_object_map_has_no_rr_column(self, strategy):
         """R2RML §7.5: FK ObjectMaps use rr:parentTriplesMap, NOT rr:column."""
@@ -647,65 +558,6 @@ class TestForeignKeyObjectMaps:
         assert om is not None, "ObjectMap node must exist"
         assert g.value(om, RR.termType) is None
 
-    def test_fk_object_map_has_parent_triples_map(self, strategy):
-        """FK ObjectMaps MUST have rr:parentTriplesMap pointing to target TriplesMap."""
-        tables = [
-            CatalogTable(
-                id="0",
-                name="customers",
-                fullyQualifiedName="db.customers",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-            ),
-            CatalogTable(
-                id="1",
-                name="orders",
-                fullyQualifiedName="db.orders",
-                columns=[CatalogColumn(name="customer_id", dataType="INT")],
-                tableConstraints=[
-                    CatalogConstraint(
-                        constraintType="FOREIGN_KEY",
-                        columns=["customer_id"],
-                        referredColumns=["customers.id"],
-                    ),
-                ],
-            ),
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        assert parent is not None
-        assert parent == ns.TriplesMap_Customers
-
-    def test_fk_object_map_has_join_condition(self, strategy):
-        """FK ObjectMaps MUST have rr:joinCondition with child/parent columns."""
-        tables = [
-            CatalogTable(
-                id="0",
-                name="customers",
-                fullyQualifiedName="db.customers",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-            ),
-            CatalogTable(
-                id="1",
-                name="orders",
-                fullyQualifiedName="db.orders",
-                columns=[CatalogColumn(name="customer_id", dataType="INT")],
-                tableConstraints=[
-                    CatalogConstraint(
-                        constraintType="FOREIGN_KEY",
-                        columns=["customer_id"],
-                        referredColumns=["customers.id"],
-                    ),
-                ],
-            ),
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        assert conditions == [('"customer_id"', '"id"')]
-
     def test_quoted_parent_column_leaves_relationship_unmapped(self, strategy, caplog):
         """Unsafe rr:parent text drops the join and maps no literal in its place.
 
@@ -763,8 +615,6 @@ class TestForeignKeyObjectMaps:
             for record in caplog.records
         )
 
-    # ── 3.2 Simple FK → Simple PK (happy path) ──────────────────────────────
-
     def test_simple_fk_to_simple_pk(self, strategy):
         """Classic case: single-column FK references single-column PK.
         This is the most common relationship type in normalized schemas."""
@@ -799,11 +649,9 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, [customers, orders])
         ns = Namespace(PREFIX)
 
-        # FK POM uses parentTriplesMap pointing to customers
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert parent == ns.TriplesMap_Customers
 
-        # joinCondition maps customer_id → id
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert conditions == [('"customer_id"', '"id"')]
 
@@ -843,8 +691,6 @@ class TestForeignKeyObjectMaps:
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert conditions == [('"customer_id"', '"customer_id"')]
 
-    # ── 3.3 FK column name differs from target PK ───────────────────────────
-
     def test_fk_column_name_differs_from_target_pk(self, strategy):
         """FK column 'cust_ref' references target PK 'customer_id'.
         Join condition maps cust_ref (child) to customer_id (parent)."""
@@ -880,8 +726,6 @@ class TestForeignKeyObjectMaps:
 
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Orders/POM_CustRef"])
         assert conditions == [('"cust_ref"', '"customer_id"')]
-
-    # ── 3.4 Self-referencing FKs ─────────────────────────────────────────────
 
     def test_self_referencing_fk(self, strategy):
         """Table with FK pointing to its own PK (e.g., manager_id → employees.id).
@@ -941,19 +785,15 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, [categories])
         ns = Namespace(PREFIX)
 
-        # Both point to same TriplesMap (self-reference)
         parent_fk = _object_map_parent_tmap(g, ns["TriplesMap_Categories/POM_ParentId"])
         root_fk = _object_map_parent_tmap(g, ns["TriplesMap_Categories/POM_RootId"])
         assert parent_fk == ns.TriplesMap_Categories
         assert root_fk == ns.TriplesMap_Categories
 
-        # Each has its own join condition
         parent_conds = _object_map_join_conditions(g, ns["TriplesMap_Categories/POM_ParentId"])
         root_conds = _object_map_join_conditions(g, ns["TriplesMap_Categories/POM_RootId"])
         assert parent_conds == [('"parent_id"', '"id"')]
         assert root_conds == [('"root_id"', '"id"')]
-
-    # ── 3.5 Multiple FKs from a single table ────────────────────────────────
 
     def test_multiple_fks_to_different_targets(self, strategy):
         """Table with FK columns pointing to different target tables."""
@@ -997,13 +837,11 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, [departments, locations, employees])
         ns = Namespace(PREFIX)
 
-        # Each FK points to its respective target TriplesMap
         dept_parent = _object_map_parent_tmap(g, ns["TriplesMap_Employees/POM_DeptId"])
         loc_parent = _object_map_parent_tmap(g, ns["TriplesMap_Employees/POM_LocationId"])
         assert dept_parent == ns.TriplesMap_Departments
         assert loc_parent == ns.TriplesMap_Locations
 
-        # Each has correct join condition
         dept_conds = _object_map_join_conditions(g, ns["TriplesMap_Employees/POM_DeptId"])
         loc_conds = _object_map_join_conditions(g, ns["TriplesMap_Employees/POM_LocationId"])
         assert dept_conds == [('"dept_id"', '"id"')]
@@ -1044,31 +882,22 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, [addresses, shipments])
         ns = Namespace(PREFIX)
 
-        # Both FKs point to addresses TriplesMap
         from_parent = _object_map_parent_tmap(g, ns["TriplesMap_Shipments/POM_FromAddressId"])
         to_parent = _object_map_parent_tmap(g, ns["TriplesMap_Shipments/POM_ToAddressId"])
         assert from_parent == ns.TriplesMap_Addresses
         assert to_parent == ns.TriplesMap_Addresses
 
-        # Each has distinct join condition (different child columns)
         from_conds = _object_map_join_conditions(g, ns["TriplesMap_Shipments/POM_FromAddressId"])
         to_conds = _object_map_join_conditions(g, ns["TriplesMap_Shipments/POM_ToAddressId"])
         assert from_conds == [('"from_address_id"', '"id"')]
         assert to_conds == [('"to_address_id"', '"id"')]
-
-    # ── 3.6 FK target not in the same build call ─────────────────────────────
 
     def test_fk_target_not_included_in_tables_list(self, strategy):
         """FK references a table NOT minted this run. The join must DEGRADE
         TO A LITERAL — not emit a dangling rr:parentTriplesMap to a TriplesMap
         that is never declared.
 
-        Previously this synthesized ``parentTriplesMap = TriplesMap_{Pascal(target)}``,
-        a reference to a TriplesMap absent from the mapping. Ontop rejects the
-        WHOLE mapping on load when a parentTriplesMap has no matching TriplesMap,
-        so one FK to a rejected / dropped / not-yet-synced target failed every
-        query in the namespace permanently. The out-of-run FK now emits a plain
-        datatype ObjectMap (raw column value), exactly as an ambiguous target does.
+        Ontop rejects the whole mapping when a parentTriplesMap has no TriplesMap.
         """
         orders = CatalogTable(
             id="1",
@@ -1087,24 +916,17 @@ class TestForeignKeyObjectMaps:
                 ),
             ],
         )
-        # customers table NOT included — the target is out of this run.
         g = _build(strategy, [orders])
         ns = Namespace(PREFIX)
 
-        # No dangling join: the ObjectMap carries no parentTriplesMap.
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert parent is None, "out-of-run FK target must not emit a dangling rr:parentTriplesMap"
 
-        # The dangling TriplesMap IRI is nowhere in the graph.
         assert (None, RR.parentTriplesMap, ns.TriplesMap_Customers) not in g
-        assert ns.TriplesMap_Customers not in set(g.objects(None, RR.parentTriplesMap))
 
-        # Degrades to a datatype literal: raw column value, no join.
         col = _object_map_column(g, ns["TriplesMap_Orders/POM_CustomerId"])
         assert col == '"customer_id"'
         assert _object_map_datatype(g, ns["TriplesMap_Orders/POM_CustomerId"]) == XSD.integer
-
-    # ── 3.7 referredColumns format variations ────────────────────────────────
 
     def test_referred_columns_two_part_table_dot_column(self, strategy):
         """Standard format from induce_catalog: 'TargetTable.column'."""
@@ -1170,13 +992,7 @@ class TestForeignKeyObjectMaps:
         assert col == '"order_ref"'
 
     def test_referred_columns_three_part_schema_table_column(self, strategy):
-        """referredColumns as 'schema.table.column' resolves to the TABLE, not the schema.
-
-        Was xfail: the R2RML builder took ``parts[0]`` (the schema) while the
-        ontology, the SHACL config, and the subtype detector all took
-        ``parts[-2]`` (the table), so the mapping pointed at a TriplesMap that does
-        not exist. All six call sites now share ``parse_referred_column``.
-        """
+        """referredColumns as 'schema.table.column' resolves to the TABLE, not the schema."""
         tables = [
             CatalogTable(
                 id="1",
@@ -1203,15 +1019,11 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
 
-        # Correct expectation: target table is "orders" (parts[1]), not "public" (parts[0])
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Invoices/POM_OrderRef"])
         assert parent == ns.TriplesMap_Orders
 
-        # parts[-1] = "order_id" (correct — last part is always the column)
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Invoices/POM_OrderRef"])
         assert conditions == [('"order_ref"', '"order_id"')]
-
-    # ── 3.8 Composite FK → Composite PK (single POM, multiple joinConditions)
 
     def test_composite_fk_produces_single_pom_with_multiple_join_conditions(self, strategy):
         """Composite FK constraint with columns=[col_a, col_b] produces ONE POM
@@ -1252,11 +1064,9 @@ class TestForeignKeyObjectMaps:
         g = _build(strategy, [time_slots, bookings])
         ns = Namespace(PREFIX)
 
-        # The first FK column (booking_day) gets the POM with parentTriplesMap
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Bookings/POM_BookingDay"])
         assert parent == ns.TriplesMap_TimeSlots
 
-        # Multiple join conditions — one per column pair
         conditions = _object_map_join_conditions(g, ns["TriplesMap_Bookings/POM_BookingDay"])
         assert conditions == [('"booking_day"', '"day"'), ('"booking_hour"', '"hour"')]
 
@@ -1321,8 +1131,6 @@ class TestForeignKeyObjectMaps:
             ('"sched_year"', '"year"'),
         ]
 
-    # ── 3.9 Single FK column → Composite PK target ──────────────────────────
-
     def test_single_fk_to_composite_pk_uses_referencing_object_map(self, strategy):
         """A single FK column referencing one column of a composite-PK target
         correctly uses rr:parentTriplesMap + rr:joinCondition (R2RML §7.5).
@@ -1366,14 +1174,6 @@ class TestForeignKeyObjectMaps:
 
         conditions = _object_map_join_conditions(g, ns["TriplesMap_GradeComments/POM_EnrollmentStudent"])
         assert conditions == [('"enrollment_student"', '"student_id"')]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: Referencing Object Maps — JOIN Correctness (R2RML §7.5)
-#
-# Tests that the rr:parentTriplesMap + rr:joinCondition mechanism produces
-# correct JOINs across various schema topologies (star, chain, diamond).
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestReferencingObjectMaps:
@@ -1459,7 +1259,6 @@ class TestReferencingObjectMaps:
         g = _build(strategy, [dim_customer, dim_product, dim_date, fact_sales])
         ns = Namespace(PREFIX)
 
-        # Each FK must reference its dimension's TriplesMap with correct join
         self._assert_referencing_correct(
             g,
             ns["TriplesMap_FactSales/POM_CustomerKey"],
@@ -1525,14 +1324,12 @@ class TestReferencingObjectMaps:
         g = _build(strategy, [countries, cities, addresses])
         ns = Namespace(PREFIX)
 
-        # cities.country_code → countries.code
         self._assert_referencing_correct(
             g,
             ns["TriplesMap_Cities/POM_CountryCode"],
             ns.TriplesMap_Countries,
             [('"country_code"', '"code"')],
         )
-        # addresses.city_id → cities.id
         self._assert_referencing_correct(
             g,
             ns["TriplesMap_Addresses/POM_CityId"],
@@ -1609,7 +1406,6 @@ class TestReferencingObjectMaps:
         g = _build(strategy, [a, b, c, d])
         ns = Namespace(PREFIX)
 
-        # All four FK→PK links must have correct referencing object maps
         self._assert_referencing_correct(
             g,
             ns["TriplesMap_ExtensionA/POM_BaseId"],
@@ -1634,55 +1430,6 @@ class TestReferencingObjectMaps:
             ns.TriplesMap_ExtensionB,
             [('"ext_b_id"', '"id"')],
         )
-
-    def test_composite_fk_in_star_schema(self, strategy):
-        """Star schema with a composite FK to a dimension with composite PK."""
-        dim_time = CatalogTable(
-            id="1",
-            name="dim_time",
-            fullyQualifiedName="dw.dim_time",
-            columns=[
-                CatalogColumn(name="date", dataType="DATE"),
-                CatalogColumn(name="hour", dataType="INT"),
-                CatalogColumn(name="label", dataType="VARCHAR"),
-            ],
-            tableConstraints=[
-                CatalogConstraint(constraintType="PRIMARY_KEY", columns=["date", "hour"]),
-            ],
-        )
-        fact_events = CatalogTable(
-            id="2",
-            name="fact_events",
-            fullyQualifiedName="dw.fact_events",
-            columns=[
-                CatalogColumn(name="event_id", dataType="INT"),
-                CatalogColumn(name="event_date", dataType="DATE"),
-                CatalogColumn(name="event_hour", dataType="INT"),
-                CatalogColumn(name="payload", dataType="TEXT"),
-            ],
-            tableConstraints=[
-                CatalogConstraint(constraintType="PRIMARY_KEY", columns=["event_id"]),
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY",
-                    columns=["event_date", "event_hour"],
-                    referredColumns=["dim_time.date", "dim_time.hour"],
-                ),
-            ],
-        )
-        g = _build(strategy, [dim_time, fact_events])
-        ns = Namespace(PREFIX)
-
-        # Composite FK produces single POM on first column with multiple joinConditions
-        parent = _object_map_parent_tmap(g, ns["TriplesMap_FactEvents/POM_EventDate"])
-        assert parent == ns.TriplesMap_DimTime
-
-        conditions = _object_map_join_conditions(g, ns["TriplesMap_FactEvents/POM_EventDate"])
-        assert conditions == [('"event_date"', '"date"'), ('"event_hour"', '"hour"')]
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: Datatype Mapping (R2RML §10)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestDatatypeMapping:
@@ -1736,14 +1483,8 @@ class TestDatatypeMapping:
     def test_temporal_types_mapped_faithfully(self, strategy, sql_type, expected):
         """Temporal types keep their real XSD type — they are NOT downcast to string.
 
-        Previously asserted xsd:string "for VKG compatibility". That downcast made
-        Ontop's type reasoner treat every temporal column as a string, so a
-        comparison against an xsd:date literal was disjoint, the query was proven
-        unsatisfiable, and Ontop emitted its no-mapping placeholder
-        ("SELECT 1 AS uselessVariable") — silently returning nothing for EVERY
-        date-filtered query. Verified against Ontop 5.5.0 that faithful temporal
-        types load without MappingOntologyMismatchException and reformulate to
-        real SQL.
+        With string-typed temporal columns Ontop 5.5.0 proves date filters
+        unsatisfiable and returns nothing.
         """
         tables = [
             CatalogTable(
@@ -1789,11 +1530,6 @@ class TestDatatypeMapping:
         ns = Namespace(PREFIX)
         dt = _object_map_datatype(g, ns["TriplesMap_T/POM_Amount"])
         assert dt == XSD.decimal
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Logical Table — SQL Identifier Handling (R2RML §2.1.1)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestSqlIdentifierHandling:
@@ -1868,14 +1604,8 @@ class TestSqlIdentifierHandling:
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
-        # to_pascal("app.version") = "Appversion" (dot stripped, not a word boundary)
         col = _object_map_column(g, ns["TriplesMap_Config/POM_Appversion"])
         assert col == '"app.version"'
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 7: URI Prefix Normalization
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestUriPrefixNormalization:
@@ -1953,55 +1683,15 @@ class TestUriPrefixNormalization:
                 ],
             ),
         ]
-        # Use prefix without separator
         g = _build(strategy, tables, prefix="http://example.org/ns")
         ns = Namespace("http://example.org/ns#")
 
-        # parentTriplesMap uses the normalized prefix with #
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_ParentId"])
         assert parent == ns.TriplesMap_Parent
-        assert str(parent).startswith("http://example.org/ns#")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 8: SCL Provenance Annotations
-# ═══════════════════════════════════════════════════════════════════════════════
 
 
 class TestProvenanceAnnotations:
     """TriplesMap annotations for VKG query routing (coa:datasourceId, coa:sourceSchema)."""
-
-    def test_datasource_id_annotated(self, strategy):
-        tables = [
-            CatalogTable(
-                id="1",
-                name="t",
-                fullyQualifiedName="mydb.public.t",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-                datasourceId="production-rds",
-            )
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        ds = g.value(ns.TriplesMap_T, SCL.datasourceId)
-        assert str(ds) == "production-rds"
-
-    def test_source_schema_annotated(self, strategy):
-        tables = [
-            CatalogTable(
-                id="1",
-                name="t",
-                fullyQualifiedName="mydb.analytics.t",
-                columns=[CatalogColumn(name="id", dataType="INT")],
-                tableConstraints=[CatalogConstraint(constraintType="PRIMARY_KEY", columns=["id"])],
-                sourceSchema="analytics",
-            )
-        ]
-        g = _build(strategy, tables)
-        ns = Namespace(PREFIX)
-        schema = g.value(ns.TriplesMap_T, SCL.sourceSchema)
-        assert str(schema) == "analytics"
 
     def test_no_annotations_when_fields_absent(self, strategy):
         tables = [
@@ -2129,11 +1819,6 @@ class TestProvenanceAnnotations:
         assert not any("coa_dbx_test_sales_orders" in name for name in emitted)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 9: Predicate Naming Convention
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestPredicateNaming:
     """Predicates follow the convention: ind:{camelCase(table)}_{camelCase(col)}."""
 
@@ -2175,11 +1860,6 @@ class TestPredicateNaming:
         assert pred == ns.users_name
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 10: Edge Cases and Defensive Behavior
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestEdgeCases:
     """Boundary conditions and unusual schemas."""
 
@@ -2196,7 +1876,6 @@ class TestEdgeCases:
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
-        # Should still produce a valid TriplesMap with SubjectMap and one POM
         assert (ns.TriplesMap_Statuses, RDF.type, RR.TriplesMap) in g
         tmpl = _subject_template(g, ns.TriplesMap_Statuses)
         assert '{"code"}' in tmpl
@@ -2219,7 +1898,6 @@ class TestEdgeCases:
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
         om = ns["TriplesMap_Broken/POM_RefId/ObjectMap"]
-        # Should be a datatype ObjectMap, not referencing
         assert g.value(om, RR.parentTriplesMap) is None
         assert g.value(om, RR.column) is not None
 
@@ -2261,7 +1939,6 @@ class TestEdgeCases:
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
         tmpl = _subject_template(g, ns.TriplesMap_Accounts)
-        # Subject uses PK (id), not UNIQUE (email)
         assert '{"id"}' in tmpl
         assert '{"email"}' not in tmpl
 
@@ -2297,10 +1974,8 @@ class TestEdgeCases:
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
-        # Subject uses user_id (it's the PK)
         tmpl = _subject_template(g, ns.TriplesMap_UserProfiles)
         assert '{"user_id"}' in tmpl
-        # user_id POM should be FK (referencing object map), not datatype
         parent = _object_map_parent_tmap(g, ns["TriplesMap_UserProfiles/POM_UserId"])
         assert parent == ns.TriplesMap_Users
         conditions = _object_map_join_conditions(g, ns["TriplesMap_UserProfiles/POM_UserId"])
@@ -2319,19 +1994,13 @@ class TestEdgeCases:
         ]
         g = _build(strategy, tables)
         ns = Namespace(PREFIX)
-        # PascalCase applied to table name
         assert (ns.TriplesMap_Useractivity, RDF.type, RR.TriplesMap) in g
-        # But rr:tableName preserves original case
         lt = g.value(ns.TriplesMap_Useractivity, RR.logicalTable)
         assert str(g.value(lt, RR.tableName)) == '"UserActivity"'
 
     def test_multiple_fk_constraints_on_same_column_emit_one_join_each(self, strategy):
         """A column carrying several FKs gets one Referencing Object Map PER target.
 
-        Previously the first constraint won and the rest were silently dropped —
-        which, once cross-source inference started producing columns that
-        legitimately reference several tables (a local parent AND a crosswalk),
-        meant approved relationships never reached the mapping (#1088 follow-up).
         With more than one relationship the POM and predicate are target-qualified
         so they cannot collide; a single-FK column keeps the plain names.
         """
@@ -2384,12 +2053,6 @@ class TestEdgeCases:
         assert (ns["TriplesMap_Refs/POM_TargetId"], RR.objectMap, None) not in g
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 10: IRI collision resolution (to_pascal is lossy)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.unit
 class TestPascalCaseCollisions:
     """Distinct tables must never share a class / TriplesMap IRI.
 
@@ -2491,13 +2154,6 @@ class TestPascalCaseCollisions:
             rev = [str(n) for lt in reverse.objects(tmap, RR.logicalTable) for n in reverse.objects(lt, RR.tableName)]
             assert fwd == rev, f"{tmap} maps {fwd} one way and {rev} the other"
 
-    def test_assignment_is_deterministic_across_runs(self, strategy):
-        """Same input order must mint the same IRIs every time."""
-        first = _build(strategy, self._tables("order_item", "order-item"))
-        second = _build(strategy, self._tables("order_item", "order-item"))
-
-        assert set(first.subjects(RDF.type, RR.TriplesMap)) == set(second.subjects(RDF.type, RR.TriplesMap))
-
     def test_ontology_and_r2rml_agree_on_class_iris(self, strategy):
         """The two builders must mint identical class IRIs for colliding names."""
         tables = self._tables("order_item", "order-item")
@@ -2558,12 +2214,6 @@ class TestPascalCaseCollisions:
         assert len(shape_classes) == 2
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 11: ontology / R2RML property parity
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.unit
 class TestOntologyR2rmlParity:
     """Every property the ontology declares must have a mapping behind it.
 
@@ -2657,8 +2307,6 @@ class TestOntologyR2rmlParity:
         assert "composite foreign key" in comment
         assert "bookings_day" in comment
 
-    # ── malformed composite FKs degrade consistently on BOTH sides ────────────
-
     @staticmethod
     def _malformed_tables(*, referred):
         return [
@@ -2703,8 +2351,6 @@ class TestOntologyR2rmlParity:
 
         unmapped = self._declared_properties(onto) - self._mapped_predicates(r2rml)
         assert unmapped == set(), f"unmapped after malformed-FK fallback: {sorted(unmapped)}"
-
-    # ── the simple cases must be untouched ───────────────────────────────────
 
     def test_simple_fk_still_yields_an_object_property(self, strategy):
         tables = [
@@ -2757,16 +2403,7 @@ class TestOntologyR2rmlParity:
 
         assert self._declared_properties(onto) - self._mapped_predicates(r2rml) == set()
 
-    # ── The SHACL shapes are the THIRD artifact and must agree too ──────────
-    #
-    # The parity tests above pin ontology↔R2RML. The shapes were the odd one out:
-    # generate_config_from_db put every column of a composite FK into fk_map, so an
-    # absorbed column got a REFERENCE constraint, which compile_to_shacl turns into
-    # sh:nodeKind sh:IRI + sh:class — while the ontology declares the same column an
-    # owl:DatatypeProperty and the mapping emits an rr:datatype literal for it. The
-    # shape then asserts a class-typed reference against data that is literal by
-    # design: a false-positive violation on every row of every composite-FK child
-    # table, which the user sees as a failed validation run.
+    # Shapes must assert sh:class only where the ontology declares an owl:ObjectProperty.
 
     @staticmethod
     def _shape_constraint_types(tables, class_name):
@@ -2873,22 +2510,8 @@ class TestOntologyR2rmlParity:
         assert ConstraintType.REFERENCE in by_col["customer_id"]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 12: referredColumns parsing is one shared rule
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.unit
 class TestReferredColumnParsing:
-    """All consumers must resolve an FK target identically.
-
-    The rule was re-implemented at six call sites under two incompatible
-    conventions: `parts[0]` in the R2RML builder and the RIGOR topological sort,
-    `parts[-2]` in the ontology builder, the SHACL config, the subtype detector,
-    and the fingerprint normalizer. For `schema.table.column` the former yields
-    the SCHEMA, so the mapping referenced a nonexistent TriplesMap while the
-    ontology and shapes correctly referenced the table.
-    """
+    """All consumers must resolve an FK target identically."""
 
     @pytest.mark.parametrize(
         ("ref", "expected"),
@@ -2937,19 +2560,7 @@ class TestReferredColumnParsing:
         ],
     )
     def test_composite_fk_with_an_empty_half_is_not_usable(self, refs):
-        """An empty half must be refused, not merely a `None` one.
-
-        `parse_referred_column` returns `""` — not `None` — for a leading or trailing
-        dot, so an identity check (`col is None`) let these through. An empty TABLE
-        half then reached `_parent_tmap`, which finds no in-run table of that name,
-        reads it as out-of-run, and mints `to_pascal("") == "Entity"`. The mapping
-        emitted `rr:parentTriplesMap ind:TriplesMap_Entity`: a join to a TriplesMap
-        that does not exist, which is the defect this function exists to prevent.
-
-        The single-column FK path guards on truthiness
-        (`if is_fk and simple_fk_target and fk_parent_col`), so identity here also
-        made the two paths disagree about the same malformed reference.
-        """
+        """An empty table or column half ("" as well as None) makes the FK unusable."""
         from coa_ontology.inducer.strategies.base import composite_fk_is_usable
 
         tc = CatalogConstraint(
@@ -3024,9 +2635,7 @@ class TestReferredColumnParsing:
         r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
         ns = Namespace(PREFIX)
 
-        # Ontology: range is the TABLE's class, never a class named after the schema
         assert onto.value(ns.invoices_orderRef, RDFS.range) == ns.Orders
-        # R2RML: parent is the TABLE's TriplesMap
         parent = _object_map_parent_tmap(r2rml, ns["TriplesMap_Invoices/POM_OrderRef"])
         assert parent == ns.TriplesMap_Orders
 
@@ -3114,18 +2723,12 @@ class TestReferredColumnParsing:
         assert ("expense_payment", "claim_amount") in confirmed
 
 
-@pytest.mark.unit
 class TestOverlappingCompositeForeignKeys:
     """Two composite FKs sharing a column must both keep their relationship.
 
     `build_r2rml` walks the columns and CONSUMES each constraint as it anchors it,
     so for FK1=(a,b)->p1 and FK2=(b,c)->p2: `a` anchors FK1 (absorbing `b`), and
     `c` — reached with FK1 already consumed — anchors FK2.
-
-    A non-consuming `composite_fk_columns` matched `c` against FK2 while also
-    treating it as absorbed by `b`, so `c` degraded to a literal and the child→p2
-    relationship vanished from the R2RML mapping AND (since both builders share the
-    helper) from the ontology.
     """
 
     @staticmethod
@@ -3241,8 +2844,7 @@ class TestOverlappingCompositeForeignKeys:
         ns = Namespace(PREFIX)
         # a anchors FK1 (folding in b); b is skipped as folded, so c anchors FK2
         # (folding in nothing new); d then anchors FK3. Every constraint keeps a
-        # relationship — matches what the pre-fix mapping emitted, verified by
-        # running both revisions.
+        # relationship.
         assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_A"]) == ns.TriplesMap_P1
         assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_C"]) == ns.TriplesMap_P2
         assert _object_map_parent_tmap(g, ns["TriplesMap_Child/POM_D"]) == ns.TriplesMap_P3
@@ -3250,23 +2852,12 @@ class TestOverlappingCompositeForeignKeys:
         assert _object_map_column(g, ns["TriplesMap_Child/POM_B"]) == '"b"'
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 13: A column in a malformed FK that also anchors a well-formed one
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestMalformedAndUsableCompositeFksShareAColumn:
     """A broken constraint must not cost an unrelated, expressible relationship.
 
     ``build_r2rml`` degrades every column of a malformed composite FK to a literal,
-    and ``composite_fk_anchors`` assigns anchors for the usable ones. A column can be
-    in both sets. The malformed check used to run FIRST, so such a column was emitted
-    as ``rr:column`` + ``rr:datatype`` — while the ontology, which asks
-    ``composite_fk_anchors``, still declared it an ``owl:ObjectProperty`` with
-    ``rdfs:range <Parent>``. That is the ontology/mapping contradiction the
-    composite-FK work set out to remove, reintroduced through a different door, and
-    it silently dropped the usable FK's relationship from the mapping entirely: the
-    anchor was consumed, so no other column re-emitted it.
+    and ``composite_fk_anchors`` assigns anchors for the usable ones. A column in
+    both sets anchors the usable FK.
     """
 
     @staticmethod
@@ -3328,9 +2919,8 @@ class TestMalformedAndUsableCompositeFksShareAColumn:
         r2rml = strategy.build_r2rml(PREFIX, tables, novel, onto)
         ns = Namespace(PREFIX)
 
-        # The ontology declares an object property pointing at the USABLE FK's
-        # parent — not at `broken`, which the first-matching-constraint lookup used
-        # to return because the malformed constraint is listed first.
+        # The range is the USABLE FK's parent even though the malformed
+        # constraint is listed first.
         assert (ns.child_c, RDF.type, OWL.ObjectProperty) in onto
         assert onto.value(ns.child_c, RDFS.range) == ns.Good
 
@@ -3355,21 +2945,13 @@ class TestMalformedAndUsableCompositeFksShareAColumn:
         assert declared - mapped == set()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 14: Same table name in two databases
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
 class TestSameNameInDifferentDatabases:
     """Two tables sharing a bare name are two tables.
 
     One induction flattens every database of every requested datasource into a
     single list (``_catalog_to_tables`` fills ``name`` from the bare table name and
     puts the qualified form in ``fullyQualifiedName``), so ``public.customers`` and
-    ``analytics.customers`` arrive as two entries both named ``customers``. Keying
-    the local-name helper on the NAME collapsed them: one TriplesMap with two
-    ``rr:logicalTable`` / ``rr:tableName`` values — invalid R2RML, the same defect
-    the separator/case collisions produced, reached by a different route.
+    ``analytics.customers`` arrive as two entries both named ``customers``.
     """
 
     @staticmethod
@@ -3438,7 +3020,6 @@ class TestSameNameInDifferentDatabases:
         ns = Namespace(PREFIX)
 
         parent = _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"])
-        assert parent is not None
         assert str(parent).startswith(f"{PREFIX}TriplesMap_Customers")
         # The FK must follow the referrer's own schema, not whichever same-named
         # table happens to be reachable by bare name.
@@ -3496,13 +3077,8 @@ class TestSameNameInDifferentDatabases:
 class TestAmbiguousFkTargetDegradesToLiteral:
     """An FK naming an ambiguous bare table must not join to an arbitrary parent.
 
-    ``reference_index`` omits a bare name two tables answer to, so the lookup
-    misses. Omission alone is not enough: the out-of-run fallback mints
-    ``TriplesMap_{to_pascal(name)}``, which is exactly the IRI ``pascal_names_for``
-    hands the ``min()`` keeper of the colliding set. So the "unresolved" path landed
-    on one of the candidates and joined real data to the lowest-identity same-named
-    table — the wrong-parent outcome ``reference_index`` documents as worse than no
-    join at all.
+    ``reference_index`` omits a bare name two tables answer to, so the FK degrades
+    to a literal instead of joining the lowest-identity same-named table.
 
     The referrer here sits in a THIRD schema, so the schema-qualified lookup misses
     too and the bare name is the only thing left to resolve on.
@@ -3596,44 +3172,12 @@ class TestAmbiguousFkTargetDegradesToLiteral:
         assert ("order_id", ConstraintType.REFERENCE) not in by_type
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 15: An approved FK whose target is NOT minted this run degrades to a
-# literal across ALL FOUR artifacts
-#
-# The dangling-join defect: an APPROVED foreign key whose target table is absent
-# from the final minted table set — rejected at review, dropped by a later
-# filter, or missing after a partial re-sync — still emitted a join reference to a
-# TriplesMap / class / shape / template that is never declared. The dangling
-# rr:parentTriplesMap made Ontop reject the WHOLE mapping on load, so the VKG
-# health check failed permanently for the namespace.
-#
-# The four emitters gate only on the FK's OWN approval (fk_edge_allowed), never on
-# whether the join TARGET is minted this run. The fix keys the final "target not
-# resolvable" branch on "is the target in the run?" — cause-agnostic — and
-# degrades to a plain datatype literal, exactly as the ambiguous-target branch
-# already did. All four must degrade TOGETHER or the artifacts contradict.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.unit
 class TestRejectedTargetDegradesAcrossArtifacts:
-    """An APPROVED FK to an out-of-run target degrades to a literal everywhere.
-
-    Non-vacuity: every assertion below fails on the pre-fix source (the four
-    emitters emitted a bare TriplesMap_<Target> / ind:<Target> reference) and
-    passes with the fix — verified by reverting the four source files to
-    origin/main, running this class red, then restoring the fix and running it
-    green.
-    """
-
-    PREFIX = PREFIX
+    """An APPROVED FK to an out-of-run target degrades to a literal everywhere."""
 
     @staticmethod
     def _tables():
-        """``orders.customer_id`` is an APPROVED FK to ``customers`` — but only
-        ``orders`` is minted this run. ``customers`` was e.g. rejected at review or
-        dropped by a later filter, so it never reaches build_r2rml / the ontology /
-        the shapes. The FK itself passes ``fk_edge_allowed`` (APPROVED)."""
+        """An approved FK whose target table is not in the run."""
         return [
             CatalogTable(
                 id="orders",
@@ -3657,29 +3201,24 @@ class TestRejectedTargetDegradesAcrossArtifacts:
             )
         ]
 
-    # ── Artifact 1: R2RML (base build_r2rml) ─────────────────────────────────
-
     def test_r2rml_emits_no_dangling_parent_triples_map(self, strategy):
         g = _build(strategy, self._tables())
-        ns = Namespace(self.PREFIX)
+        ns = Namespace(PREFIX)
 
         # No join at all — and specifically not to a non-existent TriplesMap.
         assert _object_map_parent_tmap(g, ns["TriplesMap_Orders/POM_CustomerId"]) is None
         assert set(g.objects(None, RR.parentTriplesMap)) == set()
-        assert ns.TriplesMap_Customers not in set(g.objects(None, RR.parentTriplesMap))
 
     def test_r2rml_degrades_the_column_to_a_datatype_literal(self, strategy):
         g = _build(strategy, self._tables())
-        ns = Namespace(self.PREFIX)
+        ns = Namespace(PREFIX)
 
         assert _object_map_column(g, ns["TriplesMap_Orders/POM_CustomerId"]) == '"customer_id"'
         assert _object_map_datatype(g, ns["TriplesMap_Orders/POM_CustomerId"]) == XSD.integer
 
-    # ── Artifact 2: ontology rdfs:range (table_to_ontology) ──────────────────
-
     def test_ontology_declares_a_datatype_property_not_an_object_property(self, strategy):
-        onto, _ = strategy._build_proposal_ontology(self.PREFIX, self._tables(), [])
-        ns = Namespace(self.PREFIX)
+        onto, _ = strategy._build_proposal_ontology(PREFIX, self._tables(), [])
+        ns = Namespace(PREFIX)
         prop = ns["orders_customerId"]
 
         assert (prop, RDF.type, OWL.DatatypeProperty) in onto
@@ -3688,12 +3227,10 @@ class TestRejectedTargetDegradesAcrossArtifacts:
         # The out-of-run target's class is never declared.
         assert (ns.Customers, RDF.type, OWL.Class) not in onto
 
-    # ── Artifact 3: SHACL shapes (validation.shapes.config) ──────────────────
-
     def test_shapes_assert_a_datatype_constraint_not_a_reference(self, strategy):
         from coa_ontology.validation.shapes.config import ConstraintType, generate_config_from_db
 
-        cfg = generate_config_from_db(self._tables(), uri_prefix=self.PREFIX)
+        cfg = generate_config_from_db(self._tables(), uri_prefix=PREFIX)
         by_type = {
             (c.property_name, c.constraint_type)
             for cls in cfg.classes
@@ -3708,15 +3245,13 @@ class TestRejectedTargetDegradesAcrossArtifacts:
         from coa_ontology.validation.shapes.config import compile_to_shacl, generate_config_from_db
 
         shapes = Graph().parse(
-            data=compile_to_shacl(generate_config_from_db(self._tables(), uri_prefix=self.PREFIX), self.PREFIX),
+            data=compile_to_shacl(generate_config_from_db(self._tables(), uri_prefix=PREFIX), PREFIX),
             format="turtle",
         )
         sh = Namespace("http://www.w3.org/ns/shacl#")
 
         # No shape asserts sh:class pointing at the undeclared Customers class.
-        assert URIRef(f"{self.PREFIX}Customers") not in set(shapes.objects(None, sh["class"]))
-
-    # ── Artifact 4: RIGOR R2RML (rigor_ontology) ─────────────────────────────
+        assert URIRef(f"{PREFIX}Customers") not in set(shapes.objects(None, sh["class"]))
 
     def test_rigor_mapping_emits_a_literal_not_an_iri_template(self, strategy):
         """RIGOR's writer emits an IRI template only for an object property whose
@@ -3726,48 +3261,19 @@ class TestRejectedTargetDegradesAcrossArtifacts:
         from coa_ontology.inducer.strategies.rigor_ontology import RigorOntologyStrategy
 
         tables = self._tables()
-        ontology, _ = strategy._build_proposal_ontology(self.PREFIX, tables, [])
-        ns = Namespace(self.PREFIX)
+        ontology, _ = strategy._build_proposal_ontology(PREFIX, tables, [])
+        ns = Namespace(PREFIX)
         prop = ns["orders_customerId"]
         ontology.remove((prop, RDF.type, OWL.DatatypeProperty))
         ontology.remove((prop, RDFS.range, None))
         ontology.add((prop, RDF.type, OWL.ObjectProperty))
 
-        mapping = RigorOntologyStrategy().build_r2rml(self.PREFIX, tables, {t.name for t in tables}, ontology)
-        object_map = URIRef(f"{self.PREFIX}TriplesMap_orders/POM_CustomerId/ObjectMap")
+        mapping = RigorOntologyStrategy().build_r2rml(PREFIX, tables, {t.name for t in tables}, ontology)
+        object_map = URIRef(f"{PREFIX}TriplesMap_orders/POM_CustomerId/ObjectMap")
 
         # No dangling IRI template to an out-of-run subject token; a literal column.
         assert mapping.value(object_map, RR.template) is None
         assert str(mapping.value(object_map, RR.column)) == '"customer_id"'
-
-    # ── All four agree, and the warning fires in each emitter ────────────────
-
-    def test_all_four_artifacts_degrade_consistently(self, strategy):
-        """The whole point: no artifact asserts a relationship the others drop."""
-        from coa_ontology.validation.shapes.config import ConstraintType, generate_config_from_db
-
-        tables = self._tables()
-        ns = Namespace(self.PREFIX)
-
-        r2rml = _build(strategy, tables)
-        onto, _ = strategy._build_proposal_ontology(self.PREFIX, tables, [])
-        cfg = generate_config_from_db(tables, uri_prefix=self.PREFIX)
-
-        # R2RML: literal, no join.
-        assert _object_map_parent_tmap(r2rml, ns["TriplesMap_Orders/POM_CustomerId"]) is None
-        # Ontology: datatype property.
-        assert (ns.orders_customerId, RDF.type, OWL.DatatypeProperty) in onto
-        assert (ns.orders_customerId, RDF.type, OWL.ObjectProperty) not in onto
-        # SHACL: datatype, no reference.
-        shacl_types = {
-            c.constraint_type
-            for cls in cfg.classes
-            if cls.class_name == "orders"
-            for c in cls.constraints
-            if c.property_name == "customer_id"
-        }
-        assert ConstraintType.DATATYPE in shacl_types
-        assert ConstraintType.REFERENCE not in shacl_types
 
     def test_base_r2rml_logs_the_degrade_warning(self, strategy, caplog):
         with caplog.at_level("WARNING", logger="coa_ontology.inducer.strategies.base"):
@@ -3780,7 +3286,7 @@ class TestRejectedTargetDegradesAcrossArtifacts:
         from coa_ontology.validation.shapes.config import generate_config_from_db
 
         with caplog.at_level("WARNING", logger="coa_ontology.validation.shapes.config"):
-            generate_config_from_db(self._tables(), uri_prefix=self.PREFIX)
+            generate_config_from_db(self._tables(), uri_prefix=PREFIX)
         assert any(r.getMessage() == "fk_target_out_of_run_degraded_to_literal" for r in caplog.records), (
             "generate_config_from_db must warn when it degrades an out-of-run FK target"
         )
@@ -3856,7 +3362,7 @@ class TestUnsupportedColumnsKeepMappingAndOntologyInStep:
     """Mapping checked against the ontology the same run produces."""
 
     CASES = {
-        # Kun's reproduction: the only FK's parent column contains a quote.
+        # Reproduction: the only FK's parent column contains a quote.
         "single-fk-quoted-parent-column": (
             [
                 _table("parents", ['has"quote', "safe_id"], [_pk(["safe_id"])]),

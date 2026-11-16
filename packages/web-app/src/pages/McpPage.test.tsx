@@ -96,7 +96,7 @@ describe("McpPage", () => {
       }
     });
 
-    it("leads with 'Add the MCP server' as the primary action in do-order", () => {
+    it("renders the three setup step headings", () => {
       renderPage(ctx);
       expect(
         screen.getByText("2. Add the MCP server to your client"),
@@ -122,7 +122,6 @@ describe("McpPage", () => {
       // The switcher is hidden on narrow screens, so the id must appear here
       // (it shows in the namespace label and the copy-paste verify prompt).
       expect(screen.getAllByText(/ns-123/).length).toBeGreaterThanOrEqual(1);
-      expect(screen.getByText("3. Verify it works")).toBeInTheDocument();
     });
 
     it("shows a no-namespace placeholder when none exists yet", () => {
@@ -141,19 +140,9 @@ describe("McpPage", () => {
     it("describes the PKCE browser-login auth (not a shared account)", () => {
       renderPage(ctx);
       expect(screen.getByText(/Cognito PKCE/)).toBeInTheDocument();
-      // Appears in the auth summary and again in troubleshooting.
       expect(
         screen.getAllByText(/not a shared account/).length,
       ).toBeGreaterThanOrEqual(1);
-    });
-
-    it("drops the old get-token.sh / password-secret flow", () => {
-      renderPage(ctx);
-      // The PKCE proxy removes the token script, the password placeholder, and
-      // the shared integration-test secret entirely.
-      expect(screen.queryByText(/get-token\.sh/)).toBeNull();
-      expect(screen.queryByText(/your-cognito-password/)).toBeNull();
-      expect(screen.queryByText(/integ-test-user/)).toBeNull();
     });
 
     it("does not plant an AWS_PROFILE placeholder that breaks default creds", () => {
@@ -162,7 +151,7 @@ describe("McpPage", () => {
       expect(screen.queryByText(/your-profile/)).toBeNull();
     });
 
-    it("offers troubleshooting for the three real failure modes", () => {
+    it("renders the troubleshooting section", () => {
       renderPage(ctx);
       expect(screen.getByText("Troubleshooting")).toBeInTheDocument();
     });

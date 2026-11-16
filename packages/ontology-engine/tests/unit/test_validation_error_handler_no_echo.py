@@ -93,11 +93,9 @@ def test_422_body_still_reports_field_and_reason():
 
 
 def test_custom_validator_msg_is_not_echoed():
-    """Regression: a ``@field_validator`` that interpolates the rejected
-    value into its ``ValueError`` used to leak that value through the
-    ``msg`` field, even after ``input`` was stripped. The handler now
-    replaces ``msg`` with a fixed string when ``type`` is ``value_error``
-    / ``assertion_error``.
+    """A ``@field_validator`` that interpolates the rejected value into its
+    ``ValueError`` must not leak it through ``msg``: the handler masks ``msg``
+    when ``type`` is ``value_error`` / ``assertion_error``.
 
     This test uses an XSS payload as the offending value so a regression is
     loud: if the handler ever stops masking custom-validator ``msg``s, the
@@ -134,7 +132,7 @@ def test_custom_validator_msg_is_not_echoed():
 
     payload = resp.json()
     for err in payload["detail"]:
-        # No ``input`` field (belt from Fix D's initial patch)
+        # No ``input`` field
         assert "input" not in err
         # And when the error came from a custom validator (value_error /
         # assertion_error), the ``msg`` must be an opaque replacement — not

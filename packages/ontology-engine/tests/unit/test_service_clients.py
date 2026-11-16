@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -15,7 +13,6 @@ from botocore.exceptions import ClientError
 from coa_ontology.inducer.services.embedding_generator import EmbeddingGeneratorClient
 from coa_ontology.inducer.services.grounding import _BEDROCK_MAX_POOL_CONNECTIONS
 from coa_ontology.inducer.services.llm import LLMClient
-from coa_ontology.inducer.services.neptune_client import NeptuneAnalyticsClient
 from coa_ontology.inducer.services.ontology_catalog import OntologyCatalogClient
 
 pytestmark = pytest.mark.unit
@@ -36,82 +33,6 @@ def _resp(payload: object, status_code: int = 200) -> MagicMock:
     r.status_code = status_code
     r.raise_for_status = MagicMock()
     return r
-
-
-# ── NeptuneAnalyticsClient ───────────────────────────────────────────
-
-
-class TestNeptuneAnalyticsClient:
-    def test_init_rejects_non_http_endpoint(self) -> None:
-        with pytest.raises(ValueError, match="Invalid Neptune endpoint"):
-            NeptuneAnalyticsClient(endpoint="ftp://bad/host")
-
-    def test_init_strips_trailing_slash(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200/")
-        assert c.endpoint == "http://host:9200"
-
-    def test_init_defaults_to_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("NEPTUNE_ANALYTICS_URL", "https://na-host:8182")
-        c = NeptuneAnalyticsClient()
-        assert c.endpoint == "https://na-host:8182"
-
-    def test_query_returns_results_from_urlopen(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        fake_resp = MagicMock()
-        fake_resp.read.return_value = json.dumps({"results": [{"n": 1}]}).encode()
-        fake_resp.__enter__ = MagicMock(return_value=fake_resp)
-        fake_resp.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=fake_resp):
-            out = c.query("MATCH (n) RETURN n", params={"x": 1})
-        assert out == [{"n": 1}]
-
-    def test_query_falls_back_to_curl_on_http_error(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        http_err = urllib.error.HTTPError("http://host", 413, "too big", {}, None)
-        curl_result = MagicMock()
-        curl_result.stdout = json.dumps({"results": [{"m": 2}]})
-        with (
-            patch("urllib.request.urlopen", side_effect=http_err),
-            patch("subprocess.run", return_value=curl_result) as mock_run,
-        ):
-            out = c.query("MATCH (n) RETURN n")
-        assert out == [{"m": 2}]
-        mock_run.assert_called_once()
-
-    def test_query_curl_returns_empty_on_bad_json(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        http_err = urllib.error.HTTPError("http://host", 413, "too big", {}, None)
-        curl_result = MagicMock()
-        curl_result.stdout = "not json"
-        with (
-            patch("urllib.request.urlopen", side_effect=http_err),
-            patch("subprocess.run", return_value=curl_result),
-        ):
-            assert c.query("MATCH (n) RETURN n") == []
-
-    def test_vector_upsert_returns_true_on_success(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        with patch.object(c, "query", return_value=[{"success": True}]) as mock_q:
-            assert c.vector_upsert("node-1", [0.1, 0.2]) is True
-        # node_id must be a bound parameter, not string-interpolated.
-        assert mock_q.call_args.kwargs["params"] == {"node_id": "node-1"}
-
-    def test_vector_upsert_returns_false_when_no_result(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        with patch.object(c, "query", return_value=[]):
-            assert c.vector_upsert("node-1", [0.1]) is False
-
-    def test_vector_search_returns_first_nonempty_proc(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        # First proc returns empty, second returns a hit.
-        with patch.object(c, "query", side_effect=[[], [{"nid": "x", "score": 0.9}]]):
-            out = c.vector_search("node-1", top_k=3)
-        assert out == [{"nid": "x", "score": 0.9}]
-
-    def test_vector_search_returns_empty_when_all_procs_empty(self) -> None:
-        c = NeptuneAnalyticsClient(endpoint="http://host:9200")
-        with patch.object(c, "query", return_value=[]):
-            assert c.vector_search("node-1") == []
 
 
 # ── LLMClient ────────────────────────────────────────────────────────

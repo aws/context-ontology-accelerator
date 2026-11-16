@@ -17,8 +17,8 @@ export interface DeleteNamespaceBlockers {
 /**
  * Mutation hook to delete a namespace.
  *
- * Returns 409 with blockers array if child resources still exist.
- * The onError callback receives a typed error with blockers info.
+ * Returns 409 with a blockers array if child resources still exist; onError
+ * receives the raw exception, so call parseBlockers on it.
  */
 export function useDeleteNamespace() {
   const client = useControlPlaneClient();

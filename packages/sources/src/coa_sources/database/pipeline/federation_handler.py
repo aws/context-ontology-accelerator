@@ -185,7 +185,6 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
     sm = boto3.client("secretsmanager", region_name=secret_region, config=async_boto_config())
 
     try:
-        # Fetch existing policy (if any)
         try:
             existing = sm.get_resource_policy(SecretId=secret_arn)
             policy = json.loads(existing.get("ResourcePolicy") or "{}")
@@ -200,7 +199,6 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
         except (json.JSONDecodeError, TypeError):
             policy = {}
 
-        # Build/merge the statement
         sid = "SCLRuntimeSecretRead"
         statements = policy.get("Statement", [])
         if not isinstance(statements, list):
@@ -240,11 +238,12 @@ def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
 
 
 def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
-    """Provision a managed Glue federated catalog for a JDBC source, then grant LF.
+    """Make a scanned source queryable, dispatching on its ``sourceSubType``.
 
     Input (from Step Functions): {datasourceId, sourceId, namespaceId, ...}.
-    Glue (S3/Iceberg) sources are skipped — they query natively via
-    AwsDataCatalog and need no provisioning.
+    JDBC sources get a managed Glue federated catalog plus LF grants; Glue,
+    connector-backed and graph sources take their own branches; an absent
+    sub-type is a no-op.
     """
     datasource_id = event["datasourceId"]
     source_id = event.get("sourceId") or datasource_id.removeprefix("DS#")
@@ -368,15 +367,8 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         return {"provisioned": False, "reason": "connector-backed", "queryable": True}
 
     if sub_type != SourceSubType.JDBC_DATABASE:
-        # An ABSENT sub-type is the benign case and must stay a no-op: a source
-        # deleted concurrently with its scan reads back as an empty dict, and a
-        # legacy row may predate the attribute. Turning either into a pipeline
-        # failure would convert a race into an alarm.
-        #
-        # A sub-type the enum RECOGNISES but this handler does not is different —
-        # it means a new DATABASE sub-type shipped without its branch here, and
-        # every source of that type would silently stay queryable=False, scanning
-        # cleanly and then answering nothing. That has to be loud.
+        # Absent stays a no-op; a recognised but unhandled sub-type raises (see
+        # _UNHANDLED_DATABASE_SUB_TYPES).
         if sub_type in _UNHANDLED_DATABASE_SUB_TYPES:
             raise RuntimeError(
                 f"No federation branch for sourceSubType {sub_type!r} ({datasource_id}); "

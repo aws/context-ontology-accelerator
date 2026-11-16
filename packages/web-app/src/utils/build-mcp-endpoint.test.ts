@@ -17,7 +17,6 @@ describe("buildMcpEndpoint", () => {
 
   it("URL-encodes the ARN so the colons/slashes are safe in the path", () => {
     const url = buildMcpEndpoint({ region: "us-east-1", mcpRuntimeArn: arn });
-    // The raw ARN's colons must not appear unencoded in the path segment.
     expect(url).toContain(encodeURIComponent(arn));
     expect(url).not.toContain(`/runtimes/${arn}/`);
   });

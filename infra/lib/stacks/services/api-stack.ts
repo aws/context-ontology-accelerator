@@ -66,7 +66,7 @@ export interface ApiStackProps extends cdk.StackProps {
   readonly authorizerSecurityGroup: ec2.ISecurityGroup;
 
   /**
-   * CORS allowed origin for the API (e.g. `https://d2xw5y8g9akfew.cloudfront.net`).
+   * CORS allowed origin for the API (e.g. `https://app.example.com`).
    * Defaults to `"*"` when no custom domain is configured (local dev).
    */
   readonly allowedOrigin: string;
@@ -165,13 +165,8 @@ export class ApiStack extends SCLStack {
       this,
       `${ssmPrefix}/userpool-client-id`,
     );
-    // The JWT claim name carrying group membership — "cognito:groups" for
-    // Cognito, or whatever the customer's external IdP uses (configured as
-    // oidcSettings.groupClaim, default "groups") for direct OIDC. Read from
-    // SSM rather than hardcoding DEFAULT_GROUP_CLAIM ("cognito:groups") here:
-    // that constant is wrong on the OIDC path and silently breaks all
-    // group-based role resolution (extract_groups_claim always returns []
-    // when the configured claim name doesn't match what the IdP sends).
+    // JWT group claim name: read from SSM because "cognito:groups" is wrong on
+    // the direct-OIDC path.
     const groupClaimName = ssm.StringParameter.valueForStringParameter(
       this,
       `${ssmPrefix}/authentication-group-token-name`,
@@ -298,11 +293,6 @@ export class ApiStack extends SCLStack {
       ),
     );
 
-    // Any message in the DLQ means an invalidation was dropped after 24h of
-    // retries — the authorizer's version counter never moved for that grant
-    // change, so a revoked role can stay cached (bounded only by the per-entry
-    // TTL, multiplied by warm containers). The DLQ exists to avoid silent
-    // loss; without this alarm operators would never know it filled.
     new cloudwatch.Alarm(this, "CacheInvalidationDlqAlarm", {
       alarmName: this.prefixed("cache-invalidation-dlq"),
       alarmDescription:
@@ -401,27 +391,12 @@ export class ApiStack extends SCLStack {
       pathLambdaMap[apiPath] = handler ?? stubFn.functionArn;
     }
 
-    // A spec path with no ssmPathHandlers entry silently becomes a 501 stub. That
-    // is the right behaviour for an operation with no backend yet, but it is also
-    // how a finished feature ships dead: POST .../sources/{sourceId}/stop had a
-    // handler, IAM grants, a UI button and unit tests, and still returned 501 in
-    // every environment because this map had no key for it. Nothing failed —
-    // there was nothing that could fail.
-    //
-    // So the set of stubbed paths is pinned (INTENTIONALLY_STUBBED, module-level
-    // above). Adding an operation to the Smithy model without wiring it now
-    // breaks synth, and the fix is either a handler entry or an explicit line
-    // there saying it is deliberately unimplemented.
-    //
-    // The mirror-image mistake — leaving a path in INTENTIONALLY_STUBBED after
-    // its backend actually lands — is just as silent: the guard below only
-    // checks *unwired* paths, so a wired-but-still-allowlisted path stops being
-    // covered by the "did I forget to remove this?" symptom entirely. Catch it
-    // here too: wiring a path that's still on the allowlist is itself the bug.
-    // Only meaningful when handler wiring was actually supplied. Both maps are
-    // optional props, and tests that construct this stack to assert on the
-    // authorizer or the WAF pass neither — for them every path stubs, which is
-    // correct, not a misconfiguration.
+    // A spec path with no ssmPathHandlers entry silently becomes a 501 stub. The set of
+    // stubbed paths is pinned (INTENTIONALLY_STUBBED, module-level above), so adding an
+    // operation to the Smithy model without wiring it breaks synth. Wiring a path that is
+    // still on the allowlist is itself an error. Checks only run when handler wiring was
+    // supplied: tests that construct this stack to assert on the authorizer or the WAF
+    // pass neither map, and for them every path stubs.
     const wiringSupplied =
       Object.keys(props.ssmPathHandlers ?? {}).length > 0 ||
       Object.keys(props.pathHandlers ?? {}).length > 0;
@@ -447,23 +422,12 @@ export class ApiStack extends SCLStack {
       region: this.region,
     });
 
-    // ── GET /health ────────────────────────────────────────────────
-    // Answered by API Gateway itself, not a Lambda. HealthCheck is
-    // @optionalAuth in the Smithy model and the sole entry in
-    // ``unsecuredPaths`` below, i.e. an unauthenticated probe for a
-    // load balancer or an uptime check. A mock integration is the right
-    // shape for that: no cold start, no VPC hop, and nothing that can
-    // fail independently of the gateway being up.
-    //
-    // Deliberately not ``/system-health``'s per-backend detail — the
-    // Smithy output is a bare ``status``, and an unauthenticated caller
-    // should not learn which of Neptune/AOSS/DynamoDB is degraded.
-    // Callers wanting that use the authenticated ``GET /system-health``.
-    //
-    // This runs after injectLambdaProxyIntegrations so it replaces the
-    // aws_proxy integration that loop installed (the 501 stub, absent a
-    // handler entry). It must also run before fillAuthorizerParameters,
-    // which is what strips ``security`` from the operation.
+    // GET /health: answered by API Gateway itself (mock integration). HealthCheck is
+    // @optionalAuth in the Smithy model and the sole entry in ``unsecuredPaths`` below.
+    // It returns a bare ``status``: an unauthenticated caller should not learn which
+    // backend is degraded; callers wanting that use the authenticated ``GET /system-health``.
+    // Must run after injectLambdaProxyIntegrations (it replaces the aws_proxy integration
+    // that loop installed) and before fillAuthorizerParameters (which strips ``security``).
     const healthGet = spec.paths?.["/health"]?.get;
     if (!healthGet) {
       throw new Error(
@@ -589,7 +553,7 @@ export class ApiStack extends SCLStack {
         // authorizer-resolved caller. This API uses a custom Lambda
         // authorizer, so $context.identity.caller/user are always "-"; the
         // real caller is $context.authorizer.principalId (the validated
-        // token's email, set by the authorizer's _build_policy). (V2298834436)
+        // token's email, set by the authorizer's _build_policy).
         accessLogFormat: apigw.AccessLogFormat.custom(
           JSON.stringify({
             requestId: apigw.AccessLogField.contextRequestId(),

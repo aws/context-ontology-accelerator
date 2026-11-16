@@ -12,16 +12,6 @@ schema, and ``search_metrics`` result shaping). The AOSS client, SigV4 auth,
 transient-fault retry, and the canonical index mapping live in the shared
 library (see its package docstring).
 
-Document schema (a subset of the shared canonical mapping):
-  - entity_uri: the metric's IRI (urn:coa:{ns}:metric:{name})
-  - ontology_id: GOVERNED_METRICS_ONTOLOGY_ID
-  - entity_type: "metric"
-  - embedding_type: "lexical"
-  - model_id: Bedrock model ID
-  - namespace: namespace name
-  - text: embedding source text
-  - embedding: 1024-d float vector
-
 Embedding generation via Bedrock Cohere Embed v4 (DEFAULT_EMBED_MODEL_ID).
 """
 
@@ -44,8 +34,6 @@ from coa_metrics.neptune_client import MetricDefinition, _metric_uri
 
 logger = structlog.get_logger(__name__)
 
-# ── Configuration ───────────────────────────────────────────────────────
-
 OSS_ENDPOINT = os.getenv("OPENSEARCH_ENDPOINT", "")
 OSS_REGION = os.getenv("AWS_REGION", "us-east-1")
 OSS_INDEX_PREFIX = os.getenv("OSS_INDEX_PREFIX", "ontology-workbench-embeddings")
@@ -56,9 +44,6 @@ BEDROCK_MODEL_ID = os.getenv("BEDROCK_EMBED_MODEL_ID", os.getenv("BEDROCK_MODEL_
 BEDROCK_REGION = os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "us-east-1"))
 
 
-# ── Bedrock embedding ───────────────────────────────────────────────────
-
-
 def _make_embedder() -> BedrockEmbedder:
     """Shared embedder — same model/dimensions as ontology + serve."""
     return BedrockEmbedder(model_id=BEDROCK_MODEL_ID, dimensions=OSS_DIMENSIONS, region=BEDROCK_REGION)
@@ -67,9 +52,6 @@ def _make_embedder() -> BedrockEmbedder:
 def _generate_embedding(text: str, embedder: BedrockEmbedder | None = None) -> list[float]:
     """Generate a metric embedding. Metric text is indexable content → document."""
     return (embedder or _make_embedder()).embed_document(text)
-
-
-# ── Embedding text construction ─────────────────────────────────────────
 
 
 def _build_embedding_text(metric: MetricDefinition) -> str:
@@ -83,9 +65,6 @@ def _build_embedding_text(metric: MetricDefinition) -> str:
         if metric.ai_context.examples:
             parts.append(" ".join(metric.ai_context.examples))
     return " ".join(parts)
-
-
-# ── MetricOpenSearchClient ──────────────────────────────────────────────
 
 
 class MetricOpenSearchClient:
@@ -128,10 +107,9 @@ class MetricOpenSearchClient:
         entity_uri = _metric_uri(namespace, metric.name)
         index = self._aoss().ensure_index(self._index_name(namespace))
 
-        # Delete existing docs for this entity_uri (AOSS idempotent upsert).
+        # AOSS idempotent upsert: delete existing docs first.
         self._delete_by_entity_uri(index, entity_uri)
 
-        # Index with the shared canonical schema (entity_type="metric").
         self._aoss().index_document(
             index,
             {

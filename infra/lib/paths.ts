@@ -75,16 +75,8 @@ export const Paths = {
   /** libs/common — shared Python library. */
   commonLib: fromRoot("libs/common/src"),
 
-  /** packages/sources/src/coa_sources/api — unified sources API Lambda source. */
-  sourcesApi: fromRoot("packages/sources/src/coa_sources/api"),
-
   /** packages/sources/database/trigger — database scan trigger Lambda source. */
   sourcesDatabaseTrigger: fromRoot("packages/sources/database/trigger"),
-
-  /** packages/sources/database/bulk_review_worker — bulk approve/reject worker Lambda source. */
-  sourcesBulkReviewWorker: fromRoot(
-    "packages/sources/database/bulk_review_worker",
-  ),
 
   /** packages/sources/src/coa_sources/documents/deletion — document deletion cleanup Lambda source. */
   sourcesDocumentsDeletion: fromRoot(

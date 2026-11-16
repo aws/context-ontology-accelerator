@@ -18,7 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 
-import coa_sources.database.secret_binding as _sb  # noqa: E402
+import coa_sources.database.secret_binding as _sb
 
 _ACCOUNT = "111122223333"
 _NS = "550e8400-e29b-41d4-a716-446655440000"

@@ -5,12 +5,11 @@ import * as cdk from "aws-cdk-lib";
 import { resolveLambdaReservedConcurrency } from "../../lib/context";
 import { DEFAULT_LAMBDA_RESERVED_CONCURRENCY } from "../../lib/constants";
 
-/** Build a construct Node carrying the given CDK context. */
 function nodeWith(context: Record<string, unknown>): cdk.App {
   return new cdk.App({ context });
 }
 
-describe("resolveLambdaReservedConcurrency (#48)", () => {
+describe("resolveLambdaReservedConcurrency", () => {
   test("defaults to DEFAULT_LAMBDA_RESERVED_CONCURRENCY when unset", () => {
     expect(resolveLambdaReservedConcurrency(nodeWith({}).node)).toBe(
       DEFAULT_LAMBDA_RESERVED_CONCURRENCY,

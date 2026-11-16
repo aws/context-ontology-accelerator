@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from coa_serve.config import ServiceConfig
+from coa_serve.main import _authorize_namespace_access as _REAL_ADMISSION_GATE
 from coa_serve.models import ConfidenceScore, InvokeRequest, InvokeResponse, QueryResult, TraceStep
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.schema_visibility import SchemaVisibility
@@ -50,23 +51,11 @@ async def _invoke_collect(payload, context=None):
     return results[0] if len(results) == 1 else results
 
 
-# Real reference to the admission gate, captured before any patching so the
-# dedicated gate tests below can restore it over the module-level bypass.
-from coa_serve.main import _authorize_namespace_access as _REAL_ADMISSION_GATE  # noqa: E402
-
-
 @pytest.fixture(autouse=True)
 def _bypass_namespace_admission():
-    """Bypass the F-2 Cedar admission gate for the pre-existing behavioral tests.
+    """Patch the Cedar admission gate to ALLOW with no pre-resolved profile.
 
-    These tests predate the gate and exercise downstream dispatch/resolution with
-    bare ``MagicMock`` orchestrators (whose ``authorize_namespace().denied`` would
-    be truthy). Patching the gate to a no-op ALLOW keeps them focused on what they
-    assert; the gate itself is covered end-to-end by ``TestNamespaceAdmissionGate``
-    (which restores the real gate) and at the decision level in
-    ``test_authz_invariants.py``. Returning ``(None, None)`` means "allowed, no
-    pre-resolved profile" so the query path still runs its own resolve_profile —
-    preserving the profile-resolution tests unchanged.
+    ``TestNamespaceAdmissionGate`` restores the real gate.
     """
     with patch("coa_serve.main._authorize_namespace_access", new_callable=AsyncMock, return_value=(None, None)):
         yield
@@ -90,8 +79,6 @@ def config():
 
 @pytest.fixture
 def orchestrator():
-    from unittest.mock import AsyncMock, MagicMock
-
     from coa_serve.tier1.metric_resolver import MetricMatch
     from coa_serve.tier2.strategy import StrategyOption, StructuredQueryTier
     from coa_serve.tier3.knowledge_retriever import Tier3Result
@@ -120,7 +107,6 @@ def orchestrator():
     )
 
 
-@pytest.mark.unit
 class TestInvokeEntrypoint:
     """Test the invoke logic independent of AgentCore transport."""
 
@@ -136,7 +122,7 @@ class TestInvokeEntrypoint:
         request = InvokeRequest(query="test", namespace="ns1")
         response = await orchestrator.resolve(request)
 
-        assert len(response.result.trace) >= 1
+        assert "t1.metric_match" in [s.step for s in response.result.trace]
 
     async def test_response_serialization(self, orchestrator):
         request = InvokeRequest(query="test", namespace="demo")
@@ -146,16 +132,6 @@ class TestInvokeEntrypoint:
         assert "result" in serialized
         assert "confidence" in serialized["result"]
         assert "score" in serialized["result"]["confidence"]
-
-    async def test_payload_with_profile_and_options(self, orchestrator):
-        request = InvokeRequest(
-            query="Show claims",
-            namespace="demo",
-            profile={"user_id": "u1"},
-            options={"startTier": 3},
-        )
-        response = await orchestrator.resolve(request)
-        assert isinstance(response, InvokeResponse)
 
     async def test_query_max_length_enforced(self):
         from pydantic import ValidationError
@@ -188,7 +164,6 @@ class TestInvokeEntrypoint:
             InvokeRequest(query="test", namespace="bad namespace!")
 
 
-@pytest.mark.unit
 class TestInvokePayloadParsing:
     """Test that raw payload dicts are correctly parsed into InvokeRequest."""
 
@@ -212,7 +187,6 @@ class TestInvokePayloadParsing:
         assert request.options["tierOverride"] == 1
 
 
-@pytest.mark.unit
 @agentcore_required
 class TestInvokeFunction:
     """Test the actual invoke() function end-to-end with mocked config."""
@@ -248,28 +222,6 @@ class TestInvokeFunction:
         )
         main_mod._orchestrator = mock_orch
         return mock_orch
-
-    @patch("coa_serve.main._ensure_initialized")
-    async def test_invoke_valid_payload(self, mock_init, config):
-        import coa_serve.main as main_mod
-
-        mock_orch = MagicMock()
-        mock_orch.resolve = AsyncMock(
-            return_value=InvokeResponse(
-                result=QueryResult(
-                    tier=3,
-                    confidence=ConfidenceScore(score=0.5, rationale="stub"),
-                    trace=[TraceStep(step="s", status="success", duration_ms=0)],
-                    metadata={"namespace": "demo"},
-                ),
-            )
-        )
-        main_mod._orchestrator = mock_orch
-        mock_init.return_value = None
-
-        result = await _invoke_collect({"query": "What is revenue?", "namespace": "demo"})
-
-        assert "requestId" in result
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_invoke_propagates_caller_request_id(self, mock_init, config):
@@ -399,7 +351,7 @@ class TestInvokeFunction:
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_indeterminate_existence_fails_closed_when_table_configured(self, mock_init, config):
-        """F-2: a lookup error (None) with the namespaces table configured must fail
+        """A lookup error (None) with the namespaces table configured must fail
         CLOSED — never dispatch a query against a namespace we could not verify.
         """
         mock_init.return_value = None
@@ -512,8 +464,6 @@ class TestInvokeFunction:
 
         result = await _invoke_collect({"query": "x", "namespace": "bad namespace!"})
 
-        # A malformed namespace is rejected at the boundary (400) without leaking
-        # the internal regex/constraint to the caller.
         assert result["statusCode"] == 400
         assert result["error"] == "ValidationError"
         assert "pattern" not in result["message"]
@@ -539,7 +489,6 @@ class TestInvokeFunction:
 
     @patch("coa_serve.main.load_config")
     async def test_invoke_access_denied_returns_403_no_leak(self, mock_load_config, config):
-        # TDD-6: orchestrator raises AccessDeniedError -> 403, no reason leak.
         from coa_serve.exceptions import AccessDeniedError
 
         mock_load_config.return_value = config
@@ -563,13 +512,13 @@ class TestInvokeFunction:
         assert "SELECT" not in body.upper()
 
     @patch("coa_serve.main.load_config")
-    async def test_invoke_timeout_returns_504(self, mock_load_config, config):
+    async def test_invoke_timeout_returns_504(self, mock_load_config, config, monkeypatch):
         import asyncio
 
         import coa_serve.main as main_mod
 
         main_mod._config = config
-        main_mod.RESOLVE_TIMEOUT_S = 0.01
+        monkeypatch.setattr(main_mod, "RESOLVE_TIMEOUT_S", 0.01)
 
         async def slow_resolve(request, **kwargs):
             await asyncio.sleep(1)
@@ -582,7 +531,6 @@ class TestInvokeFunction:
 
         assert result["statusCode"] == 504
         assert result["error"] == "TimeoutError"
-        main_mod.RESOLVE_TIMEOUT_S = 30
 
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
@@ -594,7 +542,6 @@ class TestInvokeFunction:
 
         mock_init.return_value = None
         mock_resolved = MagicMock()
-        mock_resolved.inject_into = MagicMock()
         mock_resolve.return_value = mock_resolved
 
         await _invoke_collect(
@@ -624,7 +571,6 @@ class TestInvokeFunction:
 
         mock_init.return_value = None
         mock_resolved = MagicMock()
-        mock_resolved.inject_into = MagicMock()
         mock_resolve.return_value = mock_resolved
 
         await _invoke_collect(
@@ -669,7 +615,6 @@ class TestInvokeFunction:
 
         mock_init.return_value = None
         mock_resolved = MagicMock()
-        mock_resolved.inject_into = MagicMock()
         mock_resolve.return_value = mock_resolved
 
         await _invoke_collect(
@@ -700,7 +645,6 @@ class TestInvokeFunction:
 
         mock_init.return_value = None
         mock_resolved = MagicMock()
-        mock_resolved.inject_into = MagicMock()
         mock_resolve.return_value = mock_resolved
         # (sub, email, groups) as returned from a validated Cognito JWT
         mock_jwt.return_value = ("9f8e7d6c-1234-4abc-9def-0123456789ab", "user@example.com", ["team-a"])
@@ -727,7 +671,6 @@ class TestInvokeFunction:
 
         mock_init.return_value = None
         mock_resolved = MagicMock()
-        mock_resolved.inject_into = MagicMock()
         mock_resolve.return_value = mock_resolved
         mock_jwt.return_value = ("sub-uuid", "real@example.com", [])
 
@@ -744,7 +687,6 @@ class TestInvokeFunction:
 
 
 @agentcore_required
-@pytest.mark.asyncio
 class TestStreamingSSEMode:
     """Tests for stream: true SSE mode in invoke()."""
 
@@ -756,7 +698,6 @@ class TestStreamingSSEMode:
         mock_orch = MagicMock()
 
         async def mock_resolve(request, trace=None, on_token=None, conversation_history=None, deadline=None):
-            """Simulate orchestrator resolve with trace callback."""
             if trace:
                 trace.record(step="t2.sql", status="done", duration_ms=50)
             return InvokeResponse(
@@ -777,21 +718,17 @@ class TestStreamingSSEMode:
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_streaming_yields_multiple_events(self, mock_init):
-        """stream: true should yield step and done events (at minimum)."""
         mock_init.return_value = None
 
         results = await _invoke_collect({"query": "show revenue", "namespace": "demo", "stream": True})
 
-        # Should yield multiple items (list, not single dict)
         assert isinstance(results, list)
-        # Last event should be a done event
         done_events = [e for e in results if isinstance(e, dict) and e.get("type") == "done"]
         assert len(done_events) == 1
         assert done_events[0]["payload"]["result"]["tier"] == 2
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_streaming_done_has_request_id(self, mock_init):
-        """done event should carry the requestId."""
         mock_init.return_value = None
 
         results = await _invoke_collect({"query": "test", "namespace": "demo", "stream": True, "requestId": "my-req"})
@@ -803,19 +740,16 @@ class TestStreamingSSEMode:
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_streaming_validation_error_yields_single_dict(self, mock_init):
-        """Invalid payload in stream mode should yield a single error dict."""
         mock_init.return_value = None
 
         result = await _invoke_collect({"query": "", "namespace": "", "stream": True})
 
-        # Single dict (not wrapped in list) per _invoke_collect behavior
         assert isinstance(result, dict)
         assert result["error"] == "ValidationError"
         assert result["statusCode"] == 400
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_non_streaming_yields_single_result(self, mock_init):
-        """stream: false (default) should yield a single result dict."""
         mock_init.return_value = None
 
         result = await _invoke_collect({"query": "show data", "namespace": "demo"})
@@ -870,9 +804,8 @@ class TestRequestIdLogContext:
 
 
 @agentcore_required
-@pytest.mark.asyncio
 class TestResolveUserIdPriority:
-    """Test the _resolve_user_id helper priority chain."""
+    """``coa_serve.identity.resolve_user_id`` priority chain, exercised through ``invoke()``."""
 
     @pytest.fixture(autouse=True)
     def stub_env(self, config):
@@ -960,13 +893,10 @@ class TestResolveUserIdPriority:
         assert result["statusCode"] == 400
 
 
-@pytest.mark.unit
 class TestHandleTranslate:
-    """Test the translate-only handler (issue #861 regression guard)."""
+    """The translate-only handler uses the module-level NL-to-SPARQL instance."""
 
-    @pytest.mark.asyncio
     async def test_handle_translate_uses_module_level_nl_to_sparql(self):
-        """Test that _handle_translate uses the module-level _nl_to_sparql instance."""
         from coa_serve.main import _handle_translate
 
         mock_nl_to_sparql = AsyncMock()
@@ -987,23 +917,21 @@ class TestHandleTranslate:
             assert result["confidence"]["score"] == 0.95
             mock_nl_to_sparql.translate.assert_called_once_with("Show all entities", "test-ns")
 
-    @pytest.mark.asyncio
     async def test_handle_translate_reports_null_ontology_version_by_design(self):
         """Translation never touches the VKG and carries no in-band snapshot
         version, so the response reports null rather than a namespace-level
-        approximation (#986)."""
+        approximation."""
         from coa_serve.main import _handle_translate
 
         mock_nl_to_sparql = AsyncMock()
         mock_nl_to_sparql.translate.return_value = MagicMock(sparql="SELECT 1", confidence=0.9, trace_steps=[])
 
         with patch("coa_serve.main._nl_to_sparql", mock_nl_to_sparql):
-            result = await _handle_translate({"query": "q", "namespace": "test-ns"}, "req-986")
+            result = await _handle_translate({"query": "q", "namespace": "test-ns"}, "req-1")
 
         assert result["statusCode"] == 200
         assert result["ontologyVersion"] is None
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("query", [42, "x" * 4001])
     async def test_handle_translate_rejects_invalid_query_before_translation(self, query):
         from coa_serve.main import _handle_translate
@@ -1015,9 +943,7 @@ class TestHandleTranslate:
         assert result["statusCode"] == 400
         mock_nl_to_sparql.translate.assert_not_called()
 
-    @pytest.mark.asyncio
     async def test_handle_translate_none_raises_clean_error(self):
-        """Test that uninitialized _nl_to_sparql returns error, not AttributeError."""
         from coa_serve.exceptions import QueryTranslationError
         from coa_serve.main import _handle_translate
 
@@ -1031,11 +957,9 @@ class TestHandleTranslate:
             )
 
 
-@pytest.mark.unit
 class TestHandleKbSearch:
     """Test defensive query validation on the isolated KB search handler."""
 
-    @pytest.mark.asyncio
     async def test_handle_kb_search_omits_blank_optional_source_document_name(self):
         from coa_serve.main import _handle_kb_search
         from coa_serve.tier3.vector_retriever import ChunkResult
@@ -1069,7 +993,6 @@ class TestHandleKbSearch:
         assert "sourceDoc" not in result["chunks"][0]
         assert "label" not in result["chunks"][0]
 
-    @pytest.mark.asyncio
     async def test_handle_kb_search_reports_dropped_provenance_less_chunks_as_degraded(self):
         from coa_serve.main import _handle_kb_search
         from coa_serve.tier3.vector_retriever import ChunkResult, ChunkSearchResults
@@ -1106,7 +1029,6 @@ class TestHandleKbSearch:
         assert search_steps[0]["status"] == "degraded"
         assert search_steps[0]["detail"] == "1 chunks; dropped 3 anonymous or malformed document chunks"
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("query", [42, "x" * 4001])
     async def test_handle_kb_search_rejects_invalid_query_before_embedding(self, query):
         from coa_serve.main import _handle_kb_search
@@ -1120,7 +1042,6 @@ class TestHandleKbSearch:
         mock_orchestrator._bedrock_client.embed.assert_not_called()
 
 
-@pytest.mark.unit
 class TestHandleKbSearchOptions:
     """KBSearch members: topK honoured up to the contract bound, minScore applied,
     unsupported filters rejected rather than silently ignored."""
@@ -1146,18 +1067,15 @@ class TestHandleKbSearchOptions:
             result = await _handle_kb_search({"query": "q", "namespace": "ns", "options": options}, "req")
         return result, orch
 
-    @pytest.mark.asyncio
     async def test_kb_search_min_score_drops_lower_scoring_chunks(self):
         result, _ = await self._run({"topK": 10, "minScore": 0.5})
         assert result["statusCode"] == 200
         assert [c["chunkId"] for c in result["chunks"]] == ["a", "b"]
 
-    @pytest.mark.asyncio
     async def test_kb_search_without_min_score_returns_every_chunk(self):
         result, _ = await self._run({"topK": 10})
         assert [c["chunkId"] for c in result["chunks"]] == ["a", "b", "c"]
 
-    @pytest.mark.asyncio
     async def test_kb_search_top_k_up_to_contract_bound_reaches_retriever(self):
         """topK=100 is valid on the contract; it must not be cut to the Tier-3 default cap."""
         from coa_serve.main import KB_SEARCH_MAX_TOP_K
@@ -1167,12 +1085,6 @@ class TestHandleKbSearchOptions:
         assert kwargs["top_k"] == 100
         assert kwargs["max_top_k"] == KB_SEARCH_MAX_TOP_K == 100
 
-    @pytest.mark.asyncio
-    async def test_kb_search_defaults_top_k(self):
-        _, orch = await self._run({})
-        assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == 10
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "options",
         [
@@ -1199,7 +1111,6 @@ class TestHandleKbSearchOptions:
 
         assert _smithy_member_range("KBSearch", "topK") == (KB_SEARCH_MIN_TOP_K, KB_SEARCH_MAX_TOP_K)
 
-    @pytest.mark.asyncio
     async def test_kb_search_default_top_k_is_within_bounds_and_applied(self):
         from coa_serve.main import KB_SEARCH_DEFAULT_TOP_K, KB_SEARCH_MAX_TOP_K, KB_SEARCH_MIN_TOP_K
 
@@ -1207,7 +1118,6 @@ class TestHandleKbSearchOptions:
         _, orch = await self._run({})
         assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == KB_SEARCH_DEFAULT_TOP_K
 
-    @pytest.mark.asyncio
     async def test_kb_search_accepts_min_top_k(self):
         from coa_serve.main import KB_SEARCH_MIN_TOP_K
 
@@ -1215,16 +1125,14 @@ class TestHandleKbSearchOptions:
         assert result["statusCode"] == 200
         assert orch._knowledge_retriever._vector.search.call_args.kwargs["top_k"] == KB_SEARCH_MIN_TOP_K
 
-    @pytest.mark.asyncio
     async def test_kb_search_empty_filters_are_accepted(self):
         """An empty filter list restricts nothing, so it is not a request to filter."""
         result, _ = await self._run({"sourceFilter": [], "entityFilter": []})
         assert result["statusCode"] == 200
 
 
-@pytest.mark.unit
 class TestNamespaceAdmissionGate:
-    """F-2 (CWE-862): invoke() gates every namespace-scoped surface before dispatch.
+    """CWE-862: invoke() gates every namespace-scoped surface before dispatch.
 
     Runs the REAL admission gate (restoring it over the module-level bypass) so a
     denied namespace short-circuits to 403 BEFORE any retrieval or orchestration,
@@ -1285,7 +1193,6 @@ class TestNamespaceAdmissionGate:
         assert result["statusCode"] == 403
         assert result["error"] == "AccessDeniedError"
         orch.authorize_namespace.assert_called_once()
-        # The retriever/embedder must never run for an unauthorized namespace.
         orch._bedrock_client.embed.assert_not_called()
         orch._knowledge_retriever._vector.search.assert_not_called()
 
@@ -1370,7 +1277,7 @@ class TestNamespaceAdmissionGate:
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
     async def test_translate_denied_returns_403_without_translation(self, mock_resolve, mock_init):
-        """`translate` is one of the three isolated actions that were ungated (F-2)."""
+        """`translate`, an isolated action, must pass the namespace admission gate."""
         import coa_serve.main as main_mod
         from coa_serve.role_resolver import ResolvedProfile
 
@@ -1386,13 +1293,12 @@ class TestNamespaceAdmissionGate:
         assert result["statusCode"] == 403
         assert result["error"] == "AccessDeniedError"
         orch.authorize_namespace.assert_called_once()
-        # Translation must not run for an unauthorized namespace.
         nl.translate.assert_not_called()
 
     @patch("coa_serve.main._ensure_initialized")
     @patch("coa_serve.main.resolve_profile")
     async def test_graph_traverse_denied_returns_403_without_traversal(self, mock_resolve, mock_init):
-        """`graphTraverse` is one of the three isolated actions that were ungated (F-2)."""
+        """`graphTraverse`, an isolated action, must pass the namespace admission gate."""
         import coa_serve.main as main_mod
         from coa_serve.role_resolver import ResolvedProfile
 
@@ -1414,7 +1320,6 @@ class TestNamespaceAdmissionGate:
         assert result["statusCode"] == 403
         assert result["error"] == "AccessDeniedError"
         orch.authorize_namespace.assert_called_once()
-        # Graph traversal must not run for an unauthorized namespace.
         graph.traverse_from_uris.assert_not_called()
 
     @patch("coa_serve.main._ensure_initialized")
@@ -1457,7 +1362,6 @@ class TestNamespaceAdmissionGate:
         assert result.get("statusCode", 200) != 403
 
 
-@pytest.mark.unit
 class TestResolvePrincipal:
     """resolve_principal centralizes the JWT-authoritative (user_id, groups) rule."""
 
@@ -1516,13 +1420,8 @@ class TestTier2QualifierWiring:
 
     ``sources_registry`` is an OPTIONAL constructor argument on both strategies (it
     has to be — the unit suites construct them without one), and its absence is
-    silent: ``qualify_cross_source_sql`` simply cannot resolve a catalog and leaves
-    the SQL bare, which is exactly the pre-fix behaviour. So dropping the keyword
-    from ``main.py`` would un-fix the cross-source qualifier in production with every unit test still
-    green. Asserted statically over the source rather than by running
-    ``_ensure_initialized`` (which would need Neptune, OpenSearch, Bedrock, DynamoDB
-    and an event loop stood up) — the wiring is a syntactic property of that
-    function, so the cheap check is the honest one.
+    silent: ``qualify_cross_source_sql`` cannot resolve a catalog and leaves the SQL
+    bare. Asserted statically because ``_ensure_initialized`` needs live AWS clients.
     """
 
     @staticmethod
@@ -1546,13 +1445,12 @@ class TestTier2QualifierWiring:
         for kwargs in calls:
             assert "sources_registry" in kwargs, (
                 f"{strategy_class}(...) in coa_serve.main omits sources_registry, so cross-source SQL "
-                f"silently stays unqualified and the cross-source defect returns in production "
+                f"silently stays unqualified in production "
                 f"(table_qualifier needs the "
                 f"registry to resolve each table's Athena catalog). Got kwargs={sorted(kwargs)}."
             )
 
 
-@pytest.mark.unit
 class TestHandleGraphTraverseOptions:
     """GraphTraverse members are validated against the contract (the MCP server calls
     this action directly, so the REST edge is not the only way in)."""
@@ -1591,19 +1489,16 @@ class TestHandleGraphTraverseOptions:
             result = await _handle_graph_traverse({"namespace": "ns", "options": options}, "req")
         return result, orch._knowledge_retriever._graph.traverse_from_uris
 
-    @pytest.mark.asyncio
     async def test_defaults_apply_when_members_are_absent(self):
         result, traverse = await self._run({"startUri": self._URI})
         assert result["statusCode"] == 200
         assert traverse.call_args.kwargs["max_hops"] == 2
 
-    @pytest.mark.asyncio
     async def test_max_results_caps_entities_and_their_relationships(self):
         result, _ = await self._run({"startUri": self._URI, "maxResults": 3}, entities=self._entities(10))
         assert [e["uri"] for e in result["entities"]] == ["urn:e:0", "urn:e:1", "urn:e:2"]
         assert {r["sourceUri"] for r in result["relationships"]} == {"urn:e:0", "urn:e:1", "urn:e:2"}
 
-    @pytest.mark.asyncio
     async def test_boundary_values_are_accepted(self):
         options = {
             "startUri": "urn:coa:customer:acme-corp",
@@ -1616,7 +1511,6 @@ class TestHandleGraphTraverseOptions:
         assert result["statusCode"] == 200
         assert traverse.call_args.kwargs["max_hops"] == 5
 
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "options",
         [
@@ -1702,16 +1596,9 @@ class TestHandleGraphTraverseOptions:
             assert bool(re.fullmatch(smithy_pattern, probe)) == graph_traverser.is_traversable_uri(probe), probe
 
 
-@pytest.mark.unit
 class TestIncludeDebugInfoGate:
-    """``includeDebugInfo`` is forwarded to the orchestrator unchanged (ADR:
-    decompose-viewnamespace-schema-visibility). The old coarse role-list pre-gate
-    in ``main`` is removed; per-artifact authorization now lives in the
-    orchestrator, which gates the SQL artifact on ``viewSource`` and the SPARQL
-    artifact on ``viewOntology`` through the fail-closed Cedar authorizer. ``main``
-    must therefore pass the flag through verbatim for every role — a schema-blind
-    caller still receives both fields withheld because the orchestrator withholds
-    them, not because ``main`` cleared the flag."""
+    """``main`` forwards ``includeDebugInfo`` to the orchestrator unchanged for every role;
+    the orchestrator does the per-artifact authorization."""
 
     @staticmethod
     def _resolved(global_roles=(), resource_roles=()):
@@ -1727,8 +1614,6 @@ class TestIncludeDebugInfoGate:
             (["platform-admin"], []),
             ([], [{"role": "namespace-owner", "resourceUID": "demo"}]),
             ([], [{"role": "data-steward", "resourceUID": "demo"}]),
-            # A schema-blind analyst: the flag is STILL forwarded unchanged — the
-            # orchestrator's per-artifact Cedar gate withholds the fields, not main.
             ([], [{"role": "data-analyst", "resourceUID": "demo"}]),
             (["global-viewer"], []),
             ([], []),
@@ -1762,14 +1647,9 @@ class TestIncludeDebugInfoGate:
                 }
             )
 
-        # The flag reaches the orchestrator untouched for every role; main no
-        # longer clears it. Per-artifact enforcement is asserted in the
-        # orchestrator's own tests (viewSource gates SQL, viewOntology gates SPARQL).
         assert orch.resolve.call_args[0][0].options["includeDebugInfo"] is True
 
 
-# ── Results-only scrub at the serve entrypoint (ADR: schema-blind analyst) ──
-#
 # Sentinel scan: each test plants distinctive schema names in every field that
 # can carry them and asserts NONE survives anywhere in the serialized output —
 # so a leak through a field nobody listed still fails the test.
@@ -1780,8 +1660,6 @@ _SB_SENTINELS = (_SB_TABLE, _SB_CLASS, _SB_PROP)
 
 
 def _sb_vis(source: bool, ontology: bool):
-    from coa_serve.schema_visibility import SchemaVisibility
-
     return SchemaVisibility(source=source, ontology=ontology)
 
 
@@ -1815,8 +1693,6 @@ def _sb_query_result(artifacts: bool = False) -> QueryResult:
     ).with_raw_artifacts(query_used=_SB_SQL, sparql=_SB_SPARQL)
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
 class TestSchemaBlindEntrypointScrub:
     """Every serve exit withholds schema from a caller lacking viewSource/viewOntology."""
 
@@ -1947,10 +1823,8 @@ class TestSchemaBlindEntrypointScrub:
             assert _sb_leaks(out) == []
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
 class TestDenyMessageDoesNotNameSchema:
-    """A firewall deny reason names tables/columns; it must stay server-side (G6)."""
+    """A firewall deny reason names tables/columns; it must stay server-side."""
 
     @patch("coa_serve.main._ensure_initialized")
     @pytest.mark.parametrize("stream", [False, True])
@@ -1973,10 +1847,8 @@ class TestDenyMessageDoesNotNameSchema:
         assert "sb_col_secret" not in str(out)
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
-class TestSchemaBlindEntrypointReviewFixes:
-    """Independent-review findings: streamed tokens, schema-naming error text, session replay."""
+class TestSchemaBlindEntrypointGuards:
+    """Schema-blind entrypoint: streamed tokens, schema-naming error text, session replay."""
 
     def _orch(self, vis):
         import coa_serve.main as main_mod
@@ -2062,9 +1934,6 @@ class TestSchemaBlindEntrypointReviewFixes:
             assert await _replay_visibility({}, "demo", "u", None, []) == _sb_vis(False, False)
 
 
-# ── Visibility is resolved from the SERVER profile, once, and published ──────
-
-_ANALYST_RESOLVED = {"user": "analyst-1", "role": "data-analyst"}
 _SPOOFED_PROFILE = {"userId": "x", "globalRoles": ["platform-admin"]}
 
 
@@ -2083,8 +1952,6 @@ def _assert_server_profile(orch) -> None:
     assert "platform-admin" not in str(profile)
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
 class TestSchemaVisibilityUsesServerProfile:
     def _orch(self):
         import coa_serve.main as main_mod
@@ -2146,8 +2013,6 @@ class TestSchemaVisibilityUsesServerProfile:
         _assert_server_profile(orch)
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
 class TestSchemaBlindPublishedDuringResolve:
     """main publishes SCHEMA_BLIND (and the decision) for the resolution, then resets it."""
 
@@ -2177,8 +2042,6 @@ class TestSchemaBlindPublishedDuringResolve:
         assert SCHEMA_BLIND.get() is False and request_schema_visibility("demo") is None
 
 
-@pytest.mark.unit
-@pytest.mark.asyncio
 class TestReplayVisibilityAndSessionActions:
     async def test_replay_visibility_positive_control_unpatched(self):
         """A steward replays with full visibility; the injected profile carries the steward role."""

@@ -37,9 +37,6 @@ _NS = "550e8400-e29b-41d4-a716-446655440000"
 _POISON = "<script>alert(1)</script>"
 
 
-# ── Minimal Smithy reader ────────────────────────────────────────────────────
-
-
 def _model() -> str:
     paths = [_SMITHY_DIR / "metric-service.smithy", _SMITHY_DIR / "common.smithy"]
     for path in paths:
@@ -116,9 +113,6 @@ def _pattern(text: str, shape: str) -> str:
         if m := re.match(r'@pattern\("(.*)"\)$', t):
             return m.group(1).encode().decode("unicode_escape")
     raise AssertionError(f"{shape} has no @pattern")
-
-
-# ── Parity ───────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -232,7 +226,7 @@ def test_metric_label_bounds_and_pattern_match_model() -> None:
         contract.METRIC_LABEL_MAX_LENGTH,
     )
     assert _pattern(text, "MetricLabel") == f"^{contract.METRIC_LABEL_PATTERN.pattern}$"
-    # Same ASCII rule as NamespaceDisplayName (namespace.smithy), by contract #1295.
+    # Same ASCII rule as NamespaceDisplayName (namespace.smithy).
     namespace_model = (_SMITHY_DIR / "namespace.smithy").read_text()
     assert _pattern(text, "MetricLabel") == _pattern(namespace_model, "NamespaceDisplayName")
 
@@ -258,9 +252,6 @@ def test_metric_definition_label_targets_metric_label() -> None:
 def test_check_metric_label_rejects_everything_the_model_pattern_and_length_reject(value: str) -> None:
     """The handwritten rule is never looser than the model, so OSI import cannot store what the API refuses."""
     assert contract.check_metric_label(value) is not None
-
-
-# ── Enforcement ──────────────────────────────────────────────────────────────
 
 
 def _event(method: str, resource: str, **kwargs: Any) -> dict[str, Any]:

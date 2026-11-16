@@ -100,8 +100,22 @@ describe("the stack a customer copies", () => {
     template.resourceCountIs("AWS::Lambda::Permission", 2);
   });
 
-  it("gets its own spill bucket", () => {
-    synth().resourceCountIs("AWS::S3::Bucket", 1);
+  it("gets its own spill bucket, logged to its own access-log bucket", () => {
+    const template = synth();
+    // The spill bucket and its server-access-log target.
+    template.resourceCountIs("AWS::S3::Bucket", 2);
+    // The spill bucket (the one with the expire-spill rule) logs to the created log bucket.
+    const buckets = Object.entries(template.findResources("AWS::S3::Bucket"));
+    const logBucketIds = buckets.map(([id]) => id).filter((id) => id.includes("SpillAccessLogsBucket"));
+    expect(logBucketIds).toHaveLength(1);
+    const spill = buckets.filter(([, bucket]) =>
+      JSON.stringify(bucket.Properties?.LifecycleConfiguration ?? {}).includes("expire-spill"),
+    );
+    expect(spill).toHaveLength(1);
+    expect(spill[0][1].Properties.LoggingConfiguration).toEqual({
+      DestinationBucketName: { Ref: logBucketIds[0] },
+      LogFilePrefix: "spill/example/",
+    });
   });
 
   it("registers no Athena data catalog: that belongs to the querying account", () => {

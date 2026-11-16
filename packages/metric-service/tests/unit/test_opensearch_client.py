@@ -19,9 +19,6 @@ from coa_metrics.opensearch_client import (
 pytestmark = pytest.mark.unit
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def sample_metric() -> MetricDefinition:
     return MetricDefinition(
@@ -53,9 +50,6 @@ def metric_no_ai_context() -> MetricDefinition:
     )
 
 
-# ── Helper tests ────────────────────────────────────────────────────────
-
-
 class TestHelpers:
     def test_build_embedding_text_with_ai_context(self, sample_metric: MetricDefinition) -> None:
         text = _build_embedding_text(sample_metric)
@@ -70,15 +64,6 @@ class TestHelpers:
         assert "order_count" in text
         assert "Number of orders" in text
         assert text == "order_count Number of orders"
-
-
-# ── Embed metric tests ──────────────────────────────────────────────────
-#
-# MetricOpenSearchClient now delegates all AOSS I/O to the shared
-# AossVectorClient (retry / auth / mapping / query-building are tested in
-# coa_common's test_opensearch_client.py). Here we inject a mock
-# shared client via ``client._client`` and assert the metric-specific shaping +
-# delegation.
 
 
 class TestEmbedMetric:
@@ -102,11 +87,9 @@ class TestEmbedMetric:
         client, aoss = self._client_with(self._fake_embedder([0.1, 0.2, 0.3]))
         client.embed_metric("test-ns", sample_metric)
 
-        # The shared embedder was invoked on the metric text (as a document).
         client._embedder.embed_document.assert_called_once()
         assert "monthly_revenue" in client._embedder.embed_document.call_args[0][0]
 
-        # Indexed with the canonical schema (entity_type="metric").
         aoss.index_document.assert_called_once()
         index_used, indexed_doc = aoss.index_document.call_args.args
         assert index_used == "ontology-workbench-embeddings-test-ns"
@@ -121,7 +104,6 @@ class TestEmbedMetric:
         client, aoss = self._client_with(self._fake_embedder([0.1]))
         client.embed_metric("test-ns", sample_metric)
 
-        # Idempotent upsert: delete-by-entity_uri, then index.
         aoss.delete_by_term.assert_called_once_with(
             "ontology-workbench-embeddings-test-ns",
             "entity_uri",
@@ -145,9 +127,6 @@ class TestEmbedMetric:
         assert warned[0].kwargs["remaining"] == 1
 
 
-# ── Delete embedding tests ──────────────────────────────────────────────
-
-
 class TestDeleteMetricEmbedding:
     def test_delete_by_entity_uri_delegates(self) -> None:
         client = MetricOpenSearchClient()
@@ -165,9 +144,6 @@ class TestDeleteMetricEmbedding:
         client._client = aoss
         # Best-effort: a missing index (first metric in a namespace) is swallowed.
         client.delete_metric_embedding("test-ns", "nonexistent")
-
-
-# ── Search tests ────────────────────────────────────────────────────────
 
 
 class TestSearchMetrics:
@@ -196,7 +172,6 @@ class TestSearchMetrics:
         assert results[0]["entity_uri"] == f"urn:{URN_PREFIX}:test-ns:metric:revenue"
         assert results[0]["score"] == 0.95
 
-        # Delegates with the metric + namespace server-side filters.
         kwargs = aoss.knn_search.call_args.kwargs
         assert kwargs["top_k"] == 5
         assert {"term": {"entity_type": "metric"}} in kwargs["filters"]

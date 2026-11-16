@@ -5,8 +5,6 @@
 
 from pydantic import BaseModel, Field, field_validator
 
-# --- Ontology schemas ---
-
 
 class OntologyCreate(BaseModel):
     """Request body to register a new ontology in the catalog."""

@@ -3,27 +3,11 @@
 
 """Sources unit test configuration.
 
-``ALLOWED_ORIGIN`` is required by coa_common.response (lazy check at
-api_response() call time). Set before any handler imports so api_response() can
-return error responses; otherwise every handler test raises
-RuntimeError("ALLOWED_ORIGIN environment variable must be set"). Matches the
-pattern used by control-plane and metric-service unit conftests.
-
-``AWS_REGION`` is pinned — not ``setdefault``-ed — because the handlers resolve
-their region via ``coa_common.resolve_region()``, which reads ``AWS_REGION``
-FIRST and only then falls back to ``AWS_DEFAULT_REGION``. The moto fixtures
-create their tables in us-east-1 and several test modules set only
-``AWS_DEFAULT_REGION``, so a developer (or CI runner) with ``AWS_REGION`` exported
-to anything else had the handler build its DAO against that region while the
-table lived in us-east-1 — every query failed with ResourceNotFoundException and
-the handler returned 500. That made ~10 tests fail depending on nothing but the
-shell they ran in.
-
-Credentials are overwritten for the same reason, and every network connection
-outside the loopback interface fails the test that made it (see
-``block_real_network``). Unit tests use moto or mocks, which never open a socket;
-a test that reaches for the network has a missing mock, and with a developer's
-exported credentials that call would otherwise land in a real account.
+``ALLOWED_ORIGIN`` is required by coa_common.response, so it is set before any
+handler imports. ``AWS_REGION`` is pinned (not ``setdefault``-ed) because
+``resolve_region()`` reads it before ``AWS_DEFAULT_REGION`` and the moto fixtures
+live in us-east-1. Credentials are overwritten, and every network connection
+outside loopback fails the test that made it (see ``block_real_network``).
 Because these overrides happen at import, run integration tests in their own
 pytest process rather than together with ``tests/unit``.
 """
@@ -59,16 +43,9 @@ os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
 for _endpoint_var in [k for k in os.environ if k.startswith("AWS_ENDPOINT_URL")]:
     os.environ.pop(_endpoint_var)
 
-# ``sources_handler`` captures ``SOURCES_TABLE`` at IMPORT time (module-level
-# ``_SOURCES_TABLE``), so whichever test module imports it FIRST decides whether
-# the DAO can be built at all — every later `_get_dao()` raises "SOURCES_TABLE env
-# var not set" if that first import saw no value. test_sources_handler.py used to
-# be that module and set the var itself, which held only because it happened to
-# sort before the other importers. Any new module importing the handler earlier,
-# directly or transitively, silently broke ~14 of its tests. Setting it here —
-# before pytest imports any test module — removes the ordering dependence, the
-# same reasoning as the AWS_REGION block above. The value matches the table
-# test_sources_handler.py creates in moto.
+# ``sources_handler`` reads ``SOURCES_TABLE`` at import time, so it is set here,
+# before pytest imports any test module. The value matches the moto table in
+# test_sources_handler.py.
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
 
 # Imported after the env block above: the module reads AWS_REGION at import time.
@@ -149,11 +126,8 @@ def block_real_network(monkeypatch):
 def dao_double() -> Any:
     """A ``DynamoDBDAO`` double that rejects calls the real class would reject.
 
-    Use this wherever a test patches ``_get_dao``. A bare ``MagicMock()`` accepts any
-    method name with any signature, which shipped a ``dao.put(..., condition_values=...)``
-    that raised ``TypeError`` on every real request while the tests stayed green.
-    ``MagicMock(spec=DynamoDBDAO)`` does not close it either — it checks only that the
-    attribute exists — whereas autospec binds each method's real signature.
+    Use this wherever a test patches ``_get_dao``. Autospec binds each method's real
+    signature; ``MagicMock(spec=DynamoDBDAO)`` only checks that the attribute exists.
     """
     return create_autospec(DynamoDBDAO, instance=True)
 
@@ -162,17 +136,10 @@ def dao_double() -> Any:
 def stub_glue_ownership(request):
     """Treat every Glue database as shared with all namespaces, unless opted out.
 
-    Creating or scanning a Glue source now requires the target database to be
-    registered to the caller's namespace — a live ``glue:GetTags`` call and an STS
-    identity lookup (see ``coa_sources.database.glue_ownership``). Neither is what
-    the tests around them are about, and unstubbed both reach for the network and
-    then fail closed, turning every Glue fixture into a 403.
-
-    The ownership check itself is covered directly in
-    ``tests/unit/database/test_glue_ownership.py`` and the route/pipeline tests that
-    carry the ``real_glue_ownership`` marker, which this fixture steps aside for.
-    Reach for that marker in any new test where the ownership decision is the
-    subject rather than a precondition.
+    The Glue ownership check calls ``glue:GetTags`` and STS, which unstubbed would
+    reach for the network and fail closed. It is covered directly in
+    ``tests/unit/database/test_glue_ownership.py`` and by tests carrying the
+    ``real_glue_ownership`` marker, which this fixture steps aside for.
     """
     if request.node.get_closest_marker("real_glue_ownership"):
         yield

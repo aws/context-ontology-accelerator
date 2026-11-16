@@ -37,9 +37,6 @@ function tierBadgeColor(
   tier: number,
   executionMode?: ExecutionMode,
 ): "green" | "blue" | "grey" | "severity-low" {
-  // Mode wins over tier (same rule as the Rationale panel): a Deep Reasoning
-  // answer resolves at tier 3 but is labelled by its mode, so give it its own
-  // badge colour rather than the tier-3 grey.
   if (executionMode === "deep-reasoning") return "severity-low";
   if (tier === 1) return "green";
   if (tier === 2) return "blue";
@@ -47,11 +44,8 @@ function tierBadgeColor(
 }
 
 /**
- * Tier outcome badge text. Mode wins over tier: a Deep Reasoning answer
- * resolves at tier 3 but must read "Deep Reasoning", not "Tier 3 — knowledge",
- * so the full-trace page agrees with the Rationale panel (#1166). Tier 2 names
- * the strategy that ran (NL→SQL and/or VKG (Ontop)) through the same tier2Title
- * the Rationale panel uses, so the two views of one answer agree.
+ * Tier outcome badge text, matching the Rationale panel: Deep Reasoning mode wins
+ * over tier, and Tier 2 uses tier2Title.
  */
 function tierOutcome(
   tier: number,
@@ -155,14 +149,7 @@ export function TraceDetail() {
   const firewallStatus = getFirewallStatus(trace);
   const guardrailStatus = getGuardrailStatus(trace, guardrailBlocked);
 
-  const displaySparql = sparqlGenerated;
-  const displaySql = queryUsed;
-
-  // Preserve the namespace across the back-nav. NamespaceProvider only reads
-  // namespace from /namespaces/:id/... paths, not from ?namespaceId query
-  // strings, so on reload+return the provider has no in-memory selectedId
-  // and would fall back to the first namespace. Restore it via setNamespace
-  // (a no-op if the user never left the same-session in-memory state).
+  // Restore the namespace on back-nav: NamespaceProvider reads it only from /namespaces/:id paths.
   const backNamespace =
     (typeof metadata.namespace === "string" && metadata.namespace) || undefined;
   const onBack = () => {
@@ -319,7 +306,7 @@ export function TraceDetail() {
           defaultExpanded={true}
         >
           <SpaceBetween size="s">
-            {displaySparql && (
+            {sparqlGenerated && (
               <Box>
                 <Box
                   variant="small"
@@ -329,11 +316,11 @@ export function TraceDetail() {
                   SPARQL
                 </Box>
                 <Box variant="code">
-                  <pre className="coa-code-block">{displaySparql}</pre>
+                  <pre className="coa-code-block">{sparqlGenerated}</pre>
                 </Box>
               </Box>
             )}
-            {displaySql && (
+            {queryUsed && (
               <Box>
                 <Box
                   variant="small"
@@ -343,11 +330,11 @@ export function TraceDetail() {
                   SQL
                 </Box>
                 <Box variant="code">
-                  <pre className="coa-code-block">{displaySql}</pre>
+                  <pre className="coa-code-block">{queryUsed}</pre>
                 </Box>
               </Box>
             )}
-            {!displaySparql && !displaySql && (
+            {!sparqlGenerated && !queryUsed && (
               <Box color="text-body-secondary">
                 {t("No compiled artifacts for this request.")}
               </Box>
@@ -360,8 +347,6 @@ export function TraceDetail() {
     </SpaceBetween>
   );
 }
-
-// ── Trace Table ─────────────────────────────────────────────────────
 
 interface IndexedTraceStep extends TraceStep {
   _index: number;
@@ -440,8 +425,6 @@ function TraceTable({ trace }: { trace: TraceStep[] }) {
   );
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
 type BoundaryStatus = "allow" | "ok" | "passed" | "blocked" | "n/a";
 
 function getCedarStatus(trace: TraceStep[]): BoundaryStatus {
@@ -460,10 +443,7 @@ function getFirewallStatus(trace: TraceStep[]): BoundaryStatus {
   return "n/a";
 }
 
-// Guardrails read the same way as Cedar/Firewall — from a dedicated trace
-// step — instead of from the guardrailBlocked boolean alone. The boolean is
-// still consulted as a fallback so legacy traces (recorded before the
-// t3.guardrail step existed) render "blocked" correctly on the block path.
+// Falls back to guardrailBlocked for traces without a guardrail step.
 function getGuardrailStatus(
   trace: TraceStep[],
   guardrailBlocked: boolean,

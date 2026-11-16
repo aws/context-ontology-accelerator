@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for cross-source FK inference (#1088)."""
+"""Unit tests for cross-source FK inference."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ class TestInferShortCircuit:
 
 
 class TestPairwiseInference:
-    """MR !1215 review: bounded per-pair prompts, focus-source work bound, dedup."""
+    """Bounded per-pair prompts, focus-source work bound, dedup."""
 
     @staticmethod
     def _four_sources():
@@ -225,8 +225,7 @@ class TestPairwiseInference:
 
 
 class TestReviewNote:
-    """0.3.3 feedback: the note is read inline next to a yes/no call — one line, no
-    internal aliases."""
+    """The note is read inline next to a yes/no call: one line, no prompt aliases."""
 
     ALIASES = {"ds1": "billing_zuora", "ds2": "crm_salesforce"}
 

@@ -15,8 +15,6 @@ from rdflib import Graph
 pytestmark = pytest.mark.unit
 
 
-# ── Test turtle fixtures ─────────────────────────────────────────
-
 _TURTLE_RDFS = """
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
@@ -65,9 +63,6 @@ schema:email a rdf:Property ;
   schema:domainIncludes schema:Person ;
   schema:rangeIncludes schema:Text .
 """
-
-
-# ── Helpers ──────────────────────────────────────────────────────
 
 
 def _extract(turtle: str, target_uris: list[str]) -> list[dict]:
@@ -125,9 +120,6 @@ def _extract(turtle: str, target_uris: list[str]) -> list[dict]:
             }
         )
     return results
-
-
-# ── Tests ────────────────────────────────────────────────────────
 
 
 class TestPropertyExtractionRdfs:

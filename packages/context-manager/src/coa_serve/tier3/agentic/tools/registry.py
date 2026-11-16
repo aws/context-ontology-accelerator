@@ -1,20 +1,20 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Internal catalog of Tools for the Agentic Retriever (Req 2.1, 11.2-11.4).
+"""Internal catalog of Tools for the Agentic Retriever.
 
 The :class:`ToolRegistry` is the single place the reasoning agent discovers the
-Tools available for a request (Req 2.1). It enforces the uniform Tool interface
+Tools available for a request. It enforces the uniform Tool interface
 on registration — rejecting any Tool missing one of the four required fields
-(Req 11.3) and rejecting a duplicate name while keeping the already-registered
-Tool unchanged (Req 11.2, 11.4) — and exposes the registered Tools' specs to the
+and rejecting a duplicate name while keeping the already-registered
+Tool unchanged — and exposes the registered Tools' specs to the
 planner prompt via :meth:`specs`.
 
 The registry and its Tools are internal to the Serve_Layer: nothing here is
 reachable from a transport or route, so a caller outside the Serve_Layer can
-neither enumerate nor invoke Tools (Req 2.7).
+neither enumerate nor invoke Tools.
 
-Import discipline (Requirement 12.3): this module imports only the dependency-
+Import discipline: this module imports only the dependency-
 free :mod:`.base` contract plus ``structlog``; it never imports
 ``graphrag_toolkit``.
 """
@@ -27,7 +27,7 @@ from .base import Tool
 
 logger = structlog.get_logger(__name__)
 
-# The four interface fields every Tool MUST present (Req 11.1).
+# The four interface fields every Tool MUST present.
 _REQUIRED_FIELDS: tuple[str, ...] = (
     "name",
     "description",
@@ -37,18 +37,7 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
 
 
 def _missing_fields(tool: object) -> list[str]:
-    """Return the required interface fields a Tool fails to satisfy (Req 11.3).
-
-    A field is considered missing when the attribute is absent, ``None``, of the
-    wrong type, or empty:
-
-    - ``name`` / ``description`` must be a non-empty (non-whitespace) ``str``.
-    - ``input_schema`` / ``output_schema`` must be ``dict`` instances (an empty
-      dict is permitted — e.g. a tool that accepts no inputs — but a non-dict or
-      missing value is rejected).
-
-    The list preserves the canonical field order so error messages are stable.
-    """
+    """Return the required interface fields a Tool fails to satisfy (empty schema dicts are allowed)."""
     missing: list[str] = []
 
     name = getattr(tool, "name", None)
@@ -71,7 +60,7 @@ def _missing_fields(tool: object) -> list[str]:
 
 
 class ToolRegistry:
-    """Internal, Serve_Layer-only catalog of Tools (Req 2.1, 11.2-11.4, 2.7).
+    """Internal, Serve_Layer-only catalog of Tools.
 
     Tools are stored keyed by their unique ``name`` in registration order, which
     :meth:`names` and :meth:`specs` preserve so the planner prompt sees a stable
@@ -86,17 +75,9 @@ class ToolRegistry:
         """Register ``tool`` after enforcing the uniform interface.
 
         Rejects, by raising :class:`ValueError`, a Tool that is missing any of
-        the four required interface fields (Req 11.3) or whose ``name`` duplicates
-        an already-registered Tool (Req 11.2, 11.4). On a duplicate, the existing
+        the four required interface fields or whose ``name`` duplicates
+        an already-registered Tool. On a duplicate, the existing
         Tool is retained unchanged and is excluded from this registration.
-
-        Args:
-            tool: The Tool to register.
-
-        Raises:
-            ValueError: If one or more required fields are missing (the message
-                identifies the missing field(s)), or if the name is already
-                registered (the message identifies the duplicate name).
         """
         missing = _missing_fields(tool)
         if missing:
@@ -108,7 +89,7 @@ class ToolRegistry:
                 "Tool rejected: missing or invalid required interface "
                 f"field(s): {', '.join(missing)}. A Tool must declare a "
                 "non-empty name and description and dict input_schema and "
-                "output_schema (Req 11.1, 11.3)."
+                "output_schema."
             )
 
         name = tool.name
@@ -118,8 +99,7 @@ class ToolRegistry:
                 duplicate_name=name,
             )
             raise ValueError(
-                f"Tool rejected: a Tool named {name!r} is already registered; "
-                "the existing Tool is retained unchanged (Req 11.2, 11.4)."
+                f"Tool rejected: a Tool named {name!r} is already registered; the existing Tool is retained unchanged."
             )
 
         self._tools[name] = tool
@@ -138,7 +118,7 @@ class ToolRegistry:
 
         Each entry is a plain dict carrying the Tool's ``name``, ``description``,
         ``input_schema``, and ``output_schema`` so the planner prompt can reason
-        about which Tool to select and how to populate its inputs (Req 11.1).
+        about which Tool to select and how to populate its inputs.
         Order matches :meth:`names`.
 
         ``exclude`` withholds the named tools from the returned specs so the

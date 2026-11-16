@@ -1,17 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test: duplicate-induction sets ``duplicate_of`` on the in-memory job.
-
-Regression for the "proposal does not exist" redirect: re-inducing a source
-whose structural fingerprint matches an already-accepted proposal short-circuits
-the run WITHOUT creating a new proposal. The client polls ``/induce/jobs/{id}``,
-which returns the in-memory ``JobResponse`` while the worker thread is alive, and
-redirects to ``duplicate_of``. If that field is only written to the DDB job row
-(not the in-memory object), the client never sees it, falls back to the job id —
-which has no proposal row — and 404s. This test pins ``duplicate_of`` onto the
-in-memory job object and asserts the phantom stub is cleaned up.
-"""
+"""Unit test: duplicate-induction sets ``duplicate_of`` on the in-memory job."""
 
 from __future__ import annotations
 
@@ -27,7 +17,6 @@ def _tbl(name: str, cols: list[CatalogColumn]) -> CatalogTable:
     return CatalogTable(id=f"t-{name}", name=name, fullyQualifiedName=f"db.{name}", columns=cols)
 
 
-@pytest.mark.unit
 def test_duplicate_induction_sets_duplicate_of_on_inmemory_job() -> None:
     from coa_ontology.induce_catalog import (
         WorkbenchInductionRequest,
@@ -52,7 +41,6 @@ def test_duplicate_induction_sets_duplicate_of_on_inmemory_job() -> None:
     body = WorkbenchInductionRequest(
         datasource_ids=["ds-1"],
         ontology_uri_prefix="http://test.org/ontology/induced#",
-        grounding_ontologies=[],
     )
 
     with (

@@ -37,7 +37,7 @@ class ChunkResult:
     label: str = ""
     uri: str = ""
     # Human-readable document name (ingest's ``filename``). Display metadata,
-    # not identity — distinct documents may share a name (#985).
+    # not identity — distinct documents may share a name.
     source_doc_name: str = ""
     # Statements the lexical graph retrieved for this chunk's source, carried on the
     # source's first chunk. Prompt evidence only; never part of the citation text.
@@ -63,11 +63,6 @@ class VectorRetriever:
             vector_client: Client issuing k-NN searches against OpenSearch.
         """
         self._vector = vector_client
-
-    @property
-    def vector_client(self) -> VectorClient:
-        """Public access to underlying vector client for direct search (T-Box assembly)."""
-        return self._vector
 
     async def search(
         self,

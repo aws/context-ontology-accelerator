@@ -4,8 +4,6 @@
 /**
  * Hook that encapsulates token buffering logic: accumulates streaming tokens
  * in a ref-backed Map, and flushes them to state every 75ms via dispatch.
- *
- * Single Responsibility: isolates the buffer lifecycle from the chat orchestrator.
  */
 import { useCallback, useEffect, useRef } from "react";
 import type { PlaygroundAction } from "./playground-reducer";

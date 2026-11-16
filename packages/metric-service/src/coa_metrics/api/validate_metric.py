@@ -41,8 +41,6 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
 
-# ── Singleton clients ───────────────────────────────────────────────────
-
 # Per-namespace cache: the SMUS-backed lookup is namespace-scoped.
 _data_source_lookups: dict[str, DataSourceLookup | None] = {}
 _ontology_lookup: NeptuneOntologyLookup | None = None
@@ -75,9 +73,6 @@ def _get_ontology_lookup() -> NeptuneOntologyLookup | None:
     return _ontology_lookup
 
 
-# ── Handler ─────────────────────────────────────────────────────────────
-
-
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """API Gateway proxy-integration Lambda handler for POST /namespaces/{ns}/metrics/validate."""
     namespace = (event.get("pathParameters") or {}).get("namespaceId", "")
@@ -87,7 +82,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not namespace:
         return api_response(400, {"message": "namespace is required"})
 
-    # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
     except (json.JSONDecodeError, TypeError):
@@ -182,7 +176,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     source_findings = [{"field": source_field, "message": source_error, "severity": "ERROR"}] if source_error else []
 
-    # Run validation
     try:
         result = validate_metric(
             metric_body=metric_body,

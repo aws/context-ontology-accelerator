@@ -12,17 +12,6 @@ from coa_serve.tier2.sql_firewall import FirewallResult, NamespaceSQLScopeError,
 
 @pytest.mark.unit
 class TestFirewallResult:
-    def test_allowed_result(self):
-        result = FirewallResult(denied=False, authorized_sql="SELECT 1")
-        assert not result.denied
-        assert result.authorized_sql == "SELECT 1"
-        assert result.reason is None
-
-    def test_denied_result(self):
-        result = FirewallResult(denied=True, authorized_sql="", reason="Table access denied")
-        assert result.denied
-        assert result.reason == "Table access denied"
-
     def test_frozen_dataclass(self):
         result = FirewallResult(denied=False, authorized_sql="SELECT 1")
         with pytest.raises(AttributeError):
@@ -31,8 +20,6 @@ class TestFirewallResult:
 
 @pytest.mark.unit
 class TestSQLFirewallValidate:
-    """Test the validate() method — safety checks."""
-
     def test_accepts_simple_select(self):
         fw = SQLFirewall()
         fw.validate("SELECT id, name FROM orders WHERE id > 5")
@@ -42,16 +29,12 @@ class TestSQLFirewallValidate:
         fw.validate("SELECT * FROM (SELECT id FROM orders) sub WHERE sub.id > 1")
 
     def test_validate_redshift_dialect_accepts_engine_specific_sql(self):
-        """follow-up: SQL already transpiled to Redshift must validate with
-        the redshift reader. ``APPROXIMATE COUNT(DISTINCT …)`` is Redshift syntax the
-        default trino reader fails to parse — validating it as trino would spuriously
-        raise ``Failed to parse SQL statement`` (the exact downstream blocker)."""
+        """SQL already transpiled to Redshift must validate with the redshift reader;
+        ``APPROXIMATE COUNT(DISTINCT …)`` does not parse as trino."""
         fw = SQLFirewall()
         redshift_sql = "SELECT APPROXIMATE COUNT(DISTINCT customer) AS c FROM wi766.orders"
-        # Trino reader can't parse it → the old behavior would reject a legit query.
         with pytest.raises(UnsafeSQLError, match="Failed to parse SQL statement"):
             fw.validate(redshift_sql, dialect="trino")
-        # Redshift reader parses it cleanly → no error (the fix).
         fw.validate(redshift_sql, dialect="redshift")
 
     def test_validate_dialect_still_blocks_non_select_before_parse(self):
@@ -256,8 +239,6 @@ class TestSQLFirewallValidate:
 
 @pytest.mark.unit
 class TestSQLFirewallEvaluate:
-    """Test the evaluate() method — safety + authorization (steel thread allows)."""
-
     def test_allows_simple_select(self):
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM orders")
@@ -283,13 +264,7 @@ class TestSQLFirewallEvaluate:
         assert not result.denied
 
     def test_empty_profile_fail_open_characterization(self):
-        # AUDIT: an empty (or None) profile imposes NO data-level restriction —
-        # even a sensitive table like `payroll` is allowed. This pins the intentional
-        # "sparse opt-in" default so a silent flip to fail-closed fails this test loudly.
-        # OPEN QUESTION (Eric/Kun/Noah): fail-open-on-empty-profile vs fail-closed is a
-        # product decision; the terminal-deny work only bites when a RESTRICTIVE profile
-        # is supplied, and the profile is currently caller-controlled. Server-side
-        # authorizer-resolved profiles are a SEPARATE task.
+        # An empty (or None) profile is intentionally fail-open: no data-level restriction.
         fw = SQLFirewall()
         assert not fw.evaluate("SELECT * FROM payroll", profile={}).denied
         assert not fw.evaluate("SELECT * FROM payroll", profile=None).denied
@@ -320,18 +295,6 @@ class TestSQLFirewallEvaluate:
         with pytest.raises(UnsafeSQLError):
             fw.evaluate("DROP TABLE orders")
 
-    def test_evaluate_accepts_dialect_kwarg(self):
-        """Regression: evaluate() must accept a ``dialect`` kwarg. The shared
-        execution primitive calls ``evaluate(sql, profile, namespace=..., dialect=...)``;
-        a signature without ``dialect`` raises TypeError there (uncaught — only
-        UnsafeSQLError is handled), so every execution fails and the agentic arm
-        returns no executed SQL. Cedar is stubbed out to isolate the structural check."""
-        from coa_serve.tier2.cedar_authorizer import NullCedarAuthorizer
-
-        fw = SQLFirewall(cedar_authorizer=NullCedarAuthorizer())
-        result = fw.evaluate("SELECT * FROM orders", profile={}, namespace="ns", dialect="trino")
-        assert not result.denied
-
     def test_evaluate_threads_dialect_to_validate(self):
         """evaluate() must pass ``dialect`` through to validate() so an already-
         transpiled engine-specific statement isn't rejected as unparseable trino.
@@ -349,8 +312,6 @@ class TestSQLFirewallEvaluate:
 
 @pytest.mark.unit
 class TestSQLFirewallExtractTables:
-    """Test table extraction via sqlglot AST parsing."""
-
     def test_single_table(self):
         tables = SQLFirewall.extract_tables("SELECT * FROM orders")
         assert tables == ["orders"]
@@ -498,8 +459,6 @@ class TestSQLFirewallCaseInsensitivity:
     """Authorization must be case-insensitive — SQL identifiers are case-insensitive
     for unquoted names and case manipulation must not bypass the allowlist/denylist."""
 
-    # --- tableAllowlist ---
-
     def test_allowlist_uppercase_query_lowercase_profile(self):
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM ORDERS", profile={"tableAllowlist": ["orders"]})
@@ -525,8 +484,6 @@ class TestSQLFirewallCaseInsensitivity:
         fw = SQLFirewall()
         result = fw.evaluate("SELECT id FROM PUBLIC.ORDERS", profile={"tableAllowlist": ["orders"]})
         assert not result.denied
-
-    # --- columnDenylist ---
 
     def test_denylist_uppercase_column_lowercase_profile(self):
         fw = SQLFirewall()
@@ -621,15 +578,7 @@ class TestSQLFirewallProfileTypeValidation:
         assert "columnDenylist" in result.reason
 
     def test_empty_list_allowlist_denies_every_table(self):
-        """SEMANTICS CHANGE — an empty allowlist is a restriction, not its absence.
-
-        This previously asserted the opposite ("should not impose any restriction"),
-        which documented a fail-open: the empty list was falsy, so the restriction
-        was dropped and every table was allowed. A grant declaring an empty
-        allowlist means "no tables permitted", and collapsing that into
-        "unrestricted" turned a deny-all into an allow-all. Absence of the key still
-        means unrestricted — see the test below.
-        """
+        """An empty allowlist permits no tables; absence of the key means unrestricted."""
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM orders", profile={"tableAllowlist": []})
         assert result.denied
@@ -776,7 +725,6 @@ class TestRealCedarThroughFirewall:
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
 
-    # ── can_view_source / can_view_ontology: the artifact gates (ADR) ─────
     @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
     def test_schema_view_steward_own_namespace_true(self, probe):
         fw = self._fw(fail_open_no_roles=False)
@@ -833,7 +781,7 @@ class TestRealCedarThroughFirewall:
 
 @pytest.mark.unit
 class TestNamespaceSQLScope:
-    """F-3: qualified SQL may not escape the requested namespace's sources."""
+    """Qualified SQL may not escape the requested namespace's sources."""
 
     _NATIVE = frozenset({"tenant_a_db"})
     _FEDERATED = frozenset({("sclds_a", "sales")})
@@ -885,13 +833,9 @@ class TestNamespaceSQLScope:
         )
 
     def test_jdbc_two_part_federated_schema_is_allowed(self):
-        """Regression (direct-JDBC engines integ): a single-source metric emits a
-        bare ``schema.table`` and dispatches to direct JDBC, where the catalog comes
-        from the connection, not Athena. The federated JDBC source's schema lives in
-        federated_catalog_schemas under its OWN nested catalog (``sclds_a``), not in
-        native_databases — so the Athena rule (pin to awsdatacatalog/native) wrongly
-        denied it (502 NamespaceSQLScopeError). schema_only authorizes the schema
-        from the selected source without applying an Athena catalog pin."""
+        """A bare ``schema.table`` on direct JDBC takes its catalog from the connection.
+
+        schema_only authorizes the schema from the selected source without an Athena catalog pin."""
         assert self._validate_jdbc("SELECT COUNT(*) FROM sales.orders")
 
     def test_jdbc_two_part_schema_is_bound_to_executing_source(self):

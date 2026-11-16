@@ -2,22 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Shared Turtle lexer.
- *
- * Three consumers in this app parse the same proposal Turtle:
- *
- * * ``components/graph/turtleToGraph.ts`` — rebuilds an OWL class
- *   graph for the Cytoscape view.
- * * ``components/ontology/ClassDetailCard.tsx`` — re-extracts the same
- *   Turtle to render per-class details.
- * * ``pages/ontology/induce/r2rml.ts`` — extracts the R2RML structure
- *   for the side-by-side mapping diagram.
- *
- * They previously each kept a private copy of the same character-aware
- * tokeniser (string + IRI + comment + list-aware splitters). This
- * module is the single source of truth so a parsing fix lands in one
- * place. The public surface is ``parseTriples`` plus a few helpers the
- * R2RML parser needs to walk inline blank-node bodies.
+ * Shared Turtle lexer. The public surface is ``parseTriples`` plus a few
+ * helpers.
  *
  * The tokeniser is intentionally not a full Turtle parser. The
  * inducer's output is a pretty-printed mix of:
@@ -50,7 +36,6 @@ export const RDFS_SUBCLASS_OF =
 export const RDFS_DOMAIN = "http://www.w3.org/2000/01/rdf-schema#domain";
 export const RDFS_RANGE = "http://www.w3.org/2000/01/rdf-schema#range";
 export const RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label";
-export const RDFS_COMMENT = "http://www.w3.org/2000/01/rdf-schema#comment";
 
 export const SCL_NS = "http://coa.amazon.com/vocab/coa#";
 export const SCL_DATASOURCE_ID = `${SCL_NS}datasourceId`;
@@ -60,12 +45,8 @@ export const SCL_SUBCLASS_PROVENANCE = `${SCL_NS}subClassProvenance`;
 export const SCL_SUGGESTED_SUBCLASS_OF = `${SCL_NS}suggestedSubClassOf`;
 export const SCL_SUGGESTION_REASON = `${SCL_NS}suggestionReason`;
 
-// Grounding is carried by ``skos:exactMatch`` / ``skos:closeMatch`` (plus
-// ``rdfs:subClassOf`` to the foundational class), NOT ``coa:groundedTo``.
-// The backend has stopped emitting ``coa:groundedTo``; keying grounding off
-// the SKOS mapping predicates renders BOTH freshly-induced ontologies (skos
-// only) and older persisted ones (which still co-emit both). We deliberately
-// do NOT key off ``rdfs:subClassOf`` — that predicate is ALSO used for
+// Grounding is keyed off ``skos:exactMatch`` / ``skos:closeMatch``, not
+// ``coa:groundedTo`` or ``rdfs:subClassOf``; the latter is also used for
 // PK-sharing to sibling ``ind:`` classes and would false-positive.
 export const SKOS_NS = "http://www.w3.org/2004/02/skos/core#";
 export const SKOS_EXACT_MATCH = `${SKOS_NS}exactMatch`;
@@ -381,48 +362,6 @@ export function literalText(literal: string): string {
   return literal;
 }
 
-/** Walk a sub-block enclosed in matching ``[`` / ``]`` starting at
- *  ``open`` (the index of the opening bracket). Returns the index of
- *  the matching ``]`` or ``-1`` if unbalanced. String- and IRI-aware. */
-export function findMatchingBracket(s: string, open: number): number {
-  let depth = 0;
-  let inStr = false;
-  let inIri = false;
-  for (let i = open; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (c === '"' && s[i - 1] !== "\\") inStr = false;
-      continue;
-    }
-    if (inIri) {
-      if (c === ">") inIri = false;
-      continue;
-    }
-    if (c === '"') {
-      inStr = true;
-      continue;
-    }
-    if (c === "<") {
-      inIri = true;
-      continue;
-    }
-    if (c === "[") depth++;
-    if (c === "]") {
-      depth--;
-      if (depth === 0) return i;
-    }
-  }
-  return -1;
-}
-
-/**
- * Tokenise a Turtle document into ``{s, p, o}`` triples plus the
- * statement spans they came from. Handles the same shapes
- * ``tokenizeTriples`` did (single-line, multi-predicate blocks, inline
- * lists for owl:hasKey, string + IRI + datatype-tagged literals) and
- * additionally reports the source line range for each triple via
- * ``tripleLines`` so the R2RML viewer can scroll to a parsed map.
- */
 export interface ParsedTriples {
   triples: Triple[];
   /** Per-triple source line range. ``tripleLines[i]`` corresponds to
@@ -431,6 +370,8 @@ export interface ParsedTriples {
   prefixes: Record<string, string>;
 }
 
+/** Tokenise a Turtle document into ``{s, p, o}`` triples, with each triple's
+ *  source line range in ``tripleLines``. */
 export function parseTriples(turtle: string): ParsedTriples {
   const prefixes = parsePrefixes(turtle);
   const stripped = stripComments(turtle);

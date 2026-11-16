@@ -59,6 +59,7 @@ complete the PKCE login without a server-side secret.
 |---|---|---|
 | The MCP server | ID token from the MCP/CLI client | `McpClientId` (auth stack output), or SSM `/<prefix>/mcp-client-id` |
 | The REST API | ID token from the web app client | `UserPoolClientId`, or SSM `/<prefix>/userpool-client-id` |
+| The self-hosted workflow MCP server | ID token from the web app client | `UserPoolClientId`, or SSM `/<prefix>/userpool-client-id` |
 
 The MCP server rejects any other token with HTTP 401, starting with the
 first request a client sends. That includes an ID token from the web app
@@ -71,6 +72,24 @@ the Bearer token from the request, forwards it to the same authorizer path,
 and the acting user's grants determine what the tool can do — a `data-analyst`
 grant restricted to certain tables via `tableAllowlist` restricts `query` tool
 calls the same way it would restrict a direct API call.
+
+### Self-hosted workflow MCP server
+
+The workflow MCP server (`coa-ai/workflow-agents`) is a second MCP server that you run
+yourself, on your machine or in your own infrastructure; the deployment does not host it. It
+exposes one tool, `run_workflow`: you describe what you want in plain language, and an agent
+works it out against the REST API. Today it reports a namespace's status (its sources,
+induction jobs and proposals).
+
+- It accepts only an **ID token from the web app client**, because it forwards that token on
+  every REST call and the REST API accepts only that client. An MCP-client token or an access
+  token is refused.
+- It holds no credentials: every call runs with the signed-in user's own grants. Mutating
+  operations run only when the call names them in `confirm_mutations`.
+- It listens on `127.0.0.1` by default. In a container, publish its port to `127.0.0.1` only.
+
+Setup, configuration and errors are in `coa-ai/skills/workflow-agents/SKILL.md` in the
+repository.
 
 ## Obtaining a Token (3LO, on behalf of a user)
 

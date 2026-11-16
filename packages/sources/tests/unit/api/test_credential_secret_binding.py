@@ -38,7 +38,7 @@ _NS = "550e8400-e29b-41d4-a716-446655440000"
 _OTHER_NS = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
 _THIRD_NS = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
 # Under test the deployment prefix is unset, so the key falls back to the brand.
-_TAG = _dr._NAMESPACE_TAG_KEY
+_TAG = _sb.NAMESPACE_TAG_KEY
 _IN_ACCT_ARN = f"arn:aws:secretsmanager:us-east-1:{_ACCOUNT}:secret:ns-a/db-AbCdEf"
 _CROSS_ACCT_ARN = "arn:aws:secretsmanager:us-east-1:999988887777:secret:ns-b/db-XyZ123"
 
@@ -101,7 +101,6 @@ def test_malformed_arn_fails_closed(monkeypatch):
 def test_account_resolution_failure_fails_closed(monkeypatch):
     # If STS can't resolve the deployment account we cannot tell in- from
     # cross-account, so we must fail closed (retryable), not skip the check.
-    from botocore.exceptions import ClientError
 
     def _boom():
         raise ClientError({"Error": {"Code": "Throttling", "Message": "slow down"}}, "GetCallerIdentity")
@@ -122,9 +121,6 @@ def test_jdbc_without_secret_is_noop(monkeypatch):
     spy.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Multi-namespace tag values
-# ---------------------------------------------------------------------------
 #
 # One credential can legitimately serve several namespaces (a shared read-only
 # reporting login), so the tag value is a space-separated list. Registration must

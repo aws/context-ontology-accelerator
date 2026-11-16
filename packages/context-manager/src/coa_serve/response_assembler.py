@@ -31,10 +31,8 @@ logger = structlog.get_logger(__name__)
 MAX_GRAPH_CONTEXT_ENTITIES = 200
 MAX_GRAPH_CONTEXT_RELATIONSHIPS = 500
 
-# empty-result penalty factor for Tier-2 calibration.
-# Conservative, documented default — NOT a tuned/measured value. Tuning the
-# magnitude (and whether 0 rows should instead trigger a Tier-3 fallback) is a
-# follow-up that intersects the Tier-2 accuracy eval; see MR "Notes for reviewers".
+# Empty-result penalty factor for Tier-2 calibration: a conservative, untuned
+# default.
 _TIER2_EMPTY_RESULT_PENALTY = 0.5
 
 
@@ -265,11 +263,10 @@ class ResponseAssembler:
             strategy: Optional Tier-2 strategy label recorded in metadata.
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
-                when the caller can name one (#986).
+                when the caller can name one.
             include_sql: When False (default), the generated SQL is withheld from
                 ``query_used`` — it exposes internal source schema (table + column
-                names, joins). Gated on caller opt-in AND ``viewSource`` (ADR
-                gating B).
+                names, joins). Gated on caller opt-in AND ``viewSource``.
 
         Returns:
             A QueryResult tagged as Tier 2.
@@ -320,11 +317,10 @@ class ResponseAssembler:
             match_source: How the metric was matched (``name`` or ``fuzzy``).
             model_id: Optional per-call model id override.
             ontology_version: Version of the ontology the query ran against,
-                when the caller can name one (#986).
+                when the caller can name one.
             include_sql: When False (default), the executed metric SQL is withheld
                 from ``query_used`` — it exposes internal source schema (table +
-                column names). Gated on caller opt-in AND the ``viewSource`` right
-                (ADR gating B).
+                column names). Gated on caller opt-in AND the ``viewSource`` right.
 
         Returns:
             A QueryResult tagged as Tier 1; confidence is 1.0 for exact matches
@@ -353,14 +349,13 @@ class ResponseAssembler:
 
     @staticmethod
     def _calibrate_tier2(base_confidence: float, row_count: int | None, truncated: bool) -> ConfidenceScore:
-        """multi-factor Tier-2 confidence from in-hand signals.
+        """Multi-factor Tier-2 confidence from in-hand signals.
 
         Starts from the LLM self-rating (base_confidence) and applies, using
         ONLY signals the orchestrator already holds at assembly time:
         - empty-result penalty when the executed SQL returned zero rows;
         - a truncation annotation when results were capped.
         Returns a ConfidenceScore whose rationale enumerates the applied factors.
-        No new pipeline call is made.
 
         row_count contract: ``None`` means UNKNOWN (no penalty — never guess);
         ``0`` is the caller's assertion of a CONFIRMED empty result (penalty).
@@ -426,10 +421,10 @@ class ResponseAssembler:
             model_id: Optional per-call model id override.
             include_sql: When False (default), the compiled SQL is withheld from
                 ``query_used`` — it exposes source table/column names. Gated on
-                caller opt-in AND ``viewSource`` (ADR gating B).
+                caller opt-in AND ``viewOntology``.
             include_sparql: When False (default), the generated SPARQL is withheld
                 from ``sparql_generated`` — it exposes ontology class/property
-                names. Gated on caller opt-in AND ``viewOntology`` (ADR gating B).
+                names. Gated on caller opt-in AND ``viewOntology``.
 
         Returns:
             A QueryResult tagged as Tier 2 with calibrated confidence.
@@ -441,8 +436,8 @@ class ResponseAssembler:
             metadata["strategy"] = strategy
 
         # When row_count is not supplied but rows are materialized, derive it so a
-        # visible empty result still triggers the calibration penalty (closes the
-        # direct-call footgun). rows=None remains "unknown" → no penalty.
+        # visible empty result still triggers the calibration penalty.
+        # rows=None remains "unknown" → no penalty.
         if row_count is None and rows is not None:
             row_count = len(rows)
 
@@ -500,35 +495,30 @@ class ResponseAssembler:
             partial: Whether the result is incomplete (e.g. a budget/timeout cut
                 the reasoning loop short); surfaced on the QueryResult.
             ontology_version: Version of the ontology the query ran against,
-                when the caller can name one (#986).
+                when the caller can name one.
             execution_mode: The resolved execution mode ("standard" /
-                "deep-reasoning"); surfaced structurally on the QueryResult so the
-                console can label a Deep Reasoning answer by its MODE rather than
-                mis-reading its Tier-3 resolution as Standard mode's Tier-3 label
-                (#1166). ``None`` leaves the field unset.
-            query_used: SQL the agentic loop built + executed (#1166).
-            sparql_generated: SPARQL the agentic loop built + executed (#1166).
+                "deep-reasoning"), so the console labels an answer by its mode.
+                ``None`` leaves the field unset.
+            query_used: SQL the agentic loop built + executed.
+            sparql_generated: SPARQL the agentic loop built + executed.
             include_sql: When False (default), ``query_used`` is WITHHELD — it
                 exposes source table/column schema. Gated on caller opt-in AND
-                ``viewSource`` (ADR gating B).
+                ``viewSource``.
             include_sparql: When False (default), ``sparql_generated`` is WITHHELD
                 — it exposes ontology schema. Gated on caller opt-in AND
-                ``viewOntology`` (ADR gating B).
+                ``viewOntology``.
 
         Returns:
             A QueryResult tagged as Tier 3.
         """
-        # defense-in-depth clamp. synthesizer.py already returns 0.0
-        # on a guardrail block; force it here too so a blocked response can never
-        # surface a non-zero confidence. This can only LOWER the score, never raise
-        # it — honoring the no-weakening-safety-controls rule.
+        # Defense-in-depth clamp: a guardrail block forces confidence 0 (it can
+        # only lower the score).
         if guardrail_blocked:
             confidence = 0.0
         metadata = self._base_metadata(namespace, principal, model_id=model_id)
 
         # ``None`` is the opt-out (see Args). Graph statement text is retrieved
-        # text too, and before #984 it was a ``supportingContent`` item, so it
-        # goes with the opt-out rather than moving to ``graphContext``.
+        # text too, so it goes with the opt-out rather than moving to ``graphContext``.
         canonical_graph_context, drops = _canonical_graph_context(
             graph_context, include_statements=supporting_content is not None
         )
@@ -567,21 +557,12 @@ class ResponseAssembler:
             supporting_content=None if supporting_content is None else list(supporting_content),
             graph_context=canonical_graph_context,
             guardrail_blocked=guardrail_blocked,
-            # Gating B (ADR): the compiled SQL is gated on viewSource and the
-            # generated SPARQL on viewOntology, independently — each artifact
-            # exposes a different schema surface. This closes the Deep-Reasoning
-            # artifact gap (#1166) without widening what a schema-blind caller sees.
             query_used=query_used if include_sql else None,
             sparql_generated=sparql_generated if include_sparql else None,
             execution_mode=execution_mode,
             trace=trace.steps,
-            # ``partial`` signals the answer was built from INCOMPLETE inputs.
-            # A degraded source (a retrieval source that errored/timed out) means the
-            # synthesis ran on partial context, so flag it. (The REST 29s-timeout
-            # truncation case is owned by Data-Layer ; this is the in-runtime
-            # partial-context signal we can set authoritatively here.)
-            # Discarded graph evidence counts too: the returned context is provably
-            # narrower than what retrieval produced.
+            # ``partial`` signals the answer was built from INCOMPLETE inputs: a
+            # retrieval source errored/timed out, or graph evidence was discarded.
             partial=bool(all_degraded_sources) or partial,
             ontology_version=ontology_version,
             metadata=metadata,

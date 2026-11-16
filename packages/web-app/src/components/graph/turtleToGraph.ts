@@ -13,15 +13,12 @@
  *   - ``<iri> a owl:Class .``
  *   - ``<child> rdfs:subClassOf <parent> .``
  *   - ``<prop> a owl:ObjectProperty .`` + rdfs:domain / rdfs:range
- *   - ``coa:datasourceId`` / ``sourceSchema`` / ``fkProvenance`` /
- *     ``subClassProvenance`` annotations the inducer attaches.
  *
  * IRIs are resolved to absolute form so node ids are stable across
  * encodings. Anything we don't recognise is ignored.
  */
 
 import {
-  HAS_KEY_LIST_PRED,
   OWL_CLASS,
   OWL_DATATYPE_PROPERTY,
   OWL_OBJECT_PROPERTY,
@@ -30,12 +27,7 @@ import {
   RDFS_LABEL,
   RDFS_RANGE,
   RDFS_SUBCLASS_OF,
-  SCL_DATASOURCE_ID,
-  SCL_FK_PROVENANCE,
-  SCL_SOURCE_SCHEMA,
-  SCL_SUBCLASS_PROVENANCE,
   SCL_SUGGESTED_SUBCLASS_OF,
-  SCL_SUGGESTION_REASON,
   SKOS_CLOSE_MATCH,
   SKOS_EXACT_MATCH,
   literalText,
@@ -45,7 +37,6 @@ import {
 
 export type TurtleGraphNode = {
   id: string;
-  type?: string;
   data: Record<string, unknown>;
 };
 
@@ -54,7 +45,6 @@ export type TurtleGraphEdge = {
   source: string;
   target: string;
   label?: string;
-  type?: string;
   data?: Record<string, unknown>;
 };
 
@@ -73,26 +63,12 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
   const propDomain: Record<string, string> = {};
   const propRange: Record<string, string> = {};
   const subclassEdges: Array<[string, string]> = [];
-  // COA annotations — populated when the inducer emits the new
-  // ``coa:datasourceId`` / ``coa:sourceSchema`` / ``coa:fkProvenance`` /
-  // ``coa:subClassProvenance`` predicates introduced in MR-B + Phase 2.
-  const datasourceId: Record<string, string> = {};
-  const sourceSchema: Record<string, string> = {};
-  const fkProvenance: Record<string, string> = {};
-  const subClassProvenance: Record<string, string> = {};
-  // Suggested-inheritance pairs — Phase 2 single-child PK-sharing
-  // emissions. The graph view renders these as a dashed sub-class
-  // edge; ClassDetailCard surfaces a Confirm/Reject panel.
+  // Suggested-inheritance pairs, rendered as dashed sub-class edges.
   const suggestedParents: Record<string, string[]> = {};
-  const suggestionReason: Record<string, string> = {};
-  // owl:hasKey list members per class. The lexer flattens the inline
-  // list via the synthetic HAS_KEY_LIST_PRED predicate so we collect
-  // members back here in declaration order.
-  const pkColumns: Record<string, string[]> = {};
-  // Grounding target: the foundational class a proposed class is grounded to.
-  // Carried by ``skos:exactMatch`` (preferred) / ``skos:closeMatch`` — NOT
-  // ``coa:groundedTo`` (retired) and NOT ``rdfs:subClassOf`` (also used for
-  // PK-sharing to sibling ind: classes). Exact wins over close when both exist.
+  // Grounding target: the foundational class a proposed class is grounded to,
+  // carried by ``skos:exactMatch`` (preferred) or ``skos:closeMatch``. Exact
+  // wins over close; ``rdfs:subClassOf`` is not grounding (it is also used for
+  // PK-sharing to sibling ind: classes).
   const groundedTo: Record<string, string> = {};
   const groundedExact: Record<string, boolean> = {};
 
@@ -113,22 +89,12 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
       propRange[s] = o;
     } else if (p === RDFS_LABEL && o.startsWith('"')) {
       labels[s] = literalText(o);
-    } else if (p === SCL_DATASOURCE_ID && o.startsWith('"')) {
-      datasourceId[s] = literalText(o);
-    } else if (p === SCL_SOURCE_SCHEMA && o.startsWith('"')) {
-      sourceSchema[s] = literalText(o);
-    } else if (p === SCL_FK_PROVENANCE && o.startsWith('"')) {
-      fkProvenance[s] = literalText(o);
-    } else if (p === SCL_SUBCLASS_PROVENANCE && o.startsWith('"')) {
-      subClassProvenance[s] = literalText(o);
     } else if (p === SCL_SUGGESTED_SUBCLASS_OF) {
       suggestedParents[s] = suggestedParents[s]
         ? [...suggestedParents[s], o]
         : [o];
       classes.add(s);
       classes.add(o);
-    } else if (p === SCL_SUGGESTION_REASON && o.startsWith('"')) {
-      suggestionReason[s] = literalText(o);
     } else if (p === SKOS_EXACT_MATCH) {
       // Exact match is the strongest grounding signal; always overwrite.
       groundedTo[s] = o;
@@ -136,8 +102,6 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
     } else if (p === SKOS_CLOSE_MATCH) {
       // Close match only grounds a class that has no exact match yet.
       if (!groundedExact[s]) groundedTo[s] = o;
-    } else if (p === HAS_KEY_LIST_PRED) {
-      pkColumns[s] = pkColumns[s] ? [...pkColumns[s], o] : [o];
     }
   }
 
@@ -164,13 +128,7 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
       data: {
         prefLabel: labels[iri] ?? localName(iri),
         typeIri: OWL_CLASS,
-        datasourceId: datasourceId[iri],
-        sourceSchema: sourceSchema[iri],
-        subClassProvenance: subClassProvenance[iri],
-        suggestionReason: suggestionReason[iri],
-        pkColumns: pkColumns[iri]?.map(localName),
         isGrounded: !!groundedTo[iri],
-        groundedTo: groundedTo[iri] ? localName(groundedTo[iri]) : undefined,
         attributes: attributesByClass[iri] ?? [],
       },
     });
@@ -187,11 +145,6 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
       label: "subClassOf",
       data: {
         kind: "subClassOf",
-        predicateLabel: "subClassOf",
-        // The provenance lives on the *child* class (PK_SHARING means
-        // the inducer auto-detected this from the FK pattern); attach
-        // to the edge so the renderer can swap arrow style.
-        subClassProvenance: subClassProvenance[child],
       },
     });
   }
@@ -208,8 +161,6 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
         label: "suggested",
         data: {
           kind: "suggestedSubClassOf",
-          predicateLabel: "suggested subClassOf",
-          suggestionReason: suggestionReason[child],
         },
       });
     }
@@ -226,12 +177,6 @@ export function turtleToGraph(turtle: string): TurtleGraphData {
       label: labels[prop] ?? localName(prop),
       data: {
         kind: "objectProperty",
-        predicateLabel: labels[prop] ?? localName(prop),
-        // FK provenance ("DETERMINISTIC" / "AI_INFERRED" / …) emitted
-        // by the inducer on the property URI, so the UI can colour the
-        // edge / show a badge per ObjectProperty.
-        fkProvenance: fkProvenance[prop],
-        propertyIri: prop,
       },
     });
   }

@@ -123,8 +123,6 @@ describe("SourceDetail — rescan schedule form state", () => {
   });
 
   it("surfaces an event-rescan failure instead of just reverting the toggle", async () => {
-    // Stewards hit this every time while the route was missing from the
-    // authorizer, and saw only a toggle that flipped back.
     mockEventError.mockReturnValue(
       new Error("Event-driven rescans unavailable"),
     );

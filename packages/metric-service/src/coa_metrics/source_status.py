@@ -62,10 +62,6 @@ def permissive_lookup_enabled() -> bool:
 def check_source_approved(namespace: str, data_source_id: str) -> str | None:
     """Verify the referenced data source is APPROVED/COMPLETED.
 
-    Args:
-        namespace: The namespace the metric belongs to.
-        data_source_id: The source referenced by the metric's ``dataSourceId``.
-
     Returns:
         None when the source is approved (or permissive mode is enabled),
         otherwise a human-readable rejection message for a 400 response.
@@ -151,8 +147,8 @@ def build_validation_lookup(namespace: str) -> DataSourceLookup | None:
     """Build one catalog lookup for all source validation in a request.
 
     In permissive development mode, lookup initialization failures degrade to
-    ``None`` just as soft validation historically did. Otherwise they fail
-    closed so hard source-table validation can return a 503.
+    ``None``. Otherwise they fail closed so hard source-table validation can
+    return a 503.
     """
     try:
         return data_source_lookup_factory.build_data_source_lookup(namespace)
@@ -171,7 +167,7 @@ def check_source_table_exists(
     *,
     data_source_lookup: LookupArgument = LOOKUP_NOT_PROVIDED,
 ) -> str | None:
-    """Verify the declared ``sourceTable`` exists in the source's catalog (#161).
+    """Verify the declared ``sourceTable`` exists in the source's catalog.
 
     Rejects only **provable** absence. An unconfigured catalog lookup falls back
     to the existing soft warning, while a configured lookup that cannot read the
@@ -182,24 +178,12 @@ def check_source_table_exists(
     This rejects unapproved assets and ambiguous bare names as well as missing
     tables.
 
-    "Cannot configure" and "read failed" are deliberately NOT the same thing:
+    No lookup configured (an unprovisioned namespace) degrades to the soft
+    warning; a lookup that built but whose catalog read failed is an outage and
+    fails closed with a 503.
 
-    - ``build_data_source_lookup`` returns ``None`` for benign, expected
-      reasons — env vars unset, the namespace row absent, no
-      ``dataZoneProjectId`` yet. That is an *unprovisioned* namespace, not a
-      failure, and 503-ing it would make every ``sourceTable`` metric
-      un-creatable there. It degrades to the soft warning (pre-#161 behavior).
-    - A lookup that *built* but whose catalog read failed
-      (``catalog_available()`` false) is a genuine outage: enforcement is
-      impossible on a source we should be able to read, so that fails closed
-      with a 503.
-
-    Args:
-        namespace: The namespace the metric belongs to.
-        data_source_id: The source referenced by the metric's ``dataSourceId``.
-        source_table: The metric's declared ``sourceTable``.
-        data_source_lookup: Optional request-scoped lookup to reuse. When
-            omitted, this function builds one for backward-compatible callers.
+    ``data_source_lookup`` is an optional request-scoped lookup to reuse; when
+    omitted, one is built.
 
     Returns:
         None when the table exists, its absence cannot be proven, the lookup

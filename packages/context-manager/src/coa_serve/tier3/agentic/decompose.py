@@ -1,34 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-r"""Query decomposition planner for the Agentic Retriever (Req 13.1-13.3, 13.10).
+r"""Query decomposition planner for the Agentic Retriever.
 
-:class:`DecompositionPlanner` performs Query_Decomposition: it inspects the input
-question and decides whether to split it into two or more independent
-:class:`~coa_serve.tier3.agentic.models.SubQuestion`\\ s (when the
-question refers to multiple distinct entities or contains multiple distinct asks,
-Req 13.2) or to keep it as a single self-contained Sub_Question (Req 13.3). The
-decision is delegated to the **planner LLM** — a Bedrock Converse concern that is
-SEPARATE from final synthesis but runs under the same Bedrock client + region and
-never bypasses the synthesis-time guardrail (mirroring the controller's planner).
+:class:`DecompositionPlanner` asks the planner LLM (a Bedrock Converse call,
+separate from final synthesis, under the same guardrail) whether to split a
+question into independent :class:`~coa_serve.tier3.agentic.models.SubQuestion`\\ s
+or keep it whole. Any failure degrades to a single Sub_Question; decomposition
+never raises.
 
-The planner is asked for a small structured-JSON decision so decomposition is
-deterministic to parse and easy to mock in unit tests. A self-contained ask that
-still names an unresolved *set* of entities (e.g. "competitors", "subsidiaries")
-is kept as a single Sub_Question flagged ``multi_entity=True`` so the reasoning
-loop can anchor and branch on those entities later rather than guessing them up
-front (see the worked example in the design).
-
-Robustness: the planner LLM is best-effort. Any failure — the Converse call
-raising, the guardrail blocking, or an unparseable / empty response — degrades
-gracefully to treating the whole query as a single Sub_Question (Req 13.3), with
-the outcome recorded in the trace. Decomposition never raises.
-
-Import discipline (Requirement 12.3): this module imports only the dependency-free
-sibling models and ``structlog``; the planner :class:`LLMClient` is referenced
-structurally (only ``converse``) and typed under ``TYPE_CHECKING``, so importing
-this module never pulls ``graphrag_toolkit`` (or the concrete Bedrock client) into
-``sys.modules``.
+Import discipline: the planner :class:`LLMClient` is typed under
+``TYPE_CHECKING``, so importing this module never pulls ``graphrag_toolkit`` (or
+the concrete Bedrock client) into ``sys.modules``.
 """
 
 from __future__ import annotations
@@ -144,7 +127,7 @@ def _parse_language_tag(raw: Any) -> str:
 
 
 class DecompositionPlanner:
-    """Splits an input question into Sub_Questions via the planner LLM (Req 13.1-13.3).
+    """Splits an input question into Sub_Questions via the planner LLM.
 
     A single instance is reused across requests; it is stateless. The planner LLM
     is consulted once per :meth:`decompose` call and its structured-JSON decision
@@ -206,29 +189,12 @@ class DecompositionPlanner:
     async def decompose_with_language(
         self, query: str, trace: TraceCollector | None = None
     ) -> tuple[list[SubQuestion], str]:
-        """Decompose ``query`` into one or more Sub_Questions (Req 13.1-13.3).
+        """Decompose ``query`` into one or more Sub_Questions and name its language.
 
-        Consults the planner LLM for a structured decomposition decision. Returns
-        two or more Sub_Questions when the planner determines the question refers
-        to multiple distinct entities / asks (Req 13.2), otherwise a single
-        Sub_Question (Req 13.3). Always returns at least one Sub_Question; on any
-        planner failure it degrades to a single Sub_Question carrying the original
-        query. The Query_Decomposition is recorded in the trace (Req 13.10).
-
-        The same planner call also names the question's language, so the session
+        The same planner call names the question's language, so the session
         resolves it once without a second model call. A script that settles the
         language (kana, Hangul) wins over the model's tag. When no tag can be
-        resolved (including every fallback path) the language is ``""`` and
-        callers keep matching the question's language as before.
-
-        Args:
-            query: The input question to evaluate for decomposition.
-            trace: The session :class:`TraceCollector`; when provided, one
-                ``decompose`` step is recorded describing the decision.
-
-        Returns:
-            A non-empty list of :class:`SubQuestion` with ``origin="decomposition"``,
-            and the canonical BCP 47 tag of the question's language or ``""``.
+        resolved (including every fallback path) the language is ``""``.
         """
         sub_questions, language, _terms = await self._decompose(query, trace, extract_terms=False)
         return sub_questions, language
@@ -289,8 +255,6 @@ class DecompositionPlanner:
         terms = self._parse_terms(payload) if extract_terms else []
         return sub_questions, language, terms
 
-    # ── parsing ────────────────────────────────────────────────────────
-
     @staticmethod
     def _parse_terms(payload: dict[str, Any] | None) -> list[str]:
         """The ``named_terms`` list of a decomposition answer (strings only, bounded)."""
@@ -299,16 +263,6 @@ class DecompositionPlanner:
             return []
         terms = [t.strip() for t in raw if isinstance(t, str) and t.strip()]
         return terms[:_MAX_NAMED_TERMS]
-
-    def _parse(self, text: str, query: str) -> list[SubQuestion] | None:
-        """Parse the planner's JSON decision into Sub_Questions.
-
-        Tolerates markdown code fences and surrounding prose by extracting the
-        first ``{ … }`` JSON object. Returns ``None`` when no usable JSON object /
-        ``sub_questions`` list can be recovered (caller falls back). An empty or
-        all-blank ``sub_questions`` list also yields ``None``.
-        """
-        return self._parse_payload(self._extract_json_object(text))
 
     def _parse_payload(self, payload: dict[str, Any] | None) -> list[SubQuestion] | None:
         """Turn an extracted JSON object into Sub_Questions, or ``None`` if unusable."""
@@ -373,8 +327,6 @@ class DecompositionPlanner:
             return None
         return parsed if isinstance(parsed, dict) else None
 
-    # ── fallback & tracing ──────────────────────────────────────────────
-
     def _fallback(
         self,
         query: str,
@@ -383,7 +335,7 @@ class DecompositionPlanner:
         *,
         detail: str,
     ) -> list[SubQuestion]:
-        """Degrade to a single Sub_Question carrying the whole query (Req 13.3).
+        """Degrade to a single Sub_Question carrying the whole query.
 
         Records the degraded decomposition outcome in the trace so the fallback is
         observable, then returns a one-element list. Never raises.
@@ -394,7 +346,7 @@ class DecompositionPlanner:
 
     @staticmethod
     def _record(trace: TraceCollector | None, status: str, ms: int, detail: str) -> None:
-        """Record the Query_Decomposition in the trace when a collector is present (Req 13.10)."""
+        """Record the Query_Decomposition in the trace when a collector is present."""
         if trace is None:
             return
         trace.record("decompose", status, ms, detail=detail)

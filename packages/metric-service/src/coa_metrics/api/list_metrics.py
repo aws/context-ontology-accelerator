@@ -85,7 +85,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             return api_response(400, {"message": "Invalid nextToken"})
         offset = int(raw_token)
 
-    # Parse filters
     data_source_id = query_params.get("dataSourceId")
     source_table = query_params.get("sourceTable")
     filter_error = None
@@ -105,7 +104,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         logger.info("list_metrics_source_table_filter_withheld", namespace=namespace)
         return api_response(200, {"metrics": []})
 
-    # Query Neptune
     metrics = _get_neptune().list_metrics(
         namespace=namespace,
         data_source_id=data_source_id,
@@ -114,7 +112,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         offset=offset,
     )
 
-    # Determine pagination
     has_next = len(metrics) > limit
     if has_next:
         metrics = metrics[:limit]

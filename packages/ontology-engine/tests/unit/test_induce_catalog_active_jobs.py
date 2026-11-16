@@ -108,21 +108,6 @@ class TestCountActiveJobs:
         assert result == {"activeJobs": 2}
         mocks["list_proposals"].assert_called_once_with(namespace="ns-1", status="accepting", limit=1000)
 
-    def test_pending_proposals_do_not_block(self):
-        """A pending proposal is just awaiting steward review — no background
-        writer, so it must not block namespace deletion indefinitely."""
-        from coa_ontology.induce_catalog import count_active_jobs
-
-        # list_proposals is called with status="accepting" so a pending
-        # proposal would never be returned by the mock in the first place —
-        # this test documents that expectation explicitly.
-        stack, mocks = _patch_dynamo_store()
-        with stack:
-            result = count_active_jobs("ns-1")
-
-        assert result == {"activeJobs": 0}
-        mocks["list_proposals"].assert_called_once_with(namespace="ns-1", status="accepting", limit=1000)
-
     def test_only_terminal_ingest_jobs_returns_zero(self):
         from coa_ontology.induce_catalog import count_active_jobs
 

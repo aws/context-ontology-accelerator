@@ -295,8 +295,6 @@ class InMemoryIRIResolver:
         # The IRI itself contains the first-seen case-preserving forms.
         self._store: dict[tuple[str, str], str] = {}
 
-    # ── Internal helpers ────────────────────────────────────────────
-
     def _normalize_pair(self, raw_value: str, raw_classification: str) -> tuple[str, str, str, str]:
         """Apply both normalizations to a (value, classification) pair.
 

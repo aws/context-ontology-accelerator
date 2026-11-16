@@ -607,6 +607,7 @@ the rest default.
 | `timeout`                     | 10 minutes                | Invocation timeout                             |
 | `memorySize`                  | 1024 MB                   | Enough to buffer a block before it spills      |
 | `spill`                       | `"create"`                | `"none"` deploys no bucket — see Spill         |
+| `accessLogsBucket`            | one created per connector | Spill access-log target — see Access logging   |
 | `environment`                 | `{}`                      | Connector-specific variables — see below       |
 | `description`                 | derived                   | Lambda description                             |
 
@@ -814,6 +815,29 @@ connector's [push-down section](databricks/DESIGN.md#push-down-what-is-and-is-no
 The bucket has block-public-access, enforced SSL, SSE-KMS with its own customer-managed key, no versioning, and a
 one-day expiry rule. One day because spill data is scratch — anything older than the query
 that wrote it is garbage.
+
+### Access logging
+
+The spill bucket writes S3 server access logs under `spill/{connectorId}/` to `accessLogsBucket`.
+By default that is a second bucket created per connector: block-public-access, enforced SSL, ACLs
+disabled, SSE-S3 (server access log delivery does not support SSE-KMS targets), a 90-day expiry,
+and no logging of its own. Log delivery is granted by a bucket-policy statement scoped to the spill
+bucket and account, not by an ACL. Under `spill: Provisioning.NONE` neither bucket is created.
+
+The log bucket follows `spillRemovalPolicy`. Under `RETAIN`, a stack delete leaves **both** buckets
+behind, and the log bucket must be deleted by hand once its logs are no longer needed: the 90-day
+expiry empties it but does not remove it. Find it with
+`aws s3api get-bucket-logging --bucket <spill-bucket>` before deleting the stack.
+
+To share one log bucket across connectors, pass it as `accessLogsBucket`. Who grants delivery to
+it depends on where it is defined:
+
+- **Defined in the same app:** CDK adds the grant. It uses a bucket policy if the app enables
+  `@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy` in `cdk.json`, and otherwise the legacy
+  `LogDeliveryWrite` ACL, which re-enables ACLs on that bucket. Enable the flag.
+- **Imported** (`Bucket.fromBucketName` and the like): CDK cannot add anything. The bucket must
+  already allow `s3:PutObject` from `logging.s3.amazonaws.com`, or no log is ever delivered and
+  nothing reports it.
 
 ### Two layers of encryption, both required
 

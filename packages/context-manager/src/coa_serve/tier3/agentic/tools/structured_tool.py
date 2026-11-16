@@ -17,8 +17,8 @@ already supports this via its ``option`` kwarg, so each tool just pins its own.
 This is what lets the agentic loop answer a structured sub-question (e.g. "what was
 revenue in Q3?") against a DATABASE source instead of only retrieving document chunks.
 
-Composition gating (Req: "don't present structured tools when there is no
-structured source") is PER-REQUEST, not at registration: the factory registers
+Composition gating (no structured tools on a namespace with no structured source)
+is PER-REQUEST, not at registration: the factory registers
 these tools process-wide whenever a ``StructuredQueryTier`` exists, and the
 retriever withholds them from the planner's spec list on a namespace with no
 structured source (``_STRUCTURED_TOOL_NAMES`` -> ``excluded_tools`` ->
@@ -32,13 +32,13 @@ LLM's to supply, and ``validate_inputs`` rejects any key outside a tool's
 CLOSED when no roles resolve, so an empty profile turns every invocation into an
 ``AccessDeniedError`` that the blanket ``except`` renders as a plain retrieval miss.
 
-Per-Tool failure tolerance (Req 9.1-9.2): like every Tool, ``invoke`` never
+Per-Tool failure tolerance: like every Tool, ``invoke`` never
 raises for a retrieval failure. ``StructuredQueryTier.resolve`` returns ``None``
 when no strategy produced a confident answer; the tool maps that to an empty
 :class:`ToolResult` whose ``detail`` records the miss, so the controller scores it
 as no-progress and can escalate, exactly as an empty document retrieval would.
 
-Import discipline (Requirement 12.3): this module imports only the dependency-free
+Import discipline: this module imports only the dependency-free
 Tool base and, lazily inside ``invoke``, the Tier-2 strategy context — never
 ``graphrag_toolkit``.
 """
@@ -172,24 +172,9 @@ class StructuredQueryTool:
     async def _embed(self, text: str) -> list[float] | None:
         """Embed the sub-question, or ``None`` if unavailable (never raises).
 
-        What the embedding actually buys (measured against the code, not assumed):
-        Ontop skips its vector-hit lookup entirely without one, which costs the
-        metric context, the ``:aiContext`` glossary, and the confidence-calibration
-        signal. It does NOT change the class/property T-Box for namespaces at or
-        under the 200-mapped-class full-context threshold — that path is
-        vector-independent. Note the calibration loss cuts both ways: with no hits
-        neither the strong-hit boost nor the weak-hit penalty applies, so an
-        ungrounded SPARQL can score HIGHER than it deserves.
-
-        For ``nl_to_sql`` this relocates an embed rather than saving one
-        (``SQLGenerator`` self-embeds otherwise) — but relocating it is still worth
-        it, because an embed failure inside ``SQLGenerator`` is terminal for the
-        strategy, whereas here it degrades to ``None``.
-
-        Embeds the SUB-QUESTION, not the original request query: the request-level
-        embedding is never plumbed into the reasoning loop at all, so there is no
-        precomputed vector available mid-loop. This matches ``vector_tool``, which
-        re-embeds its own sub-question the same way.
+        Without an embedding Ontop skips its vector-hit lookup (metric context,
+        ``:aiContext`` glossary, confidence calibration). Embedding here also means
+        an embed failure degrades to ``None`` instead of failing ``SQLGenerator``.
         """
         if self._embed_client is None or not text:
             return None
@@ -218,7 +203,7 @@ class StructuredQueryTool:
         Embeds the sub-question so the strategy gets its ontology vector context,
         then delegates to ``StructuredQueryTier.resolve`` with this tool's ``option``.
         A ``None`` result (no confident answer) or an exception both map to an empty
-        :class:`ToolResult`; the tool never raises (Req 9.1-9.2).
+        :class:`ToolResult`; the tool never raises.
 
         ``original_question`` (sent by the session only under
         ``options.sqlOriginalQuestion``) reaches the SQL writer as
@@ -227,10 +212,8 @@ class StructuredQueryTool:
         """
         from ....tier2.strategy import StrategyContext
 
-        # Sent by the session only under options.sqlOriginalQuestion.
         if original_question:
             options = {**(options or {}), "originalQuestion": original_question}
-        # Sent by the session only under options.sqlComputeMetric.
         if compute_metric:
             options = {**(options or {}), "computeMetric": True}
         # options.sqlRevision: a planner-stated reason revises the previous query of
@@ -248,9 +231,6 @@ class StructuredQueryTool:
                 ),
             }
 
-        # profile/options/model_id arrive OUT-OF-BAND from the controller (never via
-        # planner inputs — see the module docstring). profile is load-bearing:
-        # SQLFirewall/Cedar fail CLOSED on an empty one.
         context = StrategyContext(
             profile=profile or {},
             options=options or {},
@@ -260,13 +240,8 @@ class StructuredQueryTool:
         try:
             result = await self._tier.resolve(query, namespace, context, option=self._option)
         except AccessDeniedError:
-            # An authorization denial is NOT a retrieval failure and must not be
-            # degraded into "0 rows". AccessDeniedError is the firewall/Cedar 403
-            # (exceptions.py:33) and every other consumer of this engine propagates
-            # it — the standard Tier-2 path raises it straight out of the
-            # orchestrator. Swallowing it here would turn a 403 into a 200 with an
-            # empty answer, hiding a misconfigured grant behind a plausible
-            # "no data found". Re-raise so the request fails loudly with 403.
+            # AccessDeniedError is the firewall/Cedar 403: it must propagate, not
+            # become an empty "no data found" result.
             raise
         except Exception as exc:  # noqa: BLE001 - a Tool must never raise into the loop
             logger.warning(
@@ -296,7 +271,7 @@ class StructuredQueryTool:
         items = tuple({"type": "row", **row} for row in result.rows)
         detail = f"{self.name}: {len(rows)} rows via {result.strategy_name} (conf {result.confidence:.2f})"
         # Capture the query artifacts this tool built + executed so Deep Reasoning
-        # can return them the same way Standard mode does (#1166). The VKG path
+        # can return them the same way Standard mode does. The VKG path
         # yields both a SPARQL statement and the SQL it compiled to; NL→SQL yields
         # SQL only (result.sparql is empty). Surfaced behind includeDebugInfo at
         # assembly time — capturing here does not itself expose them.
@@ -451,8 +426,7 @@ class EvidenceStructuredQueryTool(StructuredQueryTool):
         whose check runs past the screener's timeout; a guardrail error lets the
         piece through (fail-open when the guardrail is unreachable). Without a
         configured screener every piece is kept. Only the SQL writer's evidence is
-        screened here; the planner and the answer step read documents unscreened,
-        as before.
+        screened here; the planner and the answer step read documents unscreened.
         """
         if self._chunk_screener is None or not pieces:
             return pieces, 0
@@ -480,9 +454,7 @@ def build_structured_tools(
     Both are registered together (they need the same engine) and both are withheld
     per-request by composition gating on a namespace with no structured source.
     Exposing them SEPARATELY lets the planner deliberately choose the ontology/VKG
-    path — previously only ``nl_to_sql`` existed and it silently fell back to Ontop
-    via the tier's default option, so the SPARQL capability was reachable but
-    mislabeled and never selectable on purpose.
+    path.
     """
     from ....tier2.strategy import StrategyOption
 

@@ -381,11 +381,7 @@ def import_client(monkeypatch, tmp_path, fake_dynamo):
         patch("coa_ontology.stores.build_stores", return_value=(mock_graph, mock_vec)),
         patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient", return_value=mock_bedrock),
         patch("coa_ontology.proposals.Thread", _InlineThread),
-        # S3 persist (#467) builds its own boto3 client + reads Neptune, and now
-        # RAISES on failure (a retried accept step) instead of swallowing — so
-        # without a stub it would make real network calls and fail these accepts.
-        # These tests don't exercise persistence (see test_s3_persistence.py); the
-        # persist-failure accept path is covered in test_proposal_turtle_ingest.py.
+        # S3 persist makes real network calls; stub it.
         patch("coa_ontology.proposals._persist_induced_to_s3", return_value=None),
     ):
         from coa_ontology.main import app

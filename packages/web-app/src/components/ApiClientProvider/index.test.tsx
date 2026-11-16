@@ -61,11 +61,7 @@ describe("ApiClientProvider error envelopes", () => {
   });
 
   it("uses a FastAPI `detail` as the error message", async () => {
-    // Most ontology-engine 4xx responses are a bare `HTTPException`, whose
-    // envelope is `detail` rather than the Smithy `message`. Reading only
-    // `message` made every one of those fall through to the raw fallback, so a
-    // page that rendered `error.message` showed the JSON envelope to the user
-    // and the sentence the backend wrote was buried inside it.
+    // FastAPI `HTTPException` responses carry `detail`, not the Smithy `message`.
     mockFailure(
       409,
       JSON.stringify({

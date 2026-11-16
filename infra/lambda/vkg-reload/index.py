@@ -93,34 +93,13 @@ def handler(event, context):
     Two entry modes:
 
     * **Per-namespace** (EventBridge ``ontology.published``): the event carries
-      ``detail.namespace`` / ``detail.version`` and only that namespace's VKG
-      service is reconciled.
-    * **Sweep** (``{"sweep": true}``, sent by the weekly scheduled rule and,
-      asynchronously, by the deploy-time custom resource whenever the VKG image
-      changes): every ``<prefix>-vkg-*`` service in the cluster is reconciled
-      against the latest SSM image. This keeps long-lived namespaces current even
-      when their ontology is never republished — otherwise a base-image digest
-      bump never reaches a running task, which is how stale VKG images
-      accumulate. A service already on the latest image is left alone.
-
-    Args:
-        event: EventBridge event or direct invoke payload. ``{"sweep": true}``
-            selects sweep mode (an optional ``trigger`` field is logged);
-            otherwise ``detail.namespace`` / ``detail.version`` select the
-            per-namespace reload.
-        context: Lambda runtime context; its remaining time bounds the
-            revision cleanup.
-
-    Returns:
-        Per-namespace: a status dict (``reload_triggered`` / ``provisioned`` /
-        ``skipped`` / ``failed``). Sweep: ``{"status": "sweep_complete", ...}``
-        with a per-namespace ``results`` list, or ``failed`` if the image cannot
-        be resolved at all.
-
-    Raises:
-        Exception: In per-namespace mode, re-raised after emitting
-            ``ReloadFailed`` on an unexpected error. The sweep isolates
-            per-namespace failures and never raises for a single bad namespace.
+      ``detail.namespace`` / ``detail.version`` and only that namespace is reconciled.
+      An unexpected error is re-raised after emitting ``ReloadFailed``.
+    * **Sweep** (``{"sweep": true}``, from the weekly rule and the deploy-time custom
+      resource): every ``<prefix>-vkg-*`` service in the cluster is reconciled against the
+      latest SSM image, so namespaces whose ontology is never republished still pick up
+      base-image bumps. A service already on the latest image is left alone, and a single
+      bad namespace never fails the sweep.
     """
     cluster = os.environ["CLUSTER_ARN"]
     prefix = os.environ["RESOURCE_PREFIX"]
@@ -236,22 +215,12 @@ def _reload_one(
 ):
     """Reconcile a single namespace's VKG service to the latest image.
 
-    Resolves the target image from SSM when not supplied (the sweep resolves it
-    once and passes it in for every namespace). If the service's task definition
-    names a different image, registers a fresh task-definition revision first.
-    If it names the same image URI, forces a new deployment when
-    ``restart_if_current`` is true (an ontology publish must restart the task to
-    load the new mappings). Otherwise (the sweep) it compares image digests: the
-    service is left alone and reported ``unchanged`` only when every running
-    task's digest equals the digest the image URI resolves to now. A reused tag
-    with a new build therefore still rolls out, and when either digest cannot be
-    resolved the service is restarted as before, so a failed lookup never stops
-    a rollout. If the service does not yet exist, provisions it. Reload outcomes
-    are published as ``ReloadTriggered``/``ReloadFailed`` CloudWatch metrics.
-
-    Raises:
-        Exception: Re-raised after emitting ``ReloadFailed`` when an unexpected
-            error occurs during reload of an existing service.
+    Registers a fresh task-definition revision when the service names a different image.
+    For the same image URI it forces a new deployment when ``restart_if_current`` is true
+    (an ontology publish must reload mappings); otherwise (the sweep) it leaves the service
+    alone only when every running task's digest equals the digest the URI resolves to now,
+    restarting when either digest is unknown. Provisions the service if it does not exist,
+    and re-raises after emitting ``ReloadFailed`` on an unexpected error.
     """
     service_name = f"{prefix}-vkg-{ns}"
     log = {"action": "reload_start", "namespace": ns, "version": version, "cluster": cluster, "service": service_name}
@@ -291,9 +260,8 @@ def _reload_one(
                     )
                 )
                 return {"status": "unchanged", "namespace": ns}
-            # Same URI but a different (or unknown) digest: the tag now points at
-            # another build, or we cannot tell. Restart so ECS resolves the tag
-            # again, exactly as before the skip existed.
+            # Same URI but a different (or unknown) digest: the tag now points at another
+            # build, or we cannot tell. Restart so ECS re-resolves the tag.
             known = bool(target_digest and running_digests)
             print(
                 json.dumps(
@@ -532,20 +500,13 @@ def _register_task_definition(ns, prefix, container_image):
     ontology_bucket = os.environ.get("ONTOLOGY_BUCKET", "")
     region = os.environ.get("AWS_REGION", "us-west-2")
 
-    # Task sizing and heap are read from the environment so this reload path and
-    # the CDK-provisioned initial service stay in sync from a single source of
-    # truth (VkgStack sets these on the reload Lambda). Previously this path
-    # hardcoded cpu=512/memory=1024 while the CDK service defaulted to 1024/2048,
-    # so per-namespace reloads silently ran under-provisioned and the OWL2QL
-    # translation pass could never finish (#149 cause B). Defaults below match
-    # the CDK stack defaults so behaviour is safe even if the env is unset.
+    # Task sizing and heap are read from the environment (set on the reload Lambda by
+    # VkgStack) so this path matches the CDK-provisioned service. Defaults below match the
+    # CDK stack defaults.
     task_cpu = os.environ.get("VKG_TASK_CPU", "1024")
     task_memory = os.environ.get("VKG_TASK_MEMORY", "2048")
-    # The Ontop launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS). Setting JAVA_OPTS
-    # was a silent no-op (#149 cause C). When VKG_ONTOP_JAVA_ARGS is not set
-    # explicitly, derive the heap from task memory (max heap ~= 75% of task
-    # memory, initial heap ~= 25%) so bumping VKG_TASK_MEMORY alone scales the
-    # heap in step rather than leaving a stale hardcoded -Xmx.
+    # The Ontop launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS). When VKG_ONTOP_JAVA_ARGS is
+    # not set, derive the heap from task memory (max heap ~= 75%, initial ~= 25%).
     ontop_java_args = os.environ.get("VKG_ONTOP_JAVA_ARGS", "").strip()
     if not ontop_java_args:
         try:

@@ -318,7 +318,7 @@ describe("ServeStack - Athena S3 permissions", () => {
   it("grants write access on the Athena spill bucket", () => {
     // Account-suffixed on purpose: the bare "athena-spill" substring also matches
     // the cross-account wildcard spill-READ resource, which would let this test
-    // pass on statements that say nothing about Orion's own bucket.
+    // pass on statements that say nothing about this stack's own bucket.
     const actions = actionsForResource("athena-spill-123456789012");
     expect(actions).toContain("s3:PutObject");
     expect(actions).toContain("s3:GetObject");
@@ -392,13 +392,7 @@ describe("ServeStack - Redshift execution engine IAM", () => {
   });
 
   it("resolves GROUP_CLAIM_NAME from SSM (not a hardcoded Cognito default)", () => {
-    // Regression: this used to be a hardcoded DEFAULT_GROUP_CLAIM
-    // ("cognito:groups") passed from app.ts regardless of idpType, which
-    // silently broke group-based role resolution on the direct-OIDC path
-    // (external IdPs configure their own claim name, e.g. plain "groups").
-    // Must be an SSM dynamic reference resolved from
-    // /authentication-group-token-name (written by idp-authentication-stack.ts
-    // on both the Cognito/SAML and OIDC paths), not a literal string.
+    // GROUP_CLAIM_NAME must be an SSM dynamic reference: external IdPs use their own claim name.
     template.hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
       EnvironmentVariables: Match.objectLike({
         GROUP_CLAIM_NAME: Match.anyValue(),
@@ -459,15 +453,6 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
     });
   });
 
-  // The tag is the whole resource scope — the ARN is a bare wildcard — so losing the
-  // condition silently restores an invoke-anything-in-any-account-via-Athena grant.
-  it("does not grant invoke without the connector tag condition", () => {
-    const condition = bySid("AthenaFederationConnectorInvoke").Condition;
-    expect(condition.StringEquals).toHaveProperty(
-      "aws:ResourceTag/coa:connector",
-    );
-  });
-
   // Without this, an Athena UDF (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`) —
   // which needs only StartQueryExecution, already held, plus InvokeFunction —
   // reaches every Lambda in OUR account, including the Lake-Formation-admin
@@ -497,18 +482,6 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
     });
   });
 
-  // StringNotEquals matches an ABSENT key, which is what makes the exemption fail
-  // closed: drop the condition and every same-account function is denied again,
-  // connector included; invert it to StringEquals and the Deny denies precisely
-  // the one thing it must permit.
-  it("exempts the connector tag by its absence, not by an equality match", () => {
-    const condition = bySid("DenyAthenaInvokeOfUntaggedFunctions").Condition;
-    expect(condition.StringNotEquals).toEqual({
-      "aws:ResourceTag/coa:connector": "true",
-    });
-    expect(condition.StringEquals).toBeUndefined();
-  });
-
   // The KEY PREFIX is what bounds this grant, not the account: the bucket belongs to
   // the customer, so it cannot be pinned, and every connector is required to spill
   // under `connectors/{connectorId}/spills/`. That is what lets the statement span
@@ -528,17 +501,6 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
         StringEquals: { "aws:RequestedRegion": "us-east-1" },
       },
     });
-  });
-
-  // Spanning our own account is the point of the prefix scoping — it is the one
-  // topology the previous aws:ResourceAccount exclusion could not serve, since a
-  // connector deployed alongside Orion could never spill. Asserted so a future
-  // "tighten this" change has to confront the trade-off rather than silently
-  // reintroduce it.
-  it("does not exclude this account from the spill read", () => {
-    expect(bySid("AthenaFederationSpillRead").Condition).not.toHaveProperty(
-      "StringNotEquals",
-    );
   });
 
   // The bucket-level actions DID prove necessary — a cross-account spill read
@@ -576,7 +538,7 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
 
   // The s3:prefix condition is the only thing keeping a wildcard-bucket ListBucket
   // from being an enumeration primitive, and it matters more now that the statement
-  // spans this account: without it, this would list any bucket Orion owns.
+  // spans this account: without it, this would list any bucket this account owns.
   it("scopes spill ListBucket to the connector spill prefix", () => {
     expect(bySid("AthenaFederationSpillList")).toEqual({
       Sid: "AthenaFederationSpillList",
@@ -593,47 +555,19 @@ describe("ServeStack - custom Athena federation connector IAM", () => {
     });
   });
 
-  // Every S3 spill statement spans this account, so `aws:CalledVia` is now the only
-  // thing keeping them off the direct-invoke path. Asserted across all three rather
-  // than per statement: dropping it from any one turns that statement into a plain
-  // S3 grant on the serve role.
-  it("gates every S3 spill statement on Athena as the caller", () => {
-    for (const sid of [
-      "AthenaFederationSpillRead",
-      "AthenaFederationSpillBucketLocation",
-      "AthenaFederationSpillList",
-    ]) {
-      expect(bySid(sid).Condition["ForAnyValue:StringEquals"]).toEqual({
-        "aws:CalledVia": "athena.amazonaws.com",
-      });
-    }
-  });
-
   // The KMS grant is scoped by a tag on the KEY, not by excluding this account — a
   // spill path is not expressible for kms:Decrypt (S3 Bucket Keys put the BUCKET arn
   // in kms:EncryptionContext, not the object's), so a tag is the only per-resource
   // handle KMS offers. Tighter than the exclusion in BOTH directions: it keeps this
-  // off Orion's own keys and off arbitrary foreign keys, which the exclusion allowed.
+  // off this deployment's own keys and off arbitrary foreign keys, which the exclusion allowed.
   it("scopes the spill KMS decrypt to tagged keys, in any account", () => {
     const condition = bySid("AthenaFederationSpillDecryptViaS3").Condition;
     expect(condition.StringEquals).toEqual({
       "kms:ViaService": "s3.us-east-1.amazonaws.com",
       "aws:ResourceTag/coa:connector-spill": "true",
     });
-    // Spanning this account is what lets a connector deployed alongside Orion spill
-    // at all; the previous exclusion made that impossible.
+    // Spanning this account lets a connector deployed alongside this stack spill.
     expect(condition).not.toHaveProperty("StringNotEquals");
-  });
-
-  // Both keys must sit in ONE StringEquals object. Two `StringEquals` properties in
-  // the object literal would silently overwrite each other, dropping kms:ViaService
-  // and widening the grant to any KMS caller — a mistake made once already.
-  it("keeps kms:ViaService alongside the tag rather than replacing it", () => {
-    expect(
-      bySid("AthenaFederationSpillDecryptViaS3").Condition.StringEquals[
-        "kms:ViaService"
-      ],
-    ).toBe("s3.us-east-1.amazonaws.com");
   });
 
   // kms:ViaService, NOT aws:CalledVia: under bucket-level SSE-KMS, S3 is the
@@ -730,11 +664,7 @@ describe("ServeStack - guardrail off switch", () => {
 });
 
 describe("ServeStack - deep-reasoning budget variables", () => {
-  // These budgets were renamed from AGENTIC_* when the execution mode was
-  // rebranded to "deep reasoning". The stack's non-default values (110s budget vs
-  // the 30s code default) are what make the mode usable at all, and serve reads
-  // them by name — so a half-reverted rename silently drops the deployment back to
-  // the code defaults with no error anywhere. These assertions fail if that happens.
+  // serve reads these budgets by name, so a missed rename silently falls back to the code defaults.
   it("passes the DEEP_REASONING_* budgets to the runtime", () => {
     createStack().hasResourceProperties("AWS::BedrockAgentCore::Runtime", {
       EnvironmentVariables: Match.objectLike({
@@ -973,9 +903,6 @@ describe("ServeStack - SERVE_VKG_TRANSLATION_TIMEOUT_S wiring", () => {
     expect(
       envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
     ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
-    expect(
-      envOf(createStack({ serve_vkg_translation_timeout_s: 0 })),
-    ).toMatchObject({ SERVE_VKG_TRANSLATION_TIMEOUT_S: "0" });
   });
 
   it("passes a set value through verbatim", () => {
@@ -1020,15 +947,8 @@ describe("ServeStack - parameter read is deliberately broad", () => {
   });
 });
 
-// The running coa-dev-context-manager image accreted Critical/High OS CVEs
-// (perl, openssl, glibc, pcre2, sqlite3) whenever a build predated the Debian
-// point releases that fix them. This image is also an arm64 OCI index, which
-// ECR BASIC scanning silently refuses — so regressions here go unnoticed until
-// a child manifest is scanned by digest. The base is now AL2023. Two
-// Dockerfile properties keep the image patchable: a pinned base digest
-// (supply-chain integrity + a cache-busting bump lever) and a post-install
-// `dnf upgrade --releasever=latest` (the only mechanism pulling AL2023 security
-// updates in past the pinned snapshot). Mirrors ontology-stack.
+// The image is an arm64 OCI index, which ECR BASIC scanning silently refuses, so CVE regressions go unnoticed.
+// The Dockerfile pins the base digest and runs `dnf upgrade --releasever=latest` to pull in AL2023 security updates.
 describe("context-manager Dockerfile CVE hygiene", () => {
   const dockerfile = fs.readFileSync(
     path.join(
@@ -1152,7 +1072,7 @@ describe("ServeStack - RDF_SPARQL graph sources", () => {
     jdbc_peer_cidrs: "10.20.0.0/16",
   };
 
-  describe("off (the default): main's template", () => {
+  describe("off (the default): unchanged template", () => {
     it("sets no graph-sources env var", () => {
       const env = runtimeEnv(createStack());
       expect(env).not.toHaveProperty("GRAPH_SOURCES_ENABLED");

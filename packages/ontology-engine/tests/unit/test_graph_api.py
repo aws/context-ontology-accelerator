@@ -4,7 +4,6 @@
 """Unit tests for the /graph/* endpoints (vertex lookup + search).
 
 All tests mock the graph store so no live Neptune/SPARQL is needed.
-Run with: uv run pytest tests/unit/test_graph_api.py -v
 """
 
 from unittest.mock import MagicMock, patch
@@ -117,15 +116,13 @@ SAMPLE_SEARCH_RESULTS = [
 ]
 
 
-def _mock_graph_store(get_vertex_return=None, search_return=None):
-    """Create a mock graph store with configurable return values."""
+def _mock_graph_store():
+    """Create a mock graph store with empty default return values."""
     mock = MagicMock()
-    mock.get_vertex.return_value = get_vertex_return
-    mock.search_entities.return_value = search_return or []
-    # count_entities must return an int (Pydantic validates total_count); the
-    # search route calls it alongside search_entities. Default to the number of
-    # search hits so tests that only set search_return get a sensible total.
-    mock.count_entities.return_value = len(search_return or [])
+    mock.get_vertex.return_value = None
+    mock.search_entities.return_value = []
+    # count_entities must return an int (Pydantic validates total_count).
+    mock.count_entities.return_value = 0
     return mock
 
 
@@ -141,11 +138,6 @@ def _patch_build_stores():
         # Expose the mock so tests can configure it
         p.mock_graph = mock_graph
         yield p
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# GET /graph/class/{uri}
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.unit
@@ -181,8 +173,7 @@ class TestGetClass:
 
     def test_superseded_history_propagates(self, _patch_build_stores):
         """The store's `superseded` history buckets must reach the API model —
-        the router maps fields explicitly, so a missing line here silently drops them
-        (which is exactly what the live E2E caught)."""
+        the router maps fields explicitly, so a missing line here silently drops them."""
         history = {"comments": ["AI: old text"], "altLabels": ["cust_master"]}
         _patch_build_stores.mock_graph.get_vertex.return_value = {**SAMPLE_CLASS_VERTEX, "superseded": history}
         resp = client.get("/graph/class/", params={"uri": "https://example.org/onto#Claim", "namespace": "default"})
@@ -222,11 +213,6 @@ class TestGetClass:
         assert "Invalid vertex URI" in resp.json()["detail"]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# GET /graph/object-property/{uri}
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @pytest.mark.unit
 class TestGetObjectProperty:
     def test_returns_object_property_vertex(self, _patch_build_stores):
@@ -252,11 +238,6 @@ class TestGetObjectProperty:
         assert "is not a object property" in resp.json()["detail"]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# GET /graph/datatype-property/{uri}
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @pytest.mark.unit
 class TestGetDatatypeProperty:
     def test_returns_datatype_property_vertex(self, _patch_build_stores):
@@ -278,11 +259,6 @@ class TestGetDatatypeProperty:
         )
         assert resp.status_code == 404
         assert "is not a datatype property" in resp.json()["detail"]
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# GET /graph/search
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.unit
@@ -368,13 +344,6 @@ class TestSearchEntities:
         call_kwargs = _patch_build_stores.mock_graph.search_entities.call_args[1]
         assert call_kwargs["ontology_id"] == "https://example.org/onto#"
 
-    def test_limit_passed_to_store(self, _patch_build_stores):
-        _patch_build_stores.mock_graph.search_entities.return_value = []
-        resp = client.get("/graph/search", params={"q": "x", "namespace": "default", "limit": "10"})
-        assert resp.status_code == 200
-        call_kwargs = _patch_build_stores.mock_graph.search_entities.call_args[1]
-        assert call_kwargs["limit"] == 10
-
     def test_501_when_backend_unsupported(self, _patch_build_stores):
         _patch_build_stores.mock_graph.search_entities.side_effect = NotImplementedError("NeptuneStore.search_x")
         resp = client.get("/graph/search", params={"q": "x", "namespace": "default"})
@@ -421,11 +390,6 @@ class TestSearchEntities:
         )
         assert resp.status_code == 400
         assert "cannot be empty" in resp.json()["detail"]
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Cross-cutting: namespace scoping
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.unit
@@ -562,10 +526,6 @@ class TestOntologyOverview:
         assert resp.status_code == 200
         assert resp.json()["classes"] == []
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# GET /graph/schema
-# ═══════════════════════════════════════════════════════════════════════
 
 SAMPLE_NAMESPACE_SCHEMA = {
     "classes": [

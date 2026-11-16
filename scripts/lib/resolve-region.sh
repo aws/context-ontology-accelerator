@@ -12,9 +12,6 @@
 # deletes in the wrong one. So after the environment variables this asks the AWS CLI
 # for the profile's region (which honors AWS_PROFILE), and only then defaults.
 #
-# Order: CDK_DEFAULT_REGION, AWS_DEFAULT_REGION, AWS_REGION, the profile's region
-# (`aws configure get region`), then us-east-1.
-#
 # Sourced, not run. Plain bash 3.2, since the scripts also run on macOS:
 #   source "${REPO_ROOT}/scripts/lib/resolve-region.sh"
 #   REGION="$(coa_resolve_region)"
