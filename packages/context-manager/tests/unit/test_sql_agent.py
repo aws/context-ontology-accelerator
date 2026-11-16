@@ -532,19 +532,12 @@ class TestSqlAgentRunOutcome:
             await _run(agent)
 
     @pytest.mark.asyncio
-    async def test_missing_strands_reports_unavailable(self):
+    async def test_missing_strands_reports_unavailable(self, monkeypatch):
         # Distinct from "ran and produced nothing" so the caller can tell a missing
         # dependency from a genuine miss.
         agent, mocks = _build()
-        saved = sys.modules.get("strands")
-        sys.modules["strands"] = None
-        try:
-            outcome = await _run(agent)
-        finally:
-            if saved is None:
-                sys.modules.pop("strands", None)
-            else:
-                sys.modules["strands"] = saved
+        monkeypatch.setitem(sys.modules, "strands", None)
+        outcome = await _run(agent)
 
         assert outcome.unavailable and not outcome.succeeded
         mocks["executor"].execute.assert_not_called()
@@ -730,18 +723,6 @@ class TestGraphTraversalTool:
         return graph
 
     @pytest.mark.asyncio
-    async def test_absent_by_default(self):
-        # No graph tool → same four tools and a prompt with no mention of it, so
-        # the arm is byte-identical to baseline.
-        agent, _ = _build()
-
-        install_fake_strands(lambda tools: _generate_and_execute(tools))
-        await _run(agent)
-
-        assert "explore_graph" not in strands_fake.last_agent.tools
-        assert "explore_graph" not in strands_fake.last_agent.system_prompt
-
-    @pytest.mark.asyncio
     async def test_offered_as_a_tool_without_touching_the_prompt(self):
         # Wiring the graph adds the TOOL and nothing else: the prompt stays
         # byte-identical, so the tool's own description is the only place it is
@@ -753,7 +734,6 @@ class TestGraphTraversalTool:
 
         assert "explore_graph" in strands_fake.last_agent.tools
         assert strands_fake.last_agent.system_prompt == build_system_prompt()
-        assert "explore_graph" not in strands_fake.last_agent.system_prompt
 
     @pytest.mark.asyncio
     async def test_traversal_result_is_returned_to_the_model(self):

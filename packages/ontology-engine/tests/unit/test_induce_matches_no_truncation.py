@@ -1,15 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test: structured induction persists ALL table-level matches to S3 (#908).
-
-Regression test for the [:50] slice bug that dropped matches > 50 from BOTH the
-DynamoDB metadata and the S3 artifact. The fix removes the slice so the full
-match list reaches create_proposal → put_proposal_matches_s3.
-"""
+"""Unit test: structured induction persists ALL table-level matches to S3."""
 
 from __future__ import annotations
 
+from collections import Counter
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -42,16 +38,7 @@ def _schemas_mod():
 
 
 def test_all_table_matches_reach_s3_no_truncation() -> None:
-    """An induction with >50 table-level matches persists ALL of them to S3.
-
-    Before the fix: line 955 in induce_catalog.py applied [:50] before passing
-    matches to create_proposal, so S3 got only the first 50. After the fix: the
-    slice is removed, and create_proposal → put_proposal_matches_s3 writes the
-    full list.
-
-    This test asserts that the matches list passed to create_proposal contains
-    ALL 75 table-level matches (no [:50] slice).
-    """
+    """An induction with >50 table-level matches persists ALL of them to S3."""
     from coa_ontology.induce_catalog import (
         WorkbenchInductionRequest,
         _jobs,
@@ -173,35 +160,21 @@ def test_all_table_matches_reach_s3_no_truncation() -> None:
 
     assert job.status == JobStatus.COMPLETED
 
-    # create_proposal was called with metadata containing ALL 75 table-level
-    # matches. Before the fix, this would have been truncated to 50.
     create_proposal_calls = mock_dynamo.create_proposal.call_args_list
     assert len(create_proposal_calls) == 1
     metadata = create_proposal_calls[0].kwargs["metadata"]
     matches_to_create_proposal = metadata["matches"]
 
-    # The regression: if this is 50, the [:50] slice was not removed.
     assert len(matches_to_create_proposal) == 75, (
         f"Expected 75 table-level matches to reach create_proposal, got {len(matches_to_create_proposal)}. "
         "If this is 50, the [:50] slice was not removed."
     )
 
-    # Verify the match types histogram: 17 exact + 13 high_confidence + 45 novel = 75
-    dumped_matches = [m if isinstance(m, dict) else m for m in matches_to_create_proposal]
-    # Count by match_type field (works whether m is dict or has .match_type attr)
-    exact_count = sum(
-        1 for m in dumped_matches if (m.get("match_type") if isinstance(m, dict) else m.match_type) == "exact"
-    )
-    high_conf_count = sum(
-        1 for m in dumped_matches if (m.get("match_type") if isinstance(m, dict) else m.match_type) == "high_confidence"
-    )
-    novel_count = sum(
-        1 for m in dumped_matches if (m.get("match_type") if isinstance(m, dict) else m.match_type) == "novel"
-    )
-
-    assert exact_count == 17, f"Expected 17 exact matches, got {exact_count}"
-    assert high_conf_count == 13, f"Expected 13 high_confidence matches, got {high_conf_count}"
-    assert novel_count == 45, f"Expected 45 novel matches, got {novel_count}"
+    assert Counter(m["match_type"] for m in matches_to_create_proposal) == {
+        "exact": 17,
+        "high_confidence": 13,
+        "novel": 45,
+    }
 
 
 def test_all_column_level_matches_yields_empty_table_matches() -> None:

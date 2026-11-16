@@ -51,12 +51,10 @@ describe("SortableTable sorting", () => {
       />,
     );
 
-    // Click the "Count" column header to sort ascending by count.
     const countHeader = screen.getByRole("columnheader", { name: /count/i });
     const btn = within(countHeader).getByRole("button");
     fireEvent.click(btn);
 
-    // Ascending by count => Alpha(1), Charlie(2), Bravo(3)
     expect(rowLabels()).toEqual(["Alpha", "Charlie", "Bravo"]);
   });
 
@@ -87,9 +85,7 @@ describe("SortableTable sorting", () => {
         ]}
       />,
     );
-    // Seeded default = label asc => Alpha, Bravo, Charlie
     expect(rowLabels()).toEqual(["Alpha", "Bravo", "Charlie"]);
-    // Click Count header => 1,2,3 => Alpha, Charlie, Bravo
     fireEvent.click(
       within(screen.getByRole("columnheader", { name: /count/i })).getByRole(
         "button",
@@ -127,9 +123,7 @@ describe("SortableTable sorting", () => {
         ]}
       />,
     );
-    // Seeded default = count desc => Bravo(3), Charlie(2), Alpha(1)
     expect(rowLabels()).toEqual(["Bravo", "Charlie", "Alpha"]);
-    // Click Label header to sort asc by label => Alpha, Bravo, Charlie
     fireEvent.click(
       within(screen.getByRole("columnheader", { name: /label/i })).getByRole(
         "button",
@@ -164,7 +158,6 @@ describe("SortableTable sorting", () => {
         ]}
       />,
     );
-    // Sort should persist across the re-render: label asc => Alpha, Bravo, Charlie
     expect(rowLabels()).toEqual(["Alpha", "Bravo", "Charlie"]);
   });
 });

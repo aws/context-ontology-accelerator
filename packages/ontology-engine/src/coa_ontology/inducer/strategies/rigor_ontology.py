@@ -228,9 +228,6 @@ class RigorOntologyStrategy(InductionStrategy):
             raise ValueError(
                 f"rigor_ontology supports only English namespaces; this namespace's language is {namespace_language}"
             )
-        # rigor_ontology uses LLM Gen+Judge rather than embedding match, so
-        # grounding_ontology_ids and grounding_mode have no effect on its
-        # current path. Accept for signature parity with the abstract base.
         del grounding_mode
         del grounding_ontology_ids
         # Every Gen/Judge/fallback LLM call flows through _call_llm; stash the
@@ -356,9 +353,6 @@ class RigorOntologyStrategy(InductionStrategy):
                 dropped_tables.append({"table_name": table.name, "reason": "parse_failed"})
 
         # Step 4b: Sanitize dual-typed properties (OWL 2 QL compliance)
-        # LLM occasionally emits a property as both owl:ObjectProperty and
-        # owl:DatatypeProperty (e.g. FK columns that are also integers).
-        # Ontop rejects this; resolve by keeping ObjectProperty (FK semantics).
         self._fix_dual_typed_properties(merged_graph)
 
         # Step 5: Novelty check
@@ -400,7 +394,7 @@ class RigorOntologyStrategy(InductionStrategy):
         """Write one table's or column's approved metadata onto ``subject``.
 
         An approved description REPLACES whatever ``rdfs:comment`` the LLM wrote:
-        two competing descriptions on one term is the failure #1118 removed, and
+        two competing ``rdfs:comment`` values on one term would conflict, and
         the approved text is the one a steward signed off. With no approved
         description the LLM's comment is kept.
         """
@@ -889,7 +883,6 @@ class RigorOntologyStrategy(InductionStrategy):
                         and str(target) not in novel_uris
                     ):
                         referenced_classes.add(target)
-        from rdflib import BNode
 
         for cls_ref in referenced_classes:
             for p, o in merged_graph.predicate_objects(cls_ref):
@@ -1104,12 +1097,6 @@ class RigorOntologyStrategy(InductionStrategy):
                     OWL.ObjectProperty,
                 ) in proposal_graph
 
-                # Resolve the FK target to the SUBJECT token its own TriplesMap
-                # mints instance IRIs under, so the reference lands on the right
-                # (possibly disambiguated) target. An ambiguous bare target — two
-                # in-run tables answering to the name, neither picked by the
-                # referrer's own schema — degrades to a datatype literal rather than
-                # a join to an arbitrary same-named table, exactly as base.py does.
                 target_token = self._fk_target_token(
                     fk_target,
                     table,
@@ -1202,9 +1189,6 @@ class RigorOntologyStrategy(InductionStrategy):
             identity = table_identity(table)
             expected_local = pascal_by_id[identity]
 
-            # Provenance and label are shared between same-named twins, so they can
-            # only re-fuse a collision. Skip straight to the disambiguated
-            # local-name match for a shared bare name.
             if table.name not in shared_names:
                 # Strategy 1: provenance match
                 for cls in gen_classes:
@@ -1286,7 +1270,7 @@ class RigorOntologyStrategy(InductionStrategy):
         does not pick one — the caller then emits a datatype literal instead of a
         join to an arbitrary same-named table.
 
-        ``target_datasource_id`` (an approved cross-source FK, #1140) goes to the
+        ``target_datasource_id`` (an approved cross-source FK) goes to the
         same :func:`resolve_fk_target_identity` call the other three artifacts
         make, so the template names the table the ontology's range does.
 
@@ -1318,12 +1302,6 @@ class RigorOntologyStrategy(InductionStrategy):
                 target_name,
             )
             return None
-        # Genuinely outside this induction run: the target table is not
-        # minted this run. An IRI-template ObjectMap pointing at a subject token
-        # whose TriplesMap is never declared is a dangling reference Ontop rejects
-        # on load, failing every query in the namespace. Degrade to a datatype
-        # literal (return None -> the caller emits rr:column), mirroring the
-        # ambiguous branch and the other three emitters.
         log.warning(
             "fk_target_out_of_run_degraded_to_literal",
             extra={"referrer": referrer.name, "target": target_name},
@@ -1437,7 +1415,7 @@ class RigorOntologyStrategy(InductionStrategy):
         """The single gate-passing FK constraint :meth:`_fk_info` reads, or ``None``.
 
         Exposed so the mapping can also read the constraint's ``targetDatasourceId``
-        (#1140) without changing :meth:`_fk_info`'s ``(table, column)`` shape.
+        without changing :meth:`_fk_info`'s ``(table, column)`` shape.
         """
         for tc in simple_fk_constraints(table, col_name):
             return tc

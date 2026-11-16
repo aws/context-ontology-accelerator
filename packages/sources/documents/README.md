@@ -1,6 +1,6 @@
 # Documents
 
-Document ingestion pipeline for the Context Ontology Accelerator. Copied from `unstructured-data-ingestion` and refactored into the `coa_sources.documents` submodule.
+Document ingestion pipeline for the Context Ontology Accelerator. Lives in the `coa_sources.documents` submodule.
 
 ## Package Structure
 
@@ -68,7 +68,3 @@ pip install smithy-generated/control-plane-python-server/ packages/sources/
 The `Dockerfile` is the source of truth; check it for the current versions.
 
 The step logs `No languages specified, defaulting to English.` for DOCX files and for text-native PDFs, including Japanese ones. Those go through `unstructured`, and preprocessing passes it no language. Text-native PDFs use its `fast` strategy, which reads the PDF's embedded text layer without OCR. Scanned PDFs, and every PDF when `enableTableExtraction` is on, go to Textract instead and don't log this line. The namespace language is applied later, during extraction and enrichment (see [Namespace Language](../../../external-docs/content/namespaces.md#namespace-language)).
-
-## Relationship to unstructured-data-ingestion
-
-This is a copy of `packages/unstructured-data-ingestion` with the business logic moved into `src/coa_sources/documents/` following the standard `src/` package layout used by `structured-data-ingestion` and `context-manager`. The original package remains unchanged and continues to serve the existing `/doc-sources` API.

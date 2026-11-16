@@ -1,12 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Tier-2 tool layer (TableCatalog, SqlAuthoringTool).
-
-These are the reusable capabilities Tier 2 owns; the agent and any future
-transport (MCP, HTTP) are consumers. Tested directly — no agent, no Strands — so
-the contract holds for every consumer.
-"""
+"""Unit tests for the Tier-2 tool layer (TableCatalog, SqlAuthoringTool), without an agent."""
 
 from __future__ import annotations
 
@@ -43,7 +38,6 @@ def _catalog(hits, llm=None, namespace="ns1", index="idx"):
 
 @pytest.mark.unit
 class TestTableCatalogSearch:
-    @pytest.mark.asyncio
     async def test_search_returns_only_mapped_tables(self):
         # An unmapped class has no backing table, so authoring SQL against it would
         # target something that does not exist — it must never be offered.
@@ -54,7 +48,6 @@ class TestTableCatalogSearch:
         assert [c.table for c in candidates] == ["orders", "customers"]
         assert candidates[0].preview.startswith("Table: orders")
 
-    @pytest.mark.asyncio
     async def test_search_scopes_to_namespace_and_index_and_overfetches_pool(self):
         catalog, vector = _catalog([_hit("orders")])
 
@@ -67,14 +60,12 @@ class TestTableCatalogSearch:
         # unmapped still yields top_k usable tables.
         assert kwargs["top_k"] >= 40
 
-    @pytest.mark.asyncio
     async def test_top_k_is_clamped_to_the_cap(self):
         catalog, _ = _catalog([_hit(f"t{i}") for i in range(30)])
 
         assert len(await catalog.search_tables("anything", top_k=99)) == MAX_TOP_K
         assert len(await catalog.search_tables("anything", top_k=0)) == 1
 
-    @pytest.mark.asyncio
     async def test_search_uses_the_embedded_query(self):
         llm = _llm()
         catalog, vector = _catalog([_hit("orders")], llm=llm)
@@ -87,7 +78,6 @@ class TestTableCatalogSearch:
 
 @pytest.mark.unit
 class TestTableCatalogSchema:
-    @pytest.mark.asyncio
     async def test_schema_prefers_context_text_over_embedded_text(self):
         # context_text carries per-column allowed values; it is what the writer needs.
         rich = "Table: orders | Columns: status:text (allowed: open, closed)"
@@ -96,7 +86,6 @@ class TestTableCatalogSchema:
 
         assert await catalog.get_table_schema("ORDERS ") == rich
 
-    @pytest.mark.asyncio
     async def test_schema_falls_back_to_targeted_search_for_uncached_table(self):
         # A caller can learn a table name from another table's FK comment; it must be
         # inspectable without re-running search_tables first.
@@ -107,13 +96,11 @@ class TestTableCatalogSchema:
         # And the targeted hit is now cached for generation.
         assert catalog.known_tables == ["line_items"]
 
-    @pytest.mark.asyncio
     async def test_schema_returns_empty_for_unknown_table(self):
         catalog, _ = _catalog([])
 
         assert await catalog.get_table_schema("nope") == ""
 
-    @pytest.mark.asyncio
     async def test_schema_returns_empty_when_retrieval_fails(self):
         # A backend failure on the lookup path is reported as "unknown table"; the
         # caller already handles that, and it must not abort the run.
@@ -123,7 +110,6 @@ class TestTableCatalogSchema:
 
         assert await catalog.get_table_schema("orders") == ""
 
-    @pytest.mark.asyncio
     async def test_search_failure_propagates(self):
         # search_tables RAISES (unlike the lookup path): a consumer that must not
         # raise translates it into its own protocol.
@@ -137,7 +123,6 @@ class TestTableCatalogSchema:
 
 @pytest.mark.unit
 class TestTableCatalogRouting:
-    @pytest.mark.asyncio
     async def test_hits_for_tables_splits_known_from_unknown(self):
         catalog, _ = _catalog([_hit("orders")])
         await catalog.search_tables("orders")
@@ -146,7 +131,6 @@ class TestTableCatalogRouting:
 
         assert len(hits) == 1 and missing == ["ghost"]
 
-    @pytest.mark.asyncio
     async def test_resolve_data_source_prefers_tables_in_the_sql(self):
         # Retrieval deliberately mixes sources; attributing by the tables the
         # statement references is precise where pool agreement is ambiguous.
@@ -158,7 +142,6 @@ class TestTableCatalogRouting:
         # since a wrong source mis-routes the query.
         assert catalog.resolve_data_source() == ""
 
-    @pytest.mark.asyncio
     async def test_resolve_data_source_falls_back_to_pool_agreement(self):
         catalog, _ = _catalog([_hit("orders"), _hit("customers")])
         await catalog.search_tables("orders")
@@ -166,7 +149,6 @@ class TestTableCatalogRouting:
         # SQL references a table outside the pool → fall back to unanimous agreement.
         assert catalog.resolve_data_source("SELECT 1 FROM other_thing") == "ds-1"
 
-    @pytest.mark.asyncio
     async def test_known_tables_is_sorted_and_deduped(self):
         catalog, _ = _catalog([_hit("orders"), _hit("customers"), _hit("orders")])
         await catalog.search_tables("orders")
@@ -181,7 +163,6 @@ class TestSqlAuthoringTool:
         generator.generate_from_context = AsyncMock(return_value=(gen_sql, 0.75))
         return SqlAuthoringTool(generator, catalog, **kwargs), generator
 
-    @pytest.mark.asyncio
     async def test_generates_from_the_chosen_tables_schema(self):
         rich = "Table: orders | Columns: status:text (allowed: open, closed)"
         catalog, _ = _catalog([_hit("orders", context_text=rich)])
@@ -198,7 +179,6 @@ class TestSqlAuthoringTool:
         assert args[0] == "how many orders" and rich in args[1]
         assert kwargs["evidence"] == "hint" and kwargs["dialect"] is None and kwargs["feedback"] == ""
 
-    @pytest.mark.asyncio
     async def test_unknown_tables_raise_ordering_error(self):
         # Generating before discovering is a caller ordering error, not a backend
         # failure — it is signalled distinctly so the caller can go search first.
@@ -211,7 +191,6 @@ class TestSqlAuthoringTool:
         assert excinfo.value.table_names == ["ghost"]
         generator.generate_from_context.assert_not_awaited()
 
-    @pytest.mark.asyncio
     async def test_partially_known_tables_generate_and_report_the_gap(self):
         catalog, _ = _catalog([_hit("orders")])
         await catalog.search_tables("orders")
@@ -221,7 +200,6 @@ class TestSqlAuthoringTool:
 
         assert out.tables_used == ["orders"] and out.missing_tables == ["ghost"]
 
-    @pytest.mark.asyncio
     async def test_feedback_and_model_override_reach_the_writer(self):
         # feedback is the self-correction channel: the writer is a stateless temp-0
         # function of (question, schema), so without it a retry returns identical SQL.

@@ -18,7 +18,7 @@ from unittest.mock import patch
 import pytest
 from coa_control_plane_server.models.source_status import SourceStatus
 
-from tests.unit.conftest import dao_double  # noqa: E402
+from tests.unit.conftest import dao_double
 
 MODULE = "coa_sources.database.pipeline.reaper_handler"
 

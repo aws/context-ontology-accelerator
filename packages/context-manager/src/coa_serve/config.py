@@ -23,23 +23,11 @@ logger = structlog.get_logger(__name__)
 def _valid_lexical_retriever_strategies() -> set[str]:
     """Return the valid ``RetrieverStrategy`` values for config validation.
 
-    Reuses the ``RetrieverStrategy`` enum from
-    ``coa_serve.lexical.strategies`` as the single source of truth.
-
     The enum is loaded directly from the ``strategies.py`` file (by path) rather
-    than via a normal ``import``. Importing
-    ``coa_serve.lexical.strategies`` the usual way executes the
-    ``lexical`` package ``__init__``, which eagerly imports ``baseline_retriever``
-    and thereby pulls in ``graphrag_toolkit`` at config-load time. Loading the
-    module file standalone keeps ``strategies.py``'s own lazy-import discipline
-    intact, so ``load_config`` never triggers the graphrag/botocore import chain.
-
-    On a broken install (missing ``strategies.py``, unrecognized loader, or an
-    exception while executing the module), falls back to a minimal set
-    containing only the documented default — ``load_config``'s existing
-    validate-or-warn handling will then warn-and-fall-back any non-default
-    deployment value, which is the correct behavior when the registry can't be
-    consulted.
+    than via a normal ``import``: importing ``coa_serve.lexical.strategies`` runs
+    the ``lexical`` package ``__init__``, which eagerly imports
+    ``baseline_retriever`` and pulls in ``graphrag_toolkit`` at config-load time.
+    On a broken install, falls back to a set holding only the documented default.
     """
     fallback: set[str] = {"chunk_based_semantic"}
 
@@ -143,10 +131,6 @@ class ServiceConfig:
     # the majority of real edges). "strict" restores the allowlist (ontology edges
     # only), guarded so it never strips the request down to nothing.
     deep_reasoning_ontology_edge_mode: Literal["soft_prior", "strict"] = "soft_prior"
-
-
-class ConfigurationError(Exception):
-    """Raised when required configuration cannot be loaded."""
 
 
 def env_with_legacy_name(name: str, default: str = "") -> str:
@@ -253,18 +237,9 @@ _GUARDRAILS_DISABLED_ENV = "SERVE_GUARDRAILS_DISABLED"
 def _guardrails_disabled() -> bool:
     """Whether this deployment has opted out of both serve-side Bedrock guardrails.
 
-    Exists for benchmarking, and the reason is measurable rather than a matter of
-    taste: the primary guardrail anonymizes PII on INPUT (NAME/EMAIL/PHONE →
-    ``{NAME}``), and in a text-to-SQL question the literals ARE the query. "What is
-    the border color of card 'Ancestor's Chosen'?" reaches the model as ``'{NAME}'``,
-    so the generated ``WHERE`` clause matches no row. Measured over the Tier-2
-    benchmark campaign: 1.6-3.2% of BIRD questions per run end up with a placeholder
-    in their FINAL SQL, and 306 of those 313 questions (97.8%) scored wrong against a
-    47-55% base wrong rate — worth roughly 1pp of execution accuracy per run
-    (0.7-1.6pp across five runs), charged to the system under test but caused by the
-    guardrail. Blocks are a smaller, separate effect: 944 of 18,305 guardrailed
-    Converse calls came back BLOCK, and questions that saw one still scored 52.1% EX
-    against 55.5% for those that did not.
+    Exists for benchmarking: the primary guardrail anonymizes PII on INPUT
+    (NAME/EMAIL/PHONE → ``{NAME}``), and in a text-to-SQL question the literals ARE
+    the query, so a generated ``WHERE`` clause can match no row.
 
     Deployment-scoped on purpose, and deliberately NOT a request option: the primary
     guardrail is the prompt-attack boundary, and a per-request bypass would let any
@@ -276,20 +251,18 @@ def _guardrails_disabled() -> bool:
     ingestion and ontology tasks, and ``cdk deploy`` of the guardrail stack writes
     the real id back over it. This flag is serve-only and survives a deploy.
     """
-    return os.environ.get(_GUARDRAILS_DISABLED_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+    return os.environ.get(_GUARDRAILS_DISABLED_ENV, "").strip().lower() in _TRUE_VALUES
 
 
 def load_config() -> ServiceConfig:
     """Load config from env vars and SSM. Called once at startup."""
     environment = os.environ.get("ENVIRONMENT", "local")
     ssm_prefix = os.environ.get("SSM_PREFIX", "/coa")
-    guardrail_id = _get_ssm_parameter(f"{ssm_prefix}/bedrock/guardrail-id", required=False)
+    guardrail_id = _get_ssm_parameter(f"{ssm_prefix}/bedrock/guardrail-id")
     if guardrail_id == "none":
         guardrail_id = ""
-    retrieval_guardrail_id = _get_ssm_parameter(f"{ssm_prefix}/bedrock/retrieval-guardrail-id", required=False)
-    retrieval_guardrail_version = (
-        _get_ssm_parameter(f"{ssm_prefix}/bedrock/retrieval-guardrail-version", required=False) or "DRAFT"
-    )
+    retrieval_guardrail_id = _get_ssm_parameter(f"{ssm_prefix}/bedrock/retrieval-guardrail-id")
+    retrieval_guardrail_version = _get_ssm_parameter(f"{ssm_prefix}/bedrock/retrieval-guardrail-version") or "DRAFT"
     guardrails_disabled = _guardrails_disabled()
     if guardrails_disabled:
         # ERROR, not warning: a stack serving unguarded traffic must not be
@@ -370,9 +343,6 @@ def load_config() -> ServiceConfig:
         )
         deep_reasoning_ontology_edge_mode = "soft_prior"
 
-    # Default topic_beam: the strongest single-shot strategy on the SEC-10-Q
-    # benchmark (45.13% strict vs 34.36% hand-rolled, 195 questions).
-    #
     # The FALLBACK is deliberately chunk_based_semantic, not topic_beam: the guard
     # fires when the value is absent from the registry's valid set, and that set
     # collapses to {"chunk_based_semantic"} when the registry itself cannot be
@@ -421,14 +391,8 @@ def load_config() -> ServiceConfig:
     )
 
 
-def _get_ssm_parameter(name: str, *, required: bool = False) -> str:
-    """Fetch a parameter from SSM Parameter Store.
-
-    Args:
-        name: The SSM parameter path.
-        required: If True, raises ConfigurationError on failure instead of
-                  returning a placeholder. Set to True in non-local environments.
-    """
+def _get_ssm_parameter(name: str) -> str:
+    """Fetch a parameter from SSM Parameter Store; any failure returns ``""``."""
     try:
         region = resolve_region()
         ssm = boto3.client("ssm", region_name=region, config=sync_boto_config())
@@ -436,17 +400,11 @@ def _get_ssm_parameter(name: str, *, required: bool = False) -> str:
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
         if error_code == "ParameterNotFound":
-            if required:
-                raise ConfigurationError(f"Required SSM parameter not found: {name}") from e
             logger.warning("ssm_parameter_not_found", name=name)
             return ""
-        if required:
-            raise ConfigurationError(f"Failed to load SSM parameter {name}: {error_code}") from e
         logger.error("ssm_parameter_error", name=name, error_code=error_code)
         return ""
     except Exception as e:
-        if required:
-            raise ConfigurationError(f"Failed to load SSM parameter {name}: {e}") from e
         logger.error("ssm_parameter_unexpected_error", name=name, error=str(e))
         return ""
 
@@ -464,9 +422,9 @@ def _read_ssm_parameter_strict(name: str, *, required: bool = False) -> str:
     The SDK's own transient-retry (``sync_boto_config`` ``max_attempts``) still
     runs first, so only errors that survive retry propagate here.
 
-    The ``required`` keyword is accepted for call-signature parity with
-    :func:`_get_ssm_parameter` (the guardrail provider passes ``required=False``);
-    it does not change behavior — a missing parameter always maps to ``""`` here.
+    The ``required`` keyword is accepted for the guardrail provider's call
+    signature; it does not change behavior — a missing parameter always maps to
+    ``""`` here.
     """
     region = resolve_region()
     ssm = boto3.client("ssm", region_name=region, config=sync_boto_config())

@@ -50,12 +50,10 @@ def _stringify_config_value(v: object) -> object:
     ints -> ``str``, whole-number floats -> their integer string. Anything
     already a string (or an unexpected type) passes through unchanged.
 
-    Floats reach here on the rescan path: the stored extraction config is
-    round-tripped through the Smithy ``ExtractionConfig`` model, which types
-    ``chunkSize``/``chunkOverlap`` as numbers, so ``0`` comes back as ``0.0``. A
-    float passed through unchanged makes the SFN ECS override fail ("must be a
-    STRING"), and ``"0.0"`` would break the container's ``int(os.environ[...])``,
-    so whole-number floats are rendered without the fractional part.
+    Floats reach here on the rescan path, where the Smithy ``ExtractionConfig``
+    model types ``chunkSize``/``chunkOverlap`` as numbers (``0`` becomes ``0.0``);
+    ``"0.0"`` would break the container's ``int(os.environ[...])``, so
+    whole-number floats are rendered without the fractional part.
 
     NOTE: bool is checked before int because ``isinstance(True, int)`` is True.
     """
@@ -110,9 +108,6 @@ def handler(event: dict, context: object) -> None:
                 **_EXTRACTION_DEFAULTS,
                 **{k: v for k, v in body.get("extraction_config", {}).items() if v is not None},
             }
-            # ECS container environment variable values must be strings, and
-            # Step Functions container-override JsonPath cannot inline a JSON
-            # object/array — see _stringify_config_value for the per-type rules.
             ec = body["extraction_config"]
             body["extraction_config"] = {k: _stringify_config_value(v) for k, v in ec.items()}
             # Namespace-language snapshot the API resolved when it enqueued the

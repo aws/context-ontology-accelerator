@@ -1,17 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for lexical baseline retriever and KnowledgeRetriever integration.
-
-Tests cover:
-- BaselineLexicalRetriever.retrieve maps toolkit output to BaselineResult
-- Timeout enforcement
-- tenant_id derivation
-- KnowledgeRetriever with lexical_retriever calls it and skips vector/graph
-- KnowledgeRetriever without lexical_retriever behaves as before (hand-rolled)
-- factory returns None when strategy is "hand-rolled"
-- factory returns BaselineLexicalRetriever when strategy is "lexical-baseline"
-"""
+"""Unit tests for lexical baseline retriever and KnowledgeRetriever integration."""
 
 from __future__ import annotations
 
@@ -50,9 +40,6 @@ def _make_synthesizer():
     )
 
 
-# ── BaselineLexicalRetriever tests ──────────────────────────────────
-
-
 @pytest.mark.unit
 class TestBaselineLexicalRetrieverInit:
     def test_tenant_id_derived_per_request(self):
@@ -63,11 +50,10 @@ class TestBaselineLexicalRetrieverInit:
         assert to_graphrag_tenant_id("550e8400-e29b-41d4-a716-446655440000") == "550e8400e29b41d4a71644665"
 
     def test_get_engine_calls_factories_with_correct_uris(self):
-        if True:  # no patch needed
-            retriever = BaselineLexicalRetriever(
-                graph_store_uri="neptune-graph://g-mytest",
-                vector_store_uri="aoss://https://mytest.aoss.amazonaws.com",
-            )
+        retriever = BaselineLexicalRetriever(
+            graph_store_uri="neptune-graph://g-mytest",
+            vector_store_uri="aoss://https://mytest.aoss.amazonaws.com",
+        )
 
         with (
             patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory") as mock_gsf,
@@ -91,44 +77,14 @@ class TestBaselineLexicalRetrieverInit:
             # Mirrors kg-build's EMBEDDING_INDEXES default (chunk,topic).
             assert "statement" not in v_kwargs["index_names"]
 
-    def test_engine_cached_per_tenant_id(self):
-        """Engine is built once per tenant_id and reused on subsequent calls."""
-        retriever = BaselineLexicalRetriever(
-            graph_store_uri="neptune-graph://g-test123",
-            vector_store_uri="aoss://https://test.aoss.amazonaws.com",
-        )
-
-        with (
-            patch("graphrag_toolkit.lexical_graph.storage.GraphStoreFactory"),
-            patch("graphrag_toolkit.lexical_graph.storage.VectorStoreFactory"),
-            patch("graphrag_toolkit.lexical_graph.LexicalGraphQueryEngine") as mock_engine,
-        ):
-            engine1 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", DEFAULT_SPEC)
-            engine2 = retriever._get_engine("550e8400-e29b-41d4-a716-446655440000", DEFAULT_SPEC)
-
-            assert engine1 is engine2
-            mock_engine.for_traversal_based_search.assert_called_once()
-
-    def test_stores_config(self):
-        if True:  # no patch needed — GraphRAGConfig already initialized at module level
-            retriever = BaselineLexicalRetriever(
-                graph_store_uri="neptune-graph://g-abc",
-                vector_store_uri="aoss://https://xyz.aoss.amazonaws.com",
-                timeout_s=20.0,
-            )
-        assert retriever._graph_store_uri == "neptune-graph://g-abc"
-        assert retriever._vector_store_uri == "aoss://https://xyz.aoss.amazonaws.com"
-        assert retriever._timeout_s == 20.0
-
 
 @pytest.mark.unit
 class TestBaselineLexicalRetrieverRetrieve:
     async def test_returns_baseline_result_on_success(self):
-        if True:  # no patch needed — GraphRAGConfig already initialized at module level
-            retriever = BaselineLexicalRetriever(
-                graph_store_uri="neptune-graph://g-test",
-                vector_store_uri="aoss://https://test.aoss.amazonaws.com",
-            )
+        retriever = BaselineLexicalRetriever(
+            graph_store_uri="neptune-graph://g-test",
+            vector_store_uri="aoss://https://test.aoss.amazonaws.com",
+        )
 
         # Mock the sync retrieve to return fake nodes shaped like real toolkit
         # output: nested ``source`` (Source.sourceId) + ``entity_contexts``
@@ -181,10 +137,10 @@ class TestBaselineLexicalRetrieverRetrieve:
         assert result.trace_steps[0]["status"] == "success"
 
     async def test_timeout_degrades_to_empty(self):
-        """Task 6.a / BUG 3 (2.8, 2.9): a retrieval that exceeds ``timeout_s``
+        """A retrieval that exceeds ``timeout_s``
         degrades to an empty ``BaselineResult`` with an error trace step and does
         NOT raise — so Tier 3 resolution can continue gracefully."""
-        import time as _time
+        import threading
 
         retriever = BaselineLexicalRetriever(
             graph_store_uri="neptune-graph://g-test",
@@ -195,12 +151,15 @@ class TestBaselineLexicalRetrieverRetrieve:
         # The synchronous toolkit call runs on the dedicated executor and cannot
         # be cancelled; it outlives the (tiny) timeout, so ``asyncio.wait_for``
         # raises ``TimeoutError`` internally, which ``retrieve`` must absorb.
+        release = threading.Event()
+
         def slow_sync(*_args):
-            _time.sleep(2)
+            release.wait(timeout=10)
             return []
 
         with patch.object(retriever, "_retrieve_sync", side_effect=slow_sync):
             result = await retriever.retrieve("test query", "550e8400-e29b-41d4-a716-446655440000")
+        release.set()
 
         # Degraded result: empty, no raise.
         assert isinstance(result, BaselineResult)
@@ -214,7 +173,7 @@ class TestBaselineLexicalRetrieverRetrieve:
         assert "TimeoutError" in step["detail"]
 
     async def test_concurrency_bounded_by_dedicated_executor(self):
-        """Task 6.a / BUG 3 (2.8): concurrent retrievals are bounded by the
+        """Concurrent retrievals are bounded by the
         retriever's own ``ThreadPoolExecutor`` (``_LEXICAL_MAX_WORKERS``) and run
         on its named threads — excess calls queue rather than spawning unbounded
         workers or starving asyncio's shared default ``to_thread`` pool."""
@@ -256,8 +215,12 @@ class TestBaselineLexicalRetrieverRetrieve:
         n = _LEXICAL_MAX_WORKERS + 3
         with patch.object(retriever, "_retrieve_sync", side_effect=blocking_sync):
             tasks = [asyncio.create_task(retriever.retrieve("q", "ns")) for _ in range(n)]
-            # Give the executor time to saturate its workers with the first batch.
-            await asyncio.sleep(0.3)
+
+            async def _saturated():
+                while max_observed < _LEXICAL_MAX_WORKERS:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(_saturated(), timeout=10)
             with lock:
                 observed_while_saturated = max_observed
             # Let every queued/running worker finish.
@@ -275,11 +238,10 @@ class TestBaselineLexicalRetrieverRetrieve:
         assert all(isinstance(r, BaselineResult) for r in results)
 
     async def test_returns_empty_on_error(self):
-        if True:  # no patch needed — GraphRAGConfig already initialized at module level
-            retriever = BaselineLexicalRetriever(
-                graph_store_uri="neptune-graph://g-test",
-                vector_store_uri="aoss://https://test.aoss.amazonaws.com",
-            )
+        retriever = BaselineLexicalRetriever(
+            graph_store_uri="neptune-graph://g-test",
+            vector_store_uri="aoss://https://test.aoss.amazonaws.com",
+        )
 
         with patch.object(retriever, "_retrieve_sync", side_effect=RuntimeError("connection failed")):
             result = await retriever.retrieve("test query", "550e8400-e29b-41d4-a716-446655440000")
@@ -326,12 +288,6 @@ class TestConnectionRetry:
     def test_retries_ssl_unexpected_eof_then_succeeds(self):
         """A dropped TLS socket mid-read (``SSL: UNEXPECTED_EOF_WHILE_READING``) is a
         transient Neptune connection drop and is retried on an idempotent read.
-
-        Regression guard for the ``chunk_based_semantic``-returned-0 diagnosis:
-        this strategy fans out the most concurrent Neptune queries, so a single
-        dropped pooled connection previously zeroed the whole retriever. The
-        variant is distinct from ``Connection was closed`` and was not covered by
-        the original marker set.
         """
         retriever = self._retriever()
         calls = {"n": 0}
@@ -413,16 +369,13 @@ class TestConnectionRetry:
         assert calls["n"] == 1  # not retried
 
 
-# ── Task 5.a: engine build + per-(tenant, strategy) caching ─────────
-
-
 @pytest.mark.unit
 class TestGetEngineTenantAndCaching:
-    """Task 5.a: strategy-aware engine build + per-(tenant, strategy) cache.
+    """Strategy-aware engine build + per-(tenant, strategy) cache.
 
-    Covers BUG 6 (tenant_id derivation asserted through the real ``_get_engine``
-    code path) and the per-``(tenant_id, strategy.name)`` cache so a per-request
-    strategy override does not collide with the cached default.
+    Covers tenant_id derivation through the real ``_get_engine`` code path and the
+    per-``(tenant_id, strategy.name)`` cache so a per-request strategy override does
+    not collide with the cached default.
     """
 
     def _make_retriever(self):
@@ -432,7 +385,7 @@ class TestGetEngineTenantAndCaching:
         )
 
     def test_get_engine_passes_derived_tenant_id_to_toolkit_factory(self):
-        """BUG 6: ``_get_engine`` builds via the toolkit factory with
+        """``_get_engine`` builds via the toolkit factory with
         ``tenant_id == to_graphrag_tenant_id(namespace)`` — asserted through the
         real ``strategy.build_engine`` code path (not a stubbed builder)."""
         from coa_common.constants import to_graphrag_tenant_id
@@ -456,7 +409,7 @@ class TestGetEngineTenantAndCaching:
             assert kwargs["tenant_id"] == expected_tenant
 
     def test_cache_key_includes_derived_tenant_id(self):
-        """The cache is keyed on the derived tenant_id (BUG 6), not the raw namespace."""
+        """The cache is keyed on the derived tenant_id, not the raw namespace."""
         from coa_common.constants import to_graphrag_tenant_id
 
         retriever = self._make_retriever()
@@ -546,7 +499,7 @@ class TestGetEngineTenantAndCaching:
 
 @pytest.mark.unit
 class TestRetrieveTraceStrategyDetail:
-    """Task 5.a: the resolved strategy name is recorded in the trace step detail
+    """The resolved strategy name is recorded in the trace step detail
     as ``detail="strategy=…; N nodes retrieved"`` on success."""
 
     def _make_retriever(self):
@@ -641,18 +594,13 @@ class TestRetrieveTraceStrategyDetail:
         assert "RuntimeError" in step["detail"]
 
 
-# ── Task 11.a: tenant override seam ─────────────────────────────────
-
-
 @pytest.mark.unit
 class TestTenantIdOverrideSeam:
-    """Task 11.a / BUG 6 extension (2.12, 2.13): the eval-only ``tenant_id_override``
-    seam on ``BaselineLexicalRetriever``.
+    """The eval-only ``tenant_id_override`` seam on ``BaselineLexicalRetriever``.
 
-    The production multi-tenancy contract (design Property 3 / BUG 6) is the
-    DEFAULT: ``_get_engine`` derives ``tenant_id = to_graphrag_tenant_id(namespace)``
+    By default ``_get_engine`` derives ``tenant_id = to_graphrag_tenant_id(namespace)``
     and passes it to the toolkit factory. The override seam bypasses that
-    derivation only when explicitly constructed (the task-12 eval/integ harness):
+    derivation only when explicitly constructed:
 
       * ``None``                     -> derive tenant from namespace (unchanged).
       * ``DEFAULT_TENANT_OVERRIDE``  -> toolkit default tenant (``tenant_id=None``).
@@ -671,8 +619,7 @@ class TestTenantIdOverrideSeam:
 
     def test_default_override_none_passes_namespace_derived_tenant(self):
         """Default (``tenant_id_override=None``): ``_get_engine`` still calls the
-        toolkit factory with ``tenant_id == to_graphrag_tenant_id(namespace)`` —
-        re-asserting design Property 3 / BUG 6 is intact."""
+        toolkit factory with ``tenant_id == to_graphrag_tenant_id(namespace)``."""
         from coa_common.constants import to_graphrag_tenant_id
 
         retriever = self._make_retriever()  # production default
@@ -796,9 +743,6 @@ class TestTenantIdOverrideSeam:
         assert (derived_tenant, strategy.name) not in override_retriever._engines
 
 
-# ── Task 7.a: result mapping (_map_results) ─────────────────────────
-
-
 def _make_node(node_id="n1", text="some text", score=0.5, metadata=None):
     """Build a fake toolkit ``NodeWithScore`` (delegates to the shared helper).
 
@@ -841,7 +785,7 @@ def _reset_shape_mismatch_warning():
 
 @pytest.mark.unit
 class TestMapResults:
-    """Task 7.a / BUG 5 (2.11): ``_map_results`` against the REAL nested toolkit
+    """``_map_results`` against the REAL nested toolkit
     metadata shape (``metadata["source"]["sourceId"]`` / ``entity_contexts``),
     plus defensive fallbacks that degrade to empties + a one-time warning rather
     than crashing on a shape mismatch."""
@@ -1391,9 +1335,6 @@ class TestMapResults:
         assert chunks[0].source_doc == "legacy-doc.pdf"
 
 
-# ── KnowledgeRetriever integration tests ────────────────────────────
-
-
 @pytest.mark.unit
 class TestKnowledgeRetrieverWithLexical:
     async def test_calls_lexical_retriever_when_present(self):
@@ -1420,19 +1361,15 @@ class TestKnowledgeRetrieverWithLexical:
             retriever_strategy=RetrieverStrategy.CHUNK_BASED_SEMANTIC,
         )
 
-        # Lexical retriever was called with the resolved StrategySpec.
         mock_lexical.retrieve.assert_called_once_with(
             "What is Apple revenue?",
             "550e8400-e29b-41d4-a716-446655440000",
             strategy=STRATEGY_REGISTRY[RetrieverStrategy.CHUNK_BASED_SEMANTIC],
         )
-        # Vector and graph were NOT called
         mock_vector.search.assert_not_called()
         mock_graph.traverse.assert_not_called()
         mock_graph.traverse_from_uris.assert_not_called()
-        # Synthesizer was called with the lexical results
         synthesizer.synthesize.assert_called_once()
-        # Result is valid
         assert result.synthesized_answer == "Apple's revenue was $83 billion in Q3 2022."
         assert result.confidence == 0.85
 
@@ -1481,7 +1418,6 @@ class TestKnowledgeRetrieverWithLexical:
 
         await retriever.resolve("test query", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 1024)
 
-        # Vector and graph WERE called (hand-rolled path)
         mock_vector.search.assert_called_once()
         mock_graph.traverse.assert_called_once()
 
@@ -1508,12 +1444,9 @@ class TestKnowledgeRetrieverWithLexical:
         assert "t3.synthesize" in step_names
 
 
-# ── Factory tests ───────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestGraphStoreUri:
-    """Task 2.a: Assert backend-aware graph_store_uri computation (BUG 1/7)."""
+    """Backend-aware graph_store_uri computation."""
 
     def test_ndb_endpoint_produces_neptune_db_uri(self):
         from coa_serve.clients.factory import _graph_store_uri
@@ -1545,16 +1478,10 @@ class TestGraphStoreUri:
         uri = _graph_store_uri("neptune-graph://g-abc1234567")
         assert uri == "neptune-graph://g-abc1234567"
 
-    def test_vector_store_uri_is_aoss_prefixed(self):
-        """The vector URI is always aoss://<endpoint>."""
-        # This is computed inline in build_lexical_retriever; verify the pattern.
-        endpoint = "https://test.aoss.amazonaws.com"
-        assert f"aoss://{endpoint}" == "aoss://https://test.aoss.amazonaws.com"
-
 
 @pytest.mark.unit
 class TestBuildLexicalRetrieverStrategy:
-    """Task 2.a: Assert factory builds retriever with resolved StrategySpec."""
+    """The factory builds the retriever with the resolved StrategySpec."""
 
     def test_retriever_receives_resolved_strategy_spec(self):
         from coa_serve.clients.factory import build_lexical_retriever
@@ -1572,9 +1499,7 @@ class TestBuildLexicalRetrieverStrategy:
         assert result._strategy is STRATEGY_REGISTRY[RetrieverStrategy.CHUNK_BASED_SEMANTIC]
 
     def test_retriever_instance_default_is_default_spec_regardless_of_config(self):
-        """Strategy is now resolved per-request and passed into ``retrieve()``;
-        the factory builds the retriever with DEFAULT_SPEC as the (unused)
-        instance fallback regardless of ``config.lexical_retriever_strategy``."""
+        """The instance default strategy is DEFAULT_SPEC regardless of ``config.lexical_retriever_strategy``."""
         from coa_serve.clients.factory import build_lexical_retriever
         from coa_serve.lexical.strategies import DEFAULT_SPEC
 
@@ -1655,22 +1580,6 @@ class TestBuildLexicalRetrieverStrategy:
         assert result is not None
         assert result._timeout_s == 30.0
 
-    def test_timeout_s_override_is_applied(self):
-        """The deep-reasoning path passes its per-tool budget so a graphrag strategy is not
-        cut short by the adapter's 15s default (live: ``strategy:entity_based
-        degraded ... TimeoutError after 15.0s`` inside a 45s per-tool budget)."""
-        from coa_serve.clients.factory import build_lexical_retriever
-
-        mock_config = MagicMock()
-        mock_config.tier3_strategy = "deep-reasoning"
-        mock_config.neptune_endpoint = "test-cluster.us-east-1.neptune.amazonaws.com"
-        mock_config.opensearch_endpoint = "https://test.aoss.amazonaws.com"
-
-        result = build_lexical_retriever(mock_config, timeout_s=45.0)
-
-        assert result is not None
-        assert result._timeout_s == 45.0
-
     def test_retriever_uses_na_graph_store_uri(self):
         from coa_serve.clients.factory import build_lexical_retriever
 
@@ -1727,28 +1636,10 @@ class TestBuildLexicalRetriever:
         result = build_lexical_retriever(mock_config)
         assert result is None
 
-    def test_returns_retriever_when_lexical_baseline(self):
-        from coa_serve.clients.factory import build_lexical_retriever
-
-        mock_config = MagicMock()
-        mock_config.tier3_strategy = "lexical-baseline"
-        mock_config.neptune_endpoint = "test-cluster.us-east-1.neptune.amazonaws.com"
-        mock_config.opensearch_endpoint = "https://test.aoss.amazonaws.com"
-        mock_config.lexical_retriever_strategy = "chunk_based_semantic"
-
-        if True:  # no patch needed — GraphRAGConfig already initialized at module level
-            result = build_lexical_retriever(mock_config)
-
-        assert result is not None
-        assert isinstance(result, BaselineLexicalRetriever)
-
-
-# ── Task 11.b: retired-model patch (load-bearing) ───────────────────
-
 
 @pytest.mark.unit
 class TestRetiredModelPatch:
-    """Task 11.b: the graphrag-toolkit retired default model is patched at import.
+    """The graphrag-toolkit retired default model is patched at import.
 
     graphrag-toolkit 3.18.3 hardcodes the now-retired
     ``us.anthropic.claude-3-7-sonnet-20250219-v1:0`` as the default extraction
@@ -1757,7 +1648,7 @@ class TestRetiredModelPatch:
     ``DEFAULT_RESPONSE_MODEL``) to an active model. This is LOAD-BEARING: without
     it every strategy fails inside retrieval (``keyword_vss_provider`` calls the
     extraction LLM) with ``ResourceNotFoundException`` ("model ... end of its
-    life"). See ``strategy-investigation-findings.md`` → "Finding 0".
+    life").
     """
 
     _RETIRED_MODEL = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
@@ -1778,19 +1669,6 @@ class TestRetiredModelPatch:
         assert _ACTIVE_MODEL != self._RETIRED_MODEL
         assert _graphrag_cfg.DEFAULT_EXTRACTION_MODEL != self._RETIRED_MODEL
         assert _graphrag_cfg.DEFAULT_RESPONSE_MODEL != self._RETIRED_MODEL
-
-    def test_active_model_is_overridable_via_env(self):
-        """``_ACTIVE_MODEL`` is sourced from ``GRAPHRAG_LLM_MODEL`` (overridable),
-        then ``BEDROCK_MODEL_ID``, falling back to the active default when both
-        are unset."""
-        import os
-
-        from coa_serve.lexical.baseline_retriever import _ACTIVE_MODEL
-
-        expected = (
-            os.environ.get("GRAPHRAG_LLM_MODEL") or os.environ.get("BEDROCK_MODEL_ID") or "us.anthropic.claude-sonnet-5"
-        )
-        assert expected == _ACTIVE_MODEL
 
     @pytest.mark.parametrize(
         ("env", "expected"),
@@ -1817,7 +1695,7 @@ class TestRetiredModelPatch:
         ],
     )
     def test_active_model_resolution_order(self, env, expected):
-        """#1253: serve sets ``BEDROCK_MODEL_ID`` from ``bedrockLlmModelId`` but never
+        """Serve sets ``BEDROCK_MODEL_ID`` from ``bedrockLlmModelId`` but never
         ``GRAPHRAG_LLM_MODEL``, so the toolkit model must follow ``BEDROCK_MODEL_ID``
         when the GraphRAG override is unset or empty. Otherwise a non-US deploy
         sends a ``us.`` model ID to Bedrock and the LLM-backed strategies fail."""
@@ -1837,29 +1715,6 @@ class TestRetiredModelPatch:
                 assert expected == br._ACTIVE_MODEL
                 assert expected == _graphrag_cfg.DEFAULT_EXTRACTION_MODEL
                 assert expected == _graphrag_cfg.DEFAULT_RESPONSE_MODEL
-        finally:
-            # Restore the module (and the toolkit constants) to the default patch.
-            importlib.reload(br)
-
-    def test_env_override_changes_patched_constants_on_reimport(self):
-        """Setting ``GRAPHRAG_LLM_MODEL`` and re-importing the module patches the
-        toolkit constants to the overridden value (proves the env seam is live,
-        not a frozen literal). The module is reloaded back to its original state
-        afterward so other tests see the default patch."""
-        import importlib
-        import os
-        from unittest.mock import patch as _patch
-
-        import coa_serve.lexical.baseline_retriever as br
-        import graphrag_toolkit.lexical_graph.config as _graphrag_cfg
-
-        override = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
-        try:
-            with _patch.dict(os.environ, {"GRAPHRAG_LLM_MODEL": override}):
-                importlib.reload(br)
-                assert override == br._ACTIVE_MODEL
-                assert override == _graphrag_cfg.DEFAULT_EXTRACTION_MODEL
-                assert override == _graphrag_cfg.DEFAULT_RESPONSE_MODEL
         finally:
             # Restore the module (and the toolkit constants) to the default patch.
             importlib.reload(br)

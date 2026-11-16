@@ -140,11 +140,6 @@ class GlueOwnershipError(ClientSafeError):
     """
 
 
-# ---------------------------------------------------------------------------
-# Platform-provisioned catalogs
-# ---------------------------------------------------------------------------
-
-
 def platform_catalog_prefix() -> str:
     """The ``{sanitizedPrefix}ds_`` shape every catalog this deployment mints carries.
 
@@ -187,20 +182,8 @@ def claim_platform_catalog(dao: Any, *, catalog_name: str, namespace_id: str, so
 
     Best-effort at the call site — a claim that fails to write leaves the catalog
     unclaimed, which :func:`assert_namespace_may_catalog` refuses for everyone
-    including its owner, rather than opening it up.
-
-    ``auto_timestamp=False`` is load-bearing, not tidiness. The DAO otherwise
-    stamps ``createdAt``, and the sources table's ``ByNamespace`` GSI is keyed
-    ``(namespaceId, createdAt)`` — so the stamp, combined with the ``namespaceId``
-    below, is exactly what lands a claim in a namespace's own source listing.
-    Keeping the claim out of the ``NS#`` key space is NOT sufficient: a GSI keys on
-    ATTRIBUTES, not on PK/SK. With no ``createdAt`` the claim is missing a GSI key
-    and DynamoDB leaves it out of the index entirely (the same sparse-index
-    behaviour that already keeps ``KGBUILD#`` rows out).
-
-    Regression: with the timestamp, ``GET /sources`` 500s for any namespace holding
-    a claim — ``_item_to_summary`` cannot project a claim into a ``SourceSummary``
-    and pydantic rejects the four absent required fields.
+    including its owner, rather than opening it up. ``auto_timestamp=False`` keeps
+    the claim out of the ``ByNamespace`` GSI (see the comment on ``_CLAIM_PK_PREFIX``).
     """
     dao.put(
         {**_claim_key(catalog_name), "catalogName": catalog_name, "namespaceId": namespace_id, "sourceId": source_id},
@@ -209,13 +192,7 @@ def claim_platform_catalog(dao: Any, *, catalog_name: str, namespace_id: str, so
 
 
 def release_platform_catalog(dao: Any, *, catalog_name: str) -> None:
-    """Drop a catalog claim once its source and catalog are gone.
-
-    Not about freeing the name — it derives from the source id, so nothing else can
-    ever be given it. It is about the record not outliving what it describes, which
-    is the difference between an audit that reads cleanly and one full of claims on
-    catalogs that no longer exist.
-    """
+    """Drop a catalog claim once its source and catalog are gone."""
     dao.delete(_claim_key(catalog_name))
 
 
@@ -223,11 +200,6 @@ def claim_owner(dao: Any, catalog_name: str) -> str | None:
     """Namespace that owns a platform-provisioned catalog, or ``None`` if unclaimed."""
     item = dao.get(_claim_key(catalog_name))
     return item.get("namespaceId") if item else None
-
-
-# ---------------------------------------------------------------------------
-# Owner-declared tags on native databases
-# ---------------------------------------------------------------------------
 
 
 def _database_arn(catalog_id: str, database_name: str, region: str) -> str:
@@ -321,10 +293,7 @@ def _tagged_namespaces(catalog_id: str, database_name: str, region: str, glue_cl
 def _unreadable_hint(catalog_id: str, database_name: str, region: str, detail: str) -> str:
     """Message for a tag that could not be read — an operator problem, not an owner one.
 
-    Deliberately does NOT tell the caller to apply the tag: the tag may already be
-    correct, and during this fix's own rollout exactly this failure (``GetTags``
-    without ``GetDatabase``) presented as "not registered to namespace" and cost a
-    deploy cycle to diagnose.
+    Does not tell the caller to apply the tag: the tag may already be correct.
     """
     return (
         f"Could not verify which namespace owns Glue database '{database_name}', so the request was "
@@ -360,11 +329,6 @@ def _tag_hint(catalog_id: str, database_name: str, namespace_id: str, region: st
         f'--resource \'{{"Database":{{"Name":"{database_name}"}}}}\' --permissions DESCRIBE\n'
         f"or grant DESCRIBE to this deployment's sources-api role specifically."
     )
-
-
-# ---------------------------------------------------------------------------
-# The check
-# ---------------------------------------------------------------------------
 
 
 def assert_namespace_may_catalog(

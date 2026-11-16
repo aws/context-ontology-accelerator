@@ -16,7 +16,7 @@ and nothing is pruned. As soon as one statement does, every 0 is dropped, and an
 topic takes its topic and source with it. The semantic beam's best matches are lost
 because a few unrelated statements share a word with the question.
 
-#1263 is that case. Over English statements, ``循環取引`` scores every statement 0 and
+For example, over English statements, ``循環取引`` scores every statement 0 and
 gets the circular-trading topic. ``取引先との間で循環取引が行われている疑いがあります``
 also contains ``取引先`` and ``疑いがある``, which appear in a handful of Japanese
 statements about other rules. Those score above 0, the English circular-trading

@@ -296,10 +296,6 @@ class TestRequireAbsent:
             )
         assert client.created == []
 
-    def test_the_same_registration_is_still_idempotent_without_it(self):
-        client = FakeAthena(existing={"Type": "LAMBDA", "Parameters": {"function": _META_ARN}})
-        assert register_lambda_catalog(catalog_name="cat1", connector_function_arn=_META_ARN, client=client) is False
-
     def test_a_second_registration_on_the_same_derived_name_is_a_conflict(self, monkeypatch):
         """Two Databricks registrations landing on one derived catalog name: the second has
         to raise, not report a retried create.

@@ -93,8 +93,8 @@ def _resolve_search_path(item: dict[str, Any], config: dict[str, Any], engine_ty
       1. ``discoveredSchemas`` (authoritative — the schemas the scan found and
          ingested; a plain identifier list). Multiple schemas are joined so
          unqualified names resolve across all of them.
-      2. ``schemaFilter`` — the onboarding glob, usable only when it is a single
-         plain identifier (a glob is rejected downstream and skipped).
+      2. ``schemaFilter``, else ``schemaName`` — returned as configured (an
+         adapter rejects a glob).
       3. ``public`` — default.
 
     Every discovered schema must be a valid identifier. Reject corrupted or
@@ -153,9 +153,9 @@ class SourceDBQueryExecutor:
         self._secrets = boto3.client("secretsmanager", region_name=self._region, config=sync_boto_config())
         # Cached connection handle per "namespace:data_source" key. The value is
         # whatever the engine's adapter returns from open_connection (a SQLAlchemy
-        # AsyncEngine for asyncpg/aiomysql, a pytds handle for SQL Server); the
-        # executor treats it as opaque and only ever hands it back to the same
-        # adapter (tracked in _adapter_cache).
+        # AsyncEngine for asyncpg/aiomysql, the resolved credentials for SQL
+        # Server); the executor treats it as opaque and only ever hands it back to
+        # the same adapter (tracked in _adapter_cache).
         self._conn_cache: OrderedDict[str, ConnHandle] = OrderedDict()
         # Adapter per cache key, in lockstep with _conn_cache — decides how the
         # handle is used and disposed.
@@ -202,17 +202,6 @@ class SourceDBQueryExecutor:
         dialect-aware row cap, and runs the query via that adapter (asyncpg for
         PostgreSQL/Redshift, aiomysql for MySQL, python-tds for SQL Server).
 
-        Args:
-            sql: The SQL to execute (write statements are rejected by the firewall).
-            namespace: Namespace owning the data source.
-            data_source_id: Identifier of the target data source.
-            params: Optional bound query parameters.
-            max_rows: Maximum rows to return; drives the injected LIMIT.
-            timeout_seconds: Statement timeout (1..MAX_TIMEOUT_SECONDS).
-
-        Returns:
-            QueryResult with rows, columns, and execution metadata.
-
         Raises:
             ValueError: If ``timeout_seconds`` is out of range or namespace is invalid.
             UnsafeSQLError: If the SQL fails firewall validation.
@@ -240,7 +229,6 @@ class SourceDBQueryExecutor:
 
         # Cap at max_rows + 1 so a result of EXACTLY max_rows is distinguishable
         # from a truly truncated one: only > max_rows means rows were dropped. A
-        # query returning exactly max_rows rows is no longer mis-flagged truncated.
         limited_sql = adapter.inject_limit(sql, max_rows + 1)
 
         rows, columns = await adapter.run(conn, limited_sql, params, timeout_seconds, schema)

@@ -132,9 +132,6 @@ def llm_max_tokens(columns: int) -> int:
     return min(LLM_MAX_OUTPUT_TOKENS, LLM_BASE_OUTPUT_TOKENS + LLM_OUTPUT_TOKENS_PER_COLUMN * columns)
 
 
-# ── Ontology views ─────────────────────────────────────────────────────
-
-
 @dataclass
 class ColumnInfo:
     """One column (datatype property) of a table class."""
@@ -357,9 +354,6 @@ def excerpt(text: str, phrases: list[str], *, max_chars: int) -> str:
     return " … ".join(out)
 
 
-# ── Vector helpers ─────────────────────────────────────────────────────
-
-
 def unit(v: list[float]) -> list[float]:
     """``v`` scaled to length 1 (unchanged when zero)."""
     n = math.sqrt(sum(x * x for x in v))
@@ -439,8 +433,6 @@ def select_candidates(
         table_docs={t: sorted(m.items(), key=lambda kv: -kv[1]) for t, m in table_docs.items()},
     )
 
-
-# ── Per-table LLM call ─────────────────────────────────────────────────
 
 # Fences around the document text in the user prompt; SYSTEM_PROMPT tells the
 # model that what is inside them is data, not instructions.
@@ -581,9 +573,6 @@ def parse_response(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("LLM response is not a JSON object")
     return data
-
-
-# ── Turning answers into writes ────────────────────────────────────────
 
 
 @dataclass

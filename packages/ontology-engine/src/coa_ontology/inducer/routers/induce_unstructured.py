@@ -17,18 +17,12 @@ Endpoints (mounted at ``/induce/unstructured`` in ``main.py``):
 - ``GET  /jobs``             — list unstructured jobs in a namespace.
 - ``GET  /jobs/{job_id}``    — fetch a single job item.
 
-Source-type isolation (Requirement 5.7) is enforced at every read /
+Source-type isolation is enforced at every read /
 write callsite via ``source_type="UNSTRUCTURED"``: a pending
 unstructured proposal does NOT block a new structured run, and vice
 versa, and ``GET /jobs/{job_id}`` returns 404 (not 403) when the
 caller passes a job_id that belongs to a different source type so
 the response does not reveal cross-source-type job IDs.
-
-References:
-    - design.md § "Router" — reference implementation for this file.
-    - Requirements 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7, 7.1, 7.2, 7.3,
-      7.4 of
-      ``.kiro/specs/unstructured-ontology-induction-api/requirements.md``.
 """
 
 from __future__ import annotations
@@ -76,8 +70,6 @@ from coa_ontology.inducer.unstructured.stores.ndb_lexical import (
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-# Cached literal "UNSTRUCTURED" — the value passed to dynamo_store so
-# every read / write on this router is scoped to unstructured items.
 SOURCE_TYPE: str = InductionSourceType.UNSTRUCTURED.value
 
 
@@ -85,26 +77,13 @@ SOURCE_TYPE: str = InductionSourceType.UNSTRUCTURED.value
 def start_induction(body: UnstructuredInductionRequest, request: Request, namespace: str) -> JobResponse:
     """Start an unstructured induction job.
 
-    ``namespace`` is an EXPLICIT route parameter bound from the
-    ``?namespace=`` query param — it is NOT read from the request body
-    and is NOT defaulted to ``"default"``, mirroring the structured
-    router's ``WorkbenchInductionRequest`` convention so a caller
-    cannot pass a namespace other than the one their token authorized
-    (Requirement 5.2).
-
-    Enforces one in-flight unstructured proposal per namespace
-    (Requirement 5.3). A pending STRUCTURED proposal does NOT block a
-    new unstructured run and vice versa — the in-flight check is
-    explicitly scoped to ``source_type="UNSTRUCTURED"``. "In flight" is the
-    shared ``PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION`` set, the same one the
-    structured router uses: unreviewed work plus an accept that is merging.
-
-    Returns HTTP 202 with a :class:`JobResponse`. The pipeline runs
-    asynchronously in a daemon worker thread; clients poll
-    ``GET /jobs/{job_id}`` to track status.
-
-    The namespace language is resolved here, from the namespace item, and
-    never taken from the request.
+    ``namespace`` comes from the ``?namespace=`` query param, never the body
+    and never defaulted, so a caller cannot pass a namespace other than the one
+    their token authorized. One in-flight unstructured proposal per namespace
+    (``PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION``, scoped to
+    ``source_type="UNSTRUCTURED"``). Returns 202; clients poll
+    ``GET /jobs/{job_id}``. The namespace language comes from the namespace
+    item, never the request.
     """
     from coa_ontology.induce_catalog import namespace_language_or_404
 
@@ -129,15 +108,8 @@ def start_unstructured_job(
     """
     job_id = str(uuid.uuid4())
 
-    # In-flight lock (see the structured router for the full two-layer
-    # rationale): this conditional lock is what actually blocks a SECOND
-    # trigger while this run is still executing (no proposal row exists during
-    # the in-flight window). The block-until-reviewed proposal check runs
-    # AFTER it is acquired — see below.
-    #
-    # Unstructured proposals go through the same accept pipeline as structured
-    # ones (accepting -> embeddings_sync -> accepted | accept_failed), so they
-    # block on the same status set, defined once in proposals.py.
+    # The lock blocks a second trigger while this run executes; the
+    # block-until-reviewed proposal check runs under it.
     from coa_ontology.proposals import PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION
 
     try:
@@ -154,18 +126,11 @@ def start_unstructured_job(
             },
         ) from e
 
-    # Everything after the lock is acquired must release it on failure — the
-    # worker's finally only runs if the worker THREAD actually starts, so a
-    # failure in create_proposal_stub / put_job / Thread.start() here would
-    # otherwise leak the lock and wedge the namespace until the stale timeout.
-    # The same handler releases it when the block-until-reviewed 409 fires.
+    # Release the lock on any failure here: the worker's finally only runs once
+    # the thread starts.
     try:
-        # Block-until-reviewed: checked UNDER the lock, not before it. Checking
-        # first left a check-then-act gap — a trigger could see no proposal,
-        # the running worker could then write its pending proposal and release
-        # the lock, and the trigger would acquire it and start a duplicate run
-        # beside an unreviewed proposal. The worker writes its proposal before
-        # releasing, so once we hold the lock this read is authoritative.
+        # Checked under the lock: the worker writes its proposal before
+        # releasing, so this read is authoritative.
         pending: list[dict] = []
         for _status in PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION:
             pending = dynamo_store.list_proposals(namespace=namespace, status=_status, source_type=SOURCE_TYPE)
@@ -228,11 +193,7 @@ def list_jobs(
 ) -> list[dict]:
     """List unstructured induction jobs in a namespace.
 
-    ``namespace`` is an EXPLICIT required route parameter (bound from
-    ``?namespace=``), mirroring the structured router — it is never
-    defaulted to ``"default"``. Always filters on
-    ``source_type="UNSTRUCTURED"`` so structured jobs are never
-    returned through this endpoint (Requirement 5.8).
+    Always filters on ``source_type="UNSTRUCTURED"``.
     """
     return dynamo_store.list_jobs(
         namespace=namespace,
@@ -245,20 +206,13 @@ def list_jobs(
 def get_job(job_id: str, namespace: str) -> dict:
     """Fetch a single unstructured induction job.
 
-    ``namespace`` is an EXPLICIT required route parameter (bound from
-    ``?namespace=``), mirroring the structured router — it is never
-    defaulted to ``"default"``. Returns 404 (not 403) when the job
-    exists but its ``source_type`` is not ``"UNSTRUCTURED"`` so the
-    response does not reveal that a job with the same ID exists under
-    a different source type (Requirement 5.8).
+    Returns 404 (not 403) when the job has another ``source_type``, so the
+    response does not reveal that the ID exists.
     """
     job = dynamo_store.get_job(job_id=job_id, namespace=namespace)
     if job is None or job.get("source_type") != SOURCE_TYPE:
         raise HTTPException(404, "Job not found")
     return job
-
-
-# ── Worker thread ───────────────────────────────────────────────────────
 
 
 def _build_lexical_store(graph_arn: str, region: str, app_config: dict, namespace: str = ""):
@@ -306,37 +260,10 @@ def _run_unstructured_induction(
 ) -> None:
     """Background worker: build clients, run the pipeline, persist the proposal.
 
-    ``namespace`` is passed explicitly by the route handler (bound from
-    the ``?namespace=`` query param) since it is no longer carried on
-    the request body.
-
-    On each pipeline stage transition the worker writes the new status
-    to the job item. On success it persists the induced ontology Turtle
-    as a proposal record (``ontology_turtle=report.turtle``) tagged
-    with ``source_type="UNSTRUCTURED"``, and marks the job
-    ``completed``. ``r2rml_turtle`` is set to the empty string because
-    R2RML mappings apply only to structured (table → ontology) sources;
-    the existing accept handler in ``proposals.py`` tolerates empty
-    R2RML and skips writing R2RML artifacts to S3 when the value is
-    empty. On any exception the worker marks the job ``failed`` with a
-    truncated error message and does NOT create a proposal record
-    (Requirement 5.6). The failure-status write relies on the
-    reserved-keyword aliasing in ``dynamo_store.update_job_status`` so
-    the ``error`` attribute (a DynamoDB reserved keyword) persists.
-
-    Args:
-        job_id: The orchestrator-issued job ID. Re-used as the
-            ``proposal_id`` for the proposal created on success
-            (1:1 mapping mirrors the structured side).
-        body: The validated request body.
-        namespace: The explicit namespace bound from the route's
-            ``?namespace=`` query param.
-        app_config: ``request.app.state.config`` snapshot. Used to pick
-            up the Bedrock + LLM model defaults configured at app
-            startup.
-        namespace_language: Canonical namespace language resolved by the
-            route. Drives class-description prompts, fixed-text templates and
-            RDF language tags.
+    Writes each stage to the job item. On success it stores the Turtle as a
+    ``source_type="UNSTRUCTURED"`` proposal (``proposal_id`` = ``job_id``, empty
+    R2RML) and marks the job ``completed``. On any exception it marks the job
+    ``failed`` with a truncated error and creates no proposal.
     """
     ns = namespace
 
@@ -413,13 +340,6 @@ def _run_unstructured_induction(
                 on_progress=_grounding_progress,
             )
 
-        # The grounding pool is EXACTLY the caller's resolved selections — the
-        # namespace's accepted induced ontology is no longer force-included. The
-        # UI pre-checks it as a default selection (so it arrives in
-        # ``grounding_ontology_ids`` and resolves like any other pick), but the
-        # user can deselect it. Mirrors the structured worker
-        # (induce_catalog._run_induction).
-
         if resolved_grounding_ids:
             # Use a NAMESPACE-BOUND in-process catalog (build_stores(ns) +
             # StoreOntologyCatalogAdapter) exactly like the structured path
@@ -436,11 +356,7 @@ def _run_unstructured_induction(
                 ontology_catalog=StoreOntologyCatalogAdapter(ns_graph, ns_vec, namespace=ns),
                 embedding_generator=EmbeddingGeneratorClient(app_config["embedding_generator_url"]),
                 llm_region=app_config.get("llm_region", "us-east-1"),
-                # Grounding rerank defaults to Haiku (a cheap reranker);
-                # main.py resolves grounding_llm_model_id, overridable with
-                # GROUNDING_LLM_MODEL_ID for a region-valid id (GH #236). `or`
-                # covers an empty value reaching this far — fall back to the
-                # same Haiku literal main.py defaults to.
+                # `or` covers an empty value: fall back to main.py's Haiku default.
                 llm_model_id=app_config.get("grounding_llm_model_id") or FALLBACK_CHAT_MODEL_ID,
                 namespace=ns,
             )
@@ -481,8 +397,6 @@ def _run_unstructured_induction(
 
         report = pipeline.run(config, on_status=on_status)
 
-        # Stage: STORING — owned by the worker thread (the orchestrator
-        # only emits stages that correspond to in-pipeline work).
         dynamo_store.update_job_status(
             job_id=job_id,
             status=InductionJobStatus.STORING.value.lower(),
@@ -490,13 +404,6 @@ def _run_unstructured_induction(
             source_type=SOURCE_TYPE,
         )
 
-        # 1:1 proposal_id ↔ job_id, mirroring the structured side.
-        # The induced ontology Turtle is persisted as ``ontology_turtle``
-        # — this is what the steward review queue and the accept
-        # handler consume. ``r2rml_turtle`` is intentionally empty:
-        # R2RML mappings exist only for structured sources, and the
-        # accept handler skips writing the R2RML artifact to S3 when
-        # the value is empty.
         proposal_id = job_id
         dynamo_store.create_proposal(
             proposal_id=proposal_id,
@@ -575,9 +482,6 @@ def _run_unstructured_induction(
             dynamo_store.release_induction_lock(ns)
         except Exception:  # noqa: BLE001 — best-effort
             log.exception("failed to release induction lock for job %s", job_id)
-
-
-# ── ARN parsing helpers ─────────────────────────────────────────────────
 
 
 def _parse_graph_id(graph_arn: str) -> str:

@@ -49,11 +49,8 @@ describe("MetricServiceStack", () => {
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
-    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-metric-api"]);
   });
-
-  // ── Lambda Function ─────────────────────────────────────────────
 
   test("creates metric API Lambda function", () => {
     template.hasResourceProperties("AWS::Lambda::Function", {
@@ -162,8 +159,6 @@ describe("MetricServiceStack", () => {
     expect(recovery?.Properties.VpcConfig).toBeUndefined();
     template.resourceCountIs("AWS::Lambda::EventSourceMapping", 2);
   });
-
-  // ── IAM Permissions ─────────────────────────────────────────────
 
   interface SynthesizedResource {
     readonly logicalId: string;
@@ -627,15 +622,11 @@ describe("MetricServiceStack", () => {
     });
   });
 
-  // ── AOSS Data Access Policy ─────────────────────────────────────
-
   test("creates AOSS data access policy", () => {
     template.hasResourceProperties("AWS::OpenSearchServerless::AccessPolicy", {
       Type: "data",
     });
   });
-
-  // ── S3 Bucket (OSI import/export) ───────────────────────────────
 
   test("creates OSI S3 bucket with encryption and block public access", () => {
     template.hasResourceProperties("AWS::S3::Bucket", {
@@ -653,23 +644,17 @@ describe("MetricServiceStack", () => {
     });
   });
 
-  // ── SSM Parameter ───────────────────────────────────────────────
-
   test("publishes Lambda ARN to SSM", () => {
     template.hasResourceProperties("AWS::SSM::Parameter", {
       Type: "String",
     });
   });
 
-  // ── Resource Count ──────────────────────────────────────────────
-
   test("creates expected Lambda functions", () => {
     // MetricApiFn + ImportWorkerFn + ImportDlqRecoveryFn + CDK auto-delete
     // custom resource for the OSI S3 bucket
     template.resourceCountIs("AWS::Lambda::Function", 4);
   });
-
-  // ── OE Monitoring ────────────────────────────────────────────
 
   it("emits a metric-service OE dashboard and alarms", () => {
     template.resourceCountIs("AWS::CloudWatch::Dashboard", 1);

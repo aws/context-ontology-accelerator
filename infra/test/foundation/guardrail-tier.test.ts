@@ -10,7 +10,7 @@ import {
 } from "../../lib/context";
 import { DEFAULT_RESOURCE_PREFIX, DEFAULT_ENV } from "../../lib/constants";
 
-// #1255: the Classic tier's content filters don't detect Japanese prompt
+// The Classic tier's content filters don't detect Japanese prompt
 // injection. `guardrail_tier=standard` + `guardrail_profile` opts in to the
 // Standard tier, which needs a cross-Region guardrail profile.
 

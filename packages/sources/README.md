@@ -521,7 +521,7 @@ Federation provisioning runs as its own dedicated pipeline step — **`DbFederat
 
 A sub-type the `SourceSubType` enum recognises but this handler has no branch for now **raises** rather than silently skipping, so a new `DATABASE` sub-type cannot ship leaving every source of that type stuck at `queryable=False`. An absent or unrecognised value keeps the historical no-op, since a source deleted concurrently with its scan reads back as an empty record.
 
-Federation failure is **FATAL for JDBC sources**. If provisioning or its persistence raises, the `DbFederation` step fails and the pipeline's error catch marks the scan `FAILED` and the source `SCAN_FAILED` — a source that isn't queryable is not a successful scan. (This is a behavioral change from the previous non-fatal approach where discovery completed even if federation failed.)
+Federation failure is **FATAL for JDBC sources**. If provisioning or its persistence raises, the `DbFederation` step fails and the pipeline's error catch marks the scan `FAILED` and the source `SCAN_FAILED` — a source that isn't queryable is not a successful scan.
 
 ### Prerequisite — Lake Formation data-lake admin
 
@@ -680,7 +680,7 @@ BulkReviewQueue (SQS, visibility 360s, DLQ after 3 receives)
                                          accumulated tablesApproved counter)
 ```
 
-A source too large for one invocation is processed across `ceil(N / budget)` chained invocations — every table is eventually approved with no silent drop (#853). CloudWatch alarms on the worker's error metric and on DLQ depth fire on the first failure.
+A source too large for one invocation is processed across `ceil(N / budget)` chained invocations — every table is eventually approved with no silent drop. CloudWatch alarms on the worker's error metric and on DLQ depth fire on the first failure.
 
 ### JDBC Schema Discovery
 
@@ -805,7 +805,7 @@ change.
 | Glue API throttles | `COA/Sources` (live) |
 | Scan state-machine outcomes, execution time, failed drill-down | `AWS/States` (AWS-native) |
 | Bedrock latency, errors, token usage | `AWS/Bedrock` (AWS-native) |
-| Overlay match rate | **dark — placeholder text, pending #114** |
+| Overlay match rate | **dark — placeholder text, no metric yet** |
 
 Two caveats are stated on the dashboard itself rather than hidden here:
 
@@ -813,8 +813,8 @@ Two caveats are stated on the dashboard itself rather than hidden here:
   ontology induction invoke the same Haiku model, so those series are the sum of
   both pipelines. Per-pipeline LLM attribution needs `PutMetricData` from the
   enrichment ECS task, which it does not have.
-- **Overlay match rate has no metric yet.** #114 (SageMaker Catalog Overlay, M2)
-  is unbuilt, so that slot is an honest text placeholder instead of a query that
+- **Overlay match rate has no metric yet.** The SageMaker Catalog Overlay feature
+  is not built, so the dashboard shows a text placeholder instead of a query that
   would render as a permanently empty graph.
 
 #### Engine support
@@ -924,19 +924,7 @@ cdk deploy coa-dev-sources \
 
 
 
-## Migration
-
-The `sources-table` is populated via a one-time backfill script (run locally, not committed):
-
-```bash
-python scripts/backfill_sources.py \
-  --doc-sources-table coa-dev-doc-sources \
-  --datasources-table coa-dev-datasource-connectors \
-  --sources-table coa-dev-sources \
-  --region us-east-1
-```
-
-### Migrating off the SAR Athena multiplexer connector
+## Migrating off the SAR Athena multiplexer connector
 
 Earlier versions deployed an Athena federation connector as a SAR-sourced nested
 CloudFormation stack (`AthenaJdbcConnector`, version `2022.4.1`) plus per-source
@@ -982,7 +970,7 @@ saved queries / BI tools to the 4-part `AwsDataCatalog` syntax (see
 
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
-| Discovery succeeds but enrichment fails | Bedrock throttling or model access not granted | Check `BedrockThrottleCount` metric; verify Bedrock model access in the account |
+| Discovery succeeds but enrichment fails | Bedrock throttling or model access not granted | Check the `BedrockInvocationErrors` metric (`ErrorType=Throttling`); verify Bedrock model access in the account |
 | `SCAN_FAILED` immediately after creation | JDBC credentials in Secrets Manager are invalid or unreachable | Verify the secret at `credentialSecretArn` contains `username`/`password`; check SG rules |
 | Tables discovered but no columns | `information_schema.columns` query returned empty (permissions issue on source DB) | Grant SELECT on `information_schema` to the connection user |
 | Federation step fails with `Insufficient Lake Formation permission(s)` | Federation provisioner role is not registered as LF data-lake admin | Run the LF admin bootstrap; see [Prerequisites](#prerequisite--lake-formation-data-lake-admin) |

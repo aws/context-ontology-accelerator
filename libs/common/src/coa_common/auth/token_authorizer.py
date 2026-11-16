@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -20,6 +22,34 @@ from jwt.exceptions import PyJWTError
 logger = structlog.get_logger(__name__)
 
 _HTTP_TIMEOUT = 30
+
+# Checked against the token's unverified header before any key lookup, so
+# ``none`` or an HMAC-confusion attempt fails early with an error naming it.
+_ALLOWED_ALGORITHMS = ("RS256",)
+
+# After a failed JWKS fetch, callers re-raise that failure for this long instead of
+# each refetching in turn behind the lock (a hung IdP would otherwise cost every
+# queued caller its own HTTP timeout).
+_JWKS_RETRY_AFTER_S = 5.0
+
+# JWT ``typ`` header values of an OAuth 2.0 access token (RFC 9068).
+_ACCESS_TOKEN_TYPES = frozenset({"at+jwt", "application/at+jwt"})
+
+
+def _normalize_audiences(audience: str | Collection[str] | None) -> frozenset[str]:
+    """Accepted ``aud`` values as a set; empty means the audience is not checked.
+
+    ``None`` or ``""`` opts out, as before. A collection with no non-empty entry is a
+    configuration error (an unset value split into ``[""]``, say), not an opt-out.
+    """
+    if audience is None:
+        return frozenset()
+    if isinstance(audience, str):
+        return frozenset({audience}) if audience else frozenset()
+    audiences = frozenset(a for a in audience if a)
+    if not audiences:
+        raise ValueError("audience collection has no non-empty value; pass None to skip the audience check")
+    return audiences
 
 
 def extract_groups_claim(claims: dict[str, Any], group_claim_name: str = "groups") -> list[str]:
@@ -65,30 +95,45 @@ class TokenAuthorizer(ABC):
     issuer:
         The expected ``iss`` claim value.
     audience:
-        The expected ``aud`` claim value. If ``None``, audience is not verified.
+        The accepted ``aud`` claim value, or a collection of accepted values
+        (any one matches). If ``None`` or empty, audience is not verified.
     jwks_uri:
         Explicit JWKS endpoint. If ``None``, discovered via OIDC well-known.
     jwks_cache_ttl:
         Seconds to cache the JWKS key set (default 300 = 5 min).
+    require_id_token:
+        Accept only ID tokens. When an audience is configured it must match
+        ``aud`` (an access token's ``client_id`` does not count); a
+        ``token_use`` claim, when present, must be ``"id"``; and a header
+        ``typ`` of ``at+jwt`` or ``application/at+jwt`` (an RFC 9068 access
+        token) is refused. Default ``False``.
     """
 
     def __init__(
         self,
         *,
         issuer: str,
-        audience: str | None = None,
+        audience: str | Collection[str] | None = None,
         jwks_uri: str | None = None,
         jwks_cache_ttl: int = 300,
+        require_id_token: bool = False,
     ) -> None:
         """Store issuer/audience config and initialize the JWKS cache."""
         self._issuer = issuer.rstrip("/")
-        self._audience = audience
+        self._audiences = _normalize_audiences(audience)
+        self._require_id_token = require_id_token
         self._configured_jwks_uri = jwks_uri
         self._jwks_cache_ttl = jwks_cache_ttl
 
-        self._jwks: dict[str, Any] | None = None
-        self._jwks_last_updated: float = 0
+        # (key set, fetched-at) as one reference, so a reader never pairs one
+        # fetch's keys with another fetch's timestamp.
+        self._jwks_cache: tuple[dict[str, Any], float] | None = None
+        # (error, failed-at) of the last failed fetch, cleared by a success.
+        self._jwks_failure: tuple[requests.RequestException, float] | None = None
         self._discovered_jwks_uri: str | None = None
+        # One instance is commonly shared process-wide across threads: without
+        # the lock two threads can both see a stale cache and refetch.
+        self._jwks_lock = threading.Lock()
 
     def validate(self, authorization_header: str) -> TokenValidationResult:
         """Validate a ``Bearer <token>`` header and return structured claims.
@@ -165,19 +210,41 @@ class TokenAuthorizer(ABC):
             raise
 
     def _get_jwks(self) -> dict[str, Any]:
-        now = time.time()
-        if self._jwks and (now - self._jwks_last_updated) < self._jwks_cache_ttl:
-            return self._jwks
+        # Fast path without the lock, re-checked under it.
+        cache = self._jwks_cache
+        if cache and (time.time() - cache[1]) < self._jwks_cache_ttl:
+            return cache[0]
+        with self._jwks_lock:
+            now = time.time()
+            cache = self._jwks_cache
+            if cache and (now - cache[1]) < self._jwks_cache_ttl:
+                return cache[0]
+            failure = self._jwks_failure
+            if failure and (now - failure[1]) < _JWKS_RETRY_AFTER_S:
+                retry_in_s = round(_JWKS_RETRY_AFTER_S - (now - failure[1]), 1)
+                logger.warning("JWKS fetch failed recently; not retrying yet", retry_in_s=retry_in_s)
+                raise requests.RequestException("JWKS fetch failed recently; not retrying yet") from failure[0]
+            try:
+                fetched = self._fetch_jwks()
+            except requests.RequestException as exc:
+                self._jwks_failure = (exc, time.time())
+                raise
+            # Stamped after the fetch, so a slow fetch does not shorten the cache's life.
+            self._jwks_cache = (fetched, time.time())
+            self._jwks_failure = None
+            return fetched
+
+    def _fetch_jwks(self) -> dict[str, Any]:
+        """Fetch the key set, discovering its URI first if needed (both network calls)."""
         jwks_url = self._get_jwks_uri()
         try:
             resp = requests.get(jwks_url, timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
-            self._jwks = resp.json()
-            self._jwks_last_updated = now
-            return self._jwks  # type: ignore[return-value]
+            fetched: dict[str, Any] = resp.json()
         except requests.RequestException:
             logger.exception("Failed to fetch JWKS", url=jwks_url)
             raise
+        return fetched
 
     def _get_public_key(self, kid: str) -> Any:
         jwks = self._get_jwks()
@@ -189,6 +256,9 @@ class TokenAuthorizer(ABC):
     def _verify_and_decode(self, token: str) -> dict[str, Any]:
         try:
             header = jwt.get_unverified_header(token)
+            alg = header.get("alg")
+            if alg not in _ALLOWED_ALGORITHMS:
+                raise ValueError(f"Unsupported token algorithm: {alg!r}")
             kid = header.get("kid")
             if not kid:
                 raise ValueError("No kid in token header")
@@ -197,21 +267,33 @@ class TokenAuthorizer(ABC):
 
             # Cognito access tokens have client_id but no aud claim, so the audience
             # is checked manually after decoding.
-            decode_opts: dict[str, Any] = {"verify_exp": True, "verify_iss": True, "verify_aud": False}
-            kwargs: dict[str, Any] = {
-                "algorithms": ["RS256"],
-                "options": decode_opts,
-                "issuer": self._issuer,
-                "leeway": 30,
-            }
+            claims = jwt.decode(
+                token,
+                public_key,
+                algorithms=list(_ALLOWED_ALGORITHMS),
+                options={"verify_exp": True, "verify_iss": True, "verify_aud": False},
+                issuer=self._issuer,
+                leeway=30,
+            )
 
-            claims = jwt.decode(token, public_key, **kwargs)
-
-            if self._audience:
-                aud = claims.get("aud") or claims.get("client_id")
-                aud_list = [aud] if isinstance(aud, str) else (aud or [])
-                if self._audience not in aud_list:
-                    raise ValueError(f"Token audience mismatch: expected {self._audience}, got {aud}")
+            # Cognito marks access tokens with token_use; other IdPs use the RFC 9068 header type.
+            is_access_token = (
+                claims.get("token_use", "id") != "id" or str(header.get("typ", "")).lower() in _ACCESS_TOKEN_TYPES
+            )
+            if self._require_id_token and is_access_token:
+                raise ValueError("Token rejected: only an ID token is accepted")
+            if self._audiences:
+                aud = claims.get("aud")
+                if aud is None and not self._require_id_token:
+                    aud = claims.get("client_id")
+                if isinstance(aud, str):
+                    aud_list = [aud]
+                elif isinstance(aud, list):
+                    aud_list = [a for a in aud if isinstance(a, str)]
+                else:
+                    aud_list = []  # a number, dict or other shape is not a valid aud
+                if not self._audiences.intersection(aud_list):
+                    raise ValueError(f"Token audience mismatch: expected one of {sorted(self._audiences)}, got {aud}")
 
             return claims
         except PyJWTError as exc:

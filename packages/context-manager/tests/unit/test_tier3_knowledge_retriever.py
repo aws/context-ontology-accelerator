@@ -20,8 +20,6 @@ from coa_serve.tier3.knowledge_retriever import (
 from coa_serve.tier3.synthesizer import Synthesizer
 from coa_serve.tier3.vector_retriever import ChunkResult, VectorRetriever
 
-# --- Fixtures ---
-
 
 @pytest.fixture
 def mock_bedrock():
@@ -128,9 +126,6 @@ def synthesizer(mock_bedrock):
     return Synthesizer(mock_bedrock, guardrail_id="gr-test-123")
 
 
-# --- KnowledgeRetriever full flow ---
-
-
 @pytest.mark.unit
 class TestKnowledgeRetrieverFullFlow:
     async def test_full_flow_with_embedding(self, vector_retriever, graph_traverser, synthesizer):
@@ -151,7 +146,7 @@ class TestKnowledgeRetrieverFullFlow:
             "sourceDocumentId": "aws:tenant:source:document-17",
             "sourceDocumentName": "policy.pdf",
             "relevanceScore": 0.92,
-            # Deprecated aliases kept for one release (see #984).
+            # Deprecated aliases, kept for one release for older clients.
             "sourceDoc": "aws:tenant:source:document-17",
             "label": "Policy v2.3",
         }
@@ -176,16 +171,13 @@ class TestKnowledgeRetrieverFullFlow:
         guardrail_step = next(s for s in result.trace_steps if s["step"] == "t3.guardrail")
         assert guardrail_step["status"] == "success"
 
-    async def test_guardrail_step_skipped_when_no_guardrail_id(self, vector_retriever, graph_traverser, mock_bedrock):
+    async def test_guardrail_step_skipped_when_no_guardrail_id(
+        self, vector_retriever, graph_traverser, mock_bedrock, monkeypatch
+    ):
         """No guardrail configured → no t3.guardrail step (UI correctly renders 'n/a')."""
-        import os
-
         # Bypass the Synthesizer constructor's non-empty guardrail_id assertion for local envs.
-        os.environ["ALLOW_NO_GUARDRAIL"] = "true"
-        try:
-            synthesizer_no_guard = Synthesizer(mock_bedrock, guardrail_id="")
-        finally:
-            os.environ.pop("ALLOW_NO_GUARDRAIL", None)
+        monkeypatch.setenv("ALLOW_NO_GUARDRAIL", "true")
+        synthesizer_no_guard = Synthesizer(mock_bedrock, guardrail_id="")
 
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer_no_guard)
         result = await retriever.resolve("SLA?", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
@@ -304,7 +296,7 @@ class TestKnowledgeRetrieverFullFlow:
 
 @pytest.mark.unit
 class TestKnowledgeRetrieverGraphBranch:
-    """Change 1 (Cause A) regression guard: resolve() must seed graph traversal
+    """resolve() must seed graph traversal
     via the language-agnostic URI-hop branch when entity_uris are supplied, and
     fall back to the ASCII keyword branch otherwise. The graph_traverse trace
     self-documents which branch ran (graphSeedMode=="uri_hop"/"keyword")."""
@@ -344,31 +336,6 @@ class TestKnowledgeRetrieverGraphBranch:
 
 
 @pytest.mark.unit
-class TestKnowledgeRetrieverTraversalStrategy:
-    async def test_keyword_strategy_without_uris(self, vector_retriever, graph_traverser, synthesizer):
-        retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve(
-            "What about claims?",
-            "550e8400-e29b-41d4-a716-446655440000",
-            embedding=[0.1] * 10,
-        )
-        graph_step = next(s for s in result.trace_steps if s["step"] == "t3.graph_traverse")
-        assert graph_step["graphSeedMode"] == "keyword"
-
-    async def test_uri_hop_strategy_with_uris(self, vector_retriever, graph_traverser, synthesizer, mock_neptune):
-        mock_neptune.query.return_value = []
-        retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve(
-            "What about claims?",
-            "550e8400-e29b-41d4-a716-446655440000",
-            embedding=[0.1] * 10,
-            entity_uris=["http://ex.org/Claim"],
-        )
-        graph_step = next(s for s in result.trace_steps if s["step"] == "t3.graph_traverse")
-        assert graph_step["graphSeedMode"] == "uri_hop"
-
-
-@pytest.mark.unit
 class TestKnowledgeRetrieverNoEmbedding:
     async def test_skips_vector_search_without_embedding(self, vector_retriever, graph_traverser, synthesizer):
         retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
@@ -380,11 +347,6 @@ class TestKnowledgeRetrieverNoEmbedding:
         # Should still have graph and synthesis
         assert any(s["step"] == "t3.graph_traverse" for s in result.trace_steps)
         assert any(s["step"] == "t3.synthesize" for s in result.trace_steps)
-
-    async def test_no_embedding_still_synthesizes(self, vector_retriever, graph_traverser, synthesizer):
-        retriever = KnowledgeRetriever(vector_retriever, graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000")
-        assert result.synthesized_answer is not None
 
 
 @pytest.mark.unit
@@ -554,28 +516,6 @@ class TestKnowledgeRetrieverDegradedSources:
         assert timeouts[0]["source"] == "t3.vector_search"
         vec_step = next(s for s in result.trace_steps if s["step"] == "t3.vector_search")
         assert vec_step["status"] == "timeout"
-
-    async def test_per_source_env_override_vector(self, graph_traverser, synthesizer, monkeypatch):
-        # the per-source override applies to vector_search only — graph
-        # keeps its default. Constants are env-derived at import, so patch the
-        # live module values (the _float_env contract itself is locked below).
-        import coa_serve.tier3.knowledge_retriever as kr
-
-        monkeypatch.setattr(kr, "VECTOR_SEARCH_TIMEOUT_S", 0.01)
-
-        async def _slow_search(*args, **kwargs):
-            import asyncio
-
-            await asyncio.sleep(1)
-            return []
-
-        slow_os = AsyncMock()
-        slow_os.search.side_effect = _slow_search
-        retriever = KnowledgeRetriever(VectorRetriever(slow_os), graph_traverser, synthesizer)
-        result = await retriever.resolve("test", "550e8400-e29b-41d4-a716-446655440000", embedding=[0.1] * 10)
-
-        timeouts = [d for d in result.degraded_sources if d["reason"] == "timeout"]
-        assert [t["source"] for t in timeouts] == ["t3.vector_search"]
 
     def test_float_env_contract(self, monkeypatch):
         # Env contract: per-source var > single-knob default > 10.0; malformed

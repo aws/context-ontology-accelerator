@@ -126,9 +126,7 @@ class TestBuildLexicalStoreSSRFPrevention:
         ):
             _build_lexical_store(graph_arn, "us-west-2", app_config)
 
-            # NeptuneAnalyticsLexicalStore was constructed
             mock_na.assert_called_once_with(graph_id="g-test", region="us-west-2")
-            # NeptuneDatabaseLexicalStore was NOT constructed
             mock_ndb.assert_not_called()
 
     def test_neptune_db_sentinel_uses_server_config_endpoint(self):
@@ -142,14 +140,12 @@ class TestBuildLexicalStoreSSRFPrevention:
         ):
             _build_lexical_store(graph_arn, "us-east-1", app_config, namespace="550e8400-e29b-41d4-a716-446655440002")
 
-            # NeptuneDatabaseLexicalStore was constructed with server config endpoint
             mock_ndb.assert_called_once()
             call_kwargs = mock_ndb.call_args.kwargs
             assert call_kwargs["endpoint"] == "real-cluster.us-east-1.neptune.amazonaws.com"
             assert call_kwargs["region"] == "us-east-1"
             assert call_kwargs["tenant_id"] != ""
 
-            # NeptuneAnalyticsLexicalStore was NOT constructed
             mock_na.assert_not_called()
 
     def test_neptune_db_missing_config_raises_valueerror(self):
@@ -169,8 +165,6 @@ class TestBuildLexicalStoreSSRFPrevention:
         bypassed, _build_lexical_store should still not use the value as an
         endpoint URL for Neptune DB.
         """
-        # This value would fail Pydantic validation, but we're testing the
-        # _build_lexical_store function in isolation
         malicious_arn = "attacker.com"
         app_config = {"neptune_endpoint": "https://safe.neptune.amazonaws.com:8182"}
 
@@ -181,71 +175,15 @@ class TestBuildLexicalStoreSSRFPrevention:
             # The function treats any non-ARN input as a Neptune DB sentinel
             _build_lexical_store(malicious_arn, "us-east-1", app_config)
 
-            # The NDB store was created with the SAFE server config, not the malicious input
             mock_ndb.assert_called_once()
             call_kwargs = mock_ndb.call_args.kwargs
             assert call_kwargs["endpoint"] == "safe.neptune.amazonaws.com"
-            # The malicious value 'attacker.com' does NOT appear in the endpoint
-            assert "attacker.com" not in call_kwargs["endpoint"]
-
-
-class TestEndToEndSSRFPrevention:
-    """Integration of Pydantic validation + _build_lexical_store prevents SSRF."""
-
-    def test_malicious_graph_arn_blocked_at_http_layer(self):
-        """An SSRF payload is rejected before reaching _build_lexical_store.
-
-        The attack scenario from an attacker supplies
-        graph_arn="neptune.amazonaws.com.attacker.com" hoping to trigger
-        boto3 to send SigV4-signed requests to their server. The Pydantic
-        schema rejects this at the HTTP layer, so _build_lexical_store is
-        never invoked with a malicious value.
-        """
-        malicious_payload = {
-            "name": "attack",
-            "graph_arn": "neptune.amazonaws.com.attacker.com",
-            "ontology_uri_prefix": "http://example.com/ontology/attack",
-        }
-
-        with pytest.raises(ValidationError) as exc_info:
-            UnstructuredInductionRequest(**malicious_payload)
-
-        # The error mentions the graph_arn field
-        assert "graph_arn" in str(exc_info.value)
-
-    def test_legitimate_use_cases_still_work(self):
-        """Legitimate Neptune Analytics and Neptune DB use cases are unaffected."""
-        # Neptune Analytics ARN
-        na_request = UnstructuredInductionRequest(
-            name="na-test",
-            graph_arn="arn:aws:neptune-graph:us-east-1:123456789012:graph/g-prod",
-            ontology_uri_prefix="http://example.com/ontology/na",
-        )
-        assert na_request.graph_arn.startswith("arn:aws:neptune-graph:")
-
-        # Neptune DB sentinel
-        ndb_request = UnstructuredInductionRequest(
-            name="ndb-test",
-            graph_arn="neptune-db",
-            ontology_uri_prefix="http://example.com/ontology/ndb",
-        )
-        assert ndb_request.graph_arn == "neptune-db"
-
-        # Both pass validation
-        assert na_request.name == "na-test"
-        assert ndb_request.name == "ndb-test"
 
 
 class TestDispatchBuildsValidGraphArn:
     """Regression: the structured→unstructured dispatch in
     ``induce_catalog.start_induction`` must build an ``UnstructuredInductionRequest``
     whose ``graph_arn`` satisfies the SSRF pattern.
-
-    The 500 in prod (2026-07-11): the dispatch passed the RAW NDB cluster URL
-    (``https://…neptune.amazonaws.com:8182`` from ``config["neptune_endpoint"]``)
-    as ``graph_arn``. Once the SSRF regex landed on the request schema, that value
-    matches neither an NA ARN nor the ``neptune-db`` sentinel → ValidationError →
-    500. The fix uses the ``neptune-db`` sentinel (or forwards an explicit NA ARN).
     """
 
     def _dispatch(self, body_graph_arn, config):

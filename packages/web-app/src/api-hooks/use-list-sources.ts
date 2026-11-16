@@ -15,7 +15,6 @@ export function useListSources(namespaceId: string, sourceType?: SourceType) {
   const client = useControlPlaneClient();
 
   const query = useInfiniteQuery<ListSourcesOutput, Error>({
-    // Include sourceType in the query key so changing the filter triggers a new fetch
     queryKey: ["sources", namespaceId, sourceType ?? "all"],
     queryFn: async ({ pageParam }) => {
       return client.send(

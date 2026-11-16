@@ -2,13 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Steward curation must SUPERSEDE AI-generated annotations on re-accept.
 
-Accepting a proposal ingests in append mode into a shared ontology graph, and
-every graph write is additive. So the curate → re-induce → re-accept flow —
-accept (AI text), curate, re-induce, accept again into the same ontology — left
-BOTH generations of ``rdfs:comment`` and ``skos:altLabel`` live on the same
-class, and the model had to pick one. These tests drive ``ingest_ontology``
-twice against an rdflib-backed fake whose writes are additive exactly like
-Neptune DB's ``INSERT DATA`` / GSP ``POST``, and assert on the resulting graph.
+These tests drive ``ingest_ontology`` twice (append mode) against an
+rdflib-backed fake whose writes are additive like Neptune DB's ``INSERT DATA``.
 
 The rule under test is field-scoped: descriptions + alt-labels are
 authored-wins; relationship axioms are retained; other subjects (co-merged
@@ -115,7 +110,6 @@ class AdditiveGraphStore:
         self.g = Graph()
         self.supersede_calls: list[dict] = []
 
-    # -- metadata (unused by these tests beyond existing) -----------------
     def create_ontology(self, data):
         return data
 
@@ -129,7 +123,6 @@ class AdditiveGraphStore:
         self.g = Graph()
         return True
 
-    # -- additive projection writes ---------------------------------------
     def store_class(self, ontology_uri, class_uri, labels=None, comments=None, super_classes=None, is_mapped=False):
         c = URIRef(class_uri)
         self.g.add((c, RDF.type, OWL.Class))
@@ -147,7 +140,6 @@ class AdditiveGraphStore:
         self.g.parse(data=turtle, format="turtle")
         return {"status": "ok", "graph_uri": ontology_uri, "bytes_loaded": len(turtle)}
 
-    # -- the supersession primitive under test ----------------------------
     def supersede_annotations(self, ontology_uri, subject_uris, predicates):
         self.supersede_calls.append({"subjects": list(subject_uris), "predicates": dict(predicates)})
         removed = 0
@@ -220,7 +212,7 @@ def _ingest(store, ttl, *, existing_row, allow_append=True, vector_store=None):
             store,
             vector_store if vector_store is not None else MagicMock(),
             ttl,
-            namespace="ns-1118",
+            namespace="ns-test",
             metadata=IngestMetadata(ontology_id=ONT, format="turtle", source="unit-test"),
             validate=False,
             allow_append=allow_append,
@@ -243,7 +235,7 @@ class TestReAcceptSupersedesAnnotations:
 
         result = _ingest(store, CURATED_TTL, existing_row=_LIVE_ROW)  # append
 
-        # The defect: two rdfs:comment + 5 mixed altLabels. Now: authored only.
+        # Authored annotations only.
         assert _values(store.g, CUST, RDFS.comment) == [
             "Steward: customer master. cust_typ_cd is the private-banking flag, NOT cust_seg_cd."
         ]
@@ -253,15 +245,12 @@ class TestReAcceptSupersedesAnnotations:
         assert _values(store.g, CUST_TYP, SKOS.altLabel) == ["customer type"]
         assert result["appended"] is True
         # Exact count so the assertion catches an off-by-one supersede: 3
-        # comments (CUST, CUST_TYP, ACCT) + 4 altLabels — the count depends on
-        # which live triples the AI ingest actually wrote. `> 0` used to be
-        # `1` under a `MagicMock()` vector store (``int(MagicMock()) == 1``),
-        # which would have hidden a real regression from an integer floor.
+        # comments (CUST, CUST_TYP, ACCT) + 4 altLabels.
         assert result["superseded_annotation_count"] == 7
 
     def test_relationship_axioms_are_retained_across_reaccept(self):
         # Supersede-with-fallback, not supersede-and-discard: the inferred FK
-        # edge (the join path the benchmark showed WINNING) must survive.
+        # edge must survive.
         store = AdditiveGraphStore()
         _ingest(store, AI_TTL, existing_row=None)
         _ingest(store, CURATED_TTL, existing_row=_LIVE_ROW)
@@ -355,7 +344,6 @@ class TestNeptuneDBSupersedeSparql:
     """Shape of the SPARQL the NDB backend emits — scoped by VALUES on s AND p."""
 
     def _store(self):
-
         s = NeptuneDBGraphStore.__new__(NeptuneDBGraphStore)
         s._graph_for = lambda uri: "http://g/" + uri.rsplit("/", 1)[-1]  # type: ignore[method-assign]
         return s
@@ -445,17 +433,8 @@ class TestNeptuneDBSupersedeSparql:
         assert f"<{CUST}>" in u.call_args.args[0]
 
     def test_emitted_sparql_produces_the_intended_effect_end_to_end(self):
-        # Shape assertions above document what the emitted SPARQL should
-        # LOOK like; this one runs the actual emitted SPARQL against an
-        # in-memory rdflib Dataset and asserts on the RESULTING QUADS.
-        # A SPARQL string that parses and coincidentally contains the
-        # expected substrings but does the wrong thing (moves the wrong
-        # predicate, forgets the VALUES clause, targets the wrong graph)
-        # would pass the shape assertions and fail here.
-
-        # Every subject in this test maps to the same named graph — that's
-        # what NDB does for a single ontology (`_graph_for` is per-ontology,
-        # not per-subject) and matches the store setup below.
+        # Runs the emitted SPARQL on an in-memory rdflib Dataset and asserts on
+        # the resulting quads; NDB uses one named graph per ontology.
         graph_uri = URIRef("http://g/onto1")
 
         def _seed() -> Dataset:
@@ -535,7 +514,7 @@ class TestNeptuneDBSupersedeSparql:
 
 
 class TestReAcceptSupersedesEmbeddings:
-    """Stale-embedding follow-up: the stale embedding of a superseded description must not
+    """The stale embedding of a superseded description must not
     survive in the namespace index beside the new one."""
 
     def test_append_retires_embeddings_of_exactly_the_incoming_subjects(self):
@@ -546,7 +525,7 @@ class TestReAcceptSupersedesEmbeddings:
         result = _ingest(store, CURATED_TTL, existing_row=_LIVE_ROW, vector_store=vs)
         assert len(vs.deleted) == 1
         uris, oid, ns = vs.deleted[0]
-        assert ns == "ns-1118"
+        assert ns == "ns-test"
         assert oid == ONT
         # Classes AND properties of the incoming payload — and only those.
         assert set(uris) == {str(CUST), str(ACCT), str(CUST_TYP), str(CUST_ACCT)}
@@ -567,10 +546,8 @@ class TestReAcceptSupersedesEmbeddings:
     def test_embedding_retire_is_the_first_write_of_an_append(self):
         # Order is load-bearing twice over: retiring embeddings AFTER re-embedding
         # would wipe the new vectors; retiring them AFTER the graph supersession
-        # (surfaced in code review) meant a vector-store failure left the graph
-        # updated and the index stale — the exact graph/index disagreement this
-        # step exists to prevent. So: vector delete -> graph supersede -> turtle
-        # load -> embed.
+        # would leave the graph updated and the index stale on a vector-store
+        # failure. So: vector delete -> graph supersede -> turtle load -> embed.
         store = AdditiveGraphStore()
         order: list[str] = []
         vs = RecordingVectorStore()
@@ -611,7 +588,7 @@ class TestReAcceptSupersedesEmbeddings:
                 store,
                 vs,
                 CURATED_TTL,
-                namespace="ns-1118",
+                namespace="ns-test",
                 metadata=IngestMetadata(ontology_id=ONT, format="turtle", source="unit-test"),
                 validate=False,
                 allow_append=True,
@@ -638,9 +615,7 @@ class TestReAcceptSupersedesEmbeddings:
 
     def test_supersede_embeddings_stale_doc_survives_delete_raises_ingest_store_error(self):
         # The real OpenSearch backend over a client whose per-doc deletes are all
-        # rejected: the stale AI-text embedding keeps matching. This used to come
-        # back as "0 retired" and the accept went on to embed the steward text
-        # beside the AI text it was meant to replace.
+        # rejected: the stale AI-text embedding keeps matching.
         aoss = _StuckDeleteAoss()
         store = OpenSearchVectorStore.__new__(OpenSearchVectorStore)
         with (
@@ -681,14 +656,12 @@ class TestNeptuneDBSupersedeChunking:
 
     @staticmethod
     def _store():
-
         s = NeptuneDBGraphStore.__new__(NeptuneDBGraphStore)
         s._graph_for = lambda uri: "http://g/x"  # type: ignore[method-assign]
         return s
 
     @pytest.mark.parametrize("n_subjects", [1, 199, 200, 201, 400, 401])
     def test_every_subject_superseded_exactly_once_per_predicate(self, n_subjects):
-
         store = self._store()
         subjects = [f"http://ex/S{i}" for i in range(n_subjects)]
         preds = {str(RDFS.comment): str(SUPERSEDED_COMMENT), str(SKOS.altLabel): str(SUPERSEDED_ALT_LABEL)}

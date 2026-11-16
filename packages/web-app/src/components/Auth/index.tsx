@@ -19,8 +19,6 @@ interface AuthProps extends PropsWithChildren {
 /**
  * Authentication wrapper. Checks OIDC auth state and renders login routes
  * when unauthenticated, or wraps children in {@link UserProvider} when authenticated.
- *
- * @param applicationName - Name shown on the login page.
  */
 export const Auth: React.FC<AuthProps> = ({ children, applicationName }) => {
   const runtimeContext = useContext(RuntimeConfigContext);
@@ -70,12 +68,9 @@ export const Auth: React.FC<AuthProps> = ({ children, applicationName }) => {
         if (!cancelled) setIsLoading(false);
       });
 
-    // Mid-session expiry handling. oidc-client-ts fires these events when the
-    // access token expires or a silent renewal fails (e.g. the refresh token
-    // is also expired/invalid). When the session can no longer be renewed we
-    // drop the user and flip to unauthenticated, which makes this component
-    // render <AuthRoutes>, whose catch-all redirects to /login — mirroring the
-    // OIDC "null user" gate used in catalog-console-commons.
+    // oidc-client-ts fires these events when the access token expires or a
+    // silent renewal fails. When the session cannot be renewed, drop the user
+    // and flip to unauthenticated, so <AuthRoutes> redirects to /login.
     const events = provider.userManager?.events;
 
     const handleSessionLost = async () => {
@@ -96,14 +91,9 @@ export const Auth: React.FC<AuthProps> = ({ children, applicationName }) => {
     events?.addAccessTokenExpired(handleSessionLost);
     events?.addSilentRenewError(handleSessionLost);
 
-    // A dropped user fires UserUnloaded. Unlike accessTokenExpired /
-    // silentRenewError — which may still leave a valid token after a
-    // successful background renew, hence handleSessionLost's re-check — a
-    // UserUnloaded means the session is definitively gone. This is the event
-    // the ad-hoc renewal path in getIdToken/getAccessToken now raises via
-    // removeUser() (issue #136), where the background events never fired. Flip
-    // straight to unauthenticated WITHOUT another signinSilent(): re-renewing
-    // here would also run during signOut()'s removeUser().
+    // UserUnloaded means the session is gone (the ad-hoc renewal path in
+    // getIdToken/getAccessToken raises it). Flip without signinSilent(), which
+    // would also run during signOut()'s removeUser().
     const handleUserUnloaded = () => {
       if (!cancelled) setAuthenticated(false);
     };
@@ -124,7 +114,6 @@ export const Auth: React.FC<AuthProps> = ({ children, applicationName }) => {
     return <AuthRoutes title={applicationName} />;
   }
 
-  // In dev bypass mode, render children directly without UserProvider
   if (isDevBypass) {
     return <>{children}</>;
   }

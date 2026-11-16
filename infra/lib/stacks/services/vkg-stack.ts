@@ -91,7 +91,9 @@ export class VkgStack extends SCLStack {
     super(scope, id, props);
     this.addComponentTag("vkg");
 
-    const { prefix, envName, ssmPrefix } = resolveContext(this.node);
+    const { prefix, envName, ssmPrefix, eventSourcePrefix } = resolveContext(
+      this.node,
+    );
     const resourcePrefix = `${prefix}-${envName}`;
     const vkgLogGroupArns = [
       `arn:aws:logs:${this.region}:${this.account}:log-group:/ecs/${resourcePrefix}-vkg-*`,
@@ -102,13 +104,11 @@ export class VkgStack extends SCLStack {
 
     const cpu = props.cpu ?? 1024;
     const memoryLimitMiB = props.memoryLimitMiB ?? 2048;
-    // Ontop heap. The launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS) — see
+    // Ontop heap. The launcher reads ONTOP_JAVA_ARGS (NOT JAVA_OPTS), see
     // packages/vkg/entrypoint.sh. When not overridden, derive from task memory
-    // (max heap ~= 75%, initial ~= 25%) so raising memoryLimitMiB alone scales
-    // the heap in step, leaving headroom for the JVM, H2, and the Python facade
-    // (#149 causes B/C). This same value is handed to the reload Lambda so
-    // per-namespace reloads and the CDK-provisioned service stay in lockstep
-    // from one source of truth.
+    // (max heap ~= 75%, initial ~= 25%) so raising memoryLimitMiB alone scales the heap,
+    // leaving headroom for the JVM, H2, and the Python facade. The same value goes to the
+    // reload Lambda so per-namespace reloads match the CDK-provisioned service.
     //
     // Ontop's Spring Boot endpoint is bound to loopback whatever the heap args:
     // only translate-server calls it (localhost:8081), so it stays unreachable
@@ -124,17 +124,13 @@ export class VkgStack extends SCLStack {
 
     this.ontologyBucket = props.ontologyBucket;
 
-    // ================================================================
     // ECS Cluster (no default namespace — we create Cloud Map separately)
-    // ================================================================
     this.cluster = new ecs.Cluster(this, "VkgCluster", {
       clusterName: this.prefixed("vkg-cluster"),
       vpc,
     });
 
-    // ================================================================
     // Task Definition
-    // ================================================================
     const taskDef = new ecs.FargateTaskDefinition(this, "VkgTaskDef", {
       family: this.prefixed("vkg-service"),
       cpu,
@@ -147,7 +143,6 @@ export class VkgStack extends SCLStack {
     // Per-namespace VKG task definitions reuse this execution role.
     grantGuardDutyAgentPull(taskDef);
 
-    // ── Container ────────────────────────────────────────────────────
     // Support pre-built image from CI (Kaniko) or local Docker build (fromAsset)
     const vkgImageUri = this.node.tryGetContext("vkg_image_uri") as
       | string
@@ -222,7 +217,6 @@ export class VkgStack extends SCLStack {
       },
     });
 
-    // ── Task role permissions ─────────────────────────────────────────
     // S3 read for ontology artifacts (all namespaces — per-namespace services
     // also use this role and scope to their prefix via ONTOLOGY_PREFIX env var).
     this.ontologyBucket.grantRead(taskDef.taskRole, "ontologies/*");
@@ -262,9 +256,7 @@ export class VkgStack extends SCLStack {
       "Allow VKG SPARQL translation from VPC",
     );
 
-    // ================================================================
     // SSM: VKG container image URI (source of truth for reload Lambda)
-    // ================================================================
     const ontopContainer = taskDef.findContainer(this.prefixed("ontop"))!;
     const vkgImageParam = new ssm.StringParameter(
       this,
@@ -276,9 +268,7 @@ export class VkgStack extends SCLStack {
       },
     );
 
-    // ================================================================
     // Ontology Reload (EventBridge → Lambda → ECS forceNewDeployment)
-    // ================================================================
     // Reserved concurrency bounds this function's blast radius (it drives ECS
     // service updates and is effectively serial). Configurable via
     // `lambda_reserved_concurrency`; `0`/undefined omits the reservation so the
@@ -301,9 +291,6 @@ export class VkgStack extends SCLStack {
           .subnetIds.join(","),
         ECS_SECURITY_GROUP_ID: ecsSecurityGroup.securityGroupId,
         VKG_IMAGE_PARAM_NAME: vkgImageParam.parameterName,
-        // Keep per-namespace reload task sizing in lockstep with the CDK
-        // service above (#149 causes B/C). One source of truth for cpu/memory
-        // and Ontop heap.
         VKG_TASK_CPU: String(cpu),
         VKG_TASK_MEMORY: String(memoryLimitMiB),
         VKG_ONTOP_JAVA_ARGS: ontopJavaArgs,
@@ -442,7 +429,6 @@ export class VkgStack extends SCLStack {
       }),
     );
 
-    const { eventSourcePrefix } = resolveContext(this.node);
     // Matches only this deployment's own event source. The default bus is shared
     // by every deployment in the account and Region, so a rule that also matched
     // the static `coa` source would provision this deployment's VKG services for
@@ -462,15 +448,11 @@ export class VkgStack extends SCLStack {
       ],
     });
 
-    // Scheduled sweep: weekly, reconcile EVERY per-namespace VKG service to the
-    // latest SSM image. OntologyPublishedRule only refreshes a namespace when
-    // its ontology is re-accepted, so a long-lived namespace that is never
-    // republished keeps its provision-time image forever — and Renovate
-    // base-image digest bumps never reach a running task, leaving stale
-    // (Inspector-flagged) VKG images. The sweep closes that gap. It is a no-op
-    // per namespace when the running tasks already have the image's current
-    // digest (the handler skips the service), and each reload deploys with the
-    // circuit-breaker + rollback in the handler, so a bad image self-heals.
+    // Scheduled sweep: weekly, reconcile every per-namespace VKG service to the latest SSM
+    // image. OntologyPublishedRule only refreshes a namespace when its ontology is
+    // re-accepted, so a namespace that is never republished keeps its provision-time image.
+    // A no-op per namespace when the running tasks already have the current digest; the
+    // handler deploys with a circuit breaker and rollback, so a bad image self-heals.
     new events.Rule(this, "VkgReloadSweepRule", {
       ruleName: this.prefixed("vkg-reload-sweep"),
       schedule: events.Schedule.rate(cdk.Duration.days(7)),
@@ -481,21 +463,13 @@ export class VkgStack extends SCLStack {
       ],
     });
 
-    // Deploy-time rollout: after a deploy that may have changed the VKG image,
-    // run the same sweep once so existing namespaces move to it right away
-    // instead of at the next weekly sweep. The image URI is part of the
-    // payload, so CloudFormation calls this whenever the URI changes (and once
-    // on create). When the image comes from a CI tag that can be pushed again
-    // for a new build, the URI cannot show a change, so a per-synth deploy id
-    // makes it run on every deploy; the sweep compares digests, so services
-    // already on the image the tag points at are not restarted. The invoke is
-    // asynchronous (InvocationType Event): a slow or failing ECS rollout (e.g. a
-    // namespace with broken ontology artifacts) never blocks or rolls back the
-    // deploy, and an ECS API error in the sweep raises the ReloadFailed alarm
-    // below (a task that never goes healthy is rolled back by the circuit
-    // breaker in the handler's deployment configuration).
-    // The handler reads the image from SSM, so the parameter must be written
-    // before the invoke (explicit dependency).
+    // Deploy-time rollout: run the same sweep once after a deploy that may have changed the
+    // VKG image. The image URI is in the payload, so CloudFormation calls this when it
+    // changes; a per-synth deploy id forces a run for CI tags that can be pushed again.
+    // The invoke is asynchronous (InvocationType Event), so a slow or failing rollout never
+    // blocks or rolls back the deploy; an ECS API error raises the ReloadFailed alarm
+    // below. The handler reads the image from SSM, so the parameter must be written before
+    // the invoke (explicit dependency).
     const imageRolloutCall: cr.AwsSdkCall = {
       service: "Lambda",
       action: "invoke",
@@ -536,9 +510,7 @@ export class VkgStack extends SCLStack {
     // The sweep registers revisions that log through the execution role's grants.
     imageRollout.node.addDependency(taskDef.executionRole!);
 
-    // ================================================================
     // OE monitoring (cdk-monitoring-constructs)
-    // ================================================================
     new SclMonitoring(this, "Monitoring", {
       alarmNamePrefix: this.prefixed("vkg"),
       alarmAction: props.alarmAction,
@@ -567,9 +539,7 @@ export class VkgStack extends SCLStack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
-    // ================================================================
     // SSM Parameters
-    // ================================================================
     new ssm.StringParameter(this, "SsmVkgClusterArn", {
       parameterName: `${ssmPrefix}/vkg/cluster-arn`,
       stringValue: this.cluster.clusterArn,
@@ -583,9 +553,7 @@ export class VkgStack extends SCLStack {
         "VKG endpoint pattern (per-namespace services resolve as vkg-{ns}.domain:port)",
     });
 
-    // ================================================================
     // CfnOutputs
-    // ================================================================
     new cdk.CfnOutput(this, "VkgClusterArn", {
       value: this.cluster.clusterArn,
       description: "VKG ECS cluster ARN",

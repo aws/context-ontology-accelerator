@@ -6,7 +6,7 @@
 
 Supports:
   - Cobertura XML  (packages/*/coverage.xml, libs/*/coverage.xml,
-                    infra/coverage/cobertura-coverage.xml)
+                    coa-ai/*/coverage.xml, infra/coverage/cobertura-coverage.xml)
   - Vitest JSON summary (packages/*/coverage/coverage-summary.json)
   - Clover XML fallback (packages/*/coverage/clover.xml)
 
@@ -19,11 +19,8 @@ import json
 import os
 from datetime import datetime
 
-# XXE hardening: defusedxml refuses entity declarations. Coverage XMLs are
-# test-suite output rather than attacker input, but the same parser is what
-# tier3.py uses, and the finding filed both sites together — no reason to keep
-# a divergent import here. `defusedxml` is a workspace transitive dep via
-# ontology-engine (uv sync installs it into the workspace .venv).
+# defusedxml refuses entity declarations (XXE); keep in step with tier3.py.
+# Installed by `uv sync`.
 try:
     from defusedxml import ElementTree as ET
 except ImportError as exc:  # pragma: no cover
@@ -79,9 +76,11 @@ def _add_json_summary(f: str, pkg: str) -> None:
 
 
 # --- Python packages: Cobertura XML ---
-for f in sorted(glob.glob("packages/*/coverage.xml") + glob.glob("libs/*/coverage.xml")):
+for f in sorted(
+    glob.glob("packages/*/coverage.xml") + glob.glob("libs/*/coverage.xml") + glob.glob("coa-ai/*/coverage.xml")
+):
     parts = f.split("/")
-    pkg = f"{parts[0]}/{parts[1]}" if parts[0] == "libs" else parts[1]
+    pkg = f"{parts[0]}/{parts[1]}" if parts[0] in ("libs", "coa-ai") else parts[1]
     _add_cobertura(f, pkg)
 
 # --- Infra: Jest cobertura (named cobertura-coverage.xml or coverage.xml) ---

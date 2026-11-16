@@ -4,13 +4,13 @@
 """Prepared, parameterized graph-query templates for the Agentic Retriever.
 
 A Query_Template is a *prepared* retrieval pattern the agent fills in rather than
-authoring a graph query from scratch (Req 5). Preferring a template over an
-Ad_Hoc_Query keeps graph retrieval reliable and avoids query-generation errors
-(Req 5.1-5.3). This module owns the templates the ``Graph_Traversal_Tool`` runs,
-including the one required by Requirement 5.5 — the edge-typed traversal.
+authoring a graph query from scratch. Preferring a template over an
+Ad_Hoc_Query keeps graph retrieval reliable and avoids query-generation errors.
+This module owns the templates the ``Graph_Traversal_Tool`` runs,
+including the edge-typed traversal.
 
-Which graph these target (load-bearing — see the design's "Two graphs")
-----------------------------------------------------------------------
+Which graph these target (load-bearing)
+---------------------------------------
 These are **openCypher** templates over the graphrag-toolkit **property graph**
 (the graph kg-build populates in Neptune Database), NOT SPARQL over the RDF
 ontology graph. They are executed through the toolkit ``GraphStore`` (which
@@ -36,7 +36,7 @@ Property-graph schema these templates assume (verified against the toolkit
   the statement text is the ``__Statement__.value`` property. The statement label
   is also tenant-scoped (``statement_label``).
 
-Import discipline (Requirement 12.3): this module is dependency-free — it holds
+Import discipline: this module is dependency-free — it holds
 only template strings, bound constants, and a normalization helper, and never
 imports ``graphrag_toolkit`` (nor anything that does), so importing it never pulls
 the toolkit into ``sys.modules``.
@@ -59,18 +59,13 @@ FROM. The templates therefore recover the stored direction with the standard
 openCypher ``startNode(r)`` / ``endNode(r)`` functions before returning
 ``sourceUri`` and ``targetUri``. ``WITH DISTINCT`` removes the duplicate match
 produced when both endpoints are seeds while preserving distinct parallel
-relationships (the relationship value ``r`` is part of the distinct key).
-
-The connected-node choice deliberately keeps the previous directed-query
-semantics: when the stored source is a seed, the target is connected; otherwise
-the source is connected. The templates retain their tenant-scoped labels,
-``$entity_ids`` bound of :data:`MAX_ENTITIES`, and global ``LIMIT {limit}``
-bounded by :data:`MAX_TRAVERSAL_LIMIT`.
+relationships (the relationship value ``r`` is part of the distinct key). When
+the stored source is a seed, the target is connected; otherwise the source is.
 """
 
 from __future__ import annotations
 
-# Inclusive parameter bounds for the edge-typed traversal template (Req 5.5).
+# Inclusive parameter bounds for the edge-typed traversal template.
 # The Graph_Traversal_Tool enforces these before populating the template so an
 # out-of-bounds request is never assembled into a query.
 MIN_ENTITIES: int = 1
@@ -90,7 +85,7 @@ DEFAULT_EDGE_TYPED_LIMIT: int = 100
 MAX_CONNECTED_TEXT_ROWS: int = 100
 CONNECTED_TEXT_QUERY_LIMIT: int = MAX_CONNECTED_TEXT_ROWS + 1
 
-# ── Chunk-window expansion bounds (idea 6) ─────────────────────────────
+# ── Chunk-window expansion bounds ─────────────────────────────
 # Inclusive bounds for the chunk-window expansion template. Enforced by the
 # Chunk_Expansion_Tool before a query is assembled.
 MIN_CHUNK_IDS: int = 1
@@ -116,7 +111,7 @@ def bounded_limit(value: object, *, default: int, ceiling: int) -> int:
 
 
 def normalize_edge_type(value: str) -> str:
-    """Normalize an edge-type label for cross-graph matching (Req 3.9 mapping).
+    """Normalize an edge-type label for cross-graph matching.
 
     The RDF ontology's edge-type labels and the property graph's
     ``__RELATION__.value`` predicate strings come from independent vocabularies,
@@ -124,12 +119,6 @@ def normalize_edge_type(value: str) -> str:
     Python normalization MUST stay identical to the openCypher normalization
     applied to ``r.value`` in the templates below (``_CYPHER_EDGE_NORM``):
     lowercase, then map spaces and hyphens to underscores.
-
-    Args:
-        value: An edge-type label (from the ontology) or a raw ``r.value``.
-
-    Returns:
-        The normalized comparison key.
     """
     return value.lower().replace(" ", "_").replace("-", "_")
 
@@ -140,7 +129,7 @@ def normalize_edge_type(value: str) -> str:
 _CYPHER_EDGE_NORM: str = "toLower(replace(replace(r.value, ' ', '_'), '-', '_'))"
 
 
-# The Requirement 5.5 prepared template: traverse the given edge types from the
+# The prepared edge-typed template: traverse the given edge types from the
 # given entities and return the connected nodes. Supporting statement text is
 # fetched by :data:`CONNECTED_TEXT_RETRIEVAL` in a second, independently bounded
 # query. Keeping text out of this relationship query prevents one high-degree
@@ -262,7 +251,7 @@ KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS: str = (
 )
 
 
-# Chunk-window expansion (idea 6): given chunk ids the agent deemed relevant,
+# Chunk-window expansion: given chunk ids the agent deemed relevant,
 # return the chunks PHYSICALLY ADJACENT in the source document by traversing the
 # toolkit's chunk-sequence edges (`__NEXT__` / `__PREVIOUS__`) up to `hops` hops.
 # Verified on the dev graph: chunks are keyed by the Neptune node id (the
@@ -276,16 +265,10 @@ KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS: str = (
 # excluded from the result (they are already in the accumulated context). An
 # undirected match (`-[...]-`) returns neighbors on BOTH sides (before and after).
 #
-# The source join is OPTIONAL on purpose. As a mandatory ``MATCH`` it silently
-# converted a SCHEMA MISMATCH into an empty success: a namespace ingested before
-# the ``__EXTRACTED_FROM__`` / ``__Source__`` shape existed — or one whose source
-# label is spelled differently — returned zero rows, so the tool reported
-# "expanded N chunk(s) -> 0 adjacent chunk(s)" with status ``succeeded``, no drop
-# count, and no degraded reason, while chunk-window expansion contributed nothing
-# to every deep-reasoning query. With ``OPTIONAL MATCH`` the adjacency rows still
-# come back and ``sourceDocumentId`` arrives null, which the tool counts as a
-# dropped anonymous chunk and reports as ``missing_document_provenance``. The
-# anonymous rows are still never used as document citations.
+# The source join is OPTIONAL: older namespaces lack the ``__EXTRACTED_FROM__`` /
+# ``__Source__`` shape, and a mandatory ``MATCH`` would turn that into an empty
+# success. With ``OPTIONAL MATCH`` ``sourceDocumentId`` arrives null, which the tool
+# counts as ``missing_document_provenance``; such rows are never cited.
 CHUNK_WINDOW_EXPANSION: str = (
     "MATCH (c:{chunk_label})\n"
     "WHERE id(c) IN $chunk_ids\n"

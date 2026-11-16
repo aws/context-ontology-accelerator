@@ -57,9 +57,6 @@ beforeEach(() => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Create
-// ═══════════════════════════════════════════════════════════════════
 describe("Create", () => {
   test("calls Cognito APIs in order (no Secrets Manager, no SetPassword)", async () => {
     await handler(makeEvent("Create"));
@@ -88,15 +85,6 @@ describe("Create", () => {
       ],
       DesiredDeliveryMediums: ["EMAIL"],
     });
-  });
-
-  test("does NOT call AdminSetUserPassword", async () => {
-    await handler(makeEvent("Create"));
-
-    const calls = cognitoSend.mock.calls.map(
-      (c: any[]) => c[0].constructor.name,
-    );
-    expect(calls).not.toContain("AdminSetUserPasswordCommand");
   });
 
   test("returns PhysicalResourceId as userPoolId/username", async () => {
@@ -133,9 +121,6 @@ describe("Create", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Update
-// ═══════════════════════════════════════════════════════════════════
 describe("Update", () => {
   test("runs full createUserAndGroup", async () => {
     const res = await handler(makeEvent("Update"));
@@ -153,9 +138,6 @@ describe("Update", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Delete
-// ═══════════════════════════════════════════════════════════════════
 describe("Delete", () => {
   test("deletes user and group", async () => {
     const res = await handler(makeEvent("Delete"));
@@ -214,9 +196,6 @@ describe("Delete", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Validation
-// ═══════════════════════════════════════════════════════════════════
 describe("validation", () => {
   test("throws on missing UserPoolId", async () => {
     const event = makeEvent("Create", {
@@ -269,9 +248,6 @@ describe("validation", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// Error handling
-// ═══════════════════════════════════════════════════════════════════
 describe("error handling", () => {
   test("wraps and rethrows errors with message", async () => {
     cognitoSend.mockRejectedValue(new Error("cognito error"));
@@ -314,9 +290,6 @@ describe("error handling", () => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// The placeholder admin address is never sent an invite
-// ═══════════════════════════════════════════════════════════════════
 describe("Create with the default placeholder address", () => {
   const placeholder = {
     ResourceProperties: {

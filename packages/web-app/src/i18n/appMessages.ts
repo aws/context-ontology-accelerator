@@ -8,16 +8,9 @@ import { MESSAGES_JA } from "./messages.ja";
  * Application-authored copy. Cloudscape's own strings live in its
  * I18nProvider bundle; this catalogue is only for text owned by COA.
  *
- * English text is the key on purpose. It keeps call sites readable, gives the
- * default locale a synchronous zero-copy path, and lets TypeScript reject a
- * message that has not been added to a non-default locale's catalogue.
- */
-
-/**
- * The set of English message keys — the source of truth for what copy exists.
- * Because `en` renders its key verbatim, the catalogue keys ARE the canonical
- * English copy. Every non-default locale is typed `Record<AppMessage, string>`
- * (see `CATALOGUES`), so TypeScript forces each one to cover every key.
+ * English text is the key: `en` renders it verbatim, and every non-default
+ * locale is typed `Record<AppMessage, string>` (see `CATALOGUES`), so
+ * TypeScript forces each one to cover every key.
  */
 export type AppMessage = keyof typeof MESSAGES_JA;
 export type AppMessageValues = Readonly<Record<string, string | number>>;
@@ -25,9 +18,7 @@ export type AppMessageValues = Readonly<Record<string, string | number>>;
 /**
  * Per-locale translation tables, keyed by every locale except the default
  * `en` (which renders its key verbatim). Each table must supply every
- * `AppMessage`, so adding a language is a single file-add — a new
- * `messages.<locale>.ts` registered here — with no change to the formatter,
- * the types, or the parity test.
+ * `AppMessage`. To add a language, register a new `messages.<locale>.ts` here.
  */
 export const CATALOGUES: Record<
   Exclude<SupportedLocale, "en">,

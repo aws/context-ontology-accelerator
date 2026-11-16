@@ -4,7 +4,6 @@
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { vi, describe, it, expect, beforeEach } from "vitest";
 
-// Mock OIDCProvider
 vi.mock("@auth", () => ({
   OIDCProvider: {
     build: () => ({
@@ -16,7 +15,6 @@ vi.mock("@auth", () => ({
   },
 }));
 
-// Mock fetch
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
@@ -121,7 +119,6 @@ describe("useSessions", () => {
   });
 
   it("createSession updates sessionId and dispatches RESET", async () => {
-    // First call: restore (no session)
     mockFetch.mockResolvedValueOnce(
       createMockResponse({ sessionId: null, messages: [] }),
     );
@@ -132,7 +129,6 @@ describe("useSessions", () => {
       expect(result.current.isRestoring).toBe(false);
     });
 
-    // Second call: createSession
     mockFetch.mockResolvedValueOnce(
       createMockResponse({
         action: "sessionCreated",
@@ -166,7 +162,6 @@ describe("useSessions", () => {
 
     expect(result.current.sessionId).toBe("captured-session");
 
-    // Second capture should not override
     act(() => {
       result.current.captureSessionId("another-session");
     });
@@ -209,7 +204,6 @@ describe("useSessions", () => {
 
     expect(result.current.sessionId).toBe("s1");
 
-    // Switch namespace
     rerender({ ...defaultProps, namespace: "other-namespace" });
 
     await waitFor(() => {

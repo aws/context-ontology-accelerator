@@ -25,7 +25,6 @@ from coa_sources.database.enrichment.table_enricher import (
     MAX_WORKERS,
     TABLE_TIMEOUT_SEC,
     _apply_column_metadata,
-    _apply_foreign_keys,
     _apply_result,
     _apply_table_metadata,
     _has_pending,
@@ -124,7 +123,6 @@ class TestApplyResult:
         result = _mock_bedrock_response()  # Only has 3 columns
         _apply_result(table, result, table.columns)
 
-        # Columns not in response keep default metadata
         assert table.columns[3].business_metadata.description == ""
         assert table.columns[4].business_metadata.description == ""
 
@@ -156,7 +154,6 @@ class TestRun:
 
         assert result["tables_enriched"] == 0
         assert result["tables_failed"] == 1
-        # Only successfully enriched tables are written
         mock_write.assert_called_once_with([], "dom-789", "ns-456")
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
@@ -165,16 +162,8 @@ class TestRun:
     def test_run_count_partition_invariant_holds(
         self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
     ) -> None:
-        """Classification is a real partition: enriched/failed disjoint, partial ⊆ enriched.
+        """Classification is a real partition: enriched/failed disjoint, partial ⊆ enriched."""
 
-        Guards the observable result contract, not a derived-count tautology
-        (``enriched + failed + skipped == total`` is always true because skipped is
-        computed by subtraction). Asserts the independently-tracked facts instead:
-        the failed set does not overlap the enriched count, enriched + failed does
-        not exceed the total, and partial is a subset of enriched.
-        """
-
-        # t1 enriches, t2 raises → one enriched, one failed, zero skipped.
         def _invoke_side_effect(*args: object, **kwargs: object) -> object:
             call = mock_client_cls.return_value.invoke.call_count
             if call == 1:
@@ -187,14 +176,9 @@ class TestRun:
 
         result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
-        total = len(tables)
         enriched = result["tables_enriched"]
         failed = result["tables_failed"]
-        # enriched + failed cannot exceed the discovered tables (no double-count).
-        assert enriched + failed <= total
-        # Exactly this batch: one enriched, one failed, none skipped.
         assert (enriched, failed, result["tables_skipped_unchanged"]) == (1, 1, 0)
-        # partial ids are a subset of the enriched tables, never a fourth bucket.
         assert set(result["partial_table_ids"]) <= ({t.table_id for t in tables} - set(result["failed_table_ids"]))
         assert result["tables_partial"] <= enriched
 
@@ -204,8 +188,6 @@ class TestRun:
     def test_run_emits_throttle_metric_on_terminal_throttle(
         self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
     ) -> None:
-        from botocore.exceptions import ClientError
-
         mock_client_cls.return_value.invoke.side_effect = ClientError(
             {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "InvokeModel"
         )
@@ -394,31 +376,18 @@ class TestDeterministicConstraintSkip:
         ]
         _apply_result(table, result, table.columns)
 
-        # Pass 1 never applies FKs — existing FKs remain untouched
         assert len(table.foreign_keys) == 1
         assert table.foreign_keys[0].source == EnrichmentSource.DETERMINISTIC
 
-    def test_ai_pk_applied_when_no_deterministic(self) -> None:
-        table = _make_table()
-        result = _mock_bedrock_response()
-        _apply_result(table, result, table.columns)
-
-        assert table.primary_key.columns == ["col_0"]
-        assert table.primary_key.source == EnrichmentSource.AI_INFERRED
-
 
 class TestPromptNoFK:
-    """Verify system prompt no longer contains FK output schema."""
+    """Verify the system prompt asks for no FK output."""
 
     def test_system_prompt_has_no_foreign_keys_in_output_schema(self) -> None:
-        from coa_sources.database.enrichment.prompts import SYSTEM_PROMPT
-
         output_schema = SYSTEM_PROMPT.split("Rules:")[0]
         assert "foreign_keys" not in output_schema
 
     def test_system_prompt_instructs_no_fk_inference(self) -> None:
-        from coa_sources.database.enrichment.prompts import SYSTEM_PROMPT
-
         assert "Do NOT infer foreign keys" in SYSTEM_PROMPT
 
 
@@ -560,7 +529,6 @@ class TestExistingMetadataPassThrough:
 
         run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
-        # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
         user_prompt = "".join(seg.text for seg in invoke_call[0][1])
         assert "foreign_keys" in user_prompt
@@ -579,7 +547,6 @@ class TestExistingMetadataPassThrough:
 
         run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
-        # First invoke call is Pass 1 (per-table); last is Pass 2 (FK inference)
         invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
         user_prompt = "".join(seg.text for seg in invoke_call[0][1])
         assert "primary_key" in user_prompt
@@ -620,7 +587,6 @@ class TestMetricEmissionDuringEnrichment:
 
         run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
-        # Pass1 invocation for the single table
         mock_emitter.emit_bedrock_invocation_metrics.assert_called()
         call_kwargs = mock_emitter.emit_bedrock_invocation_metrics.call_args_list[0][1]
         assert call_kwargs["stage"] == "Pass1"
@@ -640,7 +606,6 @@ class TestMetricEmissionDuringEnrichment:
 
         run("ds-123", "ns-456", "dom-789", "full", emitter=mock_emitter, namespace_language="en")
 
-        # Pass2 FK inference call should also emit metrics
         pass2_calls = [
             c for c in mock_emitter.emit_bedrock_invocation_metrics.call_args_list if c[1]["stage"] == "Pass2"
         ]
@@ -678,7 +643,6 @@ class TestMetricEmissionDuringEnrichment:
         pass1_calls = [
             c for c in mock_emitter.emit_bedrock_invocation_metrics.call_args_list if c[1]["stage"] == "Pass1"
         ]
-        # 3 tables = 3 Pass1 Bedrock calls
         assert len(pass1_calls) == 3
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
@@ -905,7 +869,7 @@ class TestProtectedDescriptionPreserve:
         assert table.business_metadata.enrichment_source == EnrichmentSource.CATALOG_EXISTING
 
     def test_deterministic_table_receives_ai_synonyms_and_glossary(self) -> None:
-        """Verify bug fix: DETERMINISTIC tables get AI-generated synonyms/glossary/tags."""
+        """DETERMINISTIC tables keep their description and get AI-generated synonyms/glossary/tags."""
         table = _make_table()
         table.business_metadata = BusinessMetadata(
             description="Authoritative source system description",
@@ -927,10 +891,8 @@ class TestProtectedDescriptionPreserve:
         }
         _apply_table_metadata(table, result)
 
-        # Description preserved from DETERMINISTIC source
         assert table.business_metadata.description == "Authoritative source system description"
         assert table.business_metadata.enrichment_source == EnrichmentSource.DETERMINISTIC
-        # Synonyms, glossary, tags populated from AI (bug fix #542)
         assert table.business_metadata.synonyms == ["order_tbl", "purchases"]
         assert table.business_metadata.glossary_terms == ["order management", "sales"]
         assert table.business_metadata.tags == ["transactional", "s3-backed"]
@@ -1026,8 +988,6 @@ class TestWriteEnrichedAssets:
     def test_skips_when_asset_not_found(self, mock_smus_cls: MagicMock) -> None:
         mock_client = MagicMock()
         mock_smus_cls.return_value = mock_client
-        # find_asset_by_name returns None only for a genuinely absent asset;
-        # a ranking miss no longer masquerades as one.
         mock_client.find_asset_by_name.return_value = None
 
         table = _make_table("orders")
@@ -1052,10 +1012,7 @@ class TestWriteEnrichedAssets:
 
 
 class TestIncompleteBatchDetection:
-    """A wide table whose column batches PARTIALLY fail must keep the
-    batches that SUCCEEDED (description + those columns), not discard the whole
-    table. Before the fix, one failed batch erased the entire table's enrichment
-    and counted it as tables_failed with zero enriched — silent data loss."""
+    """A wide table whose column batches partially fail keeps the batches that succeeded."""
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
@@ -1082,13 +1039,11 @@ class TestIncompleteBatchDetection:
 
         result = run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
 
-        # The table is KEPT (enriched), flagged partial, and NOT counted as failed.
         assert result["tables_enriched"] == 1
         assert result["tables_failed"] == 0
         assert result["tables_partial"] == 1
         assert result["failed_table_ids"] == []
         assert result["partial_table_ids"] == ["public.big"]
-        # The surviving description (from batch 0) was actually applied + written.
         mock_write.assert_called_once()
         written_tables = mock_write.call_args[0][0]
         assert len(written_tables) == 1
@@ -1179,14 +1134,11 @@ class TestIncompleteBatchDetection:
 
         def mock_invoke(_system, user_prompt, *args, **kwargs):
             user_prompt = "".join(seg.text for seg in user_prompt)
-            # Batch 0 carries col_0 and is the ONLY batch whose prompt lacks
-            # col_50 / col_100 (the leading columns of batches 1 and 2). Fail on
-            # batch 0's content, not call order — the ThreadPoolExecutor does not
-            # guarantee batch 0 is invoked first.
+            # Batch 0 is the only prompt with col_0 and without col_50 / col_100.
             is_batch_zero = re.search(r"\bcol_0\b", user_prompt) and not re.search(
                 r"\bcol_50\b|\bcol_100\b", user_prompt
             )
-            if is_batch_zero:  # batch 0 fails
+            if is_batch_zero:
                 raise GuardrailBlockedError("batch 0 blocked")
             return _mock_invocation_result()
 
@@ -1204,7 +1156,6 @@ class TestIncompleteBatchDetection:
         mock_write.assert_called_once()
         written = mock_write.call_args[0][0][0]
         assert written.business_metadata.description == "Pre-existing steward description"
-        # Columns from the surviving later batches were still applied.
         assert any(c.business_metadata and c.business_metadata.description for c in written.columns)
 
 
@@ -1277,89 +1228,8 @@ class TestPrepareTableContext:
         assert ctx["extra_context"] == ""
 
 
-class TestApplyForeignKeys:
-    """Verify _apply_foreign_keys applies AI-inferred FKs correctly."""
-
-    def test_applies_foreign_keys_when_no_deterministic(self) -> None:
-        table = _make_table()
-        result = {
-            "foreign_keys": [
-                {"column": "col_0", "target_table": "customers", "target_column": "id", "confidence": 0.85},
-                {"column": "col_1", "target_table": "products", "confidence": 0.7},
-            ]
-        }
-
-        _apply_foreign_keys(table, result)
-
-        assert len(table.foreign_keys) == 2
-        assert table.foreign_keys[0].column == "col_0"
-        assert table.foreign_keys[0].target_table == "customers"
-        assert table.foreign_keys[0].source == EnrichmentSource.AI_INFERRED
-        assert table.foreign_keys[1].target_column == ""
-
-    def test_skips_when_deterministic_fks_exist(self) -> None:
-        table = _make_table()
-        table.foreign_keys = [
-            ForeignKey(
-                column="col_0",
-                target_table="ref",
-                target_column="id",
-                source=EnrichmentSource.DETERMINISTIC,
-                confidence=1.0,
-            )
-        ]
-        result = {
-            "foreign_keys": [
-                {"column": "col_1", "target_table": "other", "target_column": "id", "confidence": 0.9},
-            ]
-        }
-
-        _apply_foreign_keys(table, result)
-
-        assert len(table.foreign_keys) == 1
-        assert table.foreign_keys[0].source == EnrichmentSource.DETERMINISTIC
-
-    def test_skips_incomplete_fk_entries(self) -> None:
-        table = _make_table()
-        result = {
-            "foreign_keys": [
-                {"column": "", "target_table": "customers", "target_column": "id"},
-                {"column": "col_0", "target_table": ""},
-                {"column": "col_1", "target_table": "products", "confidence": 0.8},
-            ]
-        }
-
-        _apply_foreign_keys(table, result)
-
-        assert len(table.foreign_keys) == 1
-        assert table.foreign_keys[0].column == "col_1"
-
-
 class TestCallBedrockMaxTokens:
-    """Verify max_tokens logic in _call_bedrock based on extra_context."""
-
-    @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
-    @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
-    @patch("coa_sources.database.enrichment.table_enricher.BedrockClient")
-    def test_extra_context_uses_16384_tokens(
-        self, mock_client_cls: MagicMock, mock_read: MagicMock, mock_write: MagicMock
-    ) -> None:
-        mock_client_cls.return_value.invoke.return_value = _mock_invocation_result()
-        table = _make_table("orders")
-        table.database_description = "Some database context"
-        mock_read.return_value = [table]
-
-        with patch("coa_sources.database.enrichment.table_enricher._prepare_table_context") as mock_ctx:
-            mock_ctx.return_value = {
-                "existing_description": "",
-                "existing_pk": None,
-                "existing_fks": None,
-                "extra_context": "Evidence text",
-            }
-            run("ds-123", "ns-456", "dom-789", "full", emitter=MagicMock(), namespace_language="en")
-
-        invoke_call = mock_client_cls.return_value.invoke.call_args_list[0]
-        assert invoke_call[1]["max_tokens"] == 16384
+    """Verify _call_bedrock requests 16384 max tokens."""
 
     @patch("coa_sources.database.enrichment.table_enricher._write_enriched_assets")
     @patch("coa_sources.database.enrichment.table_enricher.read_assets_for_datasource")
@@ -1539,11 +1409,9 @@ class TestReScanPreservesReviewedItems:
         ]
         _apply_column_metadata(table, column_results)
 
-        # Approved AI column preserved verbatim (content + status).
         assert table.columns[0].business_metadata.description == "Approved AI description"
         assert table.columns[0].business_metadata.synonyms == ["kept"]
         assert table.columns[0].business_metadata.review_status == ReviewStatus.APPROVED
-        # A PENDING column is still regenerated.
         assert table.columns[1].business_metadata.description == "fresh"
         assert table.columns[1].business_metadata.review_status == ReviewStatus.PENDING_REVIEW
 
@@ -1620,10 +1488,8 @@ class TestReScanPreservesReviewedItems:
 
         assert result["tables_enriched"] == 1
         assert result["tables_skipped_unchanged"] == 1
-        # The approved table was never re-generated.
         assert approved.business_metadata.description == "steward-approved"
         assert approved.business_metadata.review_status == ReviewStatus.APPROVED
         assert approved.columns[0].business_metadata.review_status == ReviewStatus.APPROVED
-        # Only the pending table is written back.
         written = mock_write.call_args[0][0]
         assert [t.name for t in written] == ["pending"]

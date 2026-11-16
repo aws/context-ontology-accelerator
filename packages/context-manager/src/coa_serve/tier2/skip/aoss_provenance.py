@@ -83,20 +83,11 @@ class AossProvenanceEvaluator:
         sources_registry: SourcesRegistry,
         oss_ontology_index: str,
     ):
-        """Wire the vector client, sources registry, and ontology index.
-
-        Args:
-            vector_client: Client used for the k-NN class-provenance probe.
-            sources_registry: Registry supplying (cached) namespace source composition.
-            oss_ontology_index: OpenSearch index holding ontology-class vectors.
-        """
+        """Wire the vector client, sources registry, and ontology index."""
         self._vector = vector_client
         self._sources_registry = sources_registry
         self._oss_ontology_index = oss_ontology_index
-        # Per-(namespace, query) decision cache so a retried identical query does
-        # not re-search; short TTL since topology/ingestion can change, bounded so a
-        # long-lived process serving high-cardinality queries cannot grow without
-        # bound. The cache owns its own expiry + LRU eviction (see TtlLruCache).
+        # Per-(namespace, query) decision cache with a short TTL and LRU bound.
         self._decision_cache: TtlLruCache[tuple[str, str], Tier2SkipDecision] = TtlLruCache(
             ttl_s=_CACHE_TTL_S, max_size=_DECISION_CACHE_MAX
         )
@@ -109,17 +100,7 @@ class AossProvenanceEvaluator:
         *,
         trace: TraceCollector,
     ) -> Tier2SkipDecision:
-        """Decide whether Tier 2 should be skipped for this query, failing open on error.
-
-        Args:
-            query: The natural-language query being routed.
-            namespace: Namespace the query targets.
-            embedding: Precomputed query embedding, or None if unavailable.
-            trace: Processing-trace collector for this request.
-
-        Returns:
-            A Tier2SkipDecision (SKIP, RUN, or ABSTAIN); ABSTAIN on any error.
-        """
+        """Decide whether Tier 2 should be skipped for this query, failing open on error."""
         try:
             return await self._evaluate(query, namespace, embedding, trace=trace)
         except Exception as e:  # defensive: an evaluator must never break resolve()
@@ -189,10 +170,9 @@ class AossProvenanceEvaluator:
         if not hits:
             return Tier2SkipDecision.ABSTAIN  # no retrieval signal → run Tier 2
 
-        # A class is Tier-2-capable iff it carries provenance (data_source_id) — see
-        # VectorHit.data_source_id, the single source of truth for this read.
-        # Positive-evidence guard: provenance must be populated SOMEWHERE in this
-        # namespace's classes, else "all empty" is ambiguous (field never stamped).
+        # A class is Tier-2-capable iff it carries provenance (data_source_id).
+        # Provenance must be populated somewhere in this namespace, else "all empty"
+        # is ambiguous.
         if not any(h.data_source_id for h in hits):
             return Tier2SkipDecision.ABSTAIN
 
@@ -201,7 +181,5 @@ class AossProvenanceEvaluator:
         if any(h.data_source_id for h in decision_window):
             return Tier2SkipDecision.RUN
 
-        # Top-k are all unmapped AND the namespace does stamp provenance elsewhere →
-        # this query matched only document-induced classes → Tier 2 cannot produce
-        # SQL for it. Prune it.
+        # Top-k are all unmapped while the namespace stamps provenance elsewhere.
         return Tier2SkipDecision.SKIP

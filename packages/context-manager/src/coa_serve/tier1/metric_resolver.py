@@ -134,29 +134,11 @@ capped like the untrusted ``evidence`` channel to bound a prompt-stuffing attemp
 class DeclinedMetricContext:
     """The governed definition Tier-1 matched but declined to execute.
 
-    Tier-1's residual-qualifier gate is correct to decline: its SQL runs verbatim,
-    so a question carrying an unconsumed qualifier would get the unfiltered
-    aggregate at confidence 1.0 with nothing marking the drop. But declining must
-    not be *total*. Dropping the ``MetricMatch`` outright means the authored formula
-    never reaches Tier 2, which then reinvents a metric the business has already
-    defined — and reinvents it differently on different runs, so a registered metric
-    can make answers LESS consistent than no metric at all.
-
-    This carries the identified definition forward as **authoritative context, not
-    an answer**: Tier 2 still writes and runs its own SQL, but does so knowing the
-    governed formula and exactly which part of the question Tier-1 could not
-    honour. Tier 2 owns the judgement the gate cannot make — whether
-    ``unhandled_qualifier`` is a predicate to add ("for the Gold tier"), a
-    definition to apply ("using the operational recency-based definition"), or a
-    token that merely names the dataset the namespace already scopes to (the
-    tenant's own company name). That decision needs the schema, which Tier 2 has
-    and the gate does not.
-
-    Deliberately NOT solved by teaching the gate to consume such tokens (e.g.
-    stripping the namespace's own name as scaffolding): that assumes the token names
-    the whole dataset rather than filtering it, and in a source holding multi-entity
-    data a company name IS a filter. The gate cannot tell the two apart without a
-    schema, so it forwards the evidence instead of guessing.
+    Tier-1's SQL runs verbatim, so it declines a question carrying an unconsumed
+    qualifier. This carries the identified definition forward to Tier 2 as
+    authoritative context, not an answer: Tier 2 writes its own SQL knowing the
+    governed formula and ``unhandled_qualifier``, and decides how to apply the
+    qualifier, since that needs the schema.
     """
 
     metric_id: str
@@ -195,15 +177,8 @@ class DeclinedMetricContext:
         reason Tier-1 declined is that the template alone answers a different,
         broader question than the one asked.
 
-        Returns ``""`` when there is no formula to forward. A metric can match by
-        name yet carry an empty ``sql_template`` (``expressionDialects`` is OPTIONAL
-        in the metric SPARQL, and the loader leaves it empty when absent or
-        unparseable). Emitting the header + a blank ``Definition SQL:`` would tell
-        the writer an authoritative definition exists, show it none, and instruct
-        it to preserve it — biasing it to invent a formula and treat it as
-        governed, strictly worse than the pre-change baseline. An empty block keeps
-        the prompt byte-identical to that baseline and stays consistent with
-        ``governedDefinitionForwarded=False`` in the trace.
+        Returns ``""`` when the metric has no SQL template (``expressionDialects``
+        is optional), so no empty definition is presented to the writer as governed.
         """
         if not self.sql_template.strip():
             return ""
@@ -327,17 +302,6 @@ def _fold(text: str) -> str:
 def declared_dimensions(sql_template: str, declared: list[str] | None = None) -> list[str]:
     """Return a metric's declared dimensions, derived from its template placeholders.
 
-    ``substitute_dimensions`` only binds a placeholder whose name is in the
-    metric's declared ``dimensions`` — but nothing in the product populates that
-    list: the CreateMetric/UpdateMetric contract has no dimensions field, the
-    Neptune publisher writes none, and ``_bindings_to_seed`` never reads any. So
-    every API-authored parameterized template (``WHERE region = {region}``)
-    resolved with ``allowed == []`` and failed closed on BOTH branches — with no
-    value ("requires dimensions with no values") and with one ("not a declared
-    dimension") — making parameterized Tier-1 metrics unreachable, while the
-    orchestrator fell through to Tier-2/3 and answered the caller's filtered
-    question with the UNFILTERED figure.
-
     The placeholders ARE the declaration: a metric author who writes ``{region}``
     in the template has declared a ``region`` dimension. Derive the list from the
     template (first-appearance order, case-insensitive dedup consistent with the
@@ -356,40 +320,20 @@ def declared_dimensions(sql_template: str, declared: list[str] | None = None) ->
     return out
 
 
-# ── Residual-qualifier detection ─────────────────────────────────────────────
+# Residual-qualifier gate. A Tier-1 match is a whole-question substring search and
+# its UNFILTERED SQL runs verbatim, so a qualifier ("for the Gold tier") would be
+# silently dropped. After a name/synonym hit, strip the matched span and a closed
+# list of question scaffolding; anything left over is a qualifier Tier-1 cannot
+# honour, so it declines and the cascade falls through to Tier 2.
 #
-# A Tier-1 match is a whole-question substring search: a metric whose synonym is
-# a common noun ("revenue") matches ANY question containing that word, and the
-# metric's UNFILTERED SQL is then executed verbatim — nothing in Tier-1 parses a
-# filter, group-by, or time window out of the natural language. Without this
-# gate, "what is revenue?" and "what is revenue for the Gold tier?" returned
-# byte-identical rows at confidence 1.0, with no signal that the qualifier was
-# dropped.
-#
-# The gate: after a name/synonym hit, strip the matched span and a closed list of
-# question scaffolding. Anything LEFT OVER is a qualifier Tier-1 cannot honour, so
-# Tier-1 declines the question and the cascade falls through to Tier 2, which can
-# express predicates. Tier-1 keeps its deterministic-1.0 guarantee precisely
-# because it now only claims questions it fully consumes.
-#
-# Deliberately a CLOSED stop-word list, not an LLM or POS tagger: Tier-1's whole
-# value is being deterministic and sub-millisecond. The failure mode of an
-# unlisted-but-harmless word is a fall-through to Tier 2 (a slower, still-correct
-# answer), which is strictly safer than the silent wrong answer it replaces.
-# The word lists themselves live in per-language modules — see
-# coa_serve.tier1.stopwords for the curation policy (what must NEVER be
-# listed) and the guide for adding a language.
+# A closed stop-word list, not an LLM or POS tagger, keeps Tier-1 deterministic and
+# sub-millisecond. An unlisted harmless word only costs a fall-through to Tier 2.
+# The word lists live in coa_serve.tier1.stopwords (curation policy there).
 _RESIDUAL_STOP_WORDS = RESIDUAL_STOP_WORDS
 
 # Tokenization for the residual gate is the shared script-run segmentation
-# (``iter_word_tokens``): Latin/digit runs keep hyphenated/possessive qualifiers
-# intact, and unsegmented scripts yield one run per script stretch, so a Japanese
-# particle (hiragana) separates from the content word (kanji/katakana) it
-# follows. Tokenizing on ``[a-z0-9_]`` alone made every non-ASCII qualifier
-# invisible: the gate saw an empty residual and Tier-1 answered the UNFILTERED
-# question at confidence 1.0 — the exact silent-wrong-answer this gate exists to
-# prevent, reintroduced for every non-English question (GitHub issue #95; the
-# Hangul-range widening that first fixed Korean is subsumed by the script runs).
+# (``iter_word_tokens``), so non-ASCII qualifiers stay visible to the gate and a
+# Japanese particle (hiragana) separates from the content word it follows.
 
 # The hiragana block (U+3041–U+309F). NOT the katakana prolonged-sound mark:
 # katakana runs are content words and must never enter the decomposition below.
@@ -462,15 +406,14 @@ semantic search (that's the downstream tiers' vector job). A fuzzy hit returns
 confidence < 1.0 so the deterministic confidence=1.0 guarantee is reserved for
 exact matches.
 
-Why 0.88 (review ask): SequenceMatcher ratio = 2*matches/total_chars. On typical
+Why 0.88: SequenceMatcher ratio = 2*matches/total_chars. On typical
 metric-name tokens (>=8 chars) a single-character edit scores ~0.92-0.96
 ("total_revenu" vs "total_revenue" = 0.96) and plural/abbreviation variants land
 ~0.90-0.95 — all admitted. Semantically different lookalikes fall below it
 ("total_revenue" vs "total_reserve" = 0.77) — rejected. 0.88 is the conservative
 midpoint: it admits one-edit near-misses on realistic name lengths while
 rejecting cross-metric confusion; on very short names (<8 chars) a single edit
-scores lower and is intentionally NOT matched (too ambiguous). Not eval-tuned —
-revisit with the accuracy workstream if fuzzy misses show up in eval traces.
+scores lower and is intentionally NOT matched (too ambiguous). Not eval-tuned.
 """
 
 # Default graph-URI scheme — mirrors the metric-service writer
@@ -482,11 +425,9 @@ _DEFAULT_GRAPH_URI_TEMPLATE = "https://ontology-workbench.local/{namespace}"
 
 # `@@PREFIX@@` = the static graph-URI prefix (everything before `{namespace}`).
 # The query returns the raw graph URI (?g) and the namespace is derived
-# client-side in `_namespace_from_graph_uri` — a prior `BIND(REPLACE(STR(?g),
-# <regex>, "$1"))` ran an XPath regex over every matched graph on EVERY row and
-# was the dominant memory sink behind Neptune `MemoryLimitExceededException`
-# under concurrent refreshes. Single-brace, valid SPARQL — placeholders are
-# substituted via str.replace (NOT str.format), so the SPARQL braces stay literal.
+# client-side in `_namespace_from_graph_uri` (a regex BIND over every row was a
+# Neptune MemoryLimitExceededException sink). Placeholders are substituted via
+# str.replace (NOT str.format), so the SPARQL braces stay literal.
 
 _METRIC_PATTERNS = """
     ?s a <http://www.w3.org/2002/07/owl#Class> .
@@ -613,30 +554,16 @@ def residual_tokens(folded_query: str, matched_spans: list[tuple[int, int]]) -> 
 def _metric_list_sparql(graph_uri_template: str = "", namespace: str = "") -> str:
     """Build the metric-list SPARQL for the configured graph-URI scheme.
 
-    metric-service publishes GovernedMetrics into `{base}/{namespace}/{ontology_id}`
-    (see metric-service `neptune_client._named_graph`); the `{base}/{namespace}`
-    prefix is exactly the deployed `GRAPH_URI_TEMPLATE`. The resolver matches any
-    graph under the template's static prefix; the namespace is the first path
-    segment after that prefix and is extracted client-side (see
-    `_namespace_from_graph_uri`) rather than with a per-row SPARQL `REPLACE()`
-    regex, which was the memory sink behind Neptune OOMs under concurrent
-    refreshes.
-
-    When ``namespace`` is given, the query names that namespace's one metric graph,
-    `{prefix}{namespace}/{ontology_id}`, as a constant `GRAPH <iri>` (with `?g`
-    bound to it), so Neptune reads only that graph. A template with text after
-    `{namespace}` doesn't fit that scheme and keeps the `STRSTARTS` filter on
-    `{prefix}{namespace}/`. The full periodic refresh passes no namespace and
-    filters every graph under the prefix, which Neptune evaluates store-wide.
-
-    This replaces the legacy hardcoded `urn:coa:{ns}:published` scheme, which no
-    writer uses — so the resolver previously loaded 0 metrics and Tier-1 never
-    matched API-published metrics.
+    Metrics live in `{base}/{namespace}/{ontology_id}`, where `{base}/{namespace}`
+    is the deployed `GRAPH_URI_TEMPLATE`. With ``namespace``, the query names that
+    namespace's one metric graph as a constant `GRAPH <iri>`, so Neptune reads only
+    that graph; a template with text after `{namespace}` keeps the `STRSTARTS`
+    filter on `{prefix}{namespace}/`. The full refresh passes no namespace and
+    filters every graph under the prefix.
     """
     if not graph_uri_template:
-        # Review (Kun): the env-unset fallback hits a hostname no real deployment
-        # uses, so Neptune returns 0 bindings and the empty cache looks identical
-        # to "no metrics published yet". Warn so a misconfiguration is distinguishable.
+        # The unset-template fallback host has no metrics; warn so a
+        # misconfiguration is distinguishable from an empty catalog.
         logger.warning("metric_resolver_graph_uri_template_unset_fallback", fallback=_DEFAULT_GRAPH_URI_TEMPLATE)
     template = graph_uri_template or _DEFAULT_GRAPH_URI_TEMPLATE
     prefix = template.split("{namespace}", 1)[0]
@@ -650,11 +577,7 @@ def _metric_list_sparql(graph_uri_template: str = "", namespace: str = "") -> st
 def _namespace_from_graph_uri(graph_uri: str, prefix: str) -> str:
     """Namespace = first path segment of ``graph_uri`` after the static ``prefix``.
 
-    Mirrors the semantics of the old SPARQL ``REPLACE(STR(?g), "^<prefix>([^/]+).*$",
-    "$1")`` without running an XPath regex on Neptune for every result row. The
-    metric graph is ``{prefix}{namespace}/{ontology_id}``, so after stripping the
-    prefix the namespace is everything up to the next ``/``. Returns "" when the
-    URI does not carry the prefix (the FILTER should prevent this, but be safe).
+    Returns "" when the URI does not carry the prefix.
     """
     if not graph_uri.startswith(prefix):
         return ""
@@ -692,7 +615,7 @@ class MetricResolver:
         self._loaded = False
         self._neptune = neptune_client
         self._refresh_task: asyncio.Task | None = None
-        # Master seed items by metric_id, retained so a lazy per-namespace lookup
+        # All seed items by metric_id, retained so a lazy per-namespace lookup
         # can MERGE into the index (rebuild from the union) rather than replace it.
         self._seed_by_id: dict[str, MetricSeedItem] = {}
         # When each namespace was last read from Neptune on its own (clock time),
@@ -787,12 +710,12 @@ class MetricResolver:
 
     @staticmethod
     def _select_expression(dialects: list[dict[str, Any]]) -> str:
-        """Pick the SQL expression to execute from a metric's dialect list (#809).
+        """Pick the SQL expression to execute from a metric's dialect list.
 
         The direct-JDBC path re-transpiles metric SQL with sqlglot ``read="trino"``,
         so a TRINO-authored expression round-trips correctly regardless of the
         target engine. Prefer it when present; otherwise fall back to the first
-        listed expression (the pre-#809 behavior) so metrics with no TRINO variant
+        listed expression so metrics with no TRINO variant
         still resolve. ``dialect`` labels are compared case-insensitively.
 
         Always returns ``str``: an empty ``dialects`` list yields ``""`` (never an
@@ -823,7 +746,6 @@ class MetricResolver:
                 continue
             key = (namespace, name)
             if key not in grouped:
-                # Parse aiContext JSON for synonyms
                 synonyms: list[str] = []
                 ai_context_raw = row.get("aiContext", "")
                 if ai_context_raw:
@@ -836,16 +758,7 @@ class MetricResolver:
                     except (ValueError, TypeError) as exc:
                         logger.warning("metric_json_parse_failed", field="aiContext", name=name, error=str(exc))
 
-                # Parse expressionDialects JSON for SQL. Select the TRINO
-                # expression when present rather than blindly taking index 0:
-                # the shared CompositeQueryExecutor re-transpiles every metric
-                # from Trino (``read="trino"``) before direct-JDBC execution, so
-                # a non-Trino ``dialects[0]`` (metrics may be authored in
-                # POSTGRESQL/REDSHIFT/SNOWFLAKE/… and the list is neither
-                # TRINO-required nor reordered at ingest) would be mis-parsed —
-                # silently wrong results or a spurious firewall reject (#809).
-                # Fall back to the first expression when no TRINO variant exists
-                # (preserves prior behavior for legacy/non-Trino-authored metrics).
+                # Prefer the TRINO expression (see select_tier1_sql_expression).
                 sql_template = ""
                 dialects_raw = row.get("expressionDialects", "")
                 if dialects_raw:
@@ -930,8 +843,6 @@ class MetricResolver:
             ns_key = defn.namespace.lower()
             by_namespace.setdefault(ns_key, []).append(defn)
 
-        # Pre-compile word-boundary regex patterns for fast matching
-        # Replace underscores with flexible whitespace/underscore pattern for matching
         def _name_pattern(name: str) -> re.Pattern:
             escaped = re.escape(name).replace("_", r"[\s_]")
             # `\b` is Unicode-aware, so it cannot separate a Latin-edged alias
@@ -944,7 +855,6 @@ class MetricResolver:
             right = "" if is_unspaced_script_letter(name[-1:]) else r"(?![a-z0-9_])"
             return re.compile(rf"{left}{escaped}{right}")
 
-        # Build patterns for all metrics with each name/synonym
         name_patterns: dict[str, list[tuple[re.Pattern, MetricDefinition]]] = {}
         for name_lower, defns in by_name.items():
             name_patterns[name_lower] = [(_name_pattern(name_lower), defn) for defn in defns]
@@ -973,7 +883,6 @@ class MetricResolver:
         matched_spans: dict[str, list[tuple[int, int]]] = {}
         snapshot = self._snapshot
 
-        # Iterate over all pattern lists (each name may have metrics from multiple namespaces)
         for _name_lower, pattern_defn_list in snapshot.name_patterns.items():
             for pattern, defn in pattern_defn_list:
                 if defn.namespace and defn.namespace.lower() != ns_lower:
@@ -1090,8 +999,7 @@ class MetricResolver:
 
         # Use the per-namespace index (+ namespace-agnostic metrics under "") so
         # scoring cost scales with the TARGET namespace's metric count, not the
-        # whole catalog (review: a large namespace must not slow lookups in a
-        # small one).
+        # whole catalog.
         candidates = snapshot.by_namespace.get(ns_lower, []) + snapshot.by_namespace.get("", [])
         best_range = (0, 0)
         for defn in candidates:
@@ -1167,8 +1075,8 @@ class MetricResolver:
         sqlglot to render each value as a properly-typed, quoted SQL LITERAL — NOT
         naive string interpolation. Building literals through sqlglot's AST means
         the value is escaped/quoted by the SQL engine's own rules (a string can't
-        break out into SQL), which is the parameterized-binding guarantee the WI
-        requires on a path (Athena) that has no native bind-parameter mechanism.
+        break out into SQL), which gives parameterized binding on a path (Athena)
+        that has no native bind-parameter mechanism.
 
         Only dimensions in ``allowed`` (the metric's declared dimensions) are
         substituted. A template with no placeholders and no supplied values is
@@ -1237,7 +1145,6 @@ class MetricResolver:
         """Return compact summaries of all metrics for a namespace (for Tier 3 context)."""
         ns_lower = namespace.lower()
         definitions = self._snapshot.by_namespace.get(ns_lower, [])
-        # Include namespace-agnostic metrics (empty namespace matches all)
         definitions = definitions + self._snapshot.by_namespace.get("", [])
         return [d.compact_summary for d in definitions]
 
@@ -1249,17 +1156,9 @@ class MetricResolver:
         A multi-metric exact match (match_count > 1) is returned as-is so the
         orchestrator can bypass Tier-1 — fuzzy is not attempted in that case.
         """
-        # Lazy-load guard: start() is kicked off fire-and-forget at init, so the
-        # first request(s) on a fresh instance can race ahead of the initial
-        # Neptune refresh and match against an EMPTY snapshot (Tier-1 false miss).
-        # Block on a one-shot refresh before matching when we haven't loaded yet.
-        # Keying on ``_loaded`` (not the index contents) is important: a namespace
-        # with legitimately ZERO metrics leaves the index empty but sets
-        # ``_loaded`` (see _refresh_from_neptune), so this no-ops thereafter
-        # instead of hitting Neptune on every request. A FAILED refresh leaves
-        # ``_loaded`` False, so it retries next time, until a full refresh or a
-        # namespace read has succeeded (``_read_namespace`` sets it). This first
-        # load is not bounded by ``_INLINE_READ_TIMEOUT_S``.
+        # Lazy-load guard: start() is fire-and-forget, so the first request can race
+        # the initial refresh. Keyed on ``_loaded``: an empty namespace sets it (no-op
+        # thereafter) while a failed refresh leaves it False and retries.
         if self._neptune is not None and not self._loaded:
             await self._refresh_from_neptune()
         read_before_match = self._cache_is_stale(namespace)
@@ -1268,9 +1167,6 @@ class MetricResolver:
 
         exact = self.exact_name_synonym_match(query, namespace)
         if exact.found:
-            # Covers multi-metric too: match_count > 1 always has found=True.
-            # Returned as-is so the orchestrator can bypass Tier-1; fuzzy is
-            # never attempted after any exact hit.
             return exact
         fuzzy = self.fuzzy_match(query, namespace)
         if fuzzy.found:

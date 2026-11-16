@@ -6,10 +6,7 @@
  *
  * Route: /namespaces/:namespaceId/permissions
  *
- * Moved off the namespace detail page so granting/revoking access has its own
- * surface. Two tabs:
- *   - Roles: the namespace's available roles.
- *   - Members: principals granted a role, with grant + revoke actions.
+ * Tabs: Members (grant and revoke) and Roles.
  */
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
@@ -76,11 +73,7 @@ function unrestrictedLabel(label: string): React.ReactNode {
   );
 }
 
-/**
- * Renders a list of values as wrapping Cloudscape badges (chips), mirroring
- * the token pills in the create-grant modal. Falls back to a muted state
- * label when the list is empty.
- */
+/** Renders a list of values as wrapping Cloudscape badges. */
 function renderBadgeList(
   values: string[] | undefined,
   color: BadgeProps["color"],
@@ -102,10 +95,7 @@ function renderBadgeList(
   );
 }
 
-/**
- * Renders the per-table column denylist as grouped rows — each table name
- * followed by its denied columns as red chips — instead of a flat string.
- */
+/** Renders the per-table column denylist as grouped rows of red chips. */
 function renderDeniedColumns(
   map: Record<string, string[]> | undefined,
   noneLabel: string,
@@ -157,8 +147,6 @@ export const NamespacePermissions: React.FC = () => {
     </SpaceBetween>
   );
 };
-
-// ── Tabs ─────────────────────────────────────────────────────────────
 
 const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   namespaceId,
@@ -492,8 +480,6 @@ const PermissionsTabs: React.FC<{ namespaceId: string }> = ({
   );
 };
 
-// ── Column definitions ───────────────────────────────────────────────
-
 function makeMemberColumns(
   roleNameMap: Map<string, string>,
   locale: string,
@@ -543,8 +529,6 @@ function makeMemberColumns(
     },
   ];
 }
-
-// ── Create grant modal ───────────────────────────────────────────────
 
 interface CreateGrantModalProps {
   namespaceId: string;
@@ -627,9 +611,7 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
       return;
     }
     setError(null);
-    const tables = tableAllowlist;
     const denylist = columnDenylistRowsToMap(columnDenylistRows);
-    const metrics = allowedMetrics;
     createGrant.mutate(
       {
         namespaceId,
@@ -637,9 +619,9 @@ const CreateGrantModal: React.FC<CreateGrantModalProps> = ({
           principalType: principalType.value as PrincipalType,
           principalId,
           role: selectedRole.value!,
-          ...(tables.length ? { tableAllowlist: tables } : {}),
+          ...(tableAllowlist.length ? { tableAllowlist } : {}),
           ...(Object.keys(denylist).length ? { columnDenylist: denylist } : {}),
-          ...(metrics.length ? { allowedMetrics: metrics } : {}),
+          ...(allowedMetrics.length ? { allowedMetrics } : {}),
         },
       },
       {

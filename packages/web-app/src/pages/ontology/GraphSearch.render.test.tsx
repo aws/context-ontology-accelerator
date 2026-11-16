@@ -31,8 +31,7 @@ const CLASSES: GraphSearchHit[] = [
   { uri: POLICY, label: "Policy", kind: "class", graph_uris: ["wb/ns/o"] },
 ];
 const CLASS_PAGE: GraphSearchResult = { hits: CLASSES, total_count: 2 };
-// The List view + graph seed are now keyed off the ontology registry (complete
-// set of ontology ids), not a capped wildcard class fetch.
+// The List view + graph seed are keyed off the ontology registry.
 const ONTOLOGY_RECORDS: OntologyRecord[] = [
   {
     ontologyId: "o",
@@ -164,10 +163,8 @@ describe("GraphSearchPage — initial Graph view builds from ontology-overview",
     searchEntities.mockResolvedValue(CLASSES);
     // The List view pages classes via searchEntitiesPaged.
     searchEntitiesPaged.mockResolvedValue(CLASS_PAGE);
-    // Both the List view's description enrichment and the Graph view's seed
-    // now fetch the FULL (un-sampled) overview per ontology — the seed only
-    // falls back to sample=true when the combined class count exceeds
-    // MAX_SEED_CLASSES, which this small fixture (2 classes) never does.
+    // The List view and the Graph seed fetch the full overview per ontology;
+    // this 2-class fixture stays under both seed caps.
     getOntologyOverview.mockImplementation(
       (
         _client: unknown,
@@ -204,16 +201,12 @@ describe("GraphSearchPage — initial Graph view builds from ontology-overview",
     );
     expect(screen.getByText("Claim")).toBeInTheDocument();
 
-    // The key win: opening the Graph view did NOT fan out getClass over every
-    // class (that was the ~100-request / deadlocking path). No getClass yet.
+    // Opening the Graph view must not fan out getClass over every class.
     expect(getClass).not.toHaveBeenCalled();
   });
 
   it("seeds object-property relationships alongside the taxonomy on the full path", async () => {
-    // The proposal-detail graph renders domain → range edges for every
-    // object property in the ontology; the Explorer seed used to drop them,
-    // leaving only class hierarchy. Under the seed cap, the seed now
-    // materializes the same relationships so the two views agree in shape.
+    // The seed renders object-property edges like the proposal graph.
     renderPage();
     await waitFor(() => expect(listOntologies).toHaveBeenCalled());
     await userEvent.click(screen.getByText("Graph"));
@@ -281,12 +274,8 @@ describe("GraphSearchPage — initial Graph view builds from ontology-overview",
   });
 
   it("keeps a small induced ontology in full (with relationships) beside an oversized reference", async () => {
-    // The realistic namespace shape, and the one a combined-total cap got
-    // wrong: a small induced ontology plus a large foundational reference
-    // loaded for grounding. The reference alone blows the cap, but it must
-    // degrade only ITSELF — the induced ontology has to keep every class and
-    // its relationship edges, or the user is back to the "tiny graph with no
-    // relationships" they complained about.
+    // A large foundational reference blows the cap but must degrade only itself:
+    // the small induced ontology keeps every class and relationship edge.
     const BIG = "big";
     listOntologies.mockResolvedValue([
       { ontologyId: "o", title: "Insurance", ontologyType: "induced" },
@@ -733,24 +722,10 @@ describe("GraphSearchPage — List view paging across chunks", () => {
     // kick off the offset-100 fetch while page-5 rows stay on screen.
     await userEvent.click(page5);
 
-    // Deliberately NOT preceded by `mockClear()`. The invariant under test is
-    // "offset-100 is requested while page-5 rows are still on screen" — it does
-    // not matter whether that request was issued on this click or already in
-    // flight from the initial load. Clearing first made the test depend on
-    // which side of the clear the request landed on: under parallel-suite load
-    // it could fire BEFORE the clear, and since the chunk is then cached
-    // nothing re-requests it, so the assertion failed on a prefetch that had
-    // demonstrably worked. The rows-visible assertions below are what keep this
-    // honest about the "one page early, no blanking" behaviour.
-    //
-    // Explicit timeout: this polls for a state transition driven by React effect
-    // scheduling (click -> setState -> effect -> fetchNextPage), which the
-    // default 1000ms waitFor budget misses under full-suite parallel load. It
-    // must also stay strictly UNDER the per-test timeout set on this `it` below:
-    // both were previously 5000ms — vitest's default — so a slow poll burned the
-    // whole test budget and died as "Test timed out in 5000ms" before waitFor
-    // could report the assertion it was polling. 12000 under a 15000 per-test
-    // budget keeps that ordering with room for the click and row assertions.
+    // No `mockClear()` first: the offset-100 request may already be in flight
+    // from the initial load, and clearing makes the test race on which side of
+    // the clear it lands. Keep this waitFor (12 s) under the 15 s per-test
+    // timeout; the default 1000ms is too short under parallel load.
     await waitFor(
       () =>
         expect(
@@ -781,13 +756,9 @@ describe("GraphSearchPage — List view paging across chunks", () => {
       ),
     );
 
-    // Now poll for a single settled frame satisfying BOTH halves of the
-    // regression: the namespace reads as empty, and NOT as the false-empty
-    // spinner. Explicit timeout because the shared CI runner exceeds the 1000ms
-    // default on first paint (the suite takes ~2m there vs ~12s locally), and it
-    // must stay under the per-test budget on this `it` — both were 5000ms
-    // (vitest's default) before, so a slow poll aborted the test as "Test timed
-    // out in 5000ms" before it could report the assertion it was polling.
+    // Poll for a single settled frame where the namespace reads as empty and not
+    // as the false-empty spinner. The 1000ms default is too short for the CI
+    // runner; keep this under the per-test timeout on this `it`.
     await waitFor(
       () => {
         expect(

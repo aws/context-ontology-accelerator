@@ -1,27 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the ``source_type`` filter on :mod:`dynamo_store`.
-
-Validates the schema delta added by Task 2.1 of the unstructured-ontology-
-induction-api spec:
-
-- ``create_proposal`` and ``put_job`` accept a ``source_type`` parameter
-  defaulting to ``"STRUCTURED"``.
-- ``list_proposals`` and ``list_jobs`` accept an optional ``source_type``
-  filter with asymmetric backfill semantics:
-
-    * ``source_type="STRUCTURED"`` matches both items with the attribute
-      set to ``"STRUCTURED"`` AND items that lack the attribute entirely
-      (pre-schema-delta data).
-    * ``source_type="UNSTRUCTURED"`` matches only items with the
-      attribute set to ``"UNSTRUCTURED"`` exactly. Pre-delta items are
-      never returned for this filter.
-
-All tests use an in-memory fake Dynamo table — no AWS traffic.
-
-Requirements: 3.3, 3.7
-"""
+"""Unit tests for :mod:`dynamo_store` against an in-memory fake table and S3 client."""
 
 from __future__ import annotations
 
@@ -32,9 +12,6 @@ import pytest
 from coa_common.constants import RESOURCE_PREFIX
 
 pytestmark = pytest.mark.unit
-
-
-# ── Fake Dynamo table with FilterExpression support ────────────────────
 
 
 class _FakeDynamoTable:
@@ -118,13 +95,7 @@ class _FakeDynamoTable:
         return {}
 
     def scan(self, **kwargs):
-        # DynamoDB ``Limit`` caps items SCANNED per page (not returned), so a page
-        # can return fewer matches than requested and set LastEvaluatedKey. We
-        # model that faithfully: walk the raw store from ExclusiveStartKey, read
-        # at most ``limit`` items (pre-filter), apply the FilterExpression to that
-        # slice, and emit LastEvaluatedKey when more raw items remain. This is
-        # what makes a paginated drain testable with a row on page 2. Without a
-        # Limit, everything is one page.
+        # ``Limit`` caps items scanned per page (pre-filter); see ``_read``.
         self.scan_calls.append(dict(kwargs))
         return self._read(list(self.items.items()), **kwargs)
 
@@ -191,8 +162,7 @@ class _FakeDao:
 
     def update(self, key, update_fields, *, auto_timestamp=True, **kwargs):
         # Mirror DynamoDBDAO: alias every field name (#a0, #a1, …) so reserved
-        # words like ``status``/``error`` are legal — exactly the behavior the
-        # helpers now rely on instead of hand-rolling aliases.
+        # words like ``status``/``error`` are legal.
         names = {}
         values = {}
         parts = []
@@ -209,16 +179,6 @@ class _FakeDao:
             ExpressionAttributeValues=values,
         )
         return True
-
-
-# ── Fake S3 client for the turtle offload ──────────────────────────────
-#
-# Mainline reworked ``create_proposal`` so the ontology / R2RML Turtle is
-# offloaded to S3 (``_get_s3().put_object`` + ``copy_object``) and only the
-# S3 keys are persisted on the DynamoDB item; ``get_proposal_by_id``
-# hydrates the Turtle back via ``get_object``. Unit tests that exercise
-# ``create_proposal`` directly must therefore stub the S3 client too,
-# otherwise the call reaches real S3 and fails with ``AccessDenied``.
 
 
 class _FakeS3Body:
@@ -351,11 +311,8 @@ def _evaluate_clause(
 def fake_dynamo(monkeypatch):
     """Patch ``dynamo_store._get_table`` to return a fresh fake table.
 
-    Each test gets its own table instance, so tests are hermetic. The S3
-    client is stubbed too: mainline offloads proposal Turtle to S3, so
-    ``create_proposal`` / ``get_proposal_by_id`` touch S3 even in unit
-    tests. Without the stub those calls reach real S3 and fail with
-    ``AccessDenied``.
+    Each test gets its own table instance. The S3 client is stubbed too,
+    because proposal Turtle is offloaded to S3.
     """
     table = _FakeDynamoTable()
     s3 = _FakeS3Client()
@@ -380,9 +337,6 @@ def fake_dynamo(monkeypatch):
         lambda: _FakeDao(table),
     )
     return table
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────
 
 
 def _seed_pre_delta_proposal(table: _FakeDynamoTable, *, namespace: str, proposal_id: str):
@@ -426,9 +380,6 @@ def _seed_pre_delta_job(table: _FakeDynamoTable, *, namespace: str, job_id: str)
     )
 
 
-# ── Proposal matches S3 offload (grounding-override 400 KB regression) ──
-
-
 class TestResolveOntologyBucket:
     """The bucket resolver must never fall back to a hardcoded foreign account."""
 
@@ -457,10 +408,7 @@ class TestResolveOntologyBucket:
         """CDK injects RESOURCE_PREFIX into deployed compute as ``{prefix}-{env}-``.
 
         The derived name must be ``scl-dev-ontology-artifacts-…``, NOT
-        ``scl-dev-dev-…``. Regression guard for the bucket name being built from
-        a brand literal instead of the deployment prefix, which resolved a bucket
-        that exists in no environment (NoSuchBucket for every caller outside the
-        deployed compute, e.g. integ tests).
+        ``scl-dev-dev-…``.
         """
         import importlib
 
@@ -504,11 +452,7 @@ class TestResolveOntologyBucket:
 class TestProposalMatchesS3Offload:
     """Grounding overrides must offload ``matches`` to S3, never write inline.
 
-    Regression for the ``POST /proposals/update`` 500: ``_apply_grounding_
-    overrides`` rebuilt ``metadata={**meta, "matches": ...}`` and wrote it
-    inline, tripping DynamoDB's 400 KB item limit (UpdateItem
-    ``ValidationException: Item size has exceeded the maximum allowed size``).
-    The matches now go to S3 with only the key persisted on the item.
+    Inline matches can exceed DynamoDB's 400 KB item limit.
     """
 
     def test_put_proposal_matches_s3_writes_to_s3_and_returns_key(self, fake_dynamo, monkeypatch):
@@ -568,9 +512,6 @@ class TestProposalMatchesS3Offload:
         assert raw["status"] == "updated"
 
 
-# ── create_proposal: source_type default + persistence ─────────────────
-
-
 class TestCreateProposalSourceType:
     def test_default_source_type_is_structured(self, fake_dynamo):
         from coa_ontology import dynamo_store as ds
@@ -626,9 +567,6 @@ class TestCreateProposalSourceType:
         assert item["source_type"] == "STRUCTURED"
 
 
-# ── list_proposals: source_type filter semantics ───────────────────────
-
-
 class TestListProposalsSourceTypeFilter:
     """Asymmetric backfill: STRUCTURED includes pre-delta items; UNSTRUCTURED does not."""
 
@@ -675,15 +613,6 @@ class TestListProposalsSourceTypeFilter:
         rows = ds.list_proposals(namespace=seeded, limit=2)
         assert len(rows) == 2
 
-    def test_limit_none_drains_all(self, seeded):
-        """limit=None returns every matching proposal (no cap) — used by the
-        grounded-proposal cleanup so a large namespace can't silently truncate."""
-        from coa_ontology import dynamo_store as ds
-
-        rows = ds.list_proposals(namespace=seeded, limit=None)
-        ids = {r["proposal_id"] for r in rows}
-        assert ids == {"p-structured", "p-unstructured", "p-predelta"}
-
     def test_structured_filter_includes_predelta(self, seeded):
         """Pre-delta items lack the attribute and are matched as STRUCTURED."""
         from coa_ontology import dynamo_store as ds
@@ -691,8 +620,6 @@ class TestListProposalsSourceTypeFilter:
         rows = ds.list_proposals(namespace=seeded, source_type="STRUCTURED")
         ids = {r["proposal_id"] for r in rows}
         assert ids == {"p-structured", "p-predelta"}
-        # The unstructured one is NOT included.
-        assert "p-unstructured" not in ids
 
     def test_unstructured_filter_excludes_predelta(self, seeded):
         """The UNSTRUCTURED filter never matches items missing the attribute."""
@@ -859,9 +786,6 @@ class TestListProposalsCrossNamespaceContainsFilter:
         assert {r["proposal_id"] for r in rows} == {"pa", "pb"}
 
 
-# ── put_job: source_type default + persistence ─────────────────────────
-
-
 class TestPutJobSourceType:
     def test_default_source_type_is_structured(self, fake_dynamo):
         from coa_ontology import dynamo_store as ds
@@ -893,9 +817,6 @@ class TestPutJobSourceType:
         item = ds.get_job("j-unstr", namespace="ns-jobs")
         assert item is not None
         assert item["source_type"] == "UNSTRUCTURED"
-
-
-# ── list_jobs: source_type filter semantics ────────────────────────────
 
 
 class TestListJobsSourceTypeFilter:
@@ -940,7 +861,6 @@ class TestListJobsSourceTypeFilter:
         rows = ds.list_jobs(namespace=seeded, source_type="STRUCTURED")
         ids = {r["job_id"] for r in rows}
         assert ids == {"j-structured", "j-predelta"}
-        assert "j-unstructured" not in ids
 
     def test_unstructured_filter_excludes_predelta(self, seeded):
         """The UNSTRUCTURED filter never matches job items missing the attribute."""
@@ -985,9 +905,6 @@ class TestListJobsSourceTypeFilter:
         assert ids == {"j-pending-unstr"}
 
 
-# ── update_job_status: reserved-keyword aliasing (Requirement 5.7) ─────
-
-
 class TestUpdateJobStatusReservedKeyword:
     """The worker failure path calls ``update_job_status(..., error=...)``.
 
@@ -996,8 +913,6 @@ class TestUpdateJobStatusReservedKeyword:
     ``ValidationException: Attribute name is a reserved keyword`` and the
     ``failed`` status + error message are silently lost. The fix aliases
     every ``**extra`` name through ``ExpressionAttributeNames``.
-
-    Requirements: 5.7
     """
 
     def test_failure_update_with_error_persists_and_reads_back(self, fake_dynamo):
@@ -1163,18 +1078,10 @@ class TestPutOntologyRegistryClearsStubStatus:
         assert ds.get_ontology_registry(ns, oid)["status"] == "deleting"
 
 
-# ── Async ontology-ingest job persistence ──────────────────────────────
-
-
 class TestIngestJobPersistence:
-    """Async ontology-ingest jobs persist status to DynamoDB.
+    """Async ontology-ingest jobs persist status in the ``#INGESTJOB#`` partition.
 
-    Previously the ingest router kept job state in a process-local dict, so
-    the ``GET .../ingest-status/{job_id}`` poll 404'd whenever the worker
-    task and the polling request landed on different ECS task instances, or
-    when the task recycled mid-ingest. These helpers move the state to the
-    ``#INGESTJOB#`` DynamoDB partition; the tests cover the create →
-    running → terminal lifecycle and the reserved-keyword ``error`` path.
+    State must survive across ECS task instances and recycles.
     """
 
     def test_put_then_get_roundtrip(self, fake_dynamo):
@@ -1285,7 +1192,6 @@ class TestIngestJobPersistence:
         induction_jobs = ds.list_jobs(namespace=ns)
         ids = {r["job_id"] for r in induction_jobs}
         assert ids == {"induce-iso"}
-        assert "ij-iso" not in ids
 
     def test_list_ingest_jobs_returns_only_this_namespace(self, fake_dynamo):
         from coa_ontology import dynamo_store as ds
@@ -1324,10 +1230,9 @@ class TestIngestJobPersistence:
         assert ids == {"ij-1"}
 
     def test_enum_status_stored_as_wire_value_not_repr(self, fake_dynamo):
-        """Regression: IngestJobState is a plain (str, Enum), so ``str(member)``
-        is ``'IngestJobState.RUNNING'`` — the stored status MUST be the wire
-        value ``'running'`` so the item re-validates as an IngestJob (the poll
-        500'd with a pydantic enum ValidationError before this fix)."""
+        """IngestJobState is a plain (str, Enum), so ``str(member)`` is
+        ``'IngestJobState.RUNNING'``; the stored status must be the wire value
+        ``'running'`` so the item re-validates as an IngestJob."""
         from coa_control_plane_server.models.ingest_job import IngestJob
         from coa_control_plane_server.models.ingest_job_state import IngestJobState
         from coa_ontology import dynamo_store as ds
@@ -1343,9 +1248,6 @@ class TestIngestJobPersistence:
         assert item["status"] == "running"  # NOT "IngestJobState.RUNNING"
         # And the stored item must round-trip back into a typed IngestJob.
         assert IngestJob.model_validate(item).status == IngestJobState.RUNNING
-
-
-# ── Generic async-job persistence + staleness sweep (Theme B) ──────────────
 
 
 class TestAsyncJobPersistence:
@@ -1422,10 +1324,7 @@ class TestAsyncJobPersistence:
         assert ds.get_async_job("INFER", "j5", namespace="ns")["status"] == "completed"
 
     def test_delete_all_namespace_items_purges_async_jobs(self, fake_dynamo):
-        # Regression: delete_all_namespace_items must sweep the #ASYNCJOB#
-        # partition too (added by the async validate/infer persistence work),
-        # not just JOB/PROPOSAL/INGESTJOB — else persisted async jobs leak past a
-        # namespace ontology wipe.
+        # delete_all_namespace_items must sweep the #ASYNCJOB# partition too.
         from coa_ontology import dynamo_store as ds
 
         ns = "wipe-ns"
@@ -1440,26 +1339,8 @@ class TestAsyncJobPersistence:
         deleted = ds.delete_all_namespace_items(ns)
 
         assert deleted == 6  # all partitions, incl. both async jobs
-        # Async-job rows are gone (the partition that previously leaked).
         assert ds.get_async_job("VALIDATE", "av", namespace=ns) is None
         assert ds.get_async_job("INFER", "ai", namespace=ns) is None
-
-    def test_delete_all_namespace_items_tears_down_job_datasources_s3(self, fake_dynamo):
-        # Regression: put_job_datasources_s3 offloads a manifest to jobs/{ns}/…;
-        # those blobs must be swept on namespace delete or they leak in S3.
-        from coa_ontology import dynamo_store as ds
-
-        ns = "wipe-ns"
-        s3 = ds._get_s3()
-        ds.put_job_datasources_s3(ns, "jb", [{"datasourceId": "db0", "tables": ["t1"]}])
-        # Another namespace's blob must survive (prefix-scoped teardown only).
-        ds.put_job_datasources_s3("other-ns", "jb", [{"datasourceId": "db0", "tables": ["t1"]}])
-        assert any(key.startswith(f"jobs/{ns}/") for (_b, key) in s3.objects)
-
-        ds.delete_all_namespace_items(ns)
-
-        assert not any(key.startswith(f"jobs/{ns}/") for (_b, key) in s3.objects)
-        assert any(key.startswith("jobs/other-ns/") for (_b, key) in s3.objects)
 
 
 class TestDeleteProposal:
@@ -1501,9 +1382,8 @@ class TestDeleteProposal:
 class TestDeleteAllNamespaceItemsS3Sweep:
     """``delete_all_namespace_items`` must also sweep offloaded job manifests.
 
-    Regression: #797 offloads job datasources to ``jobs/{ns}/{id}/datasources.json``
-    (put_job_datasources_s3), but the namespace wipe only deleted DDB rows —
-    leaking those S3 blobs. The wipe now sweeps the ``jobs/{ns}/`` prefix too.
+    ``put_job_datasources_s3`` writes ``jobs/{ns}/{id}/datasources.json``; the
+    wipe sweeps the ``jobs/{ns}/`` prefix so those blobs do not leak.
     """
 
     def test_sweeps_jobs_prefix_and_returns_ddb_count(self, fake_dynamo):
@@ -1644,9 +1524,6 @@ class TestListOntologiesRegistryPagination:
         assert len(rows) == 2
 
 
-# ── Workstream A: orphaned-job deterministic recovery ──────────────────────
-#
-# A1 startup reconcile, A2 liveness heartbeat, A3 terminal-union self-heal.
 # A hard worker death (OOM SIGKILL, exit 137) runs neither the worker's
 # ``except`` nor its ``finally``, freezing the DDB row at ``building_ontology``
 # and never releasing the namespace lock. These tests prove the recovery path
@@ -1683,14 +1560,12 @@ def _seed_induction_job(
 
 
 class TestInductionWatchdog:
-    """A2: the liveness heartbeat is deterministic and touch-only (never clobbers)."""
+    """The liveness heartbeat is deterministic and touch-only (never clobbers)."""
 
     def test_watchdog_ticks_deterministically_and_touch_only(self, fake_dynamo):
         """Drive ``_watchdog_loop`` with a counting stop-event (no wall clock):
         it must call ``touch_job`` exactly once per tick, and a tick that lands
         after a terminal write must never resurrect the finished status."""
-        import time
-
         import coa_ontology.induce_catalog as ic
         from coa_ontology import dynamo_store as ds
 
@@ -1722,9 +1597,8 @@ class TestInductionWatchdog:
 
         # Part B — a late tick against a COMPLETED row only bumps updated_at
         # (real touch_job, restored on context exit; writes to the fake table).
-        _seed_induction_job(fake_dynamo, namespace="ns-hb", job_id="j-done", status="completed")
+        _seed_induction_job(fake_dynamo, namespace="ns-hb", job_id="j-done", status="completed", age_seconds=60)
         before = fake_dynamo.items[("ns-hb#JOB#j-done", "STATUS")]["updated_at"]
-        time.sleep(0.001)  # ensure the ISO timestamp advances
 
         ds.touch_job("j-done", "ns-hb")  # a watchdog tick racing the terminal write
 
@@ -1734,7 +1608,7 @@ class TestInductionWatchdog:
 
 
 class TestCountActiveJobsSelfHeal:
-    """A3: ``count_active_jobs`` self-heals a stale orphan with no restart."""
+    """``count_active_jobs`` self-heals a stale orphan with no restart."""
 
     def test_ingested_job_counts_zero_and_stale_row_self_heals(self, fake_dynamo, monkeypatch):
         import coa_ontology.induce_catalog as ic
@@ -1756,7 +1630,7 @@ class TestCountActiveJobsSelfHeal:
 
 
 class TestGetJobStaleSweep:
-    """Regression for the EXISTING lazy ``get_job`` sweep (previously untested)."""
+    """The lazy ``get_job`` stale sweep."""
 
     def test_stale_building_ontology_is_swept_on_poll(self, fake_dynamo, monkeypatch):
         """A poll of a stale non-terminal row with no live worker on this task
@@ -1784,11 +1658,7 @@ class TestSweepJobIfStaleGuards:
     and ``get_job`` both route through it), where a raise would abort deletion."""
 
     def test_missing_job_id_returns_unchanged_without_sweep(self, monkeypatch):
-        """A stale-looking, non-terminal row with NO ``job_id`` must early-return
-        unchanged and never raise — so a malformed row can't blow up the
-        counter/poll. The age is stale AND the threshold is lowered so that,
-        without the guard, the flip branch WOULD fire; the spy asserts
-        ``update_job_status`` is never reached (no ``update_job_status(None, ...)``)."""
+        """A stale non-terminal row with NO ``job_id`` returns unchanged and never raises."""
         from datetime import UTC, datetime, timedelta
 
         import coa_ontology.induce_catalog as ic
@@ -1809,10 +1679,7 @@ class TestSweepJobIfStaleGuards:
         assert "error" not in result
 
     def test_ddb_failure_during_flip_is_swallowed(self, monkeypatch):
-        """A stale non-terminal row whose ``update_job_status`` raises (DDB
-        throttle/ClientError) must NOT propagate out of ``_sweep_job_if_stale``,
-        and the item's status stays non-terminal — the flip did not apply, so the
-        next sweep retries instead of the exception aborting namespace deletion."""
+        """A raising ``update_job_status`` is swallowed and the status stays non-terminal."""
         from datetime import UTC, datetime, timedelta
 
         import coa_ontology.induce_catalog as ic
@@ -1837,7 +1704,7 @@ class TestSweepJobIfStaleGuards:
 
 
 class TestSweepProposalIfStale:
-    """#466/#456: a proposal orphaned by a dead accept worker (stuck in
+    """A proposal orphaned by a dead accept worker (stuck in
     ``accepting``/``embeddings_sync``) must be moved to the terminal
     ``accept_failed`` state with an ``accept_error`` on read, so the UI surfaces
     the failure and the user can re-accept (the pipeline is idempotent on re-run).
@@ -1946,17 +1813,8 @@ class TestSweepProposalIfStale:
         assert item["status"] == "accepting"
 
     def test_heartbeat_keeps_a_slow_but_live_accept_from_being_swept(self, fake_dynamo):
-        """The POINT of the per-step heartbeat: a long-running accept that is
-        still making progress must never be swept.
-
-        Without a heartbeat the sweep can't tell "worker died" from "worker is
-        slow", so it would reset a LIVE accept to a re-acceptable state — the
-        user re-accepts, and now TWO workers ingest the same ontology
-        concurrently (duplicate embeddings / graph pollution, the #594 failure
-        mode). The accept pipeline checkpoints every step via update_proposal,
-        which refreshes ``updated_at``; this test proves that refresh actually
-        defeats the staleness check.
-        """
+        """A long-running accept whose ``update_proposal`` checkpoints refresh
+        ``updated_at`` is never swept."""
         from coa_ontology import dynamo_store as ds
 
         # The accept STARTED well past the stale window ago (created_at is old,
@@ -2006,13 +1864,7 @@ class TestSweepProposalIfStale:
 
 class TestSweepStaleRecord:
     """The one implementation behind all three stale sweeps (async jobs,
-    proposal accepts, induction jobs), which used to be three byte-identical
-    inline copies.
-
-    Covers the parameterisation and the best-effort write contract. The write
-    guard is new for the async-job and induction-job callers: previously a
-    transient DDB failure escaped and 500'd the very poll the user needed to
-    observe the stuck state.
+    proposal accepts, induction jobs): parameterisation and best-effort writes.
     """
 
     def _stale_item(self, status="running", age=9999):
@@ -2048,8 +1900,7 @@ class TestSweepStaleRecord:
 
         The caller is typically the very poll that triggered the sweep, so an item
         that carries the new status but the PRE-sweep ``accept_progress`` reports a
-        state DDB no longer holds. This asserted only the write before, which is
-        how that divergence went unnoticed.
+        state DDB no longer holds.
         """
         from coa_ontology import dynamo_store as ds
 

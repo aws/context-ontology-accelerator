@@ -3,7 +3,7 @@
 
 """Namespace-language label selection in the catalog graph and schema readers.
 
-The routers read the namespace's immutable language server-side (LLD §2.2.5) and
+The routers read the namespace's immutable language server-side and
 the Neptune store names each resource with it: the tag COA asserts for that
 language, then untagged, then any other literal in lexical order. Resources are
 grouped by URI and never dropped for their language. The store queries are
@@ -55,9 +55,6 @@ def _results(bindings: list[dict]) -> dict:
 
 def _store() -> NeptuneDBGraphStore:
     return NeptuneDBGraphStore(endpoint="https://fake:8182", namespace=NS)
-
-
-# ── store readers ──────────────────────────────────────────────────────────
 
 
 class TestNamespaceSchema:
@@ -189,9 +186,6 @@ class TestOntologyOverview:
         with patch.object(ndb, "_sparql_query", return_value=class_rows):
             overview = _store().get_ontology_overview("onto", namespace=NS, sample=True, label_preference=JA)
         assert [c["label"] for c in overview["classes"]] == ["設備"]
-
-
-# ── namespace language resolution ──────────────────────────────────────────
 
 
 @pytest.fixture

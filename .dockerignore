@@ -10,7 +10,7 @@
 # Allow shared library (both Dockerfiles need this)
 !libs/common/
 
-# Allow the lock and the script that turns it into install constraints (context-manager image)
+# Allow the lock and the script that turns it into install constraints (context-manager and workflow-agents images)
 !uv.lock
 !scripts/uv_lock_constraints.py
 
@@ -25,6 +25,11 @@
 # Allow MCP server package (same image, different entrypoint)
 !packages/mcp-server/pyproject.toml
 !packages/mcp-server/src/
+
+# Allow workflow-agents package (the self-hosted MCP server image)
+!coa-ai/workflow-agents/Dockerfile
+!coa-ai/workflow-agents/pyproject.toml
+!coa-ai/workflow-agents/src/
 
 # Allow sources package (unified sources — database + documents pipelines)
 !packages/sources/

@@ -76,9 +76,7 @@ const summary = (turtle: string) =>
 
 describe("parseTurtleEntities statement boundaries", () => {
   it("keeps every entity after a vocabulary edit re-serializes the Turtle", () => {
-    // n3's Writer puts no blank lines between subjects. The old blank-line
-    // splitter read its output as one block containing ``a owl:Ontology`` and
-    // dropped every class from the list.
+    // n3's Writer emits no blank lines between subjects.
     const edited = replacePreferredLabel(
       SALES,
       "http://example.org/ns#Customer",

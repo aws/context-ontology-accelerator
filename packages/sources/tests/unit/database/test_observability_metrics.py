@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the #116 dashboard metric emissions.
+"""Unit tests for the ``sources-structured-scan`` dashboard metric emissions.
 
 Every metric charted by the ``sources-structured-scan`` CloudWatch dashboard
 that is NOT AWS-native must actually be emitted, with the exact name and
@@ -25,11 +25,8 @@ from botocore.exceptions import ClientError
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_REGION", "us-east-1")
-# discovery_handler reads these three at import time with no default, and the
-# tests below import it inside the test body. Set them here so this module is
-# self-sufficient: relying on another test module to have set them first makes
-# the file pass only when something else is collected alongside it, and fail on
-# a narrower selection. setdefault so a value another module already set wins.
+# discovery_handler reads these at import time with no default; set them here so
+# this module passes when collected alone.
 os.environ.setdefault("SOURCES_TABLE", "test-sources")
 os.environ.setdefault("SOURCE_SCAN_JOBS_TABLE", "test-scan-jobs")
 os.environ.setdefault("SMUS_DOMAIN_ID", "test-domain-id")
@@ -43,10 +40,6 @@ def _emitted(mock_emit, name: str) -> list[dict]:
         if call.args and call.args[0] == name
     ]
 
-
-# ---------------------------------------------------------------------------
-# ConnectionValidation — discovery_handler._discover
-# ---------------------------------------------------------------------------
 
 _DISCOVERY = "coa_sources.database.pipeline.discovery_handler"
 
@@ -90,10 +83,6 @@ class TestConnectionValidationMetric:
             {"value": 1, "SourceType": "JDBC_DATABASE", "Result": "Failure"}
         ]
 
-
-# ---------------------------------------------------------------------------
-# CatalogAssetWrites — metadata_writer.write_to_datazone
-# ---------------------------------------------------------------------------
 
 _WRITER = "coa_sources.database.metadata_writer"
 
@@ -182,10 +171,6 @@ class TestCatalogAssetWritesMetric:
             {"value": 2, "Operation": "Update"},
         ]
 
-
-# ---------------------------------------------------------------------------
-# GlueApiThrottles — glue_connection_provisioner._count_if_throttle
-# ---------------------------------------------------------------------------
 
 _PROVISIONER = "coa_sources.database.connectors.glue_connection_provisioner"
 
@@ -303,10 +288,6 @@ class TestProvisionFederatedCatalogThrottles:
         assert _emitted(mock_emit, "GlueApiThrottles") == [{"value": 1, "Api": expected_api}]
 
 
-# ---------------------------------------------------------------------------
-# Enrichment acceptance rate — bulk_review/worker + api/database_routes
-# ---------------------------------------------------------------------------
-
 _WORKER = "coa_sources.database.bulk_review.worker"
 
 
@@ -394,24 +375,12 @@ class TestBulkReviewAcceptanceMetrics:
         assert _emitted(mock_emit, "TablesApprovedByReview") == []
 
     def test_bulk_approve_counts_transitions_not_selection_size(self):
-        """An already-APPROVED table in the selection is not a new decision.
-
-        Mirrors test_idempotent_review_emits_no_acceptance_metric on the
-        single-table half: re-approving what is already APPROVED must not
-        inflate the acceptance rate, so a 2-table selection with 1 prior
-        approval emits 1, not 2.
-        """
+        """An already-APPROVED table in the selection is not a new decision."""
         mock_emit = self._run("APPROVED", ["APPROVED", "PENDING_REVIEW"])
         assert _emitted(mock_emit, "TablesApprovedByReview") == [{"value": 1, "ReviewScope": "Bulk"}]
 
     def test_bulk_approve_excludes_failed_writes_from_acceptance_metric(self):
-        """A table whose revision write fails is not a kept decision.
-
-        worker.py filters ``transitioned`` by the ``failed`` set before emitting
-        the acceptance count (``decided = sum(... if tid not in failed)``). Two
-        PENDING tables both transition, but one write raises, so the acceptance
-        metric must report 1 — otherwise a phantom approval inflates the rate.
-        """
+        """A table whose revision write fails is not a kept decision."""
         mock_emit = self._run("APPROVED", ["PENDING_REVIEW", "PENDING_REVIEW"], fail_asset_ids={"asset-0"})
         assert _emitted(mock_emit, "TablesApprovedByReview") == [{"value": 1, "ReviewScope": "Bulk"}]
 

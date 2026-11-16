@@ -26,7 +26,6 @@ import { useAppI18n } from "../../../i18n/LocaleProvider";
 import "../chat.css";
 
 export interface TracePanelProps {
-  /** Trace steps to render. */
   steps: TraceStep[];
   /** Whether more steps may still arrive (live streaming mode). */
   isLive: boolean;
@@ -143,7 +142,6 @@ function TraceStepRow({
           )}
         </div>
       )}
-      {/* Render parallel children indented */}
       {childSteps.length > 0 && (
         <div className="trace-step-children">
           <SpaceBetween size="xxs">

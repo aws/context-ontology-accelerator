@@ -2,29 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * SortableTable — a thin wrapper over Cloudscape ``<Table>`` that adds
- * client-side column sorting.
+ * Cloudscape ``<Table>`` with client-side column sorting.
  *
- * Drop-in replacement for ``<Table>``: pass the same ``items`` and
- * ``columnDefinitions``. Any column whose definition declares a
- * ``sortingField`` (direct property) or ``sortingComparator`` (computed cell,
- * e.g. an array length or a derived badge) becomes click-to-sort in the header;
- * columns with neither stay unsortable. Clicking cycles ascending → descending.
- *
- * Why not ``useCollection``: Cloudscape tracks the active sort by the
- * ``sortingComparator`` FUNCTION INSTANCE. Our callers declare column
- * definitions inline in JSX, so a new comparator instance is created on every
- * render — ``useCollection`` (and a raw controlled ``<Table>``) then "loses"
- * the active column and silently stops reordering ("clickable but rows don't
- * reorder"). This wrapper instead tracks the active column by its stable
- * ``id`` string and performs the sort itself, re-resolving the comparator from
- * the CURRENT ``columnDefinitions`` each render — so new comparator instances
- * and new ``items`` array references can't break sorting.
- *
- * ``defaultSortingColumnId`` seeds the initial sort by column ``id``;
- * ``defaultSortingDescending`` seeds the initial direction. All other
- * ``<Table>`` props (selection, ``trackBy``, ``variant``, ``header``, ``empty``,
- * ``loading``, ``onRowClick``, …) pass straight through.
+ * Not ``useCollection``: Cloudscape tracks the active sort by the
+ * ``sortingComparator`` function instance, and inline column definitions make a
+ * new instance every render, so sorting silently stops. This tracks the active
+ * column by its stable ``id`` and sorts itself.
  */
 import { useMemo, useState } from "react";
 import Table, { type TableProps } from "@cloudscape-design/components/table";
@@ -44,11 +27,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object";
 }
 
-/**
- * Read a named field off a row via `unknown` narrowing (no type assertion).
- * Cloudscape's ``sortingField`` is a plain string, so we cannot express it as
- * ``keyof T`` without an `as` cast; instead narrow the row with a type guard.
- */
+/** Cloudscape's ``sortingField`` is a plain string, not ``keyof T``. */
 function readField(row: unknown, field: string): unknown {
   return isRecord(row) ? row[field] : undefined;
 }
@@ -60,7 +39,6 @@ export function SortableTable<T>({
   defaultSortingDescending,
   ...tableProps
 }: SortableTableProps<T>): React.JSX.Element {
-  // Track the active sort by STABLE id (not by comparator instance).
   const [sortingColumnId, setSortingColumnId] = useState<string | undefined>(
     defaultSortingColumnId,
   );
@@ -82,9 +60,6 @@ export function SortableTable<T>({
 
     const cmp = (a: T, b: T): number => {
       if (sortingComparator) return sortingComparator(a, b);
-      // Fall back to comparing the named field generically. Read it through an
-      // `unknown` narrowing (no `as` cast — frontend-typescript rule) since a
-      // Cloudscape sortingField is a string, not a typed key.
       const av = readField(a, sortingField ?? "");
       const bv = readField(b, sortingField ?? "");
       if (typeof av === "number" && typeof bv === "number") return av - bv;

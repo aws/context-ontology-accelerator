@@ -1,33 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared fixtures/helpers for the lexical-baseline co-located unit suites.
+"""Shared builders for the lexical-baseline unit suites.
 
-Single source of truth for the small builders that the lexical co-located unit
-suites (tasks 1.a–8.a) and the cross-cutting coverage sweep (task 9) all reuse:
-
-- :func:`make_strategy_spec` — a ``StrategySpec`` factory (defaults to the real
-  registry default, overridable for bespoke wiring tests).
-- :data:`NDB_ENDPOINT` / :data:`NA_ENDPOINT` (+ ``*_GRAPH_ID``) — representative
-  Neptune Database / Neptune Analytics endpoint shapes.
-- :func:`make_toolkit_node`, :func:`source_metadata`, :func:`entity_contexts` —
-  build a fake toolkit ``NodeWithScore`` and the real nested toolkit metadata
-  shapes (``Source`` / ``EntityContexts``).
-- :func:`make_synthesizer`, :func:`make_baseline_result`,
-  :func:`make_baseline_retriever` — Tier-3 wiring helpers.
-
-These are plain functions (not pytest fixtures) so they can be called inline
-inside other helpers and list comprehensions. ``tests/unit/conftest.py`` exposes
-thin fixture wrappers (``strategy_spec_factory``, ``toolkit_node_factory``,
-``ndb_endpoint``, ``na_endpoint``) for ergonomic injection where preferred.
-
-NOTE on the lazy-import invariant: the *strategies* module and ``load_config``
-must not import ``graphrag_toolkit`` (verified by their own isolated tests).
-This helpers module imports from the ``coa_serve.lexical`` package,
-whose ``__init__`` eagerly imports the adapter (and thus graphrag) — the
-existing, intended behavior — so these helpers are not themselves subject to the
-sync-only import invariant. The ``build_engine`` callables are never invoked
-here.
+Plain functions, not pytest fixtures, so they can be called inside other
+helpers and comprehensions.
 """
 
 from __future__ import annotations
@@ -45,8 +22,6 @@ from coa_serve.tier3.graph_traverser import GraphEntity
 from coa_serve.tier3.synthesizer import MAX_PROMPT_CHUNKS
 from coa_serve.tier3.vector_retriever import ChunkResult
 
-# ── Endpoint fixtures (NDB / NA) ────────────────────────────────────
-
 #: A representative Neptune Database (NDB) cluster endpoint.
 NDB_ENDPOINT = "test-cluster.us-east-1.neptune.amazonaws.com"
 #: The graph-store URI the factory should derive for :data:`NDB_ENDPOINT`.
@@ -63,9 +38,6 @@ NA_GRAPH_STORE_URI = "neptune-graph://g-abc1234567"
 AOSS_ENDPOINT = "https://test.aoss.amazonaws.com"
 #: The vector-store URI derived from :data:`AOSS_ENDPOINT`.
 AOSS_VECTOR_STORE_URI = "aoss://https://test.aoss.amazonaws.com"
-
-
-# ── StrategySpec factory ────────────────────────────────────────────
 
 
 def make_strategy_spec(
@@ -89,9 +61,6 @@ def make_strategy_spec(
         engine_family=engine_family or base.engine_family,  # type: ignore[arg-type]
         build_engine=build_engine or base.build_engine,
     )
-
-
-# ── Fake toolkit node + metadata shapes ─────────────────────────────
 
 
 class _FakeNode:
@@ -159,9 +128,6 @@ def entity_contexts(entities: list[tuple[str, str, str]]) -> dict:
         ],
         "keywords": [],
     }
-
-
-# ── Tier-3 wiring helpers ───────────────────────────────────────────
 
 
 def make_synthesizer(

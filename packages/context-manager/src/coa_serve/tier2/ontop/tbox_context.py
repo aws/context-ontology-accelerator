@@ -47,7 +47,7 @@ _SCL_DISTINCT_VALUES = f"{VOCAB_URI}distinctValues"
 # a handful of literals is enough for the LLM to anchor WHERE-clause values).
 _MAX_DISTINCT_VALUES_IN_PROMPT = 12
 
-# Steward-reviewed annotations carried into the prompt (#1167), so the NL→SPARQL
+# Steward-reviewed annotations carried into the prompt, so the NL→SPARQL
 # writer sees the same approved metadata the NL→SQL writer gets from the class
 # text: description (rdfs:comment), synonyms (skos:altLabel), glossary terms and
 # tags. Full IRIs because the graph client sends no PREFIX prolog and only
@@ -118,10 +118,7 @@ _FULL_CONTEXT_CLASS_THRESHOLD = 200
 # writes — so it matches by term equality.
 _IS_MAPPED_IRI = f"{VOCAB_URI}isMapped"
 _IS_MAPPED_PATTERN = f"?class <{_IS_MAPPED_IRI}> true ."
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ── Two-signal gate: coa:isMapped AND coa:queryBackend ──────────────────────
+# Two-signal gate: coa:isMapped AND coa:queryBackend.
 # ``coa:isMapped`` says a class is structured-answerable; ``coa:queryBackend``
 # says WHICH backend answers it (written as "RDF_SPARQL" on graph classes only;
 # absent == SQL). Each strategy builds its T-Box for ONE backend, and the backend
@@ -180,7 +177,7 @@ _TOKENS_PER_PROPERTY = 30
 _TOKENS_PER_OBJECT_PROPERTY = 25
 _TOKENS_PER_METRIC = 40
 
-# ── Named-graph scoping (query cost) ─────────────────────────────────────────
+# Named-graph scoping (query cost).
 # Resolve the namespace's graph IRIs once per build and thread them into every
 # fetch, so each query is priced by the namespace instead of by the whole cluster.
 # Failure returns ``[]`` and the prefix-filter fallback keeps working — slow, not
@@ -188,10 +185,8 @@ _TOKENS_PER_METRIC = 40
 # constant-``GRAPH <iri>`` one is load-bearing on multi-graph namespaces.
 _MAX_GRAPHS = 50
 # 10s, not 5s: this is the FIRST Neptune query of a build, so on a cold container it
-# pays connection setup and credential signing too, and 5s lost that race half the
-# time (BIRD-Interact resolved 5 of 10 builds to ``graphs=0``, 5 to ``graphs=2``, on
-# an unchanged namespace). Warm, it returns in ~10ms. Losing is asymmetric: the
-# fallback is the cluster-wide scan this exists to avoid.
+# pays connection setup and credential signing too. Losing falls back to the
+# cluster-wide scan this exists to avoid.
 _GRAPH_RESOLVE_TIMEOUT_S = 10.0
 # The builder is process-lived, so unlike the request-scoped traversal tool the
 # cache must expire or a namespace that publishes a new graph is queried against a
@@ -204,14 +199,14 @@ _SAFE_URI_RE = re.compile(r"^https?://[^\s<>\"{}|\\^`]+\Z")  # \Z, not $, so a t
 
 def _is_safe_sparql_uri(uri: str) -> bool:
     """Return True if uri is safe for SPARQL angle-bracket interpolation."""
-    return bool(_SAFE_URI_RE.match(uri)) and ">" not in uri
+    return bool(_SAFE_URI_RE.match(uri))
 
 
 __all__ = ["TBoxContext", "TBoxContextBuilder", "DEFAULT_GRAPH_URI_TEMPLATE"]
 
 
 def _render_annotations(item: dict[str, Any], max_description: int) -> str:
-    """Render a term's steward-reviewed annotations as the prompt-line suffix (#1167).
+    """Render a term's steward-reviewed annotations as the prompt-line suffix.
 
     The same fields the NL→SQL context carries, so both writers resolve business
     wording the same way. Shared by ``format_for_prompt`` and the annotation budget
@@ -291,10 +286,7 @@ class TBoxContextBuilder:
         """
         self._graph = graph_client
         self._graph_uri_template = get_graph_uri_template(graph_uri_template)
-        # optional Tier-1 MetricResolver — when present, metric vector
-        # hits are enriched with the FULL Neptune-loaded :GovernedMetric
-        # definition (description/dimensions/formula) instead of only the sparse
-        # vector-hit metadata. Optional + duck-typed to avoid a hard import cycle.
+        # Optional Tier-1 MetricResolver, duck-typed to avoid an import cycle.
         self._metric_resolver = metric_resolver
         # namespace -> (resolved_at_monotonic, graph IRIs). See _MAX_GRAPHS above.
         self._graph_iri_cache: dict[str, tuple[float, list[str]]] = {}
@@ -308,12 +300,9 @@ class TBoxContextBuilder:
         form. Cached per namespace with a TTL (see ``_GRAPH_IRI_CACHE_TTL_S``)
         because this builder outlives the request.
 
-        ONLY A SUCCESSFUL RESOLUTION IS CACHED, including a successful empty one.
-        Caching a *failure* would turn one transient timeout into 300s of cluster-wide
-        scans for every request this container serves — and those scans are what
-        overload the graph in the first place, a feedback loop that was observed
-        answering a whole BIRD-Interact cell with no ontology at all. Re-querying
-        costs one cheap query; the loop costs the run.
+        ONLY A SUCCESSFUL RESOLUTION IS CACHED, including a successful empty one:
+        caching a failure would turn one transient timeout into a TTL of
+        cluster-wide scans, which are what overload the graph in the first place.
         """
         cached = self._graph_iri_cache.get(namespace)
         if cached and (time.monotonic() - cached[0]) < _GRAPH_IRI_CACHE_TTL_S:
@@ -373,16 +362,11 @@ class TBoxContextBuilder:
                 for the native SPARQL strategy.
             allowed_metrics: The caller's ``allowedMetrics`` grant. When set, only the metric hits it names reach the
                 context (definitions and glossary); None means no metric restriction.
-
-        Returns:
-            TBoxContext with classes, properties, and metric summaries.
         """
         vector_hits = await self._permitted_hits(vector_hits, namespace, allowed_metrics)
-        # Partition hits by type
         ontology_hits = [h for h in vector_hits if h.type in ("ontology_class", "ontology_property", "ontology")]
         metric_hits = [h for h in vector_hits if h.type == "metric"]
 
-        # Build metric context from metric hits
         metrics = self._build_metric_context(metric_hits, namespace)
 
         # Bind the namespace's named graphs ONCE for every Neptune query below
@@ -396,7 +380,6 @@ class TBoxContextBuilder:
             if _is_safe_sparql_uri(prefix):
                 graph_iris = await self._resolve_graph_iris(namespace, prefix)
 
-        # Fetch ontology definitions from Neptune
         classes: list[dict[str, Any]] = []
         properties: list[dict[str, Any]] = []
 
@@ -427,19 +410,10 @@ class TBoxContextBuilder:
                 backend=backend,
             )
 
-        # fetch :aiContext glossary (synonyms/instructions) for the hit
-        # nodes so business terms map to ontology URIs. Best-effort — never blocks
-        # translation; an empty/failed fetch simply yields no glossary section.
-        #
-        # GATED to the mapped context: a glossary entry grounds a business term to
-        # an ontology node ("churn" → <...#Churn>), so it must only reference nodes
-        # that actually entered the structured context — the mapped classes /
-        # datatype properties fetched above, plus metric hits (metrics are
-        # answerable via the Tier-1 metric path). Feeding an UNMAPPED class's
-        # aiContext would ground a business term to a class the LLM cannot query —
-        # the glossary form of the unmapped-name leak the class / subClassOf-parent
-        # / object-property gates already prevent. Intersect the raw hits with the
-        # mapped URIs (no extra Neptune round-trip — the sets are already in hand).
+        # Fetch :aiContext glossary (synonyms/instructions) for the hit nodes.
+        # Best-effort; an empty/failed fetch yields no glossary section. Gated to
+        # the mapped URIs fetched above plus metric hits, so a business term is
+        # never grounded to a class the LLM cannot query.
         mapped_uris = {c["uri"] for c in classes} | {p["uri"] for p in properties}
         glossary_hits = [h for h in vector_hits if getattr(h, "uri", "") in mapped_uris or h.type == "metric"]
         glossary = await self._fetch_ai_context(glossary_hits, namespace, graph_iris=graph_iris)
@@ -574,14 +548,9 @@ class TBoxContextBuilder:
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
         # Datatype properties of mapped classes. ``?class`` is gated on isMapped
-        # here too: without it, a property whose domain is an UNMAPPED class would
-        # make ``_parse_results`` add that unmapped class (with an empty label) to
-        # the class dict — reintroducing the exact unmapped-class leak the feature
-        # prevents. Restricted to owl:DatatypeProperty (range is xsd:*, never a
-        # class IRI); object-property join paths are surfaced by
-        # ``_fetch_object_properties`` (mapped-gated on both ends). The optional
-        # ``?distinctValue`` carries per-column allowed-values (categorical enum
-        # samples) into NL→SQL/SPARQL generation.
+        # here too, so ``_parse_results`` cannot add an unmapped class from a
+        # property's domain. The optional ``?distinctValue`` carries per-column
+        # allowed-values into NL→SQL/SPARQL generation.
         props_body = f"""            ?class a owl:Class .
             {_class_gate(backend)}
             ?property a owl:DatatypeProperty .
@@ -646,23 +615,15 @@ class TBoxContextBuilder:
         if not _is_safe_sparql_uri(graph_uri_prefix):
             return []
 
-        # Only surface object-property edges where BOTH ends are
-        # MAPPED classes (both required patterns). Tier-2 turns these into SQL
-        # joins; an edge to an unmapped class can't be joined and would
-        # reintroduce an unmapped class name into the prompt. Edges between
-        # unmapped classes (e.g. unstructured<->unstructured) stay in the graph
-        # for Tier-3 / grounding-traversal — just not structured-query
-        # material.
+        # Only object-property edges whose BOTH ends are mapped classes.
         #
         # The query text itself lives in ``query_utils.object_properties_sparql``
         # because the Tier-2 FK-traversal tool reads the same edges; keeping one
         # definition means a fix there (label handling, scoping, performance)
         # reaches both callers instead of one.
         #
-        # ``graph_iris`` is the whole reason Spider-2-sized namespaces produced no
-        # join paths: unbound, this is the most expensive query the builder issues
-        # (two label lookups per edge, cluster-wide) and it was the first to
-        # ReadTimeout. See the _MAX_GRAPHS block at module top.
+        # This is the most expensive query the builder issues (two label lookups per
+        # edge), so it needs ``graph_iris``; see the _MAX_GRAPHS block at module top.
         sparql = object_properties_sparql(
             graph_uri_prefix,
             limit=_OBJECT_PROPERTY_LIMIT,
@@ -849,10 +810,8 @@ class TBoxContextBuilder:
         # OPTIONAL, one class fans out to (properties x distinct values x parents x
         # labels) rows, and with no ORDER BY a class whose rows all land past
         # ``_SPARQL_RESULT_LIMIT`` vanishes entirely from the parsed result — a
-        # matched class silently missing from the structured prompt. Reverse
-        # containment made that reachable: it matches far more classes than a
-        # handful of short forward terms did, and a multilingual namespace carries
-        # one label per language per class. DISTINCT plus the bounded class list
+        # matched class silently missing from the structured prompt. A multilingual
+        # namespace carries one label per language per class. DISTINCT plus the bounded class list
         # keeps the class query one row per (class, label, parent); ``?searchLabel``
         # is not projected, so a class's synonyms add no rows.
         entity_classes_body = f"""            ?class a owl:Class .
@@ -880,8 +839,7 @@ class TBoxContextBuilder:
         if len(class_results) >= _SPARQL_RESULT_LIMIT:
             # The class query is one row per (class, label, parent) and is not
             # ordered, so past the cap it is Neptune's row order that decides which
-            # matched classes reach the prompt. Reachable on a large multilingual
-            # namespace, and silent until now.
+            # matched classes reach the prompt.
             logger.warning(
                 "tbox_entity_classes_truncated",
                 namespace=namespace,
@@ -891,10 +849,7 @@ class TBoxContextBuilder:
 
         # De-duplicate before the VALUES cap. The class query is DISTINCT over
         # (?class, ?label, ?parentClass), so a class carrying several language
-        # labels — exactly the namespaces this MR serves — contributes one row per
-        # label. Capping the raw rows let 50 VALUES entries cover far fewer distinct
-        # classes and left the rest with no column hints, and the duplicates
-        # multiplied the property rows as well.
+        # labels contributes one row per label.
         matched_uris = list(
             dict.fromkeys(
                 row["class"] for row in class_results if row.get("class") and _is_safe_sparql_uri(row["class"])
@@ -1112,7 +1067,7 @@ class TBoxContextBuilder:
         return any(n and n in allowed for n in names)
 
     async def _definitions_named(self, name: str, namespace: str) -> list:
-        """``namespace``'s resolver definitions named ``name``, read within the resolver's TTL. None on any failure."""
+        """``namespace``'s resolver definitions named ``name``, within the resolver's TTL; ``[]`` on any failure."""
         if self._metric_resolver is None or not name:
             return []
         try:
@@ -1362,20 +1317,9 @@ class TBoxContextBuilder:
         answerable. So classes are charged before either hint list and cut only
         when they alone overrun.
 
-        This replaces a single proportional ratio applied to all four lists. That
-        ratio was set by whichever list dominates the estimate — datatype
-        properties, at ~10 per class — so property volume alone silently removed
-        mapped classes: on a 75-class namespace the class list arrived at 60.
-        Nothing here is ordered by relevance (the full-namespace path runs no
-        vector search and Neptune returns rows unordered), so a prefix slice drops
-        classes arbitrarily rather than cheaply. For the same reason the surviving
-        property budget is spread ROUND-ROBIN across domain classes: a flat slice
-        in Neptune's row order can hand one class forty columns and the next none,
-        which reads to the LLM as a class with no queryable columns.
-
-        Both cuts floor at zero: ``max_tokens`` below what the metrics alone cost
-        drives the remaining budget negative, and a negative slice index keeps the
-        TAIL of a list instead of emptying it.
+        Nothing here is ordered by relevance (Neptune returns rows unordered), so
+        the surviving property budget is spread ROUND-ROBIN across domain classes:
+        a flat slice could hand one class forty columns and the next none.
         """
         classes = context.classes
         metrics = context.metrics

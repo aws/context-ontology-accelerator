@@ -110,15 +110,6 @@ def build_user_prompt_segments(
     table, where it outweighs the schema. Line formatting next to source data
     stays inside the guarded segment.
 
-    Args:
-        table_name: Name of the table being enriched.
-        database: Database/schema the table belongs to.
-        columns: Columns to describe, including any existing per-column metadata.
-        existing_description: Current table description to preserve (not regenerated).
-        existing_pk: Known primary-key columns to preserve, if any.
-        existing_fks: Known foreign-key relationships to preserve, if any.
-        extra_context: Domain knowledge appended as "External evidence" section.
-
     Returns:
         Ordered segments. Their concatenation is the text the model sees, see
         :func:`build_user_prompt`.
@@ -144,7 +135,6 @@ def build_user_prompt_segments(
     if existing_fks:
         existing_parts.append(f"foreign_keys: {existing_fks}")
 
-    # Note which columns already have descriptions on business_metadata.
     described = [c.name for c in columns if c.business_metadata.description]
     if described:
         existing_parts.append(f"columns_with_descriptions: {described}")
