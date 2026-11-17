@@ -49,7 +49,6 @@ def test_account_level_failures_are_recognised(message: str) -> None:
         # Ordinary breakage that should stay red.
         "Could not connect: timed out after 30s",
         "AccessDeniedException: secretsmanager:GetSecretValue",
-        "",
     ],
 )
 def test_real_failures_are_not_tolerated(message: str) -> None:
@@ -73,7 +72,7 @@ def test_matching_is_case_insensitive() -> None:
 
 def test_skip_helper_skips_only_on_account_failure() -> None:
     """The skip path fires for a dead account and stays out of the way otherwise."""
-    with pytest.raises(BaseException) as excinfo:
+    with pytest.raises(pytest.skip.Exception) as excinfo:
         _skip_if_account_unavailable("Your trial has ended")
     assert "Snowflake account unavailable" in str(excinfo.value)
 

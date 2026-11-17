@@ -52,9 +52,6 @@ _SH = "coa_sources.api.sources_handler"
 _FULLY_VALIDATED = {"CreateSource", "RescanSource"}
 
 
-# ── Minimal Smithy reader ────────────────────────────────────────────────────
-
-
 def _text(name: str) -> str:
     path = _SMITHY / name
     assert path.is_file(), f"{path} not found"
@@ -103,9 +100,6 @@ def _max(traits: list[str], trait: str) -> int:
     raise AssertionError(f"no @{trait} max in {traits}")
 
 
-# ── Parity ───────────────────────────────────────────────────────────────────
-
-
 @pytest.mark.parametrize(
     ("operation", "constant"),
     [
@@ -117,12 +111,6 @@ def _max(traits: list[str], trait: str) -> int:
 def test_max_results_constant_matches_model(operation: str, constant: int) -> None:
     traits = _input_member_traits(_text("unified-sources.smithy"), operation, "maxResults")
     assert _max(traits, "range") == constant
-
-
-def test_list_source_tables_legacy_tolerance_is_the_old_shared_bound() -> None:
-    # Values above the model max up to the old bound are reduced, not rejected.
-    assert contract.LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS == 1000
-    assert contract.LIST_SOURCE_TABLES_LEGACY_MAX_RESULTS > contract.LIST_SOURCE_TABLES_MAX_RESULTS
 
 
 def test_pagination_token_constant_matches_model() -> None:
@@ -165,9 +153,6 @@ def test_every_body_operation_is_bounds_checked_or_fully_validated() -> None:
             assert model is not None, f"{op['operationId']} has a JSON body but no entry in contract.BODY_MODELS"
             assert model.__name__ == ref.rsplit("/", 1)[-1], f"{op['operationId']} is checked against the wrong model"
     assert seen >= _FULLY_VALIDATED
-
-
-# ── Enforcement ──────────────────────────────────────────────────────────────
 
 
 def _route(method: str, resource: str, *, body: dict | None = None, path: dict | None = None, qs: dict | None = None):

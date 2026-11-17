@@ -96,9 +96,6 @@ def _graph() -> Graph:
     return g
 
 
-# ── boilerplate ────────────────────────────────────────────────────────
-
-
 class TestBoilerplate:
     @pytest.mark.parametrize(
         ("text", "names"),
@@ -135,9 +132,6 @@ class TestBoilerplate:
     )
     def test_informative_text_is_not_boilerplate(self, text, names):
         assert not is_boilerplate(text, names=names)
-
-
-# ── ontology views + candidates ────────────────────────────────────────
 
 
 class TestCollect:
@@ -188,7 +182,7 @@ class TestCandidates:
         vectors = {i: unit([rng.uniform(-1, 1) for _ in range(8)]) for i in iris}
         cand = select_candidates(tables, docs, vectors, column_min_similarity=0.0)
 
-        # Reference: score every pair and sort, as before the cap existed.
+        # Reference: score every pair and sort.
         expected: dict[str, dict[str, float]] = {}
         for d in docs:
             pairs = sorted(
@@ -221,9 +215,6 @@ class TestCandidates:
         }
         cand = select_candidates(tables, docs, vectors, column_min_similarity=0.0, max_scored_docs=2)
         assert set(cand.doc_best) == {"near", "mid"}
-
-
-# ── answers → writes ──────────────────────────────────────────────────
 
 
 def _subs_table() -> TableInfo:
@@ -377,14 +368,10 @@ class TestApplyAnswer:
             parse_response("no json here")
 
 
-# ── end-to-end with fakes ─────────────────────────────────────────────
-
-
 class _FakeGraphStore:
     def __init__(self, turtle: str):
         self.turtle = turtle
         self.superseded: list = []
-        self.replaced: list[tuple] = []
         self.loaded: list[str] = []
 
     def get_graph_turtle(self, ontology_id):
@@ -443,11 +430,7 @@ class _FakeEmbedder:
 
 
 class _FakeLLM:
-    def __init__(self):
-        self.prompts: list[str] = []
-
     def generate(self, prompt, system="", max_tokens=4096):
-        self.prompts.append(prompt)
         if "TABLE: loans" in prompt:
             return json.dumps(
                 {
@@ -470,11 +453,7 @@ class _FakeLLM:
 
 
 class _FakeGrounding:
-    def __init__(self):
-        self.filters_seen: list = []
-
     def ground_class(self, *, class_label, candidate_filter, **_kw):
-        self.filters_seen.append(candidate_filter)
         if class_label != "Loan":
             return SimpleNamespace(chosen=None, match_type="novel", relationship=None)
         chosen = SimpleNamespace(entity_uri=f"{T}Loans")
@@ -753,11 +732,10 @@ class TestDefaultOff:
 
     def test_bridge_defined_comment_kept_whole_in_context_text_by_any_reembedding(self, _no_bedrock):
         """A normal ingest of a graph the bridge wrote keeps the bridge's comments whole, as the bridge does."""
+        from coa_ontology.catalog.ingest import _MAX_COLUMN_COMMENT_CHARS, _accumulate_embeddings
         from coa_ontology.catalog.ingest import DEFINITION_SOURCE as INGEST_MARKER
-        from coa_ontology.catalog.ingest import _accumulate_embeddings
 
         assert INGEST_MARKER == DEFINITION_SOURCE
-        from coa_ontology.catalog.ingest import _MAX_COLUMN_COMMENT_CHARS
 
         g = _graph()
         long = "y" * (_MAX_COLUMN_COMMENT_CHARS + 100)  # past the normal cap, so only the marker keeps it whole

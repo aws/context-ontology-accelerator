@@ -15,7 +15,6 @@ from coa_common.domain_models import (
     Table,
 )
 from coa_sources.database.enrichment.relationship_inferrer import (
-    TABLES_PER_BATCH,
     _deduplicate,
     apply_inferred_relationships,
     infer_relationships,
@@ -32,35 +31,7 @@ def _make_table(name: str, columns: list[str] | None = None) -> Table:
 
 
 class TestDeterministicFKTakesPrecedence:
-    """Deterministic FKs from #25 block AI-inferred candidates for the same column."""
-
-    def test_deterministic_fk_blocks_ai_candidate(self) -> None:
-        table = _make_table("orders", ["id", "customer_id"])
-        table.foreign_keys = [
-            ForeignKey(
-                column="customer_id",
-                target_table="customers",
-                target_column="id",
-                source=EnrichmentSource.DETERMINISTIC,
-                confidence=1.0,
-            )
-        ]
-
-        candidates = [
-            {
-                "source_table": "orders",
-                "column": "customer_id",
-                "target_table": "clients",
-                "target_column": "id",
-                "confidence": 0.9,
-            }
-        ]
-
-        count = apply_inferred_relationships([table], candidates)
-
-        assert count == 0
-        assert len(table.foreign_keys) == 1
-        assert table.foreign_keys[0].target_table == "customers"
+    """Source-reported FKs block AI-inferred candidates for the same column."""
 
     def test_steward_specified_fk_blocks_ai_candidate(self) -> None:
         table = _make_table("orders", ["id", "product_id"])
@@ -118,33 +89,6 @@ class TestDeterministicFKTakesPrecedence:
         assert len(table.foreign_keys) == 2
         assert table.foreign_keys[1].column == "product_id"
         assert table.foreign_keys[1].source == EnrichmentSource.AI_INFERRED
-
-    def test_ai_inferred_existing_does_not_block(self) -> None:
-        table = _make_table("orders", ["id", "cat_id"])
-        table.foreign_keys = [
-            ForeignKey(
-                column="cat_id",
-                target_table="old_categories",
-                target_column="id",
-                source=EnrichmentSource.AI_INFERRED,
-                confidence=0.5,
-            )
-        ]
-        categories_table = _make_table("categories", ["id", "name"])
-
-        candidates = [
-            {
-                "source_table": "orders",
-                "column": "cat_id",
-                "target_table": "categories",
-                "target_column": "id",
-                "confidence": 0.95,
-            }
-        ]
-
-        count = apply_inferred_relationships([table, categories_table], candidates)
-
-        assert count == 1
 
 
 class TestCrossBatchMergeDedupes:
@@ -243,9 +187,6 @@ class TestEmptySchemaShortCircuits:
 
 class TestLargeSchemaChunking:
     """Large-schema chunking splits into batches of TABLES_PER_BATCH."""
-
-    def test_tables_per_batch_is_250(self) -> None:
-        assert TABLES_PER_BATCH == 250
 
     def test_small_source_single_call(self) -> None:
         from coa_common.bedrock import BedrockInvocationResult

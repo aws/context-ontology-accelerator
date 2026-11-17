@@ -30,26 +30,11 @@ from coa_serve.tier2.table_qualifier import real_tables
 class TestAthenaValidation:
     """Test namespace validation and SQL safety (via centralized firewall)."""
 
-    def _make_executor(self):
+    async def test_workgroup_prefix(self):
         with patch("boto3.client"), patch("boto3.resource"):
-            return AthenaQueryExecutor(region="us-east-1", sources_table="test-sources")
-
-    def test_validates_namespace(self):
-        from coa_serve.query_utils import validate_namespace
-
-        validate_namespace("my-namespace")
-        validate_namespace("test_ns")
-        validate_namespace("demo123")
-
-        with pytest.raises(ValueError):
-            validate_namespace("invalid namespace!")
-        with pytest.raises(ValueError):
-            validate_namespace("ns with spaces")
-
-    def test_workgroup_prefix(self):
-        with patch("boto3.client"), patch("boto3.resource"):
-            executor = AthenaQueryExecutor(workgroup_prefix="coa-", sources_table="t")
-        assert executor._workgroup_prefix == "coa-"
+            executor = AthenaQueryExecutor(workgroup_prefix="custom-", sources_table="t")
+        executor._sources.resolve_workgroup = AsyncMock(return_value=None)
+        assert await executor._resolve_workgroup("demo") == "custom-demo"
 
 
 @pytest.mark.unit
@@ -180,13 +165,12 @@ class TestTableNameRewrite:
     def test_no_match_leaves_sql_unchanged(self):
         sql = "SELECT 1 FROM some_table"
         result = AthenaQueryExecutor._rewrite_table_names_for_federation(sql, "public")
-        assert "some_table" in result
+        assert result == sql
 
     def test_preserves_column_references(self):
         sql = "SELECT V1.AMOUNT FROM BIRD_PUBLIC_INCOME AS V1 WHERE V1.AMOUNT > 100"
         result = AthenaQueryExecutor._rewrite_table_names_for_federation(sql, "public")
-        assert '"income"' in result
-        assert "AMOUNT" in result or "amount" in result.lower()
+        assert result == 'SELECT V1.AMOUNT FROM "income" AS V1 WHERE V1.AMOUNT > 100'
 
     def test_invalid_sql_returns_original(self):
         sql = "NOT VALID SQL {{{"
@@ -337,17 +321,10 @@ class TestFullyQualifiedSQLSkipsCatalogResolution:
 
     @staticmethod
     async def _qualified_sql() -> str:
-        """The cross-catalog statement as the QUALIFIER actually writes it.
+        """The cross-catalog statement as the qualifier actually writes it.
 
-        Composed rather than hand-authored on purpose: this class asserts that the
-        executor leaves such SQL alone, and a hand-written literal only proves it
-        leaves *that literal* alone. If ``qualify_cross_source_sql`` ever changed the
-        form it emits (quoting, part order, alias placement), a hand-written fixture
-        would keep passing while production SQL took the rewrite path again — the
-        exact seam this fix lives in.
+        Built through ``qualify_cross_source_sql`` so the test tracks the qualifier's real output.
         """
-        from unittest.mock import AsyncMock
-
         from coa_serve.tier2.table_qualifier import qualify_cross_source_sql
 
         sources = {
@@ -379,12 +356,9 @@ class TestFullyQualifiedSQLSkipsCatalogResolution:
             mock_table.get_item.return_value = {"Item": None}
             executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
 
-        # Namespace-scope authorization (a security control added after the cross-source fix)
-        # runs on ANY qualified reference, including this fully-qualified cross-source
-        # statement — it MUST NOT be skipped just because the SQL is self-routing, or
-        # a qualified reference could reach a catalog outside the namespace. Grant a
-        # scope covering exactly the two refs the qualifier wrote so authorization
-        # passes and the invariant below (no rewrite) is what is under test.
+        # Namespace-scope authorization runs on every qualified reference, so grant a
+        # scope covering exactly the two refs the qualifier wrote; the no-rewrite
+        # invariant below is then what is under test.
         executor._sources.sql_namespace_scope = AsyncMock(
             return_value=SQLNamespaceScope(
                 native_databases=frozenset({"insurance"}),
@@ -1013,12 +987,8 @@ class TestCustomConnectorCatalogResolution:
         )
         assert kwargs["QueryExecutionContext"]["Database"] == "widgets"
 
-    # The `athenaCatalog` fallback added for nested Glue sources also reaches a
-    # custom-connector row that somehow lacks `athenaDataCatalogName` — create writes
-    # both attributes to the same derived name, so such a row resolves to the right
-    # Lambda catalog instead of falling through to the Glue-native path. What must
-    # NOT follow from taking that fallback is the crawled-name rewrite: this is still
-    # a custom connector, where the strip corrupts real table names.
+    # A custom connector resolved through `athenaCatalog` still skips the crawled-name
+    # rewrite, which corrupts real table names.
     async def test_a_custom_connector_without_the_system_attribute_resolves_and_is_not_rewritten(self):
         kwargs = await self._execute(
             {
@@ -1414,16 +1384,18 @@ class TestNestedGlueCatalogResolution:
         assert kwargs["QueryExecutionContext"]["Database"] == "sales"
 
     # A source with no catalog information at all still resolves its database from
-    # the configuration blob, as it did before the nested-catalog branch existed.
+    # the configuration blob.
     async def test_a_source_with_no_catalog_falls_back_to_the_configured_database(self):
         kwargs = await self._execute(
             {
                 "sourceType": "DATABASE",
                 "sourceSubType": "GLUE_DATABASE",
+                "configuration": '{"databaseName": "configured_db"}',
                 "queryable": True,
             }
         )
         assert kwargs["QueryExecutionContext"]["Catalog"] == "AwsDataCatalog"
+        assert kwargs["QueryExecutionContext"]["Database"] == "configured_db"
 
     # The rewrite strips a `{database}_` substring from every table name. A native
     # Glue source's R2RML names are generated from Glue table metadata, so they

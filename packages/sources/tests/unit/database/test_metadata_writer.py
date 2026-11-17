@@ -47,11 +47,6 @@ def _existing_asset(name, asset_id):
     return a
 
 
-# ===================================================================
-# write_to_datazone
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestWriteToDatazone:
     def test_creates_new_asset_when_not_exists(self):
@@ -308,11 +303,6 @@ class TestWriteToDatazone:
         assert call_kwargs["assume_role_arn"] == "arn:aws:iam::123:role/test-role"
 
 
-# ===================================================================
-# DataZone Search AccessDenied → actionable membership error
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestSearchAccessDeniedSurfacing:
     def test_access_denied_search_raises_actionable_error(self):
@@ -367,11 +357,6 @@ class TestSearchAccessDeniedSurfacing:
                 )
 
 
-# ===================================================================
-# _find_existing_asset (retained single-asset lookup)
-# ===================================================================
-
-
 @pytest.mark.unit
 class TestFindExistingAsset:
     # Looks the asset up by exact name via find_asset_by_name rather than a
@@ -405,11 +390,6 @@ class TestFindExistingAsset:
 
         result = _find_existing_asset(mock_client, "proj-123", "DS#src-001:mydb.mytable")
         assert result is None
-
-
-# ===================================================================
-# _build_existing_asset_map
-# ===================================================================
 
 
 @pytest.mark.unit

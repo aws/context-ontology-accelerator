@@ -7,11 +7,7 @@ import type { AppTranslate } from "../../i18n/LocaleProvider";
 /**
  * Canonical trace step taxonomy → human-readable labels.
  *
- * Single source of truth shared by every trace UI surface:
- *  - LiveSteps (streaming spinner)        — uses STEP_LABELS
- *  - playground-reducer (stage string)    — uses STEP_LABELS (with ellipsis)
- *  - RationalePanel (execution plan)       — uses STEP_DISPLAY_NAMES
- *  - TracePanel (inline summary)           — uses HIDDEN_UNLESS_DENIED
+ * Single source of truth shared by every trace UI surface.
  *
  * Step IDs follow the `<tier>.<action>` taxonomy emitted by the Python
  * serve layer. Keep this in sync with the backend trace.record() call sites.
@@ -115,9 +111,7 @@ export const STEP_DISPLAY_NAMES: Readonly<Record<string, AppMessage>> = {
 };
 
 /**
- * Labels historically produced by humanizeStepId and used by the compact trace
- * panel/table. Keep their English copy stable while making known backend step
- * IDs translatable. Unknown extension step IDs still use the generic fallback.
+ * Compact trace panel/table labels. Unknown step IDs use the generic fallback.
  */
 const TRACE_STEP_NAMES = {
   "t1.metric_match": "Metric Match",
@@ -191,7 +185,7 @@ export function localizeTraceStep(t: AppTranslate, stepId: string): string {
  * one step reads the same in the panel and on the Trace detail page; the
  * colour comes from {@link mapTraceStatus}.
  */
-export const TRACE_STATUS_LABELS: Readonly<Record<string, AppMessage>> = {
+const TRACE_STATUS_LABELS: Readonly<Record<string, AppMessage>> = {
   success: "Resolved",
   succeeded: "Resolved",
   ok: "Resolved",
@@ -344,12 +338,6 @@ export function tier2Title(
  * every trace surface (LiveSteps, TracePanel, RationalePanel) so a given status
  * always renders the same color. The return type matches both Cloudscape's
  * `StatusIndicator` `type` and `StepsProps.Status` (same union).
- *
- * - success: completed OK / authorized / allowed
- * - error:   hard failure / denied
- * - warning: degraded-but-continued (retry, timeout, partial)
- * - stopped: routine "not applicable, moved on" (miss / skipped / empty)
- * - info:    anything else
  */
 export type TraceStatusType =
   | "success"
@@ -360,9 +348,7 @@ export type TraceStatusType =
 
 export function mapTraceStatus(status: string): TraceStatusType {
   switch (status) {
-    // "succeeded" is what the agentic controller/retriever record on the two paths
-    // that report a tool actually working; without it every successful agentic tool
-    // call fell through to `default` and rendered as a neutral info dot.
+    // The agentic controller records "succeeded".
     case "success":
     case "succeeded":
     case "completed":

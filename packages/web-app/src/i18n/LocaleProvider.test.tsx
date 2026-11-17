@@ -103,12 +103,8 @@ describe("LocaleProvider", () => {
       expect(screen.getByLabelText("次のページ")).toBeInTheDocument();
     });
     expect(setItem).toHaveBeenCalledWith(LOCALE_KEY, "ja");
-    // Restore this spy here rather than leaving it to `vi.restoreAllMocks()`.
-    // happy-dom exposes `window.localStorage` through a Proxy, and vitest 4's
-    // bulk restore does not put back a spied property on one — the throwing
-    // `setItem` stayed installed and the two later tests that seed a stored
-    // locale failed with this test's "storage disabled" error. `mockRestore()`
-    // on the spy itself does work.
+    // vitest 4's bulk restore does not undo a spy on happy-dom's localStorage
+    // Proxy, so restore this one directly.
     setItem.mockRestore();
   });
 

@@ -83,8 +83,8 @@ npm run preview  # Preview the production build locally
 ### Test
 
 ```bash
-# Vitest with v8 coverage. Enforced floor (ratcheting toward the 80% ORR QAL-A-2
-# target): lines 58%, statements 58%, functions 58%, branches 70%.
+# Vitest with v8 coverage. Enforced floors (ratcheting toward 80% line
+# coverage) are in vitest.config.ts.
 npm run test
 ```
 

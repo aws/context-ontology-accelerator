@@ -1223,7 +1223,7 @@ _CONTRACT_RELATIONSHIP = {
 def _contract_tier3_result() -> Tier3Result:
     """A Tier3Result whose supportingContent comes from the real #984 mapper.
 
-    ``AgenticRetriever._supporting_content`` applies the document-provenance filter
+    ``AgenticRetriever._supporting_content_with_drops`` applies the document-provenance filter
     (the graph-only chunk is not a citation) and ``_supporting_content_from_chunk``
     emits the Smithy fields plus the deprecated ``sourceDoc`` / ``label`` aliases.
     """
@@ -1244,9 +1244,9 @@ def _contract_tier3_result() -> Tier3Result:
     )
     return Tier3Result(
         synthesized_answer="Filing deadline answer.",
-        supporting_content=AgenticRetriever._supporting_content(
+        supporting_content=AgenticRetriever._supporting_content_with_drops(
             AccumulatedContext(chunks=[document_chunk, graph_only_chunk])
-        ),
+        )[0],
         graph_context=(
             {
                 "uri": "urn:Claim",

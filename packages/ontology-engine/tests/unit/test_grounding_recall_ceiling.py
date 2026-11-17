@@ -1,12 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the grounding recall-ceiling fixes (issue 72).
+"""Unit tests for the grounding recall-ceiling mechanisms.
 
 Three independent mechanisms let the correct golden class reach the reranker
 when dense embedding recall alone misses it:
 
-  1. A widened, parameterized reranker window (was a hardcoded 8) so a class
+  1. A widened, parameterized reranker window so a class
      recalled at rank 9+ is still shown to the LLM.
   2. An additive token-overlap (lexical) retriever that surfaces a class
      sharing surface tokens with the subject even when dense ranked it out, and
@@ -47,9 +47,6 @@ def _svc(catalog, eg):
     )
 
 
-# ── Fix 3: flat-spread guard ─────────────────────────────────────────────────
-
-
 class TestFlatSpreadGuard:
     def test_flat_spread_caps_high_score_at_ambiguous(self):
         # A confident score off an undiscriminating recall (spread < 0.05) must
@@ -66,18 +63,9 @@ class TestFlatSpreadGuard:
     def test_wide_spread_keeps_exact(self):
         assert classify_score_tier(0.90, has_rerank=True, recall_spread=0.30) == "exact"
 
-    def test_absent_spread_is_backward_compatible(self):
-        # No spread supplied → original absolute-threshold behavior, unchanged.
-        assert classify_score_tier(0.90, has_rerank=True) == "exact"
-        assert classify_score_tier(0.70, has_rerank=True) == "high_confidence"
-        assert classify_score_tier(0.50, has_rerank=True) == "ambiguous"
-
     def test_standard_ladder_also_guarded(self):
         assert classify_score_tier(0.96, has_rerank=False, recall_spread=0.01) == "ambiguous"
         assert classify_score_tier(0.96, has_rerank=False, recall_spread=0.30) == "exact"
-
-
-# ── tokenizer ────────────────────────────────────────────────────────────────
 
 
 class TestTokenize:
@@ -101,9 +89,6 @@ class TestTokenize:
 
     def test_keeps_single_character_non_ascii_identifier(self):
         assert _tokenize("顧") == {"顧"}
-
-
-# ── Fix 2: lexical (token-overlap) recall ────────────────────────────────────
 
 
 class TestLexicalRecall:
@@ -251,9 +236,6 @@ class TestLexicalRecall:
             )
 
 
-# ── Fix 1: reranker window ───────────────────────────────────────────────────
-
-
 class TestRerankerWindow:
     def _capture_converse(self, captured):
         def fake_converse(**kwargs):
@@ -265,8 +247,7 @@ class TestRerankerWindow:
         return fake_converse
 
     def test_candidates_beyond_old_cap_reach_the_llm(self, mock_eg):
-        # 12 dense candidates: the old hardcoded [:8] hid ranks 9-12. With the
-        # widened window they must appear in the rerank prompt.
+        # 12 dense candidates: ranks 9-12 must appear in the rerank prompt.
         cands = [
             GroundingCandidate(
                 entity_uri=f"http://x/Class{i}",

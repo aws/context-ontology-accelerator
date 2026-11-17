@@ -27,13 +27,8 @@ from coa_metrics.api.contract import FILENAME_MAX_LENGTH, FILENAME_MIN_LENGTH, c
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
-# ── Constants ───────────────────────────────────────────────────────────
-
-MAX_UPLOAD_SIZE_MB = 10
 PRESIGN_EXPIRY_SECONDS = 900  # 15 minutes
 ALLOWED_EXTENSIONS = {".yaml", ".yml"}
-
-# ── Singleton S3 client ─────────────────────────────────────────────────
 
 _s3_client: Any = None
 
@@ -45,9 +40,6 @@ def _get_s3_client() -> Any:
     return _s3_client
 
 
-# ── Handler ─────────────────────────────────────────────────────────────
-
-
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Generate a pre-signed S3 PUT URL for OSI YAML upload."""
     namespace = event.get("pathParameters", {}).get("namespaceId", "")
@@ -57,7 +49,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not namespace:
         return api_response(400, {"message": "namespaceId is required"})
 
-    # Parse request body
     try:
         body = json.loads(event.get("body") or "null")
     except (ValueError, TypeError, RecursionError):  # a decode error, too many digits, too deep
@@ -77,7 +68,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if "/" in filename or "\\" in filename or filename != os.path.basename(filename):
         return api_response(400, {"message": "Invalid filename: must not contain path separators"})
 
-    # Validate file extension
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         return api_response(
@@ -85,7 +75,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             {"message": f"Invalid file extension. Allowed: {sorted(ALLOWED_EXTENSIONS)}"},
         )
 
-    # Generate unique S3 key
     bucket_name = os.environ.get("OSI_BUCKET_NAME", "")
     if not bucket_name:
         logger.error("OSI_BUCKET_NAME not configured")
@@ -94,7 +83,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     upload_id = str(uuid.uuid4())
     s3_key = f"{namespace}/imports/{upload_id}/{filename}"
 
-    # Generate pre-signed PUT URL
     try:
         s3_client = _get_s3_client()
         upload_url = s3_client.generate_presigned_url(

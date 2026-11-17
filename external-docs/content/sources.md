@@ -1059,10 +1059,26 @@ in the [API Reference](#/api-reference).
 | Glue Connection (JDBC) | Deleted |
 | Glue Federated Catalog (JDBC) | Deleted |
 | Lake Formation registration (JDBC) | Deregistered |
+| Lake Formation `SELECT`/`DESCRIBE` for the serve runtime role (Glue) | Revoked when no other source references the database |
 | Namespace source counter | Decremented |
 
 !!! warning
     JDBC source deletion requires the federation provisioner role to have Lake Formation data-lake admin privileges. If teardown fails, the delete returns `500` and the source remains — retry once the prerequisite is met.
+
+!!! note "Lake Formation revoke on Glue source deletion"
+    Deleting a `GLUE_DATABASE` source revokes the Lake Formation permissions the
+    serve runtime role holds on that database — `SELECT`/`DESCRIBE` on its
+    tables, and `DESCRIBE` on the database itself. Three things to know:
+
+    - **It is skipped while the database is still in use.** If any other source,
+      in any namespace, references the same database — or if that check cannot
+      be completed — the permissions are left in place.
+    - **It never blocks the delete.** The revoke is best-effort; a failure is
+      logged and the source is deleted regardless.
+    - **It does not distinguish how the permissions were granted.** If you
+      granted the serve runtime role permissions on that database by hand, they
+      are removed too. Use a separate principal for grants that must outlive
+      the source.
 
 ## Querying via Athena
 

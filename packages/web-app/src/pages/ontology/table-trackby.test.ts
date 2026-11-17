@@ -11,10 +11,9 @@
  * for every row: `trackBy` then gives every `<tr>` the same React key, and
  * `sortingField` silently sorts on nothing. Neither throws.
  *
- * The camelCase migration missed exactly this in GetNamespace.tsx and the whole
- * suite stayed green, so it is asserted structurally here rather than through a
- * rendered test (the tables in question are mocked to zero rows, and React only
- * *warns* on duplicate keys).
+ * The tables in question are mocked to zero rows and React only *warns* on
+ * duplicate keys, so this is asserted structurally rather than through a
+ * rendered test.
  *
  * Two scopes, deliberately:
  *   - the *stale-name* rule sweeps every page, since a snake_case
@@ -28,12 +27,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { describe, it, expect } from "vitest";
 
-// `fileURLToPath` is given the URL *string*, not a `new URL(...)` object: the
-// happy-dom environment replaces the global `URL` class, and its instances are
-// rejected by Node's path helpers ("The URL must be of scheme file"). Resolving
-// from this file also means the guard survives the files moving, and does not
-// depend on the runner's cwd (Vitest sets no `root` for this project).
-/** `packages/web-app/src/pages`, located relative to this file. */
+/**
+ * `packages/web-app/src/pages`, located relative to this file. `fileURLToPath`
+ * is given the URL *string*, not a `new URL(...)`: happy-dom replaces the
+ * global `URL`, and its instances are rejected by Node's path helpers.
+ */
 const PAGES_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Tables whose rows are `OntologyRecord`s. */
@@ -45,9 +43,8 @@ const ONTOLOGY_TABLES = [
 
 /**
  * Keys on the generated `OntologyRecord`, plus the non-ontology keys those same
- * files legitimately track or sort by (the proposals table lives in
- * OntologyPage.tsx and is still snake_case on the wire). Kept as a literal list
- * so adding a column forces a conscious update rather than silently passing.
+ * files legitimately track or sort by. Kept as a literal list so adding a
+ * column forces a conscious update rather than silently passing.
  */
 const VALID_KEYS = new Set([
   // OntologyRecord (generated, camelCase)
@@ -116,10 +113,8 @@ describe("Cloudscape table keys stay in sync with their row type", () => {
   });
 
   it("carries no unused allowlist entries", () => {
-    // An allowlist that accumulates keys nothing uses stops constraining
-    // anything: it would silently permit a stale name if one reappeared. `uri`
-    // and `datasourceId` sat here for exactly that reason — both are real keys,
-    // but only in tables outside ONTOLOGY_TABLES.
+    // An allowlist with unused keys stops constraining anything: it would
+    // permit a stale name if one reappeared.
     const used = new Set(
       ONTOLOGY_TABLES.flatMap((rel) =>
         tableKeys(readFileSync(join(PAGES_DIR, rel), "utf8")),
@@ -129,7 +124,6 @@ describe("Cloudscape table keys stay in sync with their row type", () => {
   });
 
   it("no page keys a table on a snake_case OntologyRecord field", () => {
-    // `trackBy="ontology_id"` is the exact regression that shipped.
     const offenders: string[] = [];
     for (const file of allPages) {
       const src = readFileSync(file, "utf8");

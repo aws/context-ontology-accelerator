@@ -1,16 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for metric validation module — Checks 1-6.
-
-Tests cover:
-- Check 1: SQL syntax validation (ERROR severity)
-- Check 2: Table reference existence (WARNING)
-- Check 3: Column reference existence (WARNING)
-- Check 4: Dimension column existence (WARNING)
-- Check 5: Filter type compatibility (WARNING)
-- Check 6: Ontology class linkage (WARNING)
-"""
+"""Unit tests for metric validation: SQL syntax, table, column, dimension, filter and ontology checks."""
 
 from __future__ import annotations
 
@@ -22,7 +13,6 @@ from coa_metrics.lookups import TABLE_NO_METADATA, TABLE_UNAPPROVED, source_tabl
 from coa_metrics.validator import (
     ColumnMetadata,
     DataSourceLookup,
-    DynamoDBDataSourceLookup,
     NeptuneOntologyLookup,
     OntologyLookup,
     check_data_modifying,
@@ -32,9 +22,6 @@ from coa_metrics.validator import (
 )
 
 pytestmark = pytest.mark.unit
-
-
-# ── Mock implementations ────────────────────────────────────────────────
 
 
 class MockDataSourceLookup(DataSourceLookup):
@@ -71,9 +58,6 @@ class MockOntologyLookup(OntologyLookup):
 
     def class_exists(self, class_uri: str, namespace: str) -> bool:
         return class_uri in self._classes
-
-
-# ── Fixtures ────────────────────────────────────────────────────────────
 
 
 @pytest.fixture
@@ -144,11 +128,8 @@ def ontology_lookup() -> MockOntologyLookup:
     return MockOntologyLookup(existing_classes={"ind:Order", "ind:Customer"})
 
 
-# ── Check 1: SQL Syntax ─────────────────────────────────────────────────
-
-
 class TestCheck1SqlSyntax:
-    """Check 1: SQL parses without syntax errors in declared dialect."""
+    """SQL parses without syntax errors in declared dialect."""
 
     def test_valid_sql_passes(self, valid_metric: dict) -> None:
         result = validate_metric(valid_metric)
@@ -156,9 +137,7 @@ class TestCheck1SqlSyntax:
         assert len(result.errors) == 0
 
     def test_fragment_fails_shape_check(self, fragment_metric: dict) -> None:
-        """#617: fragments parse fine but the serve firewall rejects them —
-        the sql_shape check must flag them so validate predicts serve-time
-        acceptance (previously this asserted fragments were valid)."""
+        """Aggregate fragments are rejected by the shape check."""
         result = validate_metric(fragment_metric)
         assert not result.valid
         shape_errors = [e for e in result.errors if e["check"] == "sql_shape"]
@@ -173,7 +152,6 @@ class TestCheck1SqlSyntax:
             "ontologyConcepts": [],
         }
         result = validate_metric(metric)
-        # Check 1 errors block validation
         assert not result.valid
         assert len(result.errors) >= 1
         assert result.errors[0]["check"] == "sql_syntax"
@@ -192,7 +170,6 @@ class TestCheck1SqlSyntax:
             "ontologyConcepts": [],
         }
         result = validate_metric(metric)
-        # One dialect fails, one passes
         assert not result.valid
         assert len(result.errors) >= 1
 
@@ -219,9 +196,6 @@ class TestCheck1SqlSyntax:
             }
             result = validate_metric(metric)
             assert result.valid, f"Failed for dialect: {dialect}"
-
-
-# ── Check 1b: Statement shape (serve-firewall parity, #617) ─────────────
 
 
 class TestCheckSelectShape:
@@ -386,11 +360,6 @@ class TestCheckSelectShape:
         assert check_select_shape("SELECT 1", "NOT_A_DIALECT") is None
         assert check_select_shape("COUNT(*)", "NOT_A_DIALECT") is not None
 
-    # ── Deep scan: data-modifying nodes nested inside a SELECT ──────────
-    # The DML matrix lives in TestCheckDataModifying (the hard block) — this
-    # keeps one case to pin that check_select_shape shares that denylist, plus
-    # the negative case proving the shared walk does not over-reach.
-
     def test_data_modifying_cte_delete_rejected(self) -> None:
         sql = "WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d"
         error = check_select_shape(sql, "POSTGRESQL")
@@ -405,9 +374,6 @@ class TestCheckSelectShape:
             "SELECT COUNT(*) FROM recent WHERE id IN (SELECT order_id FROM refunds)"
         )
         assert check_select_shape(sql, "POSTGRESQL") is None
-
-
-# ── Tier 1 execution contract ──────────────────────────────────────────
 
 
 class TestTier1ExecutionShape:
@@ -432,13 +398,8 @@ class TestTier1ExecutionShape:
         assert check_tier1_execution_shape(dialects) is None
 
 
-# ── check_data_modifying: read-only enforcement (#161) ──────────────────
-
-
 class TestCheckDataModifying:
     """DML/DDL is this helper's concern; statement shape is checked separately."""
-
-    # ── Delegated: shape validation handles fragments and parse errors ───
 
     @pytest.mark.parametrize("sql", ["COUNT(*)", "SUM(orders.total_amount)", "AVG(price)"])
     def test_fragment_is_allowed(self, sql: str) -> None:
@@ -467,8 +428,6 @@ class TestCheckDataModifying:
         """Comments are stripped before the regex, so DML mentioned in a
         comment does not block — the AST walk governs the real statement."""
         assert check_data_modifying("-- DROP TABLE x\nSELECT 1", "POSTGRESQL") is None
-
-    # ── Blocked: DML/DDL, however it is smuggled in ──────────────────────
 
     def test_trailing_dml_statement_blocked(self) -> None:
         error = check_data_modifying("SELECT 1; DROP TABLE x", "POSTGRESQL")
@@ -517,11 +476,7 @@ class TestCheckDataModifying:
         assert error is not None
         assert "read-only" in error
 
-    # ── DML/admin verbs beyond the original 8-node denylist ──────────────
-    # The first cut copied the serve firewall's regex + node tuple but dropped
-    # its ALLOWLIST stage, so every verb below published (201) instead of
-    # hard-blocking. sqlglot funnels unknown verbs (CALL, VACUUM, OPTIMIZE, …)
-    # into exp.Command, which is what makes the AST walk cover them.
+    # sqlglot funnels unknown verbs (CALL, VACUUM, OPTIMIZE, …) into exp.Command.
 
     @pytest.mark.parametrize(
         "sql",
@@ -583,10 +538,7 @@ class TestCheckDataModifying:
         keep returning None. Regression net against denylist over-reach."""
         assert check_data_modifying(sql, "POSTGRESQL") is None
 
-    # ── Tokenizer / recursion failures must not escape as a 500 ──────────
-    # sqlglot's TokenError is a SIBLING of ParseError (both SqlglotError), and
-    # deeply-nested parens raise RecursionError. Neither is a ValueError, so
-    # create/update handlers (which catch ValueError) turned them into a 500.
+    # TokenError and RecursionError must not escape (handlers catch only ValueError).
 
     @pytest.mark.parametrize(
         "sql",
@@ -613,12 +565,6 @@ class TestCheckDataModifying:
         by the pre-parse regex before parsing is even attempted."""
         error = check_data_modifying("DROP TABLE users; --'", "POSTGRESQL")
         assert error is not None
-
-    # ── Stacked DML that also BREAKS the parse ───────────────────────────
-    # The gap the two other layers each miss: the ``^\s*`` regex only sees the
-    # leading SELECT, and the AST walk never runs because the trailing statement
-    # is exactly what makes sqlglot raise. All four below returned None (accepted)
-    # until the parse-failure path started re-checking each ``;``-segment.
 
     @pytest.mark.parametrize(
         "sql",
@@ -656,11 +602,8 @@ class TestCheckDataModifying:
         assert check_data_modifying(sql, "POSTGRESQL") is None
 
 
-# ── Check 2: Table References ───────────────────────────────────────────
-
-
 class TestCheck2TableReferences:
-    """Check 2: All table references exist in OMS for the metric's dataSourceId."""
+    """All table references exist in OMS for the metric's dataSourceId."""
 
     def test_existing_table_passes(self, valid_metric: dict, lookup: MockDataSourceLookup) -> None:
         result = validate_metric(valid_metric, data_sources_lookup=lookup)
@@ -700,11 +643,11 @@ class TestCheck2TableReferences:
 
 
 class TestSourceTableProvableAbsence:
-    """#161: the DECLARED sourceTable is an ERROR when its absence is provable.
+    """The declared sourceTable is an ERROR when its absence is provable.
 
     Provable = the catalog was read, it enumerates at least one table for the
     source, and the declared table is not among them. Everything else stays a
-    soft WARNING — see the docstrings below for why each case is unprovable.
+    soft WARNING.
     """
 
     def _enumerating_lookup(self, *, available: bool = True, tables: set[str] | None = None):
@@ -859,9 +802,9 @@ class TestSourceTableProvableAbsence:
 class TestDeclaredSourceTableWording:
     """The declared sourceTable is worded the way the create/update gate words it.
 
-    ValidateMetric used to add "Source table 'X' not found" next to the gate's
-    "exists ... but is not approved" for the same table. Bare SQL references keep
-    "not found": they can also be CTE or subquery aliases.
+    A rejected declared table gets the gate's "exists ... but is not approved"
+    wording, not "not found". Bare SQL references keep "not found": they can also
+    be CTE or subquery aliases.
     """
 
     _KNOWN = {"public.customers", "public.orders"}
@@ -969,11 +912,8 @@ class TestDeclaredSourceTableWording:
         assert result.valid
 
 
-# ── Check 3: Column References ──────────────────────────────────────────
-
-
 class TestCheck3ColumnReferences:
-    """Check 3: All column references exist and match expected types."""
+    """All column references exist and match expected types."""
 
     def test_valid_columns_no_warning(self, valid_metric: dict, lookup: MockDataSourceLookup) -> None:
         result = validate_metric(valid_metric, data_sources_lookup=lookup)
@@ -1021,11 +961,8 @@ class TestCheck3ColumnReferences:
         assert len(col_warnings) == 0
 
 
-# ── Check 4: Dimension Columns ──────────────────────────────────────────
-
-
 class TestCheck4DimensionColumns:
-    """Check 4: Dimension columns (GROUP BY) exist in referenced tables."""
+    """Dimension columns (GROUP BY) exist in referenced tables."""
 
     def test_valid_dimension_passes(self, valid_metric: dict, lookup: MockDataSourceLookup) -> None:
         result = validate_metric(valid_metric, data_sources_lookup=lookup)
@@ -1059,11 +996,8 @@ class TestCheck4DimensionColumns:
         assert len(dim_warnings) == 0
 
 
-# ── Check 5: Filter Type Compatibility ──────────────────────────────────
-
-
 class TestCheck5FilterCompatibility:
-    """Check 5: Filter columns exist and type matches operator."""
+    """Filter columns exist and type matches operator."""
 
     def test_compatible_filter_no_warning(self, lookup: MockDataSourceLookup) -> None:
         metric = {
@@ -1126,11 +1060,8 @@ class TestCheck5FilterCompatibility:
         assert len(filter_warnings) == 0
 
 
-# ── Check 6: Ontology Class Linkage ────────────────────────────────────
-
-
 class TestCheck6OntologyLinkage:
-    """Check 6: :governedMetricFor references a valid ontology class."""
+    """:governedMetricFor references a valid ontology class."""
 
     def test_existing_class_passes(self, valid_metric: dict, ontology_lookup: MockOntologyLookup) -> None:
         result = validate_metric(valid_metric, ontology_lookup=ontology_lookup, namespace="sales")
@@ -1179,9 +1110,6 @@ class TestCheck6OntologyLinkage:
         assert len(onto_warnings) == 0
 
 
-# ── Combined / Integration Tests ───────────────────────────────────────
-
-
 class TestCombinedValidation:
     """Tests that verify multiple checks running together."""
 
@@ -1199,8 +1127,6 @@ class TestCombinedValidation:
         )
         assert result.valid
         assert len(result.errors) == 0
-        # May have some warnings for table references in SQL
-        # but core columns should pass
 
     def test_syntax_error_blocks_even_with_other_warnings(
         self, lookup: MockDataSourceLookup, ontology_lookup: MockOntologyLookup
@@ -1217,7 +1143,7 @@ class TestCombinedValidation:
             ontology_lookup=ontology_lookup,
             namespace="sales",
         )
-        assert not result.valid  # Blocked by Check 1
+        assert not result.valid  # Blocked by the syntax check
         assert len(result.errors) >= 1
         assert result.errors[0]["check"] == "sql_syntax"
 
@@ -1256,43 +1182,6 @@ class TestCombinedValidation:
         assert len(result.warnings) == 1
         assert result.warnings[0]["check"] == "table_reference"
         assert result.warnings[0]["details"]["verification"] == "unavailable"
-
-
-# ── Concrete lookup resilience ──────────────────────────────────────────
-
-
-@pytest.mark.skip(reason="DynamoDBDataSourceLookup deprecated — replaced by SmusCatalogDataSourceLookup")
-class TestDynamoDBDataSourceLookupResilience:
-    """DynamoDB errors must degrade gracefully, never crash validation."""
-
-    def _lookup(self) -> DynamoDBDataSourceLookup:
-        lookup = DynamoDBDataSourceLookup(table_name="t", region="us-east-1")
-        lookup._table = MagicMock()
-        return lookup
-
-    def test_data_source_exists_returns_false_on_dynamodb_error(self) -> None:
-        lookup = self._lookup()
-        lookup._table.get_item.side_effect = Exception("ThrottlingException")
-        assert lookup.data_source_exists("ds-1") is False
-
-    def test_data_source_exists_true_when_item_present(self) -> None:
-        lookup = self._lookup()
-        lookup._table.get_item.return_value = {"Item": {"PK": "DS#ds-1"}}
-        assert lookup.data_source_exists("ds-1") is True
-
-    def test_get_table_columns_returns_none_on_dynamodb_error(self) -> None:
-        lookup = self._lookup()
-        lookup._table.get_item.side_effect = Exception("AccessDeniedException")
-        assert lookup.get_table_columns("ds-1", "orders") is None
-
-    def test_get_table_columns_caches_none_result(self) -> None:
-        lookup = self._lookup()
-        lookup._table.get_item.side_effect = Exception("boom")
-        assert lookup.get_table_columns("ds-1", "orders") is None
-        # Second call must hit the cache, not DynamoDB again.
-        lookup._table.get_item.reset_mock()
-        assert lookup.get_table_columns("ds-1", "orders") is None
-        lookup._table.get_item.assert_not_called()
 
 
 class TestNeptuneOntologyLookupUriValidation:

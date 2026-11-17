@@ -394,27 +394,21 @@ class TestDDLAlignsToTheMapping:
         assert _tables_to_h2_ddl(tables, None) == _tables_to_h2_ddl(tables)
 
     def test_qualify_on_collision_emits_warning(self, caplog):
-        """F9: the ordinary qualification path (a bare name shared across
+        """The ordinary qualification path (a bare name shared across
         datasources, each with a DISTINCT schema) must log the shape change, so an
         operator diagnosing a namespace whose persisted rr:tableName changed shape
-        has a signal. main logged the equivalent from proposals; this restores it
-        at the disambiguation point."""
+        has a signal."""
         tables = [_table("customers", "public", "src-pg1"), _table("customers", "crm", "src-pg2")]
         with caplog.at_level("WARNING"):
             logical_table_names(tables)
         assert "logical_table_name_qualified_on_collision" in caplog.text
 
     def test_pre_revert_qualified_mapping_still_covered(self):
-        """F2: a namespace accepted under the pre-revert UNCONDITIONAL-qualification
-        rule (issue #149, on main) persisted a QUALIFIED rr:tableName (e.g.
-        "public"."customers") even for a table whose name is unique. This MR reverts
-        induction to bare-when-unique, so the current catalog derives "customers" —
-        but the STORED mapping still declares the qualified literal. That persisted
-        mapping must still load: _align_to_mapping picks the stored qualified name
-        (the reverse-skew candidate) and _tables_to_h2_ddl covers it. This is the
-        'byte-identical relative to pre-#149' migration path proven executable."""
+        """A stored qualified rr:tableName for a now-unique table is still declared.
+
+        _align_to_mapping picks the stored qualified name and _tables_to_h2_ddl covers it."""
         tables = [_table("customers", "public", "src-pg1")]
-        # What the pre-#149 mapping persisted for this now-unique table:
+        # A stored mapping that qualified this now-unique table:
         pre_revert_mapping = {'"public"."customers"'}
         ddl = _tables_to_h2_ddl(tables, pre_revert_mapping)
         assert 'CREATE TABLE IF NOT EXISTS "public"."customers" (' in ddl

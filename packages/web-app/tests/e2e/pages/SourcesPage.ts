@@ -58,34 +58,6 @@ export class SourcesPage {
     await this.expectSourceVisible(name);
   }
 
-  /** Onboard a JDBC source; returns once the new source is shown. */
-  async onboardJdbc(
-    namespaceId: string,
-    name: string,
-    opts: {
-      engine: string;
-      host: string;
-      databaseName: string;
-      secretArn: string;
-    },
-  ): Promise<void> {
-    await this.startConnect(namespaceId);
-    await this.chooseKind("JDBC database");
-    await this.page.getByPlaceholder("My JDBC Database").fill(name);
-
-    // Engine select (Cloudscape Select renders the placeholder as button text).
-    await this.page.getByText("Select an engine").click();
-    await this.page.getByRole("option", { name: opts.engine }).click();
-
-    await this.page.getByPlaceholder("db.example.com").fill(opts.host);
-    await this.page.getByPlaceholder("my_database").fill(opts.databaseName);
-    await this.page
-      .getByPlaceholder("arn:aws:secretsmanager:...")
-      .fill(opts.secretArn);
-    await this.submitWizard();
-    await this.expectSourceVisible(name);
-  }
-
   /**
    * Advance to the final wizard step and submit. Database sources have
    * intermediate steps (configure → enrichment → review); wait for each to

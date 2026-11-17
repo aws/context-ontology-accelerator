@@ -7,14 +7,11 @@ The DB scan state machine retries the discovery step, but only *transient*
 failures (connectivity, throttling, transient service errors) benefit from a
 retry. *Permanent* failures — bad configuration, denied credentials, a missing
 database, an unsupported source type — fail identically on every attempt, so
-retrying them just wastes ~15s (three attempts with backoff) before the source
-lands in SCAN_FAILED.
+retrying them only delays SCAN_FAILED.
 
 Discovery raises one of these so the state machine can scope its retry to
 ``TransientScanError`` (AWS Lambda reports the raised exception's class name as
-the Step Functions error name, which the retry policy matches on). Both subclass
-``RuntimeError`` so existing callers and tests that catch/expect ``RuntimeError``
-are unaffected.
+the Step Functions error name, which the retry policy matches on).
 """
 
 from __future__ import annotations
@@ -39,11 +36,7 @@ class PermanentScanError(ScanError):
 # (throttling, timeouts, 5xx, connectivity, unknown) is treated as transient.
 _PERMANENT_CLIENT_ERROR_CODES: frozenset[str] = frozenset(
     {
-        "AccessDenied",
-        "AccessDeniedException",
         "UnauthorizedException",
-        "EntityNotFoundException",
-        "ResourceNotFoundException",
         "ValidationException",
         "InvalidInputException",
         "InvalidRequestException",

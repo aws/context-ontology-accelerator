@@ -6,10 +6,6 @@
 Subcommands:
   notice  — write the root NOTICE (default), or --check that the committed copy
             is current with the resolved dependency set.
-
-The build regenerates and commits NOTICE (see the Makefile `notice` target), so
-the checked-in file stays current by construction. ``--check`` is offered for
-ad-hoc local verification.
 """
 
 from __future__ import annotations

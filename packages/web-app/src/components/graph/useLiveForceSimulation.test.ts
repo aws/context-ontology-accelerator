@@ -106,15 +106,13 @@ describe("useLiveForceSimulation", () => {
     const { result } = renderHook(() =>
       useLiveForceSimulation(nodes(), edges, setNodes, opts),
     );
-    expect(typeof result.current.refreshCollide).toBe("function");
-    expect(typeof result.current.kickAlpha).toBe("function");
     expect(() => {
       act(() => result.current.refreshCollide());
       act(() => result.current.kickAlpha(0.25));
     }).not.toThrow();
   });
 
-  it("refreshCollide re-invokes the per-node radius accessor (hover fix)", () => {
+  it("refreshCollide re-invokes the per-node radius accessor", () => {
     const setNodes = vi.fn();
     let fatRadius = false;
     const nodeRadius = (id: string) => (id === "a" && fatRadius ? 200 : 40);
@@ -144,8 +142,6 @@ describe("useLiveForceSimulation", () => {
     const { result } = renderHook(() =>
       useLiveForceSimulation(nodes(), edges, setNodes, opts),
     );
-    expect(typeof result.current.pinNode).toBe("function");
-    expect(typeof result.current.unpinNode).toBe("function");
     expect(() => {
       act(() => result.current.pinNode("a"));
       act(() => result.current.unpinNode("a"));

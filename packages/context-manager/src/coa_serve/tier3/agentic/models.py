@@ -7,7 +7,7 @@ These value objects are passed between the decomposition planner, the reasoning
 controller, and the retriever session. They are intentionally free of any
 ``graphrag_toolkit`` (or other heavy) import so that importing this module — and
 therefore the ``agentic`` subpackage — never pulls the toolkit into
-``sys.modules`` (Requirement 12.3).
+``sys.modules``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 
 
 class StopReason(StrEnum):
-    """Enumerated reason the Reasoning_Loop stopped retrieving (Req 6.6, 7).
+    """Enumerated reason the Reasoning_Loop stopped retrieving.
 
     Recorded once per session in the terminal ``agentic_retrieval_stop`` trace
     step. ``queue_drained`` and ``time_budget_expired`` are session-level
@@ -38,7 +38,7 @@ class StopReason(StrEnum):
 
 @dataclass(frozen=True)
 class SubQuestion:
-    """A self-contained question the agent resolves independently (Req 13.2).
+    """A self-contained question the agent resolves independently.
 
     Produced either by Query_Decomposition of the input question or by branching
     from a Reasoning_Step result. Findings from every Sub_Question contribute to
@@ -61,7 +61,7 @@ class SubQuestion:
 
 @dataclass(frozen=True)
 class ExplorationBranch:
-    """A distinct direction of investigation surfaced during retrieval (Req 13.4).
+    """A distinct direction of investigation surfaced during retrieval.
 
     Originates from a Sub_Question or from a Reasoning_Step result that surfaces
     multiple directions worth exploring (e.g. one branch per discovered
@@ -86,13 +86,13 @@ class ExplorationBranch:
 
 @dataclass(frozen=True)
 class PlannerDecision:
-    """The planner LLM's choice for the next Reasoning_Step (Req 4.3, 5).
+    """The planner LLM's choice for the next Reasoning_Step.
 
     Names the Tool to invoke next, the inputs to invoke it with (validated
     against the Tool's declared input contract before invocation), and the
     planner's reasoning (recorded in the ``next_step_select`` trace step). When
     the planner falls back to an ad-hoc graph query, ``is_ad_hoc`` is set so the
-    controller can record that no strategy tool / template fit (Req 5.4).
+    controller can record that no strategy tool / template fit.
 
     Attributes:
         tool_name: Registry name of the selected Tool (e.g. ``strategy:entity_based``).

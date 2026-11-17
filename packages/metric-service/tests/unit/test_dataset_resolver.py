@@ -17,9 +17,6 @@ from coa_metrics.validator import DataSourceLookup
 pytestmark = pytest.mark.unit
 
 
-# ── Mock lookup ─────────────────────────────────────────────────────────
-
-
 class MockDataSourceLookup(DataSourceLookup):
     """Mock lookup with configurable data sources."""
 
@@ -34,9 +31,6 @@ class MockDataSourceLookup(DataSourceLookup):
 
     def get_table_columns(self, data_source_id: str, table_name: str) -> list[str] | None:
         return None
-
-
-# ── Tests ───────────────────────────────────────────────────────────────
 
 
 class TestResolveDatasets:

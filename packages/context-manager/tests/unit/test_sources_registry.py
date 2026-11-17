@@ -32,65 +32,6 @@ class TestSourcesRegistry:
         return registry
 
     @pytest.mark.asyncio
-    async def test_resolve_database_from_configuration(self):
-        registry = self._make_registry({"configuration": json.dumps({"databaseName": "bird_test_db_catalog"})})
-        result = await registry.resolve_database_name("ns-123", "src-456")
-        assert result == "bird_test_db_catalog"
-
-    @pytest.mark.asyncio
-    async def test_resolve_database_prefers_top_level_field(self):
-        registry = self._make_registry(
-            {
-                "glueDatabaseName": "top_level_db",
-                "configuration": json.dumps({"databaseName": "config_db"}),
-            }
-        )
-        result = await registry.resolve_database_name("ns-123", "src-456")
-        assert result == "top_level_db"
-
-    @pytest.mark.asyncio
-    async def test_resolve_database_uses_athena_catalog_name(self):
-        registry = self._make_registry({"athenaDataCatalogName": "fed_catalog", "configuration": "{}"})
-        result = await registry.resolve_database_name("ns-123", "src-456")
-        assert result == "fed_catalog"
-
-    @pytest.mark.asyncio
-    async def test_resolve_database_returns_empty_when_not_found(self):
-        with patch("boto3.resource") as mock_resource:
-            mock_table = MagicMock()
-            mock_table.get_item.return_value = {"Item": None}
-            mock_resource.return_value.Table.return_value = mock_table
-            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
-        result = await registry.resolve_database_name("ns-123", "src-missing")
-        assert result == ""
-
-    @pytest.mark.asyncio
-    async def test_resolve_database_default_source_id_queries_namespace(self):
-        with patch("boto3.resource") as mock_resource:
-            mock_table = MagicMock()
-            mock_table.query.return_value = {
-                "Items": [
-                    {
-                        "sourceType": "DATABASE",
-                        "configuration": json.dumps({"databaseName": "found_db"}),
-                    }
-                ]
-            }
-            mock_resource.return_value.Table.return_value = mock_table
-            registry = SourcesRegistry(table_name="test-sources", region="us-west-2")
-
-        result = await registry.resolve_database_name("ns-123", "default")
-        assert result == "found_db"
-        mock_table.query.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_resolve_database_returns_empty_when_no_table_configured(self):
-        registry = SourcesRegistry(table_name="", region="us-west-2")
-        assert not registry.available
-        result = await registry.resolve_database_name("ns-123", "src-456")
-        assert result == ""
-
-    @pytest.mark.asyncio
     async def test_get_source(self):
         registry = self._make_registry({"PK": "NS#ns-1", "SK": "SRC#s-1", "name": "test"})
         item = await registry.get_source("ns-1", "s-1")

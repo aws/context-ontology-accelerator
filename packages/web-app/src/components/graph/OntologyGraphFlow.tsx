@@ -60,8 +60,6 @@ import { projectEdgeLabel } from "./labelProjection";
 import { useAppI18n } from "../../i18n/LocaleProvider";
 import type { AppMessage } from "../../i18n/appMessages";
 
-// ─── Types ──────────────────────────────────────────────────────────
-
 export interface GraphNodeData {
   id: string;
   label: string;
@@ -146,8 +144,6 @@ const ARROW_SIZE = 16;
 const ATTR_SIZE = 52;
 const ARROW_GAP = 3;
 
-// ─── Layout ─────────────────────────────────────────────────────────
-
 /**
  * Evenly spaced points around a circle, starting at the top (12 o'clock)
  * and going clockwise. Radius grows with the node count so neighbours stay
@@ -227,16 +223,12 @@ function layoutGraph<T extends Node>(
   return {
     nodes: nodes.map((node) => {
       const pos = g.node(node.id);
-      // Defensive: dagre returns undefined for a node it never positioned
-      // (shouldn't happen since every node is added above, but guard anyway).
       if (!pos) return { ...node, position: { x: 0, y: 0 } };
       return { ...node, position: { x: pos.x - half, y: pos.y - half } };
     }),
     edges,
   };
 }
-
-// ─── Custom Node ────────────────────────────────────────────────────
 
 const KIND_COLORS: Record<string, { bg: string; border: string }> = {
   class: { bg: "#dbeafe", border: "#3b82f6" }, // blue — novel induced class
@@ -435,8 +427,6 @@ const nodeTypes: NodeTypes = {
   attribute: AttributeNode,
 };
 
-// ─── Floating edge (force layout) ───────────────────────────────────
-
 interface FloatingEdgeData extends Record<string, unknown> {
   /** Perpendicular offset (px) so parallel edges between one pair fan out. */
   curve?: number;
@@ -499,8 +489,6 @@ function FloatingEdge({
   let path: string;
   const labelT = data?.labelT ?? 0.5;
   const labelPoint = projectEdgeLabel(sx, sy, tx, ty, curve, labelT);
-  const labelX = labelPoint.x;
-  const labelY = labelPoint.y;
   if (curve === 0) {
     path = `M ${sx} ${sy} L ${tx} ${ty}`;
   } else {
@@ -520,7 +508,7 @@ function FloatingEdge({
           <div
             className="coa-graph-edge-label"
             style={{
-              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              transform: `translate(-50%, -50%) translate(${labelPoint.x}px, ${labelPoint.y}px)`,
               opacity: style?.opacity,
             }}
             onMouseEnter={() => setHoveredEdgeId(id)}
@@ -593,8 +581,6 @@ function usePreserveCenterOnResize() {
     setViewport({ x: vp.x + dw / 2, y: vp.y + dh / 2, zoom: vp.zoom });
   }, [width, height, getViewport, setViewport]);
 }
-
-// ─── Component ──────────────────────────────────────────────────────
 
 function OntologyGraphFlowInner({
   nodes,
@@ -716,7 +702,6 @@ function OntologyGraphFlowInner({
     [flowNodes, structuralEdges, layout],
   );
 
-  // Hold the focal point centered across pane resizes (see hook doc).
   usePreserveCenterOnResize();
 
   const [liveNodes, setLiveNodes] = useState<OntologyFlowNode[]>(initialNodes);
@@ -847,14 +832,8 @@ function OntologyGraphFlowInner({
   );
   const handleEdgeMouseLeave = useCallback(() => setHoveredEdgeId(null), []);
 
-  // When hover enters/leaves a class, update the collider ref so forceCollide
-  // reserves space for its attribute ring + edge-label headroom, then force
-  // d3-force to re-read the per-node radii (it caches them at `initialize()`
-  // and never re-invokes the accessor per tick) and give the sim a one-shot
-  // alpha boost so neighbours actually drift out — then settle naturally on
-  // their own without holding alphaTarget above alphaMin. The hovered node
-  // itself is pinned at its current position for the duration of the hover
-  // so the one-shot kick doesn't drift it out from under the pointer.
+  // Inflate the hovered collider, pin the hovered node, and kick alpha once so
+  // neighbours drift out and then settle.
   const { refreshCollide, kickAlpha, pinNode, unpinNode } = simulation;
   const pinnedHoverIdRef = useRef<string | null>(null);
   useEffect(() => {
@@ -940,12 +919,6 @@ function OntologyGraphFlowInner({
   );
 
   // Per-edge label `t` value (position along the chord as a fraction).
-  // Topology-only: depends on `edges` and the packed `initialNodes`, NOT on
-  // the live sim's positions, so this map is computed once per layout change
-  // and never per tick. `FloatingEdge` projects the actual coordinate from
-  // the current source/target node centres (and the curve bow for parallel
-  // edges), so the label always sits on the drawn edge.
-  //
   // Labels around a hub (degree ≥ `HUB_DEGREE_THRESHOLD`) get a staggered t
   // from `T_PATTERN` sorted by the angle of their spoke, so sibling-spoke
   // labels land on different radii from the hub rather than stacking at the
@@ -983,10 +956,6 @@ function OntologyGraphFlowInner({
       const otherId = hubId === e.source ? e.target : e.source;
       const other = nodeById.get(otherId);
       if (!hub || !other) continue;
-      // Shortest chord where the inner stagger t ≈ 0.35 still lands the
-      // label past the hub's own radius + the label half-width. Below this
-      // the staggered label sits on top of the hub, worse than the midpoint
-      // fallback, so skip the stagger for this edge.
       const chordDx = other.position.x - hub.position.x;
       const chordDy = other.position.y - hub.position.y;
       const chordLen = Math.hypot(chordDx, chordDy);
@@ -1060,8 +1029,6 @@ function OntologyGraphFlowInner({
     // Scope label obstacles to the hovered node's incident edges only — the
     // visible labels at this zoom are the ones on those edges (focus+context
     // dims the rest to 0.12), so attributes only need to yield around them.
-    // Project each label position from the current source/target centres at
-    // its topology-derived t, keeping the Bézier bow for curved edges.
     const incidentLabelPositions: { x: number; y: number }[] = [];
     for (const e of edges) {
       if (e.source !== hoveredId && e.target !== hoveredId) continue;
@@ -1084,13 +1051,12 @@ function OntologyGraphFlowInner({
       ox: number,
       oy: number,
       minDist: number,
-      share: number,
     ) => {
       const dx = p.x - ox;
       const dy = p.y - oy;
       const d = Math.hypot(dx, dy) || 0.01;
       if (d < minDist) {
-        const f = ((minDist - d) * share) / d;
+        const f = (minDist - d) / d;
         p.x += dx * f;
         p.y += dy * f;
       }
@@ -1131,14 +1097,11 @@ function OntologyGraphFlowInner({
     };
     for (let iter = 0; iter < 10; iter++) {
       for (const p of centres) {
-        for (const o of obstacles) push(p, o.x, o.y, o.r + attrR + gap, 1);
+        for (const o of obstacles) push(p, o.x, o.y, o.r + attrR + gap);
         for (const s of segments)
           pushOffSegment(p, s.ax, s.ay, s.bx, s.by, attrR + gap);
-        // Edge labels on this node's incident edges are ground truth — push
-        // attribute glyphs off those label positions. Non-incident labels are
-        // dimmed anyway (focus+context) so they do not need to be obstacles.
         for (const lp of incidentLabelPositions) {
-          push(p, lp.x, lp.y, LABEL_HALF + attrR + gap, 1);
+          push(p, lp.x, lp.y, LABEL_HALF + attrR + gap);
         }
       }
       for (let i = 0; i < centres.length; i++) {
@@ -1217,11 +1180,6 @@ function OntologyGraphFlowInner({
   );
 
   const displayEdges = useMemo(() => {
-    // Pass each edge's topology-derived `labelT` through on its data. The
-    // `FloatingEdge` projects the actual coordinate from the current source
-    // and target node centres (and the Bézier bow for curved edges), so a
-    // sim tick never has to rebuild label positions here — React Flow only
-    // re-renders the edges whose endpoint positions moved.
     const base = labelTValues.size
       ? flowEdges.map((e) => {
           const t = labelTValues.get(e.id);

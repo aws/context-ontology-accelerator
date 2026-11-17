@@ -66,21 +66,13 @@ def _target(event: dict) -> str:
 def _delete_target(event: dict) -> str | None:
     """Resolve the ARN this physical resource registered, from its own id.
 
-    Delete MUST deregister the principal *this* physical resource created, which
-    is encoded in ``PhysicalResourceId`` (``lf-admin-{arn}``) — NOT whatever the
-    SSM parameter happens to point at now. When an update changes the role ARN,
-    CloudFormation creates the new physical resource first and then sends a
-    cleanup Delete for the OLD id; resolving from SSM at that point returns the
-    NEW arn, so the handler deregistered the role it had just registered and left
-    the stale one in place. Every LF-privileged operation downstream (federated
-    catalog creation during JDBC scans, LF-governed catalog teardown) then failed
-    with authorization errors unrelated-looking to the deploy — and
-    ``contextlib.suppress`` in the caller hid it while the deployment reported
-    success.
+    Delete must deregister the principal this physical resource created, encoded in
+    ``PhysicalResourceId`` (``lf-admin-{arn}``), not the current SSM value: when an update
+    changes the role ARN, CloudFormation sends a cleanup Delete for the OLD id.
 
-    Returns ``None`` when the id carries no ARN (the ``"lf-admin"`` fallback a
-    failed Create returns, or a resource created before the id carried the ARN),
-    in which case there is nothing safe to deregister and Delete is a no-op.
+    Returns ``None`` when the id carries no ARN (the ``"lf-admin"`` fallback a failed
+    Create returns, or a resource created before the id carried the ARN), in which case
+    Delete is a no-op.
     """
     physical_id = event.get("PhysicalResourceId") or ""
     if not physical_id.startswith(_PHYSICAL_ID_PREFIX):
@@ -107,12 +99,9 @@ def _apply(request_type: str, target: str) -> None:
         _lf.put_data_lake_settings(DataLakeSettings=settings)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "AccessDeniedException":
-            # NOT a missing data-lake-admin registration. PutDataLakeSettings is
-            # authorized by the IAM action, which this role is granted — a
-            # non-admin caller holding it can modify the admin list (verified by
-            # direct test against an account with four existing admins). So a
-            # denial here means the ACTION is blocked: an SCP, a permission
-            # boundary, or the grant having been removed from the role.
+            # NOT a missing data-lake-admin registration: PutDataLakeSettings is authorized
+            # by the IAM action, so a denial means the ACTION is blocked (an SCP, a
+            # permission boundary, or the grant removed from the role).
             raise PermissionError(
                 f"lakeformation:PutDataLakeSettings denied for this Lambda role — check for an SCP or "
                 f"permission boundary denying the action (data-lake admin membership is NOT required): {e}"
@@ -121,36 +110,15 @@ def _apply(request_type: str, target: str) -> None:
 
 
 def handler(event: dict, context: object = None) -> dict:
-    """Register or deregister the target IAM role as a Lake Formation admin.
-
-    CloudFormation custom-resource entry point. On Create/Update, resolves and
-    validates the target role ARN from SSM and appends it to the data-lake
-    admins (read-modify-write, preserving existing settings). On Delete, removes
-    it best-effort so an LF error never blocks stack teardown.
-
-    Args:
-        event: Custom-resource event with ``RequestType`` and
-            ``ResourceProperties.RoleArnSsmParameterName``.
-        context: Lambda runtime context (unused).
-
-    Returns:
-        A Provider-framework ``OnEventResponse`` dict carrying
-        ``PhysicalResourceId``.
-    """
+    """Register or deregister the target IAM role as a Lake Formation admin."""
     if event["RequestType"] == "Delete":
-        # Deregister the principal recorded in THIS physical resource's id, not
-        # the current SSM value — see _delete_target. Best-effort: never block
-        # stack deletion on an LF error, but log it, since a swallowed failure
-        # here is how a stale admin silently survives a teardown.
+        # Deregister the principal recorded in this physical resource's id; see
+        # _delete_target. Best-effort: never block stack deletion.
         try:
             target = _delete_target(event)
             if target is not None:
                 _apply("Delete", target)
         except Exception:  # noqa: BLE001 - deliberately non-fatal
-            # ``exc_info`` deliberately: the stack trace is the whole point of
-            # logging here, and printing only the exception type/message discards
-            # it. The Lambda runtime pre-configures the root logger, so this
-            # reaches CloudWatch without any handler setup.
             logger.warning("failed to deregister LF admin on Delete", exc_info=True)
         return {"PhysicalResourceId": event.get("PhysicalResourceId", "lf-admin")}
     target = _target(event)

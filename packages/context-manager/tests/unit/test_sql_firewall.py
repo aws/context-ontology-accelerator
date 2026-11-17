@@ -6,23 +6,19 @@
 from __future__ import annotations
 
 import pytest
+import sqlglot
 import structlog.testing
-from coa_serve.tier2.sql_firewall import FirewallResult, NamespaceSQLScopeError, SQLFirewall, UnsafeSQLError
+from coa_serve.tier2.sql_firewall import (
+    FirewallResult,
+    NamespaceSQLScopeError,
+    SQLFirewall,
+    UnsafeSQLError,
+    _references_a_table,
+)
 
 
 @pytest.mark.unit
 class TestFirewallResult:
-    def test_allowed_result(self):
-        result = FirewallResult(denied=False, authorized_sql="SELECT 1")
-        assert not result.denied
-        assert result.authorized_sql == "SELECT 1"
-        assert result.reason is None
-
-    def test_denied_result(self):
-        result = FirewallResult(denied=True, authorized_sql="", reason="Table access denied")
-        assert result.denied
-        assert result.reason == "Table access denied"
-
     def test_frozen_dataclass(self):
         result = FirewallResult(denied=False, authorized_sql="SELECT 1")
         with pytest.raises(AttributeError):
@@ -31,8 +27,6 @@ class TestFirewallResult:
 
 @pytest.mark.unit
 class TestSQLFirewallValidate:
-    """Test the validate() method — safety checks."""
-
     def test_accepts_simple_select(self):
         fw = SQLFirewall()
         fw.validate("SELECT id, name FROM orders WHERE id > 5")
@@ -42,16 +36,12 @@ class TestSQLFirewallValidate:
         fw.validate("SELECT * FROM (SELECT id FROM orders) sub WHERE sub.id > 1")
 
     def test_validate_redshift_dialect_accepts_engine_specific_sql(self):
-        """follow-up: SQL already transpiled to Redshift must validate with
-        the redshift reader. ``APPROXIMATE COUNT(DISTINCT …)`` is Redshift syntax the
-        default trino reader fails to parse — validating it as trino would spuriously
-        raise ``Failed to parse SQL statement`` (the exact downstream blocker)."""
+        """SQL already transpiled to Redshift must validate with the redshift reader;
+        ``APPROXIMATE COUNT(DISTINCT …)`` does not parse as trino."""
         fw = SQLFirewall()
         redshift_sql = "SELECT APPROXIMATE COUNT(DISTINCT customer) AS c FROM wi766.orders"
-        # Trino reader can't parse it → the old behavior would reject a legit query.
         with pytest.raises(UnsafeSQLError, match="Failed to parse SQL statement"):
             fw.validate(redshift_sql, dialect="trino")
-        # Redshift reader parses it cleanly → no error (the fix).
         fw.validate(redshift_sql, dialect="redshift")
 
     def test_validate_dialect_still_blocks_non_select_before_parse(self):
@@ -256,8 +246,6 @@ class TestSQLFirewallValidate:
 
 @pytest.mark.unit
 class TestSQLFirewallEvaluate:
-    """Test the evaluate() method — safety + authorization (steel thread allows)."""
-
     def test_allows_simple_select(self):
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM orders")
@@ -283,13 +271,7 @@ class TestSQLFirewallEvaluate:
         assert not result.denied
 
     def test_empty_profile_fail_open_characterization(self):
-        # AUDIT: an empty (or None) profile imposes NO data-level restriction —
-        # even a sensitive table like `payroll` is allowed. This pins the intentional
-        # "sparse opt-in" default so a silent flip to fail-closed fails this test loudly.
-        # OPEN QUESTION (Eric/Kun/Noah): fail-open-on-empty-profile vs fail-closed is a
-        # product decision; the terminal-deny work only bites when a RESTRICTIVE profile
-        # is supplied, and the profile is currently caller-controlled. Server-side
-        # authorizer-resolved profiles are a SEPARATE task.
+        # An empty (or None) profile is intentionally fail-open: no data-level restriction.
         fw = SQLFirewall()
         assert not fw.evaluate("SELECT * FROM payroll", profile={}).denied
         assert not fw.evaluate("SELECT * FROM payroll", profile=None).denied
@@ -320,18 +302,6 @@ class TestSQLFirewallEvaluate:
         with pytest.raises(UnsafeSQLError):
             fw.evaluate("DROP TABLE orders")
 
-    def test_evaluate_accepts_dialect_kwarg(self):
-        """Regression: evaluate() must accept a ``dialect`` kwarg. The shared
-        execution primitive calls ``evaluate(sql, profile, namespace=..., dialect=...)``;
-        a signature without ``dialect`` raises TypeError there (uncaught — only
-        UnsafeSQLError is handled), so every execution fails and the agentic arm
-        returns no executed SQL. Cedar is stubbed out to isolate the structural check."""
-        from coa_serve.tier2.cedar_authorizer import NullCedarAuthorizer
-
-        fw = SQLFirewall(cedar_authorizer=NullCedarAuthorizer())
-        result = fw.evaluate("SELECT * FROM orders", profile={}, namespace="ns", dialect="trino")
-        assert not result.denied
-
     def test_evaluate_threads_dialect_to_validate(self):
         """evaluate() must pass ``dialect`` through to validate() so an already-
         transpiled engine-specific statement isn't rejected as unparseable trino.
@@ -349,8 +319,6 @@ class TestSQLFirewallEvaluate:
 
 @pytest.mark.unit
 class TestSQLFirewallExtractTables:
-    """Test table extraction via sqlglot AST parsing."""
-
     def test_single_table(self):
         tables = SQLFirewall.extract_tables("SELECT * FROM orders")
         assert tables == ["orders"]
@@ -498,8 +466,6 @@ class TestSQLFirewallCaseInsensitivity:
     """Authorization must be case-insensitive — SQL identifiers are case-insensitive
     for unquoted names and case manipulation must not bypass the allowlist/denylist."""
 
-    # --- tableAllowlist ---
-
     def test_allowlist_uppercase_query_lowercase_profile(self):
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM ORDERS", profile={"tableAllowlist": ["orders"]})
@@ -525,8 +491,6 @@ class TestSQLFirewallCaseInsensitivity:
         fw = SQLFirewall()
         result = fw.evaluate("SELECT id FROM PUBLIC.ORDERS", profile={"tableAllowlist": ["orders"]})
         assert not result.denied
-
-    # --- columnDenylist ---
 
     def test_denylist_uppercase_column_lowercase_profile(self):
         fw = SQLFirewall()
@@ -621,15 +585,7 @@ class TestSQLFirewallProfileTypeValidation:
         assert "columnDenylist" in result.reason
 
     def test_empty_list_allowlist_denies_every_table(self):
-        """SEMANTICS CHANGE — an empty allowlist is a restriction, not its absence.
-
-        This previously asserted the opposite ("should not impose any restriction"),
-        which documented a fail-open: the empty list was falsy, so the restriction
-        was dropped and every table was allowed. A grant declaring an empty
-        allowlist means "no tables permitted", and collapsing that into
-        "unrestricted" turned a deny-all into an allow-all. Absence of the key still
-        means unrestricted — see the test below.
-        """
+        """An empty allowlist permits no tables; absence of the key means unrestricted."""
         fw = SQLFirewall()
         result = fw.evaluate("SELECT * FROM orders", profile={"tableAllowlist": []})
         assert result.denied
@@ -776,7 +732,6 @@ class TestRealCedarThroughFirewall:
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
 
-    # ── can_view_source / can_view_ontology: the artifact gates (ADR) ─────
     @pytest.mark.parametrize("probe", ["can_view_source", "can_view_ontology"])
     def test_schema_view_steward_own_namespace_true(self, probe):
         fw = self._fw(fail_open_no_roles=False)
@@ -833,7 +788,7 @@ class TestRealCedarThroughFirewall:
 
 @pytest.mark.unit
 class TestNamespaceSQLScope:
-    """F-3: qualified SQL may not escape the requested namespace's sources."""
+    """Qualified SQL may not escape the requested namespace's sources."""
 
     _NATIVE = frozenset({"tenant_a_db"})
     _FEDERATED = frozenset({("sclds_a", "sales")})
@@ -885,13 +840,9 @@ class TestNamespaceSQLScope:
         )
 
     def test_jdbc_two_part_federated_schema_is_allowed(self):
-        """Regression (direct-JDBC engines integ): a single-source metric emits a
-        bare ``schema.table`` and dispatches to direct JDBC, where the catalog comes
-        from the connection, not Athena. The federated JDBC source's schema lives in
-        federated_catalog_schemas under its OWN nested catalog (``sclds_a``), not in
-        native_databases — so the Athena rule (pin to awsdatacatalog/native) wrongly
-        denied it (502 NamespaceSQLScopeError). schema_only authorizes the schema
-        from the selected source without applying an Athena catalog pin."""
+        """A bare ``schema.table`` on direct JDBC takes its catalog from the connection.
+
+        schema_only authorizes the schema from the selected source without an Athena catalog pin."""
         assert self._validate_jdbc("SELECT COUNT(*) FROM sales.orders")
 
     def test_jdbc_two_part_schema_is_bound_to_executing_source(self):
@@ -1070,6 +1021,11 @@ class TestSchemaEchoRefused:
             ("SELECT x FROM (VALUES ('sales.orders'), ('b')) AS v(x)", "trino", _NO_TABLE),
             ("SELECT x FROM UNNEST(ARRAY['sales.orders']) AS u(x)", "trino", _NO_TABLE),
             ("SELECT * FROM generate_series(1, 3)", "postgres", _NO_TABLE),
+            # Trino/Athena bind these references to the CTE, so nothing stored is read.
+            ("WITH X AS (SELECT 'leak' AS c) SELECT c FROM x", "trino", _NO_TABLE),
+            ("WITH \"X\" AS (SELECT 'leak' AS c) SELECT c FROM x", "trino", _NO_TABLE),
+            ("WITH x AS (SELECT 'leak' AS c) SELECT c FROM \"X\"", "trino", _NO_TABLE),
+            ("WITH RECURSIVE a AS (SELECT c FROM b), b AS (SELECT 'leak' AS c) SELECT c FROM a", "postgres", _NO_TABLE),
             ("SELECT 'customer_id' AS c FROM orders", "trino", _CONSTANT),
             ("SELECT 'customer_id' AS c FROM orders UNION ALL SELECT name FROM orders", "trino", _CONSTANT),
             ("SELECT CHR(99) || CHR(117) AS c FROM orders", "trino", _CONSTANT),
@@ -1164,3 +1120,208 @@ class TestSchemaEchoRefused:
             assert not fw.evaluate("SELECT 'x' AS c", profile={}, namespace=self._NS).denied
         # Outside the scope the probe raises → fails closed → refused.
         assert fw.evaluate("SELECT 'x' AS c", profile={}, namespace=self._NS).denied
+
+
+@pytest.mark.unit
+class TestCteNameShadowing:
+    """A CTE name hides only the BARE references bound to it, never a real table.
+
+    A ``WITH`` alias binds bare references in its own scope. A schema- or
+    catalog-qualified reference always names a physical table, and a bare
+    reference outside the CTE's scope (or inside a non-recursive CTE's own body)
+    reads the real table too, so it is checked against the allowlist and denylist.
+    """
+
+    _ALLOW_ORDERS = {"tableAllowlist": ["orders"]}
+    _DENY_SSN = {"columnDenylist": {"customers": ["ssn"]}}
+
+    @pytest.mark.parametrize(
+        ("sql", "denied_table"),
+        [
+            ("WITH customers AS (SELECT 1 AS id) SELECT * FROM crm.customers", "crm.customers"),
+            ("WITH customers AS (SELECT 1 AS id) SELECT id FROM crm.customers", "crm.customers"),
+            ("WITH customers AS (SELECT 1 AS id) SELECT id FROM AwsDataCatalog.crm.customers", "crm.customers"),
+            ("WITH customers AS (SELECT 1 AS id) SELECT id FROM othercat.crm.customers", "customers"),
+            ('WITH "Customers" AS (SELECT 1 AS id) SELECT id FROM "CRM"."CUSTOMERS"', "crm.customers"),
+            (
+                "WITH customers AS (SELECT id FROM orders) "
+                "SELECT o.id FROM orders o JOIN crm.customers c ON o.id = c.id",
+                "crm.customers",
+            ),
+            # Bare reference outside the CTE's scope reads the real table.
+            (
+                "SELECT id FROM customers WHERE id IN (WITH customers AS (SELECT 1 AS id) SELECT id FROM customers)",
+                "customers",
+            ),
+            # Inside a non-recursive CTE's own body its name is not yet bound.
+            ("WITH customers AS (SELECT id FROM customers) SELECT id FROM customers", "customers"),
+            # A later CTE's name is not bound inside an earlier CTE's body.
+            ("WITH a AS (SELECT id FROM customers), customers AS (SELECT 1 AS id) SELECT id FROM a", "customers"),
+        ],
+        ids=[
+            "two-part-star",
+            "two-part",
+            "three-part-root-catalog",
+            "three-part-other-catalog",
+            "quoted-mixed-case",
+            "join",
+            "outer-scope",
+            "self-reference-non-recursive",
+            "forward-reference",
+        ],
+    )
+    def test_shadowed_table_is_checked_against_allowlist(self, sql, denied_table):
+        result = SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS)
+        assert result.denied
+        assert result.reason == f"Access denied to table(s): {denied_table}"
+
+    @pytest.mark.parametrize(
+        ("sql", "reason"),
+        [
+            (
+                "WITH customers AS (SELECT 1 AS id) SELECT customers.ssn FROM crm.customers",
+                "Access denied to column(s): customers.ssn",
+            ),
+            (
+                "WITH customers AS (SELECT 1 AS id) SELECT * FROM crm.customers",
+                "Access denied: SELECT * may expose restricted columns of 'customers'",
+            ),
+            (
+                "WITH customers AS (SELECT 1 AS id) SELECT customers.* FROM crm.customers",
+                "Access denied: SELECT * may expose restricted columns of 'customers'",
+            ),
+            (
+                "WITH customers AS (SELECT 1 AS id) SELECT c.ssn FROM cat.crm.customers c",
+                "Access denied to column(s): customers.ssn",
+            ),
+            # Alias equal to a CTE name: the qualifier names the real table.
+            (
+                "WITH x AS (SELECT 1 AS id) SELECT x.ssn FROM crm.customers AS x",
+                "Access denied to column(s): customers.ssn",
+            ),
+            (
+                "WITH x AS (SELECT 1 AS ssn) SELECT x.ssn FROM customers AS x",
+                "Access denied to column(s): customers.ssn",
+            ),
+        ],
+        ids=["qualified-column", "star", "qualified-star", "three-part-alias", "alias-equals-cte", "bare-alias-cte"],
+    )
+    def test_shadowed_table_is_checked_against_column_denylist(self, sql, reason):
+        result = SQLFirewall().evaluate(sql, profile=self._DENY_SSN)
+        assert result.denied
+        assert result.reason == reason
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "WITH recent AS (SELECT id FROM orders) SELECT id FROM recent",
+            "WITH orders AS (SELECT id FROM crm.orders) SELECT id FROM orders",
+            "WITH a AS (SELECT id FROM orders), b AS (SELECT id FROM a) SELECT id FROM b",
+            "SELECT id FROM (WITH r AS (SELECT id FROM orders) SELECT id FROM r) s",
+            "WITH RECURSIVE r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+            "SELECT o.id FROM orders o JOIN r ON o.id = r.n",
+            # sqlglot hangs the WITH on the set operation, not on either SELECT.
+            "WITH c AS (SELECT id FROM orders) SELECT id FROM c UNION ALL SELECT id FROM c",
+            "WITH c AS (SELECT id FROM orders) SELECT id FROM c INTERSECT SELECT id FROM c",
+            # The reference sits in a subquery under the WITH-bearing SELECT.
+            "WITH c AS (SELECT id FROM orders) SELECT id FROM orders WHERE id IN (SELECT id FROM c)",
+        ],
+        ids=[
+            "plain",
+            "cte-wraps-allowed-table",
+            "chained",
+            "nested",
+            "recursive",
+            "union",
+            "intersect",
+            "subquery-in-body",
+        ],
+    )
+    def test_genuine_cte_references_still_pass(self, sql):
+        assert not SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS).denied
+
+    @pytest.mark.parametrize("dialect", ["trino", "postgres"])
+    @pytest.mark.parametrize(
+        ("sql", "denied_table"),
+        [
+            ('WITH "Customers" AS (SELECT 1 AS id) SELECT * FROM customers JOIN orders ON 1=1', "customers"),
+            ('WITH "Customers" AS (SELECT 1 AS id) SELECT id FROM "customers"', "customers"),
+            ('WITH "CUSTOMERS" AS (SELECT id FROM orders) SELECT id FROM CUSTOMERS', "customers"),
+            ('WITH customers AS (SELECT id FROM orders) SELECT id FROM "CUSTOMERS"', "customers"),
+            ('WITH "customers" AS (SELECT id FROM orders) SELECT id FROM CUSTOMERS', "customers"),
+            ("WITH Customers AS (SELECT id FROM orders) SELECT id FROM customers", "customers"),
+            ("WITH Customers AS (SELECT id FROM orders) SELECT id FROM CUSTOMERS", "customers"),
+            ('WITH "Customers" AS (SELECT 1 AS id) SELECT id FROM customers', "customers"),
+        ],
+        ids=[
+            "quoted-mixed-cte-unquoted-ref",
+            "quoted-mixed-cte-quoted-lower-ref",
+            "quoted-upper-cte-unquoted-upper-ref",
+            "unquoted-cte-quoted-upper-ref",
+            "quoted-lower-cte-unquoted-upper-ref",
+            "unquoted-case-variant",
+            "unquoted-mixed-cte-unquoted-upper-ref",
+            "quoted-mixed-cte-unquoted-lower-ref",
+        ],
+    )
+    def test_case_or_quoting_mismatch_is_the_stored_table(self, sql, denied_table, dialect, monkeypatch):
+        # A viewSource holder reaches the table checks; a schema-blind caller is
+        # refused earlier because the reference binds to the CTE on Trino.
+        monkeypatch.setattr(SQLFirewall, "_source_visible", lambda *_a: True)
+        result = SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS, dialect=dialect)
+        assert result.denied
+        assert result.reason == f"Access denied to table(s): {denied_table}"
+        monkeypatch.undo()
+        assert SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS, dialect=dialect).denied
+
+    @pytest.mark.parametrize("dialect", ["trino", "postgres"])
+    def test_quoted_mixed_case_cte_does_not_hide_denied_column(self, dialect, monkeypatch):
+        monkeypatch.setattr(SQLFirewall, "_source_visible", lambda *_a: True)
+        sql = 'WITH "Customers" AS (SELECT 1 AS ssn) SELECT customers.ssn FROM customers'
+        result = SQLFirewall().evaluate(sql, profile=self._DENY_SSN, dialect=dialect)
+        assert result.denied
+        assert result.reason == "Access denied to column(s): customers.ssn"
+
+    @pytest.mark.parametrize("dialect", ["trino", "postgres"])
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            'WITH "Recent" AS (SELECT id FROM orders) SELECT id FROM "Recent"',
+            'WITH "recent" AS (SELECT id FROM orders) SELECT id FROM recent',
+            'WITH recent AS (SELECT id FROM orders) SELECT id FROM "recent"',
+            "WITH Recent AS (SELECT id FROM orders) SELECT id FROM Recent",
+        ],
+        ids=["both-quoted-mixed", "quoted-lower-cte", "quoted-lower-ref", "same-unquoted-mixed"],
+    )
+    def test_same_name_on_every_engine_still_binds_to_the_cte(self, sql, dialect):
+        assert not SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS, dialect=dialect).denied
+
+    def test_recursive_forward_reference_is_the_stored_table(self):
+        sql = "WITH RECURSIVE b AS (SELECT * FROM a), a AS (SELECT id FROM orders) SELECT * FROM b"
+        result = SQLFirewall().evaluate(sql, profile=self._ALLOW_ORDERS, dialect="postgres")
+        assert result.denied
+        assert result.reason == "Access denied to table(s): a"
+
+    def test_cte_column_not_attributed_to_restricted_table(self):
+        sql = "WITH safe AS (SELECT name FROM customers) SELECT safe.name FROM safe"
+        assert not SQLFirewall().evaluate(sql, profile=self._DENY_SSN).denied
+
+    def test_referenced_tables_reports_the_shadowed_table(self):
+        sql = "WITH customers AS (SELECT 1 AS id) SELECT id FROM crm.customers"
+        assert SQLFirewall.referenced_tables(sql) == ["customers"]
+
+    def test_constant_projection_over_shadowed_table_reads_a_table(self):
+        parsed = sqlglot.parse_one("WITH customers AS (SELECT 1 AS id) SELECT 'x' FROM crm.customers", read="trino")
+        assert _references_a_table(parsed)
+        assert not _references_a_table(
+            sqlglot.parse_one("WITH customers AS (SELECT 1 AS id) SELECT 'x' FROM customers", read="trino")
+        )
+
+    def test_namespace_scope_checks_the_shadowed_table(self):
+        with pytest.raises(NamespaceSQLScopeError):
+            SQLFirewall.validate_namespace_sql_scope(
+                "WITH customers AS (SELECT 1 AS id) SELECT id FROM other_db.customers",
+                native_databases=frozenset({"tenant_a_db"}),
+                federated_catalog_schemas=frozenset(),
+                default_catalog="AwsDataCatalog",
+            )

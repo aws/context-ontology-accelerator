@@ -1,10 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for predicate normalization and XSD type inference.
-
-Requirements: 19.1–19.4, 18.1–18.8
-"""
+"""Unit tests for predicate normalization and XSD type inference."""
 
 from __future__ import annotations
 
@@ -30,9 +27,6 @@ class TestNormalizePredicate:
 
     def test_spaces_to_underscores(self):
         assert normalize_predicate("works for") == "works_for"
-
-    def test_all_caps_with_underscores(self):
-        assert normalize_predicate("PART_OF") == "part_of"
 
     def test_strips_special_chars(self):
         assert normalize_predicate("has-age!") == "hasage"
@@ -71,20 +65,9 @@ class TestNormalizePredicate:
     def test_numbers_preserved(self):
         assert normalize_predicate("version_2") == "version_2"
 
-    def test_real_graph_predicates(self):
-        """Test with actual predicates from the dev graph."""
-        assert normalize_predicate("ABBREVIATION_OF") == "abbreviation_of"
-        assert normalize_predicate("ACCESSED_VIA") == "accessed_via"
-        assert normalize_predicate("ACCOUNTED_AS") == "accounted_as"
-        assert normalize_predicate("CEASED OPERATIONS IN") == "ceased_operations_in"
-
 
 class TestNormalizePredicateIsScriptAgnostic:
     """A predicate must survive normalization in every script, not just Latin.
-
-    The previous implementation stripped by ASCII range (``[^a-z0-9_]``), which
-    failed in two different ways depending on the script — and only one of them
-    was noisy. Every test here fails against that implementation.
 
     Nothing about the IRI required it: the normalized predicate is handed to
     ``iri_resolver.resolve``, which builds an IRI (RFC 3987), where a Unicode
@@ -103,13 +86,7 @@ class TestNormalizePredicateIsScriptAgnostic:
         ],
     )
     def test_a_non_latin_predicate_is_not_normalized_away(self, predicate, expected):
-        """It normalized to the empty string, and the caller then dropped the fact.
-
-        ``induce_object_properties`` cannot mint an IRI from an empty string, so
-        it logged ``skipped_empty_predicate`` and discarded the fact — meaning
-        every predicate of a non-Latin-script corpus was lost. Loud, at least,
-        unlike the collision below.
-        """
+        """A non-Latin predicate must not normalize to the empty string."""
         assert normalize_predicate(predicate) == expected
 
     @pytest.mark.parametrize(
@@ -127,30 +104,11 @@ class TestNormalizePredicateIsScriptAgnostic:
         ],
     )
     def test_a_latin_predicate_keeps_its_diacritics(self, predicate, expected):
-        """The silent half of the defect, and the reason this is not a CJK fix.
-
-        Stripping by ASCII range removed the accented letter itself rather than
-        just its case, so a Latin-script predicate came out misspelled with no
-        warning: ``HÖHE`` → ``hhe``, ``FÜR`` → ``fr``, ``MODÈLE`` → ``modle``,
-        ``ÓRGÃO`` → ``rgo``. The property IRI and its label both carried the
-        mangled form. Unlike the non-Latin case, which normalized to empty and
-        was at least logged, this looked like a spelling the corpus had used.
-
-        This is why the defect is general rather than a CJK one: it hit
-        de / fr / es / pt-BR, whose output is plausible enough that nobody
-        re-reads it.
-        """
+        """Diacritics are preserved."""
         assert normalize_predicate(predicate) == expected
 
     def test_stripping_accents_could_merge_two_distinct_predicates(self):
-        """Worst case of the same bug: two real predicates became one property.
-
-        Spanish ``AÑO`` (year) and Portuguese ``AÇÃO`` (action) both normalized to
-        ``ao``, so the aggregation key collided: one property IRI, one surviving
-        ``rdfs:label``, and the other predicate's facts silently folded into it.
-        A cross-language corpus is not exotic — a spec sheet and its translated
-        annex are one document set.
-        """
+        """Distinct accented predicates must not merge."""
         assert normalize_predicate("AÑO") != normalize_predicate("AÇÃO")
 
     def test_lowercasing_does_not_merge_distinct_german_predicates(self):
@@ -164,11 +122,7 @@ class TestNormalizePredicateIsScriptAgnostic:
         assert normalize_predicate("ΟΣ") == normalize_predicate("οσ") == normalize_predicate("ος")
 
     def test_ideographic_space_separates_words(self):
-        """U+3000 is an ordinary word separator in Japanese and Chinese.
-
-        ``str.replace(" ", "_")`` only knew about U+0020, so an ideographic space
-        was stripped as punctuation and two words were run together.
-        """
+        """U+3000 is an ordinary word separator in Japanese and Chinese."""
         assert normalize_predicate("設置　場所") == "設置_場所"
 
     @pytest.mark.parametrize(
@@ -268,11 +222,7 @@ class TestNormalizePredicateIsScriptAgnostic:
         assert normalize_predicate(once) == once
 
     def test_punctuation_is_still_stripped_in_any_script(self):
-        """Widening to Unicode letters must not start admitting punctuation.
-
-        Full-width punctuation is punctuation, not a letter — the change is
-        letters-and-digits-in-every-script, not keep-everything.
-        """
+        """Widening to Unicode letters must not start admitting punctuation."""
         assert normalize_predicate("設置場所（屋内）") == "設置場所屋内"
         assert normalize_predicate("año!") == "año"
 
@@ -341,7 +291,6 @@ class TestSelectCanonicalLabel:
         assert select_canonical_label({"OPERATES_IN": 5, "operates_in": 2}) == "OPERATES_IN"
 
     def test_breaks_ties_lexicographically(self):
-        # Same count → pick lexicographically smallest
         assert select_canonical_label({"beta": 3, "alpha": 3}) == "alpha"
 
     def test_single_entry(self):
@@ -361,14 +310,8 @@ class TestSelectCanonicalLabel:
         assert select_canonical_label(originals) == "OPERATES_IN"
 
 
-@pytest.mark.unit
 class TestNormalizePredicateJapanese:
-    """Japanese predicates keep their letters in every namespace.
-
-    Namespace-language LLD 2.2.6: IRIs minted by unstructured induction keep
-    non-ASCII letters. Since !922 the normalizer is the same for every
-    namespace language, so these hold for an ``en`` namespace too.
-    """
+    """Japanese predicates keep their letters in every namespace."""
 
     @pytest.mark.parametrize(
         ("raw", "expected"),

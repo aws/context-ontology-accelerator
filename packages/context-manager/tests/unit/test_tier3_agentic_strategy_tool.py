@@ -1,29 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Retrieval_Strategy_Tool layer (task 6).
-
-Covers ``coa_serve.tier3.agentic.tools.strategy_tool``:
-
-- :func:`build_strategy_tools` registers exactly one Tool per
-  ``RetrieverStrategy`` enum member, each named ``strategy:<value>`` (Req 2.2),
-  and each Tool presents the four required interface fields (Req 11.1).
-- :meth:`RetrievalStrategyTool.invoke` delegates to the wrapped
-  ``BaselineLexicalRetriever`` and returns the native chunks/entities plus their
-  normalized ``items`` (Req 5.1).
-- An adapter error/timeout (the adapter degrades to an empty result with an
-  error trace step, or — defensively — raises) surfaces as a degraded
-  :class:`ToolResult`; the Tool NEVER raises (Req 9.1-9.2).
-- Module load of ``strategy_tool`` does NOT import ``graphrag_toolkit``
-  (Req 12.3).
-
-The adapter is mocked with a lightweight fake exposing the same ``retrieve``
-coroutine and a ``BaselineResult``-shaped return (``.chunks`` / ``.entities`` /
-``.trace_steps``), so the invoke-path tests need no ``graphrag_toolkit`` access.
-The one-tool-per-strategy test does enumerate the real ``RetrieverStrategy``
-enum (which transitively imports the toolkit) — but at test-run time, never at
-module load, preserving the invariant the dedicated subprocess test asserts.
-"""
+"""Unit tests for the Retrieval_Strategy_Tool layer (``coa_serve.tier3.agentic.tools.strategy_tool``)."""
 
 from __future__ import annotations
 
@@ -38,9 +16,7 @@ from coa_serve.tier3.agentic.tools.strategy_tool import (
     build_strategy_tools,
 )
 
-# The seven non-deprecated graphrag-toolkit strategies (mirrors
-# ``RetrieverStrategy``); kept as plain strings so most tests need no enum/
-# toolkit import.
+# The ``RetrieverStrategy`` values as plain strings, so most tests need no toolkit import.
 _STRATEGY_VALUES = (
     "chunk_based",
     "chunk_based_semantic",
@@ -74,39 +50,21 @@ def _baseline_result(*, chunks=(), entities=(), trace_steps=(), dropped_anonymou
 
 
 class FakeStrategy:
-    """A ``RetrieverStrategy``-shaped stand-in exposing only ``.value``.
-
-    ``RetrievalStrategyTool`` reads only ``strategy.value`` at construction (for
-    the name and description), so a fake member is sufficient for the
-    construction/interface tests and needs no toolkit import. The invoke-path
-    tests, by contrast, use a REAL :class:`RetrieverStrategy` member (via
-    :func:`_real_strategy`) because ``invoke`` resolves the strategy's
-    ``StrategySpec`` from the real ``STRATEGY_REGISTRY``.
-    """
+    """A ``RetrieverStrategy``-shaped stand-in exposing only ``.value``."""
 
     def __init__(self, value: str) -> None:
         self.value = value
 
 
 def _real_strategy(value: str):
-    """Return the real ``RetrieverStrategy`` member for ``value``.
-
-    Lazily imports the enum (which transitively imports the toolkit) — at
-    test-run time, never at this module's load — so the invoke path resolves a
-    genuine ``StrategySpec`` exactly as in production.
-    """
+    """Return the real ``RetrieverStrategy`` member for ``value`` (imported lazily)."""
     from coa_serve.lexical.strategies import RetrieverStrategy
 
     return RetrieverStrategy(value)
 
 
 class FakeLexical:
-    """Mock of ``BaselineLexicalRetriever`` capturing the last ``retrieve`` call.
-
-    ``retrieve`` either returns the configured ``BaselineResult`` stand-in or, when
-    ``raises`` is set, raises it — letting a single fake exercise both the normal
-    path and the defensive never-raise guard.
-    """
+    """Mock of ``BaselineLexicalRetriever`` capturing the last ``retrieve`` call."""
 
     def __init__(self, result=None, *, raises: Exception | None = None) -> None:
         self._result = result if result is not None else _baseline_result()
@@ -118,9 +76,6 @@ class FakeLexical:
         if self._raises is not None:
             raise self._raises
         return self._result
-
-
-# ── Interface fields & naming ──────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -138,7 +93,7 @@ class TestToolInterface:
 
     def test_unknown_strategy_value_still_gets_a_description(self):
         """An unmapped value gets a generic (still non-empty) description so the
-        Tool remains registrable (Req 11.1)."""
+        Tool remains registrable."""
         tool = RetrievalStrategyTool(FakeStrategy("some_future_strategy"), FakeLexical())
         assert "some_future_strategy" in tool.description
 
@@ -148,13 +103,10 @@ class TestToolInterface:
         assert isinstance(tool.output_schema, dict)
 
     def test_is_registrable_as_a_tool(self):
-        """A strategy tool satisfies the registry's four-field contract (Req 11.1)."""
+        """A strategy tool satisfies the registry's four-field contract."""
         registry = ToolRegistry()
         registry.register(RetrievalStrategyTool(FakeStrategy("chunk_based"), FakeLexical()))
         assert registry.names() == ["strategy:chunk_based"]
-
-
-# ── invoke() returns chunks/entities ───────────────────────────────
 
 
 @pytest.mark.unit
@@ -209,14 +161,11 @@ class TestInvokeReturnsResults:
         assert "0 chunks, 0 entities" in out.detail
 
 
-# ── Degraded / never-raises (Req 9.1-9.2) ──────────────────────────
-
-
 @pytest.mark.unit
 class TestDegradedNeverRaises:
     async def test_adapter_error_trace_step_surfaces_as_degraded(self):
         """The adapter returns an empty result + error trace step on timeout/error;
-        the Tool surfaces a degraded ToolResult and does not raise (Req 9.1-9.2)."""
+        the Tool surfaces a degraded ToolResult and does not raise."""
         lexical = FakeLexical(
             _baseline_result(
                 trace_steps=(
@@ -274,16 +223,10 @@ class TestDegradedNeverRaises:
         assert out.degraded_reason == "error"
 
 
-# ── Builder: one tool per strategy (Req 2.2) ───────────────────────
-
-
 @pytest.mark.unit
 class TestBuildStrategyTools:
     def test_registers_one_tool_per_strategy_named_strategy_value(self):
-        """Exactly one Tool per RetrieverStrategy member, named ``strategy:<value>``.
-
-        Enumerates the real enum (transitively imports the toolkit at run time —
-        never at module load, per the dedicated subprocess test below)."""
+        """Exactly one Tool per RetrieverStrategy member, named ``strategy:<value>``."""
         registry = ToolRegistry()
         lexical = FakeLexical()
 
@@ -292,7 +235,6 @@ class TestBuildStrategyTools:
         expected = [f"strategy:{v}" for v in _STRATEGY_VALUES]
         assert sorted(names) == sorted(expected)
         assert sorted(registry.names()) == sorted(expected)
-        assert len(registry.names()) == 8
 
     def test_each_registered_tool_has_required_interface_fields(self):
         registry = ToolRegistry()
@@ -320,9 +262,6 @@ class TestBuildStrategyTools:
         assert getattr(passed.name, "value", passed.name) == "chunk_based"
 
 
-# ── Lazy-import invariant (Req 12.3) ───────────────────────────────
-
-
 @pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_strategy_tool_does_not_import_graphrag(self):
@@ -330,7 +269,7 @@ class TestLazyImportInvariant:
 
         Runs in a fresh subprocess (current ``sys.path`` propagated) so a
         ``graphrag_toolkit`` already imported by a sibling test cannot mask a
-        regression (mirrors the task-1 invariant test)."""
+        regression."""
         code = (
             "import sys; "
             "import coa_serve.tier3.agentic.tools.strategy_tool; "

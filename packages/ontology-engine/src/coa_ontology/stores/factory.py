@@ -63,13 +63,3 @@ def build_stores(namespace: str | None = None) -> tuple[GraphStore, VectorStore]
 
     _store_cache[namespace] = pair
     return pair
-
-
-def get_graph_store() -> GraphStore:
-    """Return the graph store for the configured backend."""
-    return build_stores()[0]
-
-
-def get_vector_store() -> VectorStore:
-    """Return the vector store for the configured backend."""
-    return build_stores()[1]

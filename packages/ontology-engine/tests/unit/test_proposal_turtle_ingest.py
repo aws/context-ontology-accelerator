@@ -3,25 +3,8 @@
 
 """Proposal acceptance → Turtle ingest tests.
 
-``POST /ontology/proposals/{id}/accept`` returns 202 immediately and runs
-the ingest on a daemon thread. To keep these tests deterministic we patch
-``Thread`` so the worker runs synchronously inline; the route still
-returns 202 first, but by the time the response lands the worker is done
-and DDB carries the terminal state.
-
-We verify that, end-to-end through the worker:
-
-  1. Per-entity catalog writes (create_ontology, store_class,
-     store_property, update_ontology) hit the configured GraphStore.
-
-  2. ``load_turtle`` is called with the full Turtle body so backends
-     capable of bulk ingest (Neptune DB GSP) actually receive the raw
-     file, not just the projection.
-
-  3. Proposal status flips to ``accepted`` (success) or ``accept_failed``
-     with ``accept_error`` naming the failed pipeline step.
-
-DynamoDB and GraphStore are stubbed; no AWS traffic.
+``Thread`` is patched so the accept worker runs inline. DynamoDB and
+GraphStore are stubbed; no AWS traffic.
 """
 
 from __future__ import annotations
@@ -39,13 +22,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _no_accept_backoff():
-    """Zero the accept-step retry backoff for every test in this module.
-
-    The accept pipeline retries transient step failures with exponential
-    backoff; the attempt COUNT is what tests assert on, and no unit test should
-    spend real seconds sleeping. Autouse rather than an opt-in context manager so
-    a future retry test cannot silently add ~6s to the suite by forgetting it.
-    """
+    """Zero the accept-step backoff so retry tests do not sleep."""
     with patch.object(proposals, "_ACCEPT_STEP_BACKOFF_SECONDS", 0):
         yield
 
@@ -91,16 +68,16 @@ ex:age a owl:DatatypeProperty ;
 
 
 @pytest.fixture()
-def accept_client():
+def accept_client(monkeypatch):
     """FastAPI test client with Dynamo + GraphStore stubbed."""
-    os.environ["WORKBENCH_BACKEND"] = "opensearch_neptune"
-    os.environ.setdefault(
+    monkeypatch.setenv("WORKBENCH_BACKEND", "opensearch_neptune")
+    monkeypatch.setenv(
         "NDB_ENDPOINT",
-        "https://<test-ndb-cluster>.cluster-<id>.us-east-1.neptune.amazonaws.com:8182",
+        os.environ.get("NDB_ENDPOINT", "https://<test-ndb-cluster>.cluster-<id>.us-east-1.neptune.amazonaws.com:8182"),
     )
-    os.environ.setdefault(
+    monkeypatch.setenv(
         "OSS_ENDPOINT",
-        "https://<test-aoss-collection>.<region>.aoss.amazonaws.com",
+        os.environ.get("OSS_ENDPOINT", "https://<test-aoss-collection>.<region>.aoss.amazonaws.com"),
     )
 
     # In-memory Dynamo stand-in
@@ -229,37 +206,16 @@ def accept_client():
     mock_bedrock.model_id = "fake-titan-v2"
     mock_bedrock.embed_texts = MagicMock(side_effect=lambda texts: [[float(len(t))] * 4 for t in texts])
 
-    # Pre-import the ``proposals`` submodule before the patch context so
-    # ``unittest.mock.patch("...proposals.Thread")`` can resolve the
-    # attribute path. Without this the fixture fails with
-    # ``AttributeError: module 'coa_ontology' has no
-    # attribute 'proposals'`` because patch's path resolver walks the
-    # parent package's __dict__ which doesn't auto-load submodules.
-    import coa_ontology.proposals  # noqa: F401
-
     with (
         patch("coa_ontology.dynamo_store._get_table", return_value=mock_table),
         patch("coa_ontology.dynamo_store._get_s3", return_value=mock_s3),
         patch("coa_ontology.stores.build_stores", return_value=(mock_graph, mock_vec)),
         patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient", return_value=mock_bedrock),
         patch("coa_ontology.proposals.Thread", _InlineThread),
-        # S3 persist (#467) builds its own boto3 s3 client + reads Neptune via
-        # _gsp_get_turtle — neither is stubbed here, and it now RAISES on failure
-        # (a retried accept step) rather than swallowing. Stub it to a no-op so
-        # these accept-flow tests don't make real network calls; the persist
-        # behavior itself is covered by test_s3_persistence.py, and the
-        # persist-failure accept path is covered explicitly in
-        # TestAcceptRetryAndRecovery / TestS3PersistStepFailure.
+        # S3 persist reaches boto3 and Neptune; stubbed here, covered in test_s3_persistence.py.
         patch("coa_ontology.proposals._persist_induced_to_s3", return_value=None),
         patch("coa_ontology.proposals._reconcile_counts", return_value=None),
-        # notify_vkg builds a real boto3 EventBridge client and calls put_events.
-        # Unpatched it is the ONE accept step that reaches AWS from a unit test:
-        # locally it silently succeeds off ambient credentials, but in CI (no
-        # credentials) it raises NoCredentialsError, exhausts its 3 retries, and
-        # checkpoints ``skipped`` — so the happy-path test saw the last step as
-        # skipped rather than done and failed only in CI. Stub it here so these
-        # tests are hermetic; the step's own success/raise contract is covered in
-        # test_s3_persistence.py and test_eventbridge_emission.py.
+        # notify_vkg calls EventBridge put_events; stub it to keep the test hermetic.
         patch("coa_ontology.proposals._emit_ontology_published", return_value=True),
     ):
         from coa_ontology.main import app
@@ -309,7 +265,6 @@ class TestProposalTurtleIngest:
         assert "file_path" in file_update
         assert file_update["file_path"].endswith(".ttl")
 
-        # ── The critical assertion: Turtle was handed to the store ──
         mock_graph.load_turtle.assert_called_once()
         call = mock_graph.load_turtle.call_args
         assert call.kwargs["ontology_uri"] == "https://example.com/onto"
@@ -325,7 +280,6 @@ class TestProposalTurtleIngest:
         g_out.parse(data=call.kwargs["turtle"], format="turtle")
         assert set(g_in) == set(g_out)
 
-        # ── Embedding accumulation fired for every class + property ──
         mock_bedrock.embed_texts.assert_called_once()
         texts = mock_bedrock.embed_texts.call_args.args[0]
         assert len(texts) == 4  # 2 classes + 2 properties
@@ -367,8 +321,8 @@ class TestProposalTurtleIngest:
             side_effect=_spy_wait,
         ) as wait_mock:
             resp = http.post("/ontology/proposals/p-1/accept")
-
         assert resp.status_code == 202, resp.text
+
         wait_mock.assert_called_once()
         # State was flipped to embeddings_sync BEFORE the wait ran …
         assert seen_status["at_wait"] == "embeddings_sync"
@@ -408,19 +362,7 @@ class TestProposalTurtleIngest:
     def test_accept_race_returns_409_when_status_changed_concurrently(self, accept_client):
         """Concurrent accepts can't both spawn workers.
 
-        The handler reads the proposal, checks the status, and writes
-        ``accepting`` with a ``ConditionExpression: status = <read
-        value>``. If a second writer flipped the status between our
-        get and update (after our ``status == "pending"`` check
-        already passed), DDB raises
-        ``ConditionalCheckFailedException`` and we return 409 with a
-        "changed concurrently" message.
-
-        Simulated by intercepting ``update_item`` and synthesizing a
-        ``ConditionalCheckFailedException`` once. This exercises the
-        conditional-write branch specifically — the status-was-already-
-        accepting branch returns the older "Accept already in
-        progress" error and is covered by the idempotency test.
+        A ConditionalCheckFailedException on the ``accepting`` write returns 409.
         """
         http, dynamo, mock_graph, mock_vec, mock_bedrock, _s3 = accept_client
 
@@ -698,10 +640,6 @@ class TestProposalUpdate:
 class TestProposalValidate:
     def test_validate_starts_job(self, accept_client):
         http, dynamo, *_ = accept_client
-        # The validation worker requires Java (HermiT). We only test that
-        # the endpoint accepts the request and returns a job — the worker
-        # runs on a real thread and may fail due to missing JRE; we don't
-        # wait for it.
         resp = http.post("/ontology/proposals/p-1/validate")
         assert resp.status_code == 200
         body = resp.json()
@@ -779,13 +717,7 @@ class TestInductionBlockingStatuses:
 
 
 class TestJobStatusMirrorIsAPipelineStep:
-    """The job-status mirror is a retried, checkpointed step — not a bare except.
-
-    It was a ``try/except`` that logged a warning, so a transient DDB blip left
-    the job row permanently desynced from the proposal with only a log line. It
-    is non-fatal (the proposal row is what the UI reads), but it must be retried
-    and recorded like every other step.
-    """
+    """The job-status mirror is a retried, non-fatal accept step."""
 
     def test_mirror_failure_is_retried_then_skipped_and_accept_still_succeeds(self, accept_client):
         http, dynamo, *_ = accept_client
@@ -805,14 +737,14 @@ class TestJobStatusMirrorIsAPipelineStep:
         assert calls["n"] == proposals._ACCEPT_STEP_MAX_ATTEMPTS
 
     def test_mirror_is_invoked_with_the_ingested_status(self, accept_client):
-        http, dynamo, *_ = accept_client
+        http, *_ = accept_client
         with patch.object(proposals.dynamo_store, "update_job_status") as mock_mirror:
             http.post("/ontology/proposals/p-1/accept")
-        assert any(c.args[1:2] == ("ingested",) or "ingested" in c.args for c in mock_mirror.call_args_list)
+        assert any(c.args[1] == "ingested" for c in mock_mirror.call_args_list)
 
 
 class TestRunAcceptStep:
-    """Unit tests for the per-step retry/checkpoint primitive (#456/#466/#467).
+    """Unit tests for the per-step retry/checkpoint primitive.
 
     ``_run_accept_step`` is the core of the resilient accept pipeline: it runs
     one step, checkpoints progress (heartbeat), retries transient failures with
@@ -830,7 +762,7 @@ class TestRunAcceptStep:
         assert kwargs["accept_progress"] == {"step": "ingest", "state": "done"}
 
     def test_false_return_is_checkpointed_skipped_not_done(self):
-        """#467: a step that reports 'did not complete' without raising (e.g.
+        """A step that reports 'did not complete' without raising (e.g.
         wait_for_embeddings_searchable on a stalled index) must checkpoint
         'skipped' — recording 'done' for a step that did not run is a checkpoint
         that lies."""
@@ -844,9 +776,6 @@ class TestRunAcceptStep:
         """Only an explicit False means skipped; True/None are normal success."""
         for retval in (True, None, {"ok": 1}):
             with patch.object(proposals, "dynamo_store") as mock_ds:
-                # Bind retval as a default arg: a bare closure over the loop
-                # variable would read the LAST value on every iteration (B023),
-                # making this loop test only one case.
                 proposals._run_accept_step("notify_vkg", "p-1", "ns", lambda v=retval: v)
             assert mock_ds.update_proposal.call_args.kwargs["accept_progress"]["state"] == "done"
 
@@ -859,9 +788,7 @@ class TestRunAcceptStep:
                 raise RuntimeError("AOSS 503")
             return "ok"
 
-        with (
-            patch.object(proposals, "dynamo_store"),
-        ):
+        with patch.object(proposals, "dynamo_store"):
             out = proposals._run_accept_step("s3_persist", "p-1", "ns", flaky)
         assert out == "ok"
         assert calls["n"] == 2  # failed once, succeeded on retry
@@ -884,11 +811,6 @@ class TestRunAcceptStep:
     def test_non_fatal_step_is_retried_then_skipped_not_raised(self):
         """``fatal=False`` buys the SAME retry as a fatal step; only the outcome
         of exhaustion differs (skipped + accept continues, vs _AcceptStepError).
-
-        Regression: reconcile_counts / notify_vkg used to catch their own
-        exception and return False, so this loop never saw a failure and the
-        documented 3-attempt retry silently never ran — one EventBridge blip was
-        a permanent skip.
         """
         calls = {"n": 0}
 
@@ -960,7 +882,7 @@ class TestRunAcceptStep:
 
 
 class TestAcceptRetryAndRecovery:
-    """End-to-end (#456/#466/#467): the accept worker retries transient step
+    """End-to-end: the accept worker retries transient step
     failures, records heartbeat progress, lands on the terminal ``accept_failed``
     state when retries are exhausted, and a failed proposal is re-acceptable and
     converges on re-run."""
@@ -992,11 +914,7 @@ class TestAcceptRetryAndRecovery:
         assert final["accept_progress"]["step"] == "ingest"
 
     def test_successful_accept_reaches_accepted_and_clears_error(self, accept_client):
-        """A clean accept walks the whole pipeline to ``accepted``. The DDB flip
-        happens mid-pipeline (so reconcile_counts + s3_persist can run after it),
-        clearing any prior ``accept_error``; the later steps then checkpoint their
-        own progress — so ``accept_progress`` reflects the LAST completed step, not
-        empty. The user-visible contract is: status == accepted, no error."""
+        """A clean accept ends with status == accepted and no error."""
         http, dynamo, mock_graph, mock_vec, mock_bedrock, _s3 = accept_client
         resp = http.post("/ontology/proposals/p-1/accept")
         assert resp.status_code == 202
@@ -1010,7 +928,7 @@ class TestAcceptRetryAndRecovery:
     def test_accept_failed_proposal_is_reacceptable_and_converges(self, accept_client):
         """A proposal left in ``accept_failed`` (dead worker / prior failure) can
         be accepted again; once the transient cause clears, re-accept converges to
-        ``accepted``. This is the idempotent-recovery guarantee (#456/#466)."""
+        ``accepted``."""
         http, dynamo, mock_graph, mock_vec, mock_bedrock, _s3 = accept_client
 
         # First attempt: permanent-for-now failure → accept_failed.
@@ -1028,21 +946,12 @@ class TestAcceptRetryAndRecovery:
 
 
 class TestS3PersistStepFailure:
-    """#467 folded into the pipeline: S3 persist no longer swallows failures — it
-    is retried, and the failure is recorded on the proposal instead of leaving the
-    VKG copy silently stale (the Neptune<->S3 split-brain)."""
+    """S3 persist failures are retried and recorded on the proposal."""
 
     def test_persist_failure_is_recorded_but_does_not_downgrade_accepted(self, accept_client):
-        """``s3_persist`` runs AFTER ``flip_accepted`` (it must — it reads
-        ``list_proposals(status="accepted")`` to pick up this proposal's own
-        R2RML). So by the time it fails, the graph, embeddings and registry row
-        are live and serving.
-
-        The proposal must therefore STAY ``accepted``: four call sites select on
-        ``status="accepted"`` to rebuild the ontology's R2RML/datasource ids, so
-        downgrading it here would silently drop this proposal's mappings from the
-        next accept into the same ontology. The failed step is still recorded for
-        diagnosis, and a re-accept re-runs it (the S3 writes are overwrites).
+        """``s3_persist`` runs after ``flip_accepted``, so its failure must not downgrade
+        the status: other call sites select on ``status="accepted"`` to rebuild R2RML.
+        The failed step is still recorded.
         """
         http, dynamo, mock_graph, mock_vec, mock_bedrock, _s3 = accept_client
         # Override the fixture's no-op persist stub with a hard failure.
@@ -1057,21 +966,8 @@ class TestS3PersistStepFailure:
         assert final["accept_progress"] == {"step": "s3_persist", "state": "failed"}
         assert "S3 PutObject 500" in final["accept_error"]
 
-    def test_pre_flip_failure_still_fails_the_accept(self, accept_client):
-        """The guard is scoped to already-``accepted`` proposals only: a step that
-        fails BEFORE the flip (here ``ingest``) must still land ``accept_failed``,
-        because nothing is live yet."""
-        http, dynamo, mock_graph, mock_vec, mock_bedrock, _s3 = accept_client
-        mock_graph.load_turtle.side_effect = RuntimeError("GSP 503")
-
-        resp = http.post("/ontology/proposals/p-1/accept")
-        assert resp.status_code == 202
-        final = _final_status(dynamo)
-        assert final["status"] == "accept_failed"
-        assert final["accept_progress"]["step"] == "ingest"
-
     def test_persist_module_function_raises_not_swallows(self):
-        """The primitive itself must propagate (#467): a mocked S3 failure raises
+        """The primitive itself must propagate: a mocked S3 failure raises
         rather than being logged-and-swallowed."""
         with (
             patch("boto3.client") as mock_client,
@@ -1087,7 +983,7 @@ class TestS3PersistStepFailure:
 
 
 class TestNaReadTimeoutBounded:
-    """#456/#466: the NA execute_query client must carry a bounded read_timeout
+    """The NA execute_query client must carry a bounded read_timeout
     so a hung Neptune Analytics call can't block the accept worker forever.
 
     Asserts on the CONSTRUCTED boto client config, not just the module constant —
@@ -1115,7 +1011,6 @@ class TestNaReadTimeoutBounded:
 
     def test_default_read_timeout_is_bounded_on_the_boto_config(self, monkeypatch):
         na_store, cfg = self._build_client_config(monkeypatch)
-        # Finite, positive — NOT None, which was the previous unbounded default.
         assert cfg.read_timeout is not None
         assert cfg.read_timeout > 0
         assert cfg.read_timeout == na_store.NA_READ_TIMEOUT

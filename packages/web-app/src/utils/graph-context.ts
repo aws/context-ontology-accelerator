@@ -63,19 +63,12 @@ function toRelationship(
 /**
  * Normalize canonical GraphContext and the legacy top-level entity-array shape.
  *
- * `entities` and `relationships` are assigned UNCONDITIONALLY. A conditional
- * spread only overwrites the key when the field was already an array, so
- * `{ entities: "abc" }` survived `...value` untouched: `hasGraphContext` read
- * `"abc".length === 3` as truthy, `GraphContextSection` called `.map` on a string,
- * and the error boundary replaced the whole chat panel — losing the conversation
- * view over a malformed field. Making the shape safe is this function's entire
- * job, so a non-array is replaced with `[]`, never passed through.
+ * `entities` and `relationships` are always arrays; a non-array becomes `[]`.
  */
 export function normalizeGraphContext(
   value: unknown,
 ): GraphContextItem | undefined {
-  // Legacy top-level entity array: `entities` is an array by construction here, so
-  // this branch was never the unsafe one.
+  // Legacy top-level entity array.
   if (Array.isArray(value)) {
     return { entities: value.filter(isGraphContextEntity).map(toEntity) };
   }

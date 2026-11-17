@@ -255,11 +255,8 @@ class TestRobustness:
         assert len(g) <= 1  # at most the matchConfidence AnnotationProperty decl
 
     def test_rerank_infra_failure_fails_loud_not_novel(self):
-        # A GroundingRerankError (LLM rerank INFRASTRUCTURE failure) must
-        # propagate so the induction job fails loud — NOT be swallowed by the
-        # fail-open handler into a silent all-novel result. This is the
-        # enhanced-grounding defect (issue #59) on the unstructured path:
-        # class_grounding's broad `except Exception` used to catch it.
+        # A GroundingRerankError must propagate so the induction job fails loud,
+        # not become a silent all-novel result.
         svc = MagicMock()
         svc.ground_class.side_effect = GroundingRerankError(
             "rerank response truncated (stopReason=max_tokens) — raise rerank_max_tokens (currently 1000)"
@@ -382,13 +379,11 @@ class TestApplyOverridesToTurtle:
         g = Graph()
         g.parse(data=new_ttl, format="turtle")
         cls = URIRef(self._CLS)
-        # Old target fully removed, new target asserted.
         assert (cls, SKOS.closeMatch, URIRef(self._OLD_TARGET)) not in g
         assert (cls, RDFS.subClassOf, URIRef(self._OLD_TARGET)) not in g
         assert (cls, RDFS.subClassOf, URIRef(self._NEW_TARGET)) in g
         assert (cls, SKOS.closeMatch, URIRef(self._NEW_TARGET)) in g
         assert grounded == 1
-        # Non-grounding triples preserved.
         assert (cls, RDF.type, OWL.Class) in g
         assert (cls, RDFS.label, Literal("FinancialInstrument")) in g
 
@@ -399,12 +394,10 @@ class TestApplyOverridesToTurtle:
         g = Graph()
         g.parse(data=new_ttl, format="turtle")
         cls = URIRef(self._CLS)
-        # No grounding predicates remain.
         assert (cls, RDFS.subClassOf, None) not in g
         assert not any(True for _ in g.triples((cls, SKOS.closeMatch, None)))
         assert not any(True for _ in g.triples((cls, SKOS.exactMatch, None)))
         assert grounded == 0
-        # Class declaration + label still intact.
         assert (cls, RDF.type, OWL.Class) in g
 
     def test_partial_override_counts_untouched_grounded_classes(self):
@@ -532,7 +525,7 @@ class TestOverrideLabelNormalization:
 
 
 class TestEmissionRelationship:
-    """Finding #6: match_type decides ACCEPTANCE; the reranker's `relationship`
+    """match_type decides ACCEPTANCE; the reranker's `relationship`
     selects the SKOS predicate and whether a forward subClassOf is implied.
     broad/narrowMatch must be honored (not collapsed to exact/close)."""
 
@@ -573,8 +566,6 @@ class TestEmissionRelationship:
         assert (cls, RDFS.subClassOf, target) in g
 
     def test_concept_match_carries_relationship(self):
-        # Finding #6: to_concept_match must persist `relationship` so the override
-        # editor and re-emission can use it.
         svc = _svc(_result("high_confidence", relationship="broadMatch", confidence=0.9))
         _g, _n, matches = ground_classes(
             _one_input(), grounding_service=svc, ontology_ids=["fibo"], model_id="m", uri_prefix=_PREFIX
@@ -583,7 +574,7 @@ class TestEmissionRelationship:
 
 
 class TestSelfGroundingGuard:
-    """Finding #2: a class must never ground to ITSELF (its own IRI), even if the
+    """A class must never ground to ITSELF (its own IRI), even if the
     recall-exclusion is bypassed — the emission guard is the backstop."""
 
     def test_class_does_not_ground_to_its_own_iri(self):
@@ -613,7 +604,7 @@ class TestSelfGroundingGuard:
 
 
 class TestOverridePreservesWithinRunLinks:
-    """Finding #3: apply_overrides_to_turtle must strip only FOUNDATIONAL
+    """apply_overrides_to_turtle must strip only FOUNDATIONAL
     grounding edges, preserving within-namespace links (e.g. the Rule-1
     skos:closeMatch dedupe link to a SIBLING induced class)."""
 
@@ -661,10 +652,8 @@ class TestNormalizeNameKeyIsScriptAgnostic:
     """The key drives dict lookup, so an empty key attaches results to the wrong class.
 
     ``_normalize_name_key`` joins the grounding side's SPACED label with the
-    Turtle's CamelCase ``rdfs:label``. The previous ``[^a-zA-Z0-9]`` filter judged
-    by ASCII range, so a non-Latin class label keyed to ``""`` — and because the
-    key is a dict key, every such label collided on one bucket rather than simply
-    failing to join.
+    Turtle's CamelCase ``rdfs:label``; a non-Latin label must keep a non-empty,
+    distinct key.
 
     These assertions must stay in step with ``grounding.ts::normalizeNameKey``:
     the join works only because both sides produce the same key.
@@ -696,9 +685,7 @@ class TestNormalizeNameKeyIsScriptAgnostic:
         ],
     )
     def test_a_latin_label_keeps_its_accented_letter(self, label, expected):
-        """Previously ``HÖHE`` keyed to ``hhe`` — the letter went, not just its case.
-
-        Unlike ``grounding._normalize``, this key deliberately does NOT fold
+        """Unlike ``grounding._normalize``, this key deliberately does NOT fold
         diacritics: it joins two spellings of the same label, not two labels that
         merely resemble each other.
         """

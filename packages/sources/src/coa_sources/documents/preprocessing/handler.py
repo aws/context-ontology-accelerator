@@ -59,10 +59,6 @@ from coa_sources.documents.preprocessing.processors import (
     process_pdf,
 )
 
-# ---------------------------------------------------------------------------
-# Logging - structured JSON output for CloudWatch
-# ---------------------------------------------------------------------------
-
 
 class _JsonFormatter(logging.Formatter):
     """Emit each log record as a single JSON line."""
@@ -111,10 +107,6 @@ logger.handlers.clear()
 logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
-# ---------------------------------------------------------------------------
-# Environment variable validation — fail fast at cold start
-# ---------------------------------------------------------------------------
-
 
 def _require_env(key: str) -> str:
     """Return the value of a required environment variable or raise at cold start."""
@@ -125,10 +117,6 @@ def _require_env(key: str) -> str:
         )
     return value
 
-
-# ---------------------------------------------------------------------------
-# File size limit
-# ---------------------------------------------------------------------------
 
 try:
     _MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", str(DEFAULT_MAX_FILE_SIZE_MB)))
@@ -152,30 +140,22 @@ _ROLE_PREFIX = os.environ.get("CROSS_ACCOUNT_ROLE_PREFIX", "coa")
 # Cap on the per-file issue entries carried inline in the Step Functions state
 # payload. The full list is one entry per skipped/errored object and is
 # unbounded, so a heterogeneous source can push the Lambda's returned result
-# past the Step Functions 256 KB limit and fail the whole execution (issue 104).
+# past the Step Functions 256 KB limit and fail the whole execution.
 _ISSUES_PREVIEW_MAX = 20
 
-# The preview bounds per-entry BYTES too, not just the entry count. An error
-# entry's reason is str(exc) (unbounded) and filename is the full S3 key (up to
-# 1 KB, more once json escapes non-ASCII to \uXXXX), so 20 entries with multi-KB
-# reasons would still cross the 256 KB state limit from the byte axis. Cap both
-# fields; the full untruncated text stays in the S3 report. Worst case with
-# all-non-ASCII escaping is ~(256*6 + 500*6) ≈ 4.5 KB/entry → ~90 KB for 20,
-# provably under the limit.
+# The preview bounds per-entry bytes too: an error reason is str(exc) (unbounded)
+# and filename is the full S3 key, so both are capped. The full text stays in the
+# S3 report.
 _PREVIEW_FILENAME_MAX = 256
 _PREVIEW_REASON_MAX = 500
 
 
 def _bounded_issues(issues: list[dict[str, str]], *, namespace_id: str, doc_source_id: str) -> dict[str, Any]:
-    """Bound the issues list for the Step Functions state payload (issue 104).
+    """Bound the issues list for the Step Functions state payload.
 
-    Returns a capped ``issues_preview`` inline, an ``issues_truncated`` flag, and
-    — only when truncated — an ``issues_s3_key`` pointing at the complete report
-    persisted under the platform bucket. Persistence is best-effort: a failure is
-    logged and leaves ``issues_s3_key`` empty, but the payload stays bounded and
-    the job never fails over a diagnostics-write miss. ``issues_s3_key`` is an
-    empty string (never null) when absent, so the state machine's DynamoDB write
-    can treat it as a plain string.
+    Returns a capped ``issues_preview`` inline, an ``issues_truncated`` flag, and,
+    only when truncated, an ``issues_s3_key`` for the complete report (written
+    best-effort). ``issues_s3_key`` is an empty string, never null, when absent.
     """
     preview = [
         {
@@ -187,16 +167,11 @@ def _bounded_issues(issues: list[dict[str, str]], *, namespace_id: str, doc_sour
     ]
     truncated = len(issues) > _ISSUES_PREVIEW_MAX
     s3_key = ""
-    # Persist the full report only when truncated AND the identifiers are safe
-    # for an S3 key. The large-list path is only reached after the ids passed
-    # validate_id, but this guard makes id-safety non-negotiable rather than a
-    # caller invariant: an id carrying a path separator (a would-be traversal)
-    # can never reach put_object, whatever future caller passes it.
+    # Persist the full report only when truncated and the ids are safe for an S3
+    # key (no path separators).
     if truncated and SAFE_ID_RE.match(namespace_id) and SAFE_ID_RE.match(doc_source_id):
         # Millisecond precision + a short random suffix so two scans of one
-        # source in the same second cannot overwrite each other's report. (The
-        # Step Functions execution id would work too if the state machine passed
-        # it into the Lambda payload.)
+        # source in the same second cannot overwrite each other's report.
         key = (
             f"{namespace_id}/scan-results/{doc_source_id}/{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}-issues.json"
         )
@@ -209,11 +184,8 @@ def _bounded_issues(issues: list[dict[str, str]], *, namespace_id: str, doc_sour
             )
             s3_key = key
         except Exception as exc:
-            # Best-effort: never fail the job over a diagnostics write. Catch
-            # broadly (a ClientError like AccessDenied AND a BotoCoreError like a
-            # connection timeout must both be swallowed), but surface the error
-            # code so operators can tell a retryable throttle from a permanent
-            # permissions/config fault.
+            # Best-effort: never fail the job over a diagnostics write, but log the
+            # error code so a throttle can be told from a permissions fault.
             code = (
                 exc.response.get("Error", {}).get("Code", "Unknown")
                 if isinstance(exc, ClientError)
@@ -225,11 +197,6 @@ def _bounded_issues(issues: list[dict[str, str]], *, namespace_id: str, doc_sour
         "issues_truncated": truncated,
         "issues_s3_key": s3_key,
     }
-
-
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
 
 
 def handler(event: dict, context: Any) -> dict:
@@ -254,27 +221,16 @@ def handler(event: dict, context: Any) -> dict:
         validate_id(doc_source_id, "doc_source_id")
         for prefix in s3_prefixes:
             validate_s3_prefix(prefix, "s3_prefixes")
-        # Defense-in-depth: upload-type sources read from the
-        # shared platform bucket, so a prefix must be scoped to this job's
-        # namespace. The create path already reconstructs the prefix server-side
-        # as {namespace_id}/raw/{uploadId}/; this guard is a second line that
-        # refuses a foreign-namespace prefix if a job ever reaches here without
-        # going through create. S3-type prefixes live in the customer's own
-        # bucket (source_bucket_arn set) and are exempt. Mirrors
-        # deletion/cleanup_handler.py. The reason is intentionally generic so it
-        # does not echo the offending prefix back through GetSource.
-        # (An empty prefix — whole shared bucket — cannot occur for upload type:
-        # create always derives a concrete non-empty prefix, so it is not a
-        # reachable path and is not special-cased here.)
+        # Upload-type sources read from the shared platform bucket, so a
+        # foreign-namespace prefix is refused (S3-type prefixes live in the
+        # customer's bucket and are exempt). The reason is generic so it does not
+        # echo the prefix back through GetSource.
         if not source_bucket_arn:
             for prefix in s3_prefixes:
                 if not prefix.startswith(f"{namespace_id}/"):
                     raise ValueError("source prefix is not scoped to the namespace")
-        # Cross-account role names must follow the deployment's naming
-        # convention. Validated here (inside the try) so a non-conforming name
-        # returns a structured SCAN_FAILED instead of raising uncaught and
-        # failing the Lambda. The message names the required prefix only, not
-        # the caller-supplied role name.
+        # Validated inside the try so a non-conforming name returns a structured
+        # SCAN_FAILED. The message names the required prefix only.
         if source_bucket_arn and role_arn:
             role_name = role_arn.rsplit("/", 1)[-1] if "/" in role_arn else ""
             if not role_name.startswith(f"{_ROLE_PREFIX}-"):
@@ -315,25 +271,13 @@ def handler(event: dict, context: Any) -> dict:
     # -- Determine source bucket & S3 clients ------------------------------
     if source_bucket_arn:
         source_bucket = parse_bucket_from_arn(source_bucket_arn)
-        # Role-name convention is validated above (inside the input-validation
-        # try block) so a bad name returns a structured error, not a crash.
-        #
-        # The bucket is caller-named, and holding manageSource on a namespace says
-        # nothing about whether the caller may read it. The bucket's own tag is the
-        # authorization: setting it takes a bucket-level write permission, so its
-        # presence is the owner's consent. Read it with the ambient client — we
-        # cannot know whether we may assume anything until we know the bucket is
-        # authorized at all, and this reads metadata, not data.
-        #
-        # Checked here as well as at registration because this handler is a
-        # separate entry point; the sibling deletion path guards the same way
-        # (cleanup_handler.py refuses a prefix outside its own namespace).
-        #
-        # Deliberately NOT moved into the input-validation try above, unlike the
-        # role-name check: this makes an S3 call, and a throttle or transport fault
-        # there must stay retryable rather than being converted into a terminal
-        # SCAN_FAILED. An unauthorized bucket raises, which the state machine's
-        # Catch turns into SCAN_FAILED.
+        # The bucket is caller-named, and manageSource on a namespace does not say
+        # the caller may read it. The bucket's own namespace tag is the
+        # authorization (setting it takes a bucket-level write); it is metadata, so
+        # the ambient client reads it. Checked here as well as at registration
+        # because this handler is a separate entry point. Kept outside the
+        # validation try so an S3 throttle stays retryable; an unauthorized bucket
+        # raises and the state machine's Catch turns it into SCAN_FAILED.
         bucket_tags = get_bucket_tags(get_s3_client(), source_bucket)
         if not bucket_grants_namespace(bucket_tags, namespace_id):
             raise ValueError(
@@ -455,30 +399,16 @@ def handler(event: dict, context: Any) -> dict:
                     processing_method = "textract_analyze_document_tables"
                 else:
                     processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
-            elif ext in _PROCESSORS:
+            else:
                 processed_text, out_ext = _PROCESSORS[ext](content_bytes, filename)
                 processing_method = (
                     "passthrough" if ext in {".txt", ".md"} else f"unstructured_partition_{ext.lstrip('.')}"
                 )
-            else:
-                # Defensive: shouldn't happen
-                logger.warning("No processor for supported extension, skipping", extra={**log_extra, "extension": ext})
-                files_skipped += 1
-                issues.append({"filename": source_key, "type": "skipped", "reason": f"No processor for {ext}"})
-                continue
 
-            # 4b. Refuse to stage an empty extraction.
-            #
-            # Every processor above can return "" while raising nothing:
-            # `unstructured` abandons text extraction on drawing-heavy pages
-            # ("exceeds thresholds ... falling back to hi_res strategy without
-            # text extraction") and yields zero characters, and the passthrough
-            # and Textract paths do the same for an empty upload or a page with
-            # no LINE blocks. That used to be written to staging as a 0-byte file
-            # and counted as a success, so the source reported Skipped=0/Errored=0
-            # and Completed while KG build silently dropped it — 39 of 78 files
-            # vanished that way with nothing in the UI to show it. Count it as
-            # skipped and say which file and how it was read.
+            # 4b. Refuse to stage an empty extraction. Processors can return ""
+            # without raising (e.g. `unstructured` abandoning text extraction on
+            # drawing-heavy pages), which would stage a 0-byte file counted as a
+            # success. Count it as skipped and say which file and how it was read.
             if not processed_text.strip():
                 logger.warning(
                     "Extraction produced no text, skipping file",
@@ -524,7 +454,7 @@ def handler(event: dict, context: Any) -> dict:
                 "page_count": page_count,
                 "char_count": char_count,
                 "processing_method": processing_method,
-                # Provenance fields (SDO-188 §4 data card/BOM)
+                # Provenance fields
                 "provenance": {
                     "source_s3_key": f"s3://{source_bucket}/{source_key}",
                     "uploader_identity": s3_tags.get("coa:uploader", s3_user_metadata.get("uploader", "unknown")),

@@ -133,13 +133,9 @@ class TestCheckSourceApproved:
 
 
 class TestCheckSourceTableExists:
-    """#161: sourceTable is a hard block, but ONLY when its absence is provable.
+    """sourceTable is a hard block only when its absence is provable.
 
-    The catalog lookup fails OPEN (an unreachable catalog looks identical to an
-    empty one), so a naive "table not found → 400" would reject every metric on
-    a COMPLETED source whose assets aren't steward-approved yet. These tests
-    pin the three-way split: provable absence → 400, unknown → 503, and
-    can't-tell → fall through to today's soft warning.
+    Provable absence → 400, unknown → 503, can't tell → soft warning.
     """
 
     def _lookup(
@@ -258,13 +254,9 @@ class TestCheckSourceTableExists:
             check_source_table_exists("ns-1", "ds-1", "no_such_table")
 
     def test_unconfigured_lookup_degrades_to_soft_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A ``None`` lookup means "cannot configure", NOT "read failed".
+        """A ``None`` lookup means "cannot configure", not "read failed".
 
-        ``build_data_source_lookup`` returns None for benign reasons — missing
-        env vars, namespace row absent, ``dataZoneProjectId`` unset. Raising 503
-        here made every sourceTable metric un-creatable in any namespace without
-        a provisioned DataZone project (pre-#161 that degraded to a soft
-        warning). Only a *configured-but-unreadable* catalog is a 503.
+        Only a configured-but-unreadable catalog is a 503.
         """
         monkeypatch.delenv(PERMISSIVE_ENV, raising=False)
         with self._patch_build(None):
@@ -360,11 +352,6 @@ class TestCheckSourceTableExists:
         with patch("coa_metrics.data_source_lookup_factory.build_data_source_lookup") as mock_build:
             assert check_source_table_exists("ns-1", "ds-1", "no_such_table") is None
         mock_build.assert_not_called()
-
-    # ── The 400 names WHY table_exists said no ─────────────────────────────
-    # A known-but-unapproved table used to get "not found in data source …
-    # known tables: <a list containing that very table>", which sent the
-    # pipeline triage hunting for a table-matching bug.
 
     def _error(
         self,

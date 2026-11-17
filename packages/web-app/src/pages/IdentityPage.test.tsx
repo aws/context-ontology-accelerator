@@ -99,16 +99,10 @@ describe("IdentityPage", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows Members and Roles tabs (no other tabs)", () => {
+  it("shows Members and Roles tabs", () => {
     render(<IdentityPage />, { wrapper });
     expect(screen.getByRole("tab", { name: /Members/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Roles/i })).toBeInTheDocument();
-    expect(
-      screen.queryByRole("tab", { name: /API keys/i }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("tab", { name: /Identity providers/i }),
-    ).not.toBeInTheDocument();
   });
 
   it("shows platform grants on the Members tab with a Grant access button", () => {

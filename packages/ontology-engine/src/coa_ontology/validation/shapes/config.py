@@ -127,7 +127,7 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
         pk_cols: set[str] = set()
         unique_cols: set[str] = set()
         # column -> the FK targets it carries: (target table name, target datasource id).
-        # EVERY gate-passing single-column FK (#1088 follow-up), through the same
+        # EVERY gate-passing single-column FK, through the same
         # selection the ontology and the mapping use, so the shape asserts
         # sh:class on exactly the properties those two artifacts made references —
         # and nothing on a withheld (pending/rejected) relationship.

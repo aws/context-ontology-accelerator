@@ -290,10 +290,6 @@ def _extract_spc_predicate_complement(fact_value: str, subject_value: str) -> tu
     if not tokens:
         return "", None
 
-    # Walk through tokens building the predicate phrase. A leading
-    # connector (``OF``, ``IN`` etc.) without a content uppercase
-    # token before it is unlikely — predicates always start with a
-    # content word — but the heuristic doesn't enforce that.
     predicate_tokens: list[str] = []
     for i, tok in enumerate(tokens):
         if not predicate_tokens and _is_caseless_predicate_word(tok):

@@ -29,18 +29,13 @@ export function useApproveSource(namespaceId: string, sourceId: string) {
     mutationFn: () =>
       client.send(new ApproveSourceCommand({ namespaceId, sourceId })),
     onSuccess: () => {
-      // Source detail and per-source tables both reflect the bulk-review
-      // status transition.
       queryClient.invalidateQueries({
         queryKey: ["source", namespaceId, sourceId],
       });
       queryClient.invalidateQueries({
         queryKey: ["sourceTables", namespaceId, sourceId],
       });
-      // The namespace-scoped sources list shows the same status badge, so
-      // keep it in sync. ``["sources"]`` is the canonical unified key
-      // (see ``use-list-sources.ts``); invalidating the prefix matches all
-      // sourceType-filtered variants.
+      // The prefix matches every sourceType-filtered list.
       queryClient.invalidateQueries({ queryKey: ["sources", namespaceId] });
     },
   });

@@ -39,6 +39,12 @@ RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
     pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
     pip uninstall -y msgpack
 
+# Prefer IPv4 unless built with PREFER_IPV4=false. In a dual-stack subnet
+# without IPv6 egress to AWS, IPv6-first connects stall for minutes, long
+# enough to expire a request's SigV4 signature. Kept before USER (needs root).
+ARG PREFER_IPV4=true
+RUN if [ "$PREFER_IPV4" = "true" ]; then echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf; fi
+
 USER 1000
 
 # Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).

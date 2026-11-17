@@ -18,8 +18,8 @@ Environment variables (injected by Step Functions container overrides):
         namespace item and records it on the scan-job row.
     SCAN_TYPE: "full" or "incremental"
     SMUS_DOMAIN_ID: DataZone domain ID
-    DATASOURCES_TABLE: DynamoDB table for data source configs
-    SCAN_JOBS_TABLE: DynamoDB table for scan job tracking
+    SOURCES_TABLE: DynamoDB table for data source configs
+    SOURCE_SCAN_JOBS_TABLE: DynamoDB table for scan job tracking
 """
 
 from __future__ import annotations
@@ -245,8 +245,8 @@ def handler() -> None:
 
         # Tables enriched only PARTIALLY (a wide table where one column batch was
         # guardrail-blocked / failed to parse, but other batches succeeded) are
-        # now written back WITH the surviving description + columns rather than
-        # discarded. They land in tables_enriched, so record which ones are
+        # written back with the surviving description + columns. They land in
+        # tables_enriched, so record which ones are
         # incomplete on the scan-job row and log them, so a steward reviewing the
         # source can tell a partially-enriched table from a fully-enriched one.
         partial_table_ids = result.get("partial_table_ids", [])
@@ -258,8 +258,7 @@ def handler() -> None:
                 result["tables_partial"],
                 partial_table_ids,
             )
-            partial_scan_dao = DynamoDBDAO(os.environ["SOURCE_SCAN_JOBS_TABLE"], region=region)
-            partial_scan_dao.update(
+            scan_dao.update(
                 key=scan_job_key,
                 update_fields={
                     "enrichmentPartialTables": partial_table_ids,
@@ -276,7 +275,7 @@ def handler() -> None:
             condition="attribute_exists(PK)",
         )
 
-        # Cross-source relationship detection (#1088). Now that this source is
+        # Cross-source relationship detection. Now that this source is
         # enriched, look for relationships between it and the namespace's OTHER
         # enriched sources (the single-source Pass 2 above cannot see across a
         # source boundary). Best-effort and NON-FATAL: this source's own tables

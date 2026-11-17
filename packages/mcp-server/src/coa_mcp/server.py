@@ -26,11 +26,15 @@ from mcp.server.fastmcp import Context, FastMCP
 from .audit import log_tool_invocation
 from .auth.claims import CallerIdentity, ClaimsExtractionError, extract_caller_identity
 from .auth.grant_resolver import TOOL_CEDAR_ACTION, GrantResolutionError, resolve_grant
-from .clients.context_manager import ContextManagerClient
+from .clients.context_manager import (
+    RUNTIME_SESSION_HEADER,
+    ContextManagerClient,
+    ContextManagerError,
+    derive_runtime_session_id,
+)
 from .clients.lambda_client import LambdaClient
 from .config import MCPConfig
 from .tools import discovery, execution
-from .tools.execution import ContextManagerError
 
 logger = structlog.get_logger(__name__)
 
@@ -179,6 +183,44 @@ def _extract_bearer_token(ctx: Any) -> str:
     except (AttributeError, ValueError):
         pass
     raise ValueError("Bearer token extraction failed: no Authorization header found in request")
+
+
+def _mcp_session_id(ctx: Any) -> str | None:
+    """The MCP session of this tool call, from the inbound request headers; ``None`` when both are absent.
+
+    The server is ``stateless_http=True``, so the session is AgentCore's. ``Mcp-Session-Id`` is read first because
+    AgentCore routes MCP traffic on it; the inbound ``X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`` (the MCP
+    runtime's own session) is the fallback. Behind AgentCore one of them is normally present, so ``None`` (and the
+    caller-and-namespace key) is mostly a local or off-platform case.
+    """
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except (AttributeError, ValueError):
+        return None
+    if request is None or not hasattr(request, "headers"):
+        return None
+    for header in ("mcp-session-id", RUNTIME_SESSION_HEADER.lower()):
+        value = (request.headers.get(header) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _cm_runtime_session_id(ctx: Any, caller: CallerIdentity, namespace_id: str) -> str:
+    """AgentCore runtime session id for this tool call's Context Manager invocation.
+
+    Keyed by the caller and the MCP session (``_mcp_session_id``: ``Mcp-Session-Id``, else the inbound runtime
+    session id), so the calls of one MCP session share one warm CM microVM and two users never share one.
+    ``SCL_CM_SESSION_SCOPE=caller``, or a request carrying neither header, keys by caller and namespace instead.
+    It only selects the microVM: the MCP tools never send the payload ``sessionId`` that keys the CM's
+    conversational memory, so each call stays independent. Parallel calls of one MCP session share the microVM;
+    the async CM entrypoint serves them, and ``ContextManagerClient.invoke`` retries AgentCore's 409
+    RetryableConflictException while a session is provisioned.
+    """
+    mcp_session_id = _mcp_session_id(ctx) if config.cm_session_scope == "mcp_session" else None
+    return derive_runtime_session_id(caller.user_id, mcp_session_id=mcp_session_id, namespace_id=namespace_id)
 
 
 def _build_authorizer_context(caller: CallerIdentity, profile: dict) -> dict:
@@ -435,6 +477,7 @@ async def query(
             include_supporting=includeSupporting,
             max_results=maxResults,
             timeout_ms=timeoutMs,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
@@ -485,7 +528,9 @@ async def translate_sparql(
         )
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
-        result = await execution.execute_translate_sparql(cm, query, namespaceId, profile, token)
+        result = await execution.execute_translate_sparql(
+            cm, query, namespaceId, profile, token, runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId)
+        )
         if config.auth_enabled:
             result = _suppress_schema_unless_viewer(
                 result, profile, namespaceId, _TRANSLATE_SPARQL_SCHEMA_KEYS, "translate_sparql"
@@ -558,6 +603,7 @@ async def rag_retrieval(
             min_score=minScore,
             source_filter=sourceFilter,
             entity_filter=entityFilter,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
@@ -625,6 +671,7 @@ async def graph_traversal(
             direction=direction,
             max_results=maxResults,
             relationship_filter=relationshipFilter,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         if config.auth_enabled:
             result = _suppress_schema_unless_viewer(
