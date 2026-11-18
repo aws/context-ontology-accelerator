@@ -321,6 +321,153 @@ def dangerous_sql_ast_reason(node: Any, dialect: Any = None, sql: str = "") -> s
         if dangerous:
             return f"LegacyTableHint({', '.join(dangerous)})"
 
+    return table_source_reason(node, dialect)
+
+
+# Relation sources that only produce rows from their own arguments and read no
+# stored table: ``generate_series(1, 10)``, ``UNNEST(ARRAY[...])`` and the
+# explode family (Snowflake ``LATERAL FLATTEN`` parses as ``Explode``). A table
+# read inside their arguments (a scalar subquery) is still an ordinary Table
+# node, so the authorization checks see it.
+_ROW_GENERATOR_NODE_NAMES = frozenset(
+    {
+        "Explode",
+        "ExplodeOuter",
+        "ExplodingGenerateSeries",
+        "GenerateSeries",
+        "Posexplode",
+        "PosexplodeOuter",
+        "Unnest",
+    }
+)
+_ROW_GENERATOR_FUNCTION_NAMES = frozenset({"generate_series", "unnest"})
+
+# Every SQL Server table hint the legacy ``FROM t (HINT)`` form can carry. Only
+# this shape is read as a hint rather than as a call to a table-valued function.
+_TSQL_TABLE_HINTS = _DANGEROUS_TSQL_TABLE_HINTS | frozenset(
+    {
+        "forcescan",
+        "forceseek",
+        "noexpand",
+        "nolock",
+        "nowait",
+        "readcommitted",
+        "readpast",
+        "readuncommitted",
+        "snapshot",
+    }
+)
+
+
+def is_row_generator_source(node: Any) -> bool:
+    """Whether a relation source only generates rows from its arguments (see ``_ROW_GENERATOR_NODE_NAMES``)."""
+    node_name = type(node).__name__
+    if node_name in _ROW_GENERATOR_NODE_NAMES:
+        return True
+    return node_name == "Anonymous" and str(getattr(node, "name", "")).lower() in _ROW_GENERATOR_FUNCTION_NAMES
+
+
+def _is_tsql_legacy_hint_call(source: Any) -> bool:
+    """``orders (NOLOCK)``: SQL Server's legacy hint syntax, which sqlglot parses as a call."""
+    if type(source).__name__ != "Anonymous":
+        return False
+    expressions = list(getattr(source, "expressions", None) or [])
+    if not expressions:
+        return False
+    for expression in expressions:
+        expression_name = type(expression).__name__
+        expression_args = getattr(expression, "args", {})
+        if expression_name == "Column":
+            identifier = expression_args.get("this")
+            if (
+                type(identifier).__name__ != "Identifier"
+                or bool(getattr(identifier, "args", {}).get("quoted"))
+                or any(expression_args.get(part) is not None for part in ("table", "db", "catalog"))
+            ):
+                return False
+        elif expression_name != "Var":
+            return False
+        if str(getattr(expression, "name", "")).strip().lower() not in _TSQL_TABLE_HINTS:
+            return False
+    return True
+
+
+def _function_label(node: Any) -> str:
+    """A readable name for a function used as a relation (``pg.system.query``, ``TABLE``)."""
+    node_name = type(node).__name__
+    if node_name == "Dot":
+        args = getattr(node, "args", {})
+        return f"{_function_label(args.get('this'))}.{_function_label(args.get('expression'))}"
+    name = getattr(node, "name", "") if node is not None else ""
+    if node_name == "Anonymous" and str(name).lower() == "table":
+        inner = list(getattr(node, "expressions", None) or [])
+        return f"TABLE({_function_label(inner[0])})" if inner else "TABLE"
+    if node_name != "Anonymous" and callable(getattr(node, "sql_name", None)):
+        # A typed function's ``.name`` is its first argument, often a string literal:
+        # label it by its sqlglot type (``JSONTable``), never by an argument.
+        return node_name
+    return str(name or node_name)
+
+
+def _is_identifier_chain(node: Any) -> bool:
+    """``a.b.c.d``: a dotted name made only of identifiers, not ``a.b.c.query(...)``."""
+    node_name = type(node).__name__
+    if node_name == "Identifier":
+        return True
+    args = getattr(node, "args", {})
+    return (
+        node_name == "Dot" and _is_identifier_chain(args.get("this")) and _is_identifier_chain(args.get("expression"))
+    )
+
+
+def table_source_reason(node: Any, dialect: Any = None) -> str | None:
+    """Why ``node`` is a relation the firewall cannot attribute to stored tables, or None.
+
+    A table-valued function hides what it reads. Trino and Athena pass-through
+    functions (``TABLE(pg.system.query(query => 'SELECT ...'))``) hand a second
+    statement to the source database as a string literal, and ``TABLE(...)``
+    arguments (``system.fn(input => TABLE(t))``) do not parse as Table nodes.
+    The same holds for ``OPENQUERY``, ``EXTERNAL_QUERY``, ``JSON_TABLE`` and any
+    user-defined table function. So every relation source must be a named
+    table, a subquery, or a row generator; anything else is refused, in every
+    dialect. A name nested too deeply to inspect is refused too.
+    """
+    try:
+        return _table_source_reason(node, dialect)
+    except RecursionError:
+        return "UnresolvedTableSource(too deeply nested)"
+
+
+def _table_source_reason(node: Any, dialect: Any) -> str | None:
+    """:func:`table_source_reason` without the recursion guard."""
+    node_name = type(node).__name__
+    args = getattr(node, "args", {})
+    if node_name == "Anonymous" and str(getattr(node, "name", "")).lower() == "table":
+        return f"TableFunction({_function_label(node)})"
+    if node_name == "TableFromRows":
+        return f"TableFunction(TABLE({_function_label(args.get('this'))}))"
+    if node_name == "Table":
+        source = args.get("this")
+        source_name = type(source).__name__
+        # A schema-qualified generator (``x.generate_series(...)``) may be a user-defined
+        # table function, so only the bare built-in name is a row generator.
+        qualified = any(getattr(node, part, "") for part in ("catalog", "db"))
+        if _is_identifier_chain(source) or (is_row_generator_source(source) and not qualified):
+            return None
+        if _normalize_dialect(dialect) == "tsql" and _is_tsql_legacy_hint_call(source):
+            return None
+        # A call (``Anonymous``, a typed sqlglot ``Func``, which alone carries
+        # ``sql_name``, or a dotted call ``a.b.c.query(...)``) is a table function;
+        # anything else (a placeholder, a parameter, nothing) names no stored table either.
+        if source_name in {"Anonymous", "Dot"} or callable(getattr(source, "sql_name", None)):
+            qualifiers = [str(getattr(node, part, "") or "") for part in ("catalog", "db")]
+            return f"TableFunction({'.'.join([q for q in qualifiers if q] + [_function_label(source)])})"
+        return f"UnresolvedTableSource({source_name})"
+    if node_name == "Lateral":
+        source = args.get("this")
+        if type(source).__name__ == "Subquery" or is_row_generator_source(source):
+            return None
+        return f"TableFunction(LATERAL {_function_label(source)})"
     return None
 
 

@@ -26,9 +26,6 @@ from coa_metrics.neptune_client import (
 pytestmark = pytest.mark.unit
 
 
-# ── Fixtures ────────────────────────────────────────────────────────────
-
-
 @pytest.fixture
 def client() -> MetricNeptuneClient:
     return MetricNeptuneClient()
@@ -59,9 +56,6 @@ def sample_metric() -> MetricDefinition:
     )
 
 
-# ── Helper tests ────────────────────────────────────────────────────────
-
-
 class TestHelpers:
     def test_iri_valid(self) -> None:
         assert _iri(f"urn:{URN_PREFIX}:test:metric/foo") == "<urn:coa:test:metric/foo>"
@@ -89,9 +83,6 @@ class TestHelpers:
         assert _metric_uri("my-ns", "revenue") == f"urn:{URN_PREFIX}:my-ns:metric:revenue"
 
 
-# ── Create tests ────────────────────────────────────────────────────────
-
-
 class TestCreateMetric:
     @patch("coa_metrics.neptune_client._sparql_query")
     @patch("coa_metrics.neptune_client._sparql_update")
@@ -104,25 +95,19 @@ class TestCreateMetric:
         mock_update.assert_called_once()
         sparql = mock_update.call_args[0][0]
 
-        # Verify graph target uses ontology-engine scheme
         assert "GRAPH" in sparql
         assert "test-ns" in sparql
-        # Verify metric URI
         assert f"urn:{URN_PREFIX}:test-ns:metric:monthly_revenue" in sparql
-        # Verify type declarations
         assert OWL + "Class" in sparql
         assert COA_VOCAB + "GovernedMetric" in sparql
-        # Verify required fields
         assert "dataSourceId" in sparql
         assert "ds-abc123" in sparql
         assert "sourceTable" in sparql
         assert "orders" in sparql
-        # Verify optional fields
         assert "defaultTimeGrain" in sparql
         assert "MONTH" in sparql
         assert "definedBy" in sparql
         assert "effectiveFrom" in sparql
-        # Verify governedMetricFor as IRI object property (not string literal)
         assert "governedMetricFor" in sparql
         assert f"<{GRAPH_BASE_URI}/namespace/test-ns/ontology/insurance/Order>" in sparql
 
@@ -146,9 +131,6 @@ class TestCreateMetric:
         sparql = mock_update.call_args[0][0]
         # Non-IRI concepts should NOT appear as governedMetricFor triples
         assert "governedMetricFor" not in sparql
-
-
-# ── Get tests ───────────────────────────────────────────────────────────
 
 
 class TestGetMetric:
@@ -190,9 +172,6 @@ class TestGetMetric:
         assert client.get_metric("test-ns", "nonexistent") is None
 
 
-# ── List tests ──────────────────────────────────────────────────────────
-
-
 class TestListMetrics:
     @patch("coa_metrics.neptune_client._sparql_query")
     def test_list_with_no_filters(self, mock_query: patch, client: MetricNeptuneClient) -> None:
@@ -216,9 +195,6 @@ class TestListMetrics:
         metrics = client.list_metrics("test-ns")
         assert len(metrics) == 1
         assert metrics[0].name == "revenue"
-
-
-# ── Bulk get tests ──────────────────────────────────────────────────────
 
 
 class TestGetMetricsBulk:
@@ -300,9 +276,6 @@ class TestGetMetricsBulk:
         assert client.get_metrics_bulk("test-ns") == []
 
 
-# ── Update tests ────────────────────────────────────────────────────────
-
-
 class TestUpdateMetric:
     @patch("coa_metrics.neptune_client._sparql_update")
     def test_update_is_atomic_delete_insert(
@@ -317,9 +290,6 @@ class TestUpdateMetric:
         assert "DELETE" in sparql
         assert "INSERT" in sparql
         assert "WHERE" in sparql
-
-
-# ── Delete tests ────────────────────────────────────────────────────────
 
 
 class TestDeleteMetric:
@@ -365,13 +335,11 @@ class TestDeleteAllMetricsForNamespace:
         deleted = client.delete_all_metrics_for_namespace("test-ns")
 
         assert deleted == 3
-        # First query counts metrics
         mock_query.assert_called_once()
         count_query = mock_query.call_args[0][0]
         assert "COUNT(DISTINCT ?s)" in count_query
         assert "GovernedMetric" in count_query
 
-        # Second call is the DELETE
         mock_update.assert_called_once()
         delete_sparql = mock_update.call_args[0][0]
         assert "DELETE" in delete_sparql
@@ -391,7 +359,6 @@ class TestDeleteAllMetricsForNamespace:
 
         assert deleted == 0
         mock_query.assert_called_once()
-        # Should NOT issue DELETE when count is 0
         mock_update.assert_not_called()
 
     @patch("coa_metrics.neptune_client._sparql_update")
@@ -404,7 +371,6 @@ class TestDeleteAllMetricsForNamespace:
 
         client.delete_all_metrics_for_namespace("my-namespace")
 
-        # Verify both queries reference the namespace in the graph URI
         count_query = mock_query.call_args[0][0]
         assert "my-namespace" in count_query
         assert "GovernedMetrics" in count_query
@@ -412,9 +378,6 @@ class TestDeleteAllMetricsForNamespace:
         delete_sparql = mock_update.call_args[0][0]
         assert "my-namespace" in delete_sparql
         assert "GovernedMetrics" in delete_sparql
-
-
-# ── Resolve class URIs tests ────────────────────────────────────────────
 
 
 class TestResolveClassUris:

@@ -30,26 +30,12 @@ export interface AuthnzStackProps extends cdk.StackProps {
 /**
  * Foundation stack: DynamoDB tables and GSIs for the AuthNZ subsystem.
  *
- * Tables provisioned:
- *   - Roles                — namespace-scoped and global role definitions
- *   - ResourceRoleMappings — principal ↔ resource ↔ role grants with
- *                            PrincipalIndex and NamespaceGrantsIndex GSIs
- *   - CacheInvalidation    — single-row version counter for auth cache busting
- *   - Idempotency          — clientToken records that make the API's create
- *                            operations retry-safe (PK only, TTL on `ttl`).
- *                            Shared with the namespace, sources, metric and
- *                            ontology stacks via SSM.
+ * The Idempotency table (clientToken records, PK only, TTL on `ttl`) is shared with the
+ * namespace, sources, metric and ontology stacks via SSM.
  *
- * IdP group → role mappings are handled via ResourceRoleMappings with
- * principalType "Group" and the IdP group name as principalId. The
- * authorizer extracts group claims from the JWT and queries the
- * PrincipalIndex GSI directly — no separate claims mapping table needed.
- *
- * All tables use PAY_PER_REQUEST billing, AWS-managed encryption, PITR,
- * and env-aware removal policy (RETAIN in prod, DESTROY elsewhere).
- *
- * DynamoDB Streams (NEW_AND_OLD_IMAGES) are enabled on Roles and
- * ResourceRoleMappings to drive cache invalidation.
+ * IdP group → role mappings live in ResourceRoleMappings with principalType "Group"
+ * and the IdP group name as principalId; the authorizer queries the PrincipalIndex GSI
+ * directly from the JWT group claims.
  */
 export class AuthnzStack extends SCLStack {
   /** Roles table. */
@@ -71,7 +57,6 @@ export class AuthnzStack extends SCLStack {
     const PK = { name: "PK", type: dynamodb.AttributeType.STRING };
     const SK = { name: "SK", type: dynamodb.AttributeType.STRING };
 
-    // ── 1. Roles ─────────────────────────────────────────────────────
     const roles = new DynamoDBTable(this, "RolesTable", {
       tableName: TABLE_NAMES.ROLES,
       partitionKey: PK,
@@ -80,7 +65,6 @@ export class AuthnzStack extends SCLStack {
     });
     this.rolesTable = roles.table;
 
-    // ── 3. ResourceRoleMappings ──────────────────────────────────────
     const rrm = new DynamoDBTable(this, "ResourceRoleMappingsTable", {
       tableName: TABLE_NAMES.RESOURCE_ROLE_MAPPINGS,
       partitionKey: PK,
@@ -115,7 +99,6 @@ export class AuthnzStack extends SCLStack {
     });
     this.resourceRoleMappingsTable = rrm.table;
 
-    // ── 4. CacheInvalidation ─────────────────────────────────────────
     const cache = new DynamoDBTable(this, "CacheInvalidationTable", {
       tableName: TABLE_NAMES.CACHE_INVALIDATION,
       partitionKey: PK,
@@ -123,7 +106,6 @@ export class AuthnzStack extends SCLStack {
     });
     this.cacheInvalidationTable = cache.table;
 
-    // ── 4b. Idempotency ──────────────────────────────────────────────
     // One record per (operation, caller, scope, clientToken) hash. Records
     // expire after 24 h via TTL; consumers read the name from SSM and get
     // Get/Put/Update/DeleteItem on this table only (see utils/idempotency.ts).
@@ -139,10 +121,8 @@ export class AuthnzStack extends SCLStack {
       description: "Idempotency-record DynamoDB table name",
     });
 
-    // ── 5. Seed built-in roles ───────────────────────────────────────
     this.seedBuiltInRoles(roles.table);
 
-    // ── 6. Seed group → role mappings from IdP claims ────────────────
     for (const mapping of props?.claimsMappings ?? []) {
       for (const roleId of mapping.mappedRoles) {
         const group = mapping.groupValue;

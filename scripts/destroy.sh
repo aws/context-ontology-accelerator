@@ -3,58 +3,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Full CDK teardown, orchestrated step by step so nothing CFN doesn't own
-# blocks `cdk destroy`:
+# blocks the CDK stack destroy:
 #
-#   1. Delete AgentCore Runtimes (serve + mcp) directly via the API —
-#      CFN doesn't wait for their ENIs to detach, so deleting them here
-#      first (rather than letting `cdk destroy` hit DependencyViolation
-#      on the security group) starts the ENI-detach clock as early as
-#      possible.
-#   2. Check those Runtimes' ENIs, without waiting for them. AgentCore
-#      releases them up to ~8 h after the Runtimes are deleted, and they hold
-#      only the runtime security groups, the subnets and the VPC.
-#   3. Delete VKG's per-namespace ECS services directly (they were
-#      created outside CFN by the reload Lambda) and wait for them to
-#      reach INACTIVE, so ECS DeleteCluster doesn't fail with
-#      ClusterContainsServicesException. Then deregister the per-namespace
-#      task definitions the same Lambda registered.
-#   4. Delete the Cloud Map services registered inside the private DNS
-#      namespace. CFN owns the namespace (network-stack) but NOT the
-#      services inside it — those are created at runtime by the VKG
-#      reload Lambda (`servicediscovery:CreateService`), so CFN has no
-#      record of them. DeleteNamespace fails while any service remains,
-#      which puts the network stack in DELETE_FAILED. The application's
-#      own namespace-delete flow cleans these up
-#      (namespace-deletion-pipeline.ts), but this script never takes that
-#      path, so anything left behind has to be cleared here.
-#   5. Force-delete the DataZone domain via
-#      `delete-domain --skip-deletion-check`, which cascades to every
-#      project, asset, and asset type under it. CFN's own DeleteProject
-#      calls (which it already issues with skipDeletionCheck=true
-#      internally) can't clear a shared asset type still referenced by
-#      OTHER projects' assets, which stalls the system project's delete,
-#      which stalls the domain's — confirmed against a real stuck stack.
-#      The domain and its child resources (project, form type, policy
-#      grants, etc.) are RemovalPolicy.RETAIN in namespace-stack.ts so
-#      CFN never attempts (and fails) to delete them itself; this step
-#      is what actually tears the whole tree down.
-#   6. Start deleting every connector stack. They belong to separate CDK apps in
-#      connectors/, so `cdk destroy` below never sees them, and left behind
-#      each keeps a spill bucket and a customer-managed KMS key alive. Also the
-#      integ suites' AOSS inspect stack, whose Lambda sits in the VPC. Step 8
-#      waits for them. Then delete the federated Glue connections the sources
-#      service created for registered database sources, with their catalogs and
-#      Lake Formation registrations: no stack owns them, and each keeps an ENI on
-#      the network stack's connector security group.
-#   7. `cdk destroy` every stack but network, re-running it past the failures
-#      it is known to hit (see fix_failed_stack).
-#   8. Finish the network stack. First wait (up to 30 minutes) for Glue to release
-#      the deleted connections' ENIs; still held after that is a failure. While
-#      AgentCore still holds ENIs, CloudFormation deletes only its NAT gateway,
-#      Elastic IP and VPC endpoints, and the script exits 3; a later run finishes it.
-#      GuardDuty Runtime Monitoring's endpoint and security group in the VPC are
-#      deleted only with SCL_DESTROY_DELETE_GUARDDUTY_ENDPOINT=1; without it they
-#      fail the run (exit 1), and the script prints how to remove them.
+#   1. Delete AgentCore Runtimes (serve + mcp) via the API, to start the ENI-detach clock early.
+#   2. Check those Runtimes' ENIs without waiting; AgentCore releases them up to ~8 h later.
+#   3. Delete VKG's per-namespace ECS services and task definitions (created outside CFN).
+#   4. Delete the Cloud Map services inside the private DNS namespace (also created outside CFN).
+#   5. Force-delete the DataZone domain with `delete-domain --skip-deletion-check`.
+#   6. Start deleting every connector stack (separate CDK apps in connectors/) and the integ
+#      suites' AOSS inspect stack, then the federated Glue connections with their catalogs and
+#      Lake Formation registrations.
+#   7. Destroy every stack but network with the CDK CLI, re-running it past known failures
+#      (see fix_failed_stack).
+#   8. Finish the network stack: wait up to 30 minutes for Glue to release the connections'
+#      ENIs. While AgentCore still holds ENIs, CloudFormation deletes only the NAT gateway,
+#      Elastic IP and VPC endpoints and the script exits 3. GuardDuty Runtime Monitoring's
+#      endpoint and security group are deleted only with SCL_DESTROY_DELETE_GUARDDUTY_ENDPOINT=1;
+#      without it they fail the run (exit 1) and the script prints how to remove them.
 #
 # Exit status: 0 everything deleted, 3 deferred (run again later), anything
 # else a failure. `make destroy-dev` reports any non-zero status as 2.
@@ -89,8 +54,7 @@ NETWORK_STACK="${STACK_PREFIX}-network"
 SSM_PREFIX="/${PREFIX}"
 
 # Validate inputs that will be interpolated into shell commands.
-# These are controlled env vars (set by CI or the developer), not user input,
-# but validating them defends against accidental misconfiguration.
+# These are controlled env vars, not user input.
 if [[ ! "$ENV" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   echo "ERROR: ENV must be alphanumeric/dash/underscore, got: $ENV" >&2; exit 1
 fi
@@ -120,10 +84,7 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_AOSS_VPC_ENDPOINT_ID:-}" ] && CONTEXT="$CONTEXT --context aoss_vpc_endpoint_id=$SCL_AOSS_VPC_ENDPOINT_ID"
 
 # Statuses that mean "this stack still exists and owns resources", for step 6's connector sweep.
-# It once omitted ROLLBACK_FAILED, UPDATE_ROLLBACK_FAILED and CREATE_FAILED, so a stack stuck in
-# any of them was reported as gone.
-# REVIEW_IN_PROGRESS is deliberately absent: cdk-dryrun-mr creates change-set-only stacks in that
-# state on every MR, and they are not this deployment's to delete.
+# REVIEW_IN_PROGRESS is deliberately absent: change-set-only stacks are not this deployment's to delete.
 CFN_LIVE_STATUSES=(CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE
   CREATE_FAILED UPDATE_FAILED DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED
   IMPORT_COMPLETE IMPORT_ROLLBACK_COMPLETE IMPORT_ROLLBACK_FAILED)
@@ -186,13 +147,9 @@ arn_id() { echo "$1" | awk -F/ '{print $NF}'; }
 
 # Add this deployment's runtime security groups to AGENTCORE_SG_IDS, by name: it outlives their stacks.
 #
-# The SGs carry no explicit name, so CloudFormation names them
-# "<stack name>-<logical id>-<suffix>", with the stacks named
-# "${STACK_PREFIX}-serve" / "${STACK_PREFIX}-mcp" (infra/bin/app.ts) and the
-# logical ids starting "AgentCoreSG" / "McpSG". Spell out the full stack name
-# before the logical id: ENV and SCL_PREFIX may contain dashes, so a looser
-# "${STACK_PREFIX}-*AgentCoreSG*" also matches a sibling deployment such as
-# env "dev-b" when tearing down "dev", and this script then waits on its ENIs.
+# CloudFormation names them "<stack name>-<logical id>-<suffix>" (stacks "${STACK_PREFIX}-serve" /
+# "${STACK_PREFIX}-mcp", logical ids starting "AgentCoreSG" / "McpSG"). Spell out the full stack
+# name: ENV and the prefix may contain dashes, so a looser glob matches a sibling deployment.
 find_runtime_sgs() {
   local sg out
   if ! out=$(aws ec2 describe-security-groups --region "$REGION" \
@@ -545,8 +502,6 @@ else
   ok "Deregistered $VKG_TD_DEREGISTERED VKG task definition(s)."
 fi
 
-# ── Step 4: Delete Cloud Map services (CFN owns the namespace, not the
-# services registered inside it) ──────────────────────────────────────────
 echo ""
 echo "=== Step 4/8: Delete Cloud Map services ==="
 
@@ -641,9 +596,6 @@ else
   fi
 fi
 
-# ── Step 5: Delete the DataZone domain (force-cascades to child projects,
-# assets, and asset types that CFN's own DeleteDomain/DeleteProject calls
-# cannot clear on their own) ──────────────────────────────────────────────
 echo ""
 echo "=== Step 5/8: Delete DataZone domain ==="
 
@@ -668,19 +620,8 @@ domain_is_ours() {
 if [ -z "$DOMAIN_ID" ] || [ "$DOMAIN_ID" == "None" ]; then
   ok "No DataZone domain ID found in SSM — already deleted or never deployed."
 elif domain_is_ours "$DOMAIN_ID"; then
-  # CFN already calls DeleteProject with skipDeletionCheck=true internally
-  # (confirmed via CloudTrail), but that cascade stops at cross-project
-  # asset-type references: a shared asset type (e.g. CoaRelationalTable,
-  # owned by the system project) can't be force-deleted by DeleteProject
-  # while OTHER projects' assets still use that type — and every namespace
-  # has its own project holding its scanned-table assets of that type, so
-  # this isn't an edge case. That leaves the system project DELETE_FAILED
-  # ("failed to stabilize"), which cascades to DefaultProjectProfile, which
-  # cascades to SMUSDomain itself ("Domain cannot be deleted because there
-  # are existing projects under this domain") — confirmed against a real
-  # stuck stack. DataZone's own delete-domain --skip-deletion-check is a
-  # true force-delete at the domain level with no such cross-project
-  # carve-out, so it succeeds where DeleteProject's narrower cascade can't.
+  # DeleteProject cannot clear an asset type still used by other projects' assets, which
+  # stalls the domain delete; delete-domain --skip-deletion-check force-deletes the whole tree.
   info "Deleting DataZone domain $DOMAIN_ID (--skip-deletion-check force-"
   info "deletes every project, asset, and asset type under it — this is"
   info "asynchronous and can take a while for a domain with many namespaces)."
@@ -752,24 +693,16 @@ elif domain_is_ours "$DOMAIN_ID"; then
   done
 fi
 
-# ── Step 6: Delete the example connector stack ─────────────────────────────
-# Not part of the CDK app `cdk destroy --all` covers — it is a separate app in a
-# separate workspace (connectors/), deployed by scripts/deploy-example-connector.sh.
-# Left behind it would keep a spill bucket and a customer-managed KMS key alive, and
-# the verification below would report it.
-#
-# Deleted through CloudFormation rather than `cdk destroy`: that would synthesize the
-# connector's app, which needs COA's serve and discovery role ARNs from SSM. At teardown
-# those parameters may already be gone, so synth would fail and block the whole step.
-# Everything the stack owns is RemovalPolicy.DESTROY, including the auto-delete of the
-# spill bucket's objects, so CloudFormation clears it unaided.
+# ── Step 6: Delete connector stacks and federated Glue connections ─────────
+# Connector stacks belong to separate CDK apps in connectors/ that the CDK stack destroy never
+# sees; left behind each keeps a spill bucket and a KMS key alive. They are deleted with
+# delete-stack rather than the CDK CLI because synth needs COA's role ARNs from SSM, which
+# may already be gone at teardown. Everything they own is RemovalPolicy.DESTROY.
 echo ""
 echo "=== Step 6/8: Delete connector stacks and federated Glue connections ==="
 
-# Matched by SUFFIX, not named one by one: every connector's stack ends in -coa-connector
-# (CONNECTOR_FUNCTION_SUFFIX in connectors/cdk-toolkit), so a second connector added later is
-# torn down without editing this script. Naming only the example's stack meant any other
-# connector survived, then failed the verification below on every subsequent run.
+# Matched by suffix: every connector's stack ends in -coa-connector (CONNECTOR_FUNCTION_SUFFIX
+# in connectors/cdk-toolkit).
 # DELETE_IN_PROGRESS too: an earlier run may have started a delete that step 8 still awaits.
 CONNECTORS_DELETING=()
 CONNECTOR_STACKS=""
@@ -1749,13 +1682,8 @@ if [ -n "$REMAINING" ]; then
   echo "The following stacks did not fully delete:" >&2
   echo "$REMAINING" >&2
   echo "" >&2
-  # Known S3 autoDeleteObjects failure modes (GetBucketTagging AccessDenied,
-  # NoSuchTagSet) — an upstream CDK Custom::S3AutoDeleteObjects race, not
-  # something this script can prevent (the bucket policy granting the
-  # Lambda access IS created with an explicit DependsOn ahead of it; the
-  # failure is a timing/propagation issue on AWS's side, not a missing
-  # grant). Scan each failed stack's events and print copy-pasteable
-  # remediation so this doesn't require a wiki lookup every time.
+  # S3 autoDeleteObjects can fail on a tag-propagation race (GetBucketTagging AccessDenied,
+  # NoSuchTagSet) that this script cannot prevent. Print remediation for each failed stack.
   while IFS=$'\t' read -r STACK_NAME _; do
     [ -z "$STACK_NAME" ] && continue
     EVENTS=$(aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \

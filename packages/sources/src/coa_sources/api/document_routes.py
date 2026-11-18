@@ -54,37 +54,20 @@ _BY_NAME_GSI = "ByName"
 logger = structlog.get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# CREATE DOCUMENT SOURCE
-# ---------------------------------------------------------------------------
-
-
 def _validate_bucket_namespace_authorization(source_bucket_arn: str | None, namespace_id: str) -> dict[str, Any] | None:
     """Bind an S3 document source's bucket to the registering namespace.
 
-    The bucket must carry ``{tag_prefix}.namespace`` listing this namespace. Only a
-    principal with ``s3:TagResource`` on the bucket can set that, so the tag is the
-    bucket owner's consent — which is the evidence the request itself cannot
-    provide, since holding ``manageSource`` on a namespace says nothing about who
-    may read the bucket it names.
-
-    Fail-closed on every uncertainty: a malformed ARN, an unreadable tag set, or a
-    tag that does not list this namespace all refuse the request, so a bucket we
-    cannot prove is authorized is never persisted. A transient client-side fault is
-    distinguished from a refusal — it returns a retryable 503, because "retry" and
-    "fix your tag" are different instructions.
-
-    This is the fail-fast front door; the preprocessing handler re-checks because it
-    is a separate entry point. Mirrors ``_validate_credential_secret_binding`` for
-    JDBC credential secrets.
+    The bucket must carry ``{tag_prefix}.namespace`` listing this namespace; only
+    a principal with ``s3:TagResource`` on the bucket can set it, so the tag is
+    the owner's consent. Fails closed on a malformed ARN, an unreadable tag set,
+    or a tag that does not list this namespace. A transient client-side fault
+    returns a retryable 503. The preprocessing handler re-checks because it is a
+    separate entry point.
 
     Returns an error response, or ``None`` when the binding holds.
     """
-    # The Smithy S3BucketArn pattern normally rejects a malformed ARN upstream, but
-    # this must not depend on that — parse_bucket_from_arn raises rather than
-    # returning empty, so an unguarded call would surface as a 500. An absent ARN is
-    # refused here rather than narrowed away at the call site, so that a caller who
-    # reaches this function can never skip the check by passing nothing.
+    # parse_bucket_from_arn raises on a malformed ARN, and an absent ARN is refused
+    # here so a caller cannot skip the check by passing nothing.
     try:
         bucket = parse_bucket_from_arn(source_bucket_arn or "")
     except ValueError:
@@ -150,7 +133,6 @@ def _create_document_source(
     source_bucket_arn: str | None = doc_req.source_bucket_arn or None
     role_arn: str | None = doc_req.role_arn or None
 
-    # Infer sub-type: sourceBucketArn → S3, else → LOCAL_UPLOAD
     if source_bucket_arn:
         sub_type = SourceSubType.S3
         doc_source_type = "s3"
@@ -176,14 +158,10 @@ def _create_document_source(
         if error:
             return error
     else:
-        # Upload sub-type: files live in the shared platform bucket under a
-        # server-issued, namespace-scoped prefix. Reconstruct that prefix from
-        # the uploadId minted by GetSourceUploadUrls and ignore any
-        # caller-supplied s3Prefixes — otherwise a steward with manageSource on
-        # one namespace could point ingestion at another namespace's objects
-        # in the shared bucket. uploadId is a UUID-v4-constrained model field;
-        # validate_id re-checks it here so the derived prefix can never contain
-        # a path separator or traversal segment.
+        # Upload sub-type: rebuild the prefix server-side from the uploadId and
+        # ignore any caller-supplied s3Prefixes, or a steward on one namespace
+        # could point ingestion at another namespace's objects. validate_id keeps
+        # the prefix free of path separators.
         upload_id: str = (doc_req.upload_id or "").strip()
         if not upload_id:
             return api_response(400, {"error": "uploadId is required for upload sources"})
@@ -198,7 +176,7 @@ def _create_document_source(
     except ValueError as exc:
         return api_response(400, {"error": str(exc)})
 
-    # Name uniqueness check via ByName GSI — O(1) lookup matching existing unstructured pattern
+    # Reject duplicate names via the ByName GSI
     try:
         gsi_result = _get_dao().query(
             QueryParams(
@@ -262,8 +240,6 @@ def _create_document_source(
         logger.exception("ddb_put_failed")
         return api_response(500, {"error": "Internal server error"})
 
-    # Increment the namespace sourceCount. Best-effort: counter drift
-    # is undesirable but must never block source creation.
     adjust_namespace_source_count(namespace_id, SourceType.DOCUMENTS, 1)
 
     if _INGESTION_QUEUE_URL:
@@ -298,11 +274,6 @@ def _create_document_source(
 
     logger.info("document_source_created", source_id=source_id, namespace_id=namespace_id)
     return api_response(201, _item_to_detail(item))
-
-
-# ---------------------------------------------------------------------------
-# UPLOAD URLS
-# ---------------------------------------------------------------------------
 
 
 def _handle_upload_urls(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:

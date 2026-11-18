@@ -147,10 +147,8 @@ def test_plan_payload_v3_round_trips_the_label() -> None:
     assert parsed.entries[0].definition.label == "売上合計"
 
 
-# Written by the pre-label serializer: base revision 2e57a750b's
-# canonical_plan_payload_bytes over the plan _payload() builds. Committed as
-# bytes so a later change to the shared serializer cannot move the fixture with
-# it; real v2 plans in S3 were written by that code.
+# Bytes written by the pre-label serializer, committed so a later change to the
+# shared serializer cannot move the fixture.
 _PRE_LABEL_V2_PLAN = Path(__file__).parent / "fixtures" / "import_plan_v2_pre_label.json"
 
 

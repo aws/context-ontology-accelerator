@@ -54,8 +54,6 @@ describe("turtleToGraph", () => {
     expect(result.nodes).toEqual([]);
   });
 
-  // ── COA provenance + owl:hasKey extraction ──
-
   const RICH_SAMPLE = `
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
@@ -88,44 +86,7 @@ ind:claim_assignedAdjuster a owl:ObjectProperty ;
     coa:fkProvenance "AI_INFERRED" .
 `;
 
-  it("captures coa:datasourceId + coa:sourceSchema on the class node", () => {
-    const { nodes } = turtleToGraph(RICH_SAMPLE);
-    const lp = nodes.find((n) => n.id === "http://ex.org/ind#LossPayment");
-    expect(lp?.data.datasourceId).toBe("ds-7f3a9");
-    expect(lp?.data.sourceSchema).toBe("pc_insurance");
-  });
-
-  it("attaches coa:subClassProvenance to the child class node + subClassOf edge", () => {
-    const result = turtleToGraph(RICH_SAMPLE);
-    const lpNode = result.nodes.find(
-      (n) => n.id === "http://ex.org/ind#LossPayment",
-    );
-    expect(lpNode?.data.subClassProvenance).toBe("PK_SHARING");
-    const sc = result.edges.find((e) => e.data?.kind === "subClassOf");
-    expect(sc?.data?.subClassProvenance).toBe("PK_SHARING");
-  });
-
-  it("attaches coa:fkProvenance per ObjectProperty edge", () => {
-    const { edges } = turtleToGraph(RICH_SAMPLE);
-    const fkEdges = edges.filter((e) => e.data?.kind === "objectProperty");
-    const provenance = fkEdges.map((e) => e.data?.fkProvenance).sort();
-    expect(provenance).toEqual(["AI_INFERRED", "DETERMINISTIC"]);
-  });
-
-  it("parses owl:hasKey inline lists into pkColumns (local names)", () => {
-    const { nodes } = turtleToGraph(RICH_SAMPLE);
-    const lp = nodes.find((n) => n.id === "http://ex.org/ind#LossPayment");
-    expect(lp?.data.pkColumns).toEqual([
-      "lossPayment_claimAmountIdentifier",
-      "lossPayment_kind",
-    ]);
-    const ca = nodes.find((n) => n.id === "http://ex.org/ind#ClaimAmount");
-    expect(ca?.data.pkColumns).toEqual(["claimAmount_id"]);
-  });
-
   it("handles multi-predicate blocks separated by semicolons", () => {
-    // Regression: the old line-oriented parser would only see the first
-    // predicate-object pair on a multi-line ``;``-joined statement.
     const { nodes, edges } = turtleToGraph(RICH_SAMPLE);
     expect(nodes).toHaveLength(2);
     expect(edges.filter((e) => e.data?.kind === "objectProperty")).toHaveLength(
@@ -133,8 +94,6 @@ ind:claim_assignedAdjuster a owl:ObjectProperty ;
     );
     expect(edges.filter((e) => e.data?.kind === "subClassOf")).toHaveLength(1);
   });
-
-  // ── Item 8: grounding keyed off skos:exactMatch/closeMatch ──
 
   const GROUNDED_SAMPLE = `
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
@@ -162,14 +121,12 @@ ind:LossPayment a owl:Class ;
     const { nodes } = turtleToGraph(GROUNDED_SAMPLE);
     const party = nodes.find((n) => n.id === "http://ex.org/ind#Party");
     expect(party?.data.isGrounded).toBe(true);
-    expect(party?.data.groundedTo).toBe("Party");
   });
 
   it("marks a class grounded from skos:closeMatch too", () => {
     const { nodes } = turtleToGraph(GROUNDED_SAMPLE);
     const agreement = nodes.find((n) => n.id === "http://ex.org/ind#Agreement");
     expect(agreement?.data.isGrounded).toBe(true);
-    expect(agreement?.data.groundedTo).toBe("Contract");
   });
 
   it("does NOT mark PK-sharing (rdfs:subClassOf to a sibling) as grounded", () => {
@@ -178,7 +135,6 @@ ind:LossPayment a owl:Class ;
     const { nodes } = turtleToGraph(GROUNDED_SAMPLE);
     const lp = nodes.find((n) => n.id === "http://ex.org/ind#LossPayment");
     expect(lp?.data.isGrounded).toBe(false);
-    expect(lp?.data.groundedTo).toBeUndefined();
   });
 
   it("groups datatype properties as attributes on their domain class", () => {

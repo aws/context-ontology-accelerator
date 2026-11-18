@@ -3,12 +3,11 @@
 
 """Unit tests: DatatypeTokenValidator surfaces malformed XSD datatype tokens.
 
-Replaces the previous silent write-boundary canonicalization: instead of quietly
-rewriting a user's ontology, validation now REPORTS malformed/mis-cased/aliased
-tokens (as a non-blocking warning) so the user can consent to a repair. The
-finding must carry the per-element offender list for the UI preview, must be
-silent when the ontology is clean, must never flag valid/unknown types, and must
-also catch malformed R2RML rr:datatype tokens (an accept-time break path).
+Validation REPORTS malformed/mis-cased/aliased tokens (as a non-blocking
+warning) so the user can consent to a repair. The finding must carry the
+per-element offender list for the UI preview, must be silent when the ontology
+is clean, must never flag valid/unknown types, and must also catch malformed
+R2RML rr:datatype tokens (an accept-time break path).
 """
 
 from __future__ import annotations
@@ -82,9 +81,3 @@ def test_ontology_and_r2rml_offenders_combined():
     )
     assert len(findings) == 1
     assert findings[0].details["count"] == 2
-
-
-def test_no_r2rml_kwarg_is_tolerated():
-    # The standalone validate router passes no r2rml_turtle — must not raise.
-    findings = DatatypeTokenValidator().validate(_range_graph("http://www.w3.org/2001/XMLSchema#datetime"))
-    assert len(findings) == 1

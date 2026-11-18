@@ -5,8 +5,8 @@
 
 A ``Tier2SkipEvaluator`` lets the orchestrator prune the Tier-2 structured-query
 path for a query it provably cannot answer — WITHOUT the orchestrator owning any
-of the detection logic. The evaluator is injected optionally; when absent, the
-orchestrator behaves exactly as before (no extra work, no behavior change).
+of the detection logic. The evaluator is injected optionally; when absent,
+Tier 2 always runs.
 
 See ``evaluator.py`` for the interface and the fail-open contract, and
 ``aoss_provenance.py`` for the AOSS mapped-class-provenance provider.

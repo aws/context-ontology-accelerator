@@ -55,8 +55,8 @@ echo ""
 echo "Installing pre-commit hooks..."
 if git config --get core.hooksPath >/dev/null 2>&1; then
     HOOKS_PATH=$(git config --get core.hooksPath)
-    echo "⚠ Skipping pre-commit install: core.hooksPath is set to '$HOOKS_PATH' (likely git-defender)."
-    echo "  Run 'make lint' manually before committing, or configure pre-commit to run via git-defender."
+    echo "⚠ Skipping pre-commit install: core.hooksPath is set to '$HOOKS_PATH' (a managed hooks path)."
+    echo "  Run 'make lint' manually before committing, or configure pre-commit to run via the managed hooks path."
 else
     if command -v pre-commit >/dev/null 2>&1; then
         pre-commit install

@@ -67,6 +67,7 @@ semantic-context/
 ├── libs/ts-shared/      # Shared TypeScript interfaces and constants
 ├── connectors/          # Athena federation connectors: toolkit, reference connector, Databricks
 ├── coa-ai/skills/       # Agent skills for driving a deployed COA (control-plane)
+├── coa-ai/workflow-agents/ # Self-hosted workflow-agents MCP server (Python)
 ├── scripts/             # CI-agnostic build/test/deploy scripts
 └── external-docs/       # Published documentation (getting-started, deployment guides)
 ```
@@ -88,8 +89,6 @@ semantic-context/
 ## Contributing
 
 This repository is published as a read-only mirror. We are not accepting pull requests at this time. You are welcome to report bugs and share feedback through GitHub Issues. See [CONTRIBUTING.md](CONTRIBUTING.md) for details including direction for Amazon employees.
-
-Because this repository is a squashed mirror, the people who build COA are credited as co-authors on its commits rather than as commit authors.
 
 ## External Dependencies
 

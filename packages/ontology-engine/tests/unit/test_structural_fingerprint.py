@@ -28,6 +28,18 @@ def _tbl(name, cols, cons=None):
     return CatalogTable(id=f"t-{name}", name=name, fullyQualifiedName=f"db.{name}", columns=cols, tableConstraints=cons)
 
 
+def _orders_with_fk(ref):
+    return _tbl(
+        "orders",
+        [CatalogColumn(name="customer_id", dataType="INT")],
+        [CatalogConstraint(constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=[ref])],
+    )
+
+
+def _customers():
+    return _tbl("customers", [CatalogColumn(name="id", dataType="INT")])
+
+
 class TestFingerprintCanonicalization:
     def test_equivalent_type_spellings_hash_identically(self):
         """``character varying`` (PG) and ``VARCHAR`` (Glue) → same fingerprint."""
@@ -49,27 +61,23 @@ class TestFingerprintCanonicalization:
         without_cons = _tbl("policy", [CatalogColumn(name="id", dataType="INTEGER", constraint=None)])
         assert _compute_structural_fingerprint([with_cons]) == _compute_structural_fingerprint([without_cons])
 
-    def test_fk_fqn_vs_bare_reference_hash_identically(self):
-        """FK referredColumns ``db.customers.id`` and ``customers.id`` match."""
-        fqn = _tbl(
-            "orders",
-            [CatalogColumn(name="customer_id", dataType="INT")],
-            [
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=["db.customers.id"]
-                )
-            ],
-        )
-        bare = _tbl(
-            "orders",
-            [CatalogColumn(name="customer_id", dataType="INT")],
-            [
-                CatalogConstraint(
-                    constraintType="FOREIGN_KEY", columns=["customer_id"], referredColumns=["customers.id"]
-                )
-            ],
-        )
-        assert _compute_structural_fingerprint([fqn]) == _compute_structural_fingerprint([bare])
+    def test_fk_schema_qualified_reference_differs_from_bare(self):
+        """``crm.customers.id`` names a schema, so it is not the bare ``customers.id``."""
+        qualified = _orders_with_fk("crm.customers.id")
+        bare = _orders_with_fk("customers.id")
+        assert _compute_structural_fingerprint([qualified]) != _compute_structural_fingerprint([bare])
+
+    def test_fk_target_schema_change_differs(self):
+        """Keys into same-named tables in different schemas give different fingerprints."""
+        crm = [_orders_with_fk("CRM.customers.id"), _customers()]
+        marketing = [_orders_with_fk("MARKETING.customers.id"), _customers()]
+        assert _compute_structural_fingerprint(crm) != _compute_structural_fingerprint(marketing)
+
+    def test_bare_fk_fingerprint_is_stable(self):
+        """A bare reference hashes as ``table.column`` alone, so proposals accepted from bare keys still dedupe."""
+        # The value the table.column-only fingerprint gives this fixture (computed on main).
+        tables = [_orders_with_fk("customers.id"), _customers()]
+        assert _compute_structural_fingerprint(tables) == "924ffd68fc52a69c"
 
     def test_genuinely_different_schema_differs(self):
         """A real structural change (extra column) MUST produce a new fingerprint."""

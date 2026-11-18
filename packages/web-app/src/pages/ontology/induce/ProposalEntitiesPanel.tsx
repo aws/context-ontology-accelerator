@@ -31,8 +31,6 @@ import {
 } from "./grounding";
 import { useAppI18n } from "../../../i18n/LocaleProvider";
 
-// ─── Helpers ────────────────────────────────────────────────────────
-
 /**
  * All ``skos:exactMatch``/``skos:closeMatch``/``skos:relatedMatch`` object
  * tokens on a class body, with the match strength. rdflib serializes each match
@@ -59,8 +57,7 @@ function extractSkosMatches(
   return out;
 }
 
-/** Bare column names from ``owl:hasKey ( ind:col1 ind:col2 )`` (ported from
- *  the !436 helper): strip the list delimiters + any ``prefix:`` on members. */
+/** Bare column names from ``owl:hasKey ( ind:col1 ind:col2 )``, prefixes stripped. */
 function extractPkColumns(body: string): string[] {
   const m = body.match(/owl:hasKey\s*\(([^)]*)\)/);
   if (!m) return [];
@@ -98,8 +95,6 @@ function propertyDomainMatches(
   return false;
 }
 
-// ─── Grouped model ──────────────────────────────────────────────────
-
 interface ClassMatch {
   matchType: "close" | "exact";
   label: string;
@@ -110,9 +105,8 @@ interface ClassGroup {
   classEntity: TurtleEntity;
   label: string;
   description: string | null;
-  /** Foundational grounding target (local name), or null when novel. Derived
-   *  from skos:exactMatch/closeMatch/relatedMatch whose target is NOT a sibling
-   *  proposal class (coa:groundedTo is retired — see Item 8 re-key). */
+  /** Foundational target (local name) from skos matches to a non-sibling
+   *  class, or null when novel. */
   groundedTo: string | null;
   matchType: string | null;
   /** owl:hasKey columns (bare names). */
@@ -138,18 +132,9 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
 
   const claimed = new Set<string>();
 
-  // Bidirectional close/exact-match index (one pass, O(n)): a class is matched
-  // whether it authors the skos:closeMatch/exactMatch or is the target of one
-  // on another class. Keyed by local name so prefix vs full-URI targets resolve.
-  //
-  // These sibling (intra-proposal) skos matches are REAL for unstructured /
-  // RIGOR inductions: the unstructured class normalizer runs a per-run embedding
-  // dedup index and emits skos:closeMatch from a class to an earlier SIBLING
-  // class it collapsed against (class_normalizer.normalize → induction_rules
-  // Req 9.4). The structured (table_to_ontology) path does not emit these today,
-  // so the "Matches" column is 0 for structured proposals but populated for
-  // unstructured ones. The classByLocal filter below is also what lets grounding
-  // detection exclude these sibling targets from the external-grounding origin.
+  // Bidirectional sibling skos close/exact-match index (one pass, O(n)), keyed
+  // by local name so prefix vs full-URI targets resolve. classByLocal also
+  // excludes sibling targets from external-grounding detection.
   const matchLocal = (token: string) =>
     token.replace(/[<>]/g, "").split(/[#/]/).pop() ?? token;
   const classByLocal = new Map<string, TurtleEntity>();
@@ -197,12 +182,9 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
     );
     for (const p of [...rels, ...attrs]) claimed.add(p.fullSubject);
 
-    // Foundational grounding target: a skos:exactMatch/closeMatch/relatedMatch
-    // whose target is NOT another proposal class. (coa:groundedTo is retired —
-    // Item 8.) A skos match to a SIBLING ind: class is a dedup/close-match
-    // relationship surfaced separately via ``matches``, not grounding, so we
-    // exclude those to avoid false "Grounded" origins. Exact wins over close,
-    // close wins over related.
+    // Foundational grounding target: the first non-sibling skos match, exact
+    // over close over related. A skos match to a sibling ind: class is a dedup
+    // relationship surfaced via ``matches``, not grounding.
     const skosMatches = extractSkosMatches(cls.body);
     const foundational =
       skosMatches.find(
@@ -219,13 +201,8 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
       ) ??
       null;
 
-    // Match strength for the badge: ONLY the foundational match's strength, so
-    // matchType and groundedTo are set together and can never disagree. A
-    // sibling-only skos match (dedup relationship, no foundational target) is
-    // NOT grounding — it leaves both null so the origin renders "Novel". A prior
-    // body.includes(...) fallback set matchType here even with groundedTo null,
-    // which made the origin gates render "Grounded"/"Ambiguous" with a blank
-    // target for sibling-only classes (bug #910 follow-up).
+    // Match strength for the badge: only the foundational match's strength, so
+    // matchType never disagrees with groundedTo.
     const matchType: "exact" | "close" | "related" | null = foundational
       ? foundational.strength
       : null;
@@ -252,8 +229,6 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
   return { groups, ungrouped };
 }
 
-// ─── Props ──────────────────────────────────────────────────────────
-
 interface Props {
   entities: TurtleEntity[];
   prelude: string;
@@ -269,7 +244,6 @@ interface Props {
   /** Called when a control rewrites the WHOLE proposal Turtle (e.g. the
    *  SuggestionPanel Confirm/Reject promotes/drops a suggested subclass). */
   onUpdateTurtle?: (updatedTurtle: string) => void;
-  // ─── Grounding editor (folded into the class-card Matches tab, Item 1) ──
   /** ConceptMatch records (proposal ``metadata.matches``), keyed per source
    *  table. The class→match link is recovered via ``buildClassMatchResolver``.
    *  Owned + persisted by ProposalDetail (``grounding_overrides``). */
@@ -282,8 +256,6 @@ interface Props {
   /** Stage "keep novel" for a stable grounding match key. */
   onMarkGroundingNovel?: (matchKey: string) => void;
 }
-
-// ─── Component ──────────────────────────────────────────────────────
 
 export function ProposalEntitiesPanel({
   entities,
@@ -308,7 +280,6 @@ export function ProposalEntitiesPanel({
     [entities],
   );
 
-  // Derive the selected group from the fresh groups array
   const selectedGroup = useMemo(
     () =>
       selectedClassUri
@@ -331,11 +302,8 @@ export function ProposalEntitiesPanel({
     wasPanelOpenRef.current = panelState.isOpen;
   }, [panelState.isOpen, selectedClassUri]);
 
-  // Raw R2RML slice per class — for the "View raw R2RML" pane only. This
-  // block-slice is intentionally lossy (it captures only the block carrying
-  // ``rr:class``), which is exactly why the OLD ``parseR2rml`` produced
-  // "Mapping: Unknown". The parsed mapping below is derived from the WHOLE
-  // document via the TriplesMap-id join instead (Item 4).
+  // Raw R2RML slice per class, for the "View raw R2RML" pane only. The block
+  // slice is lossy; the parsed mapping below comes from parseR2rmlByClass.
   const r2rmlRawByClass = useMemo(() => {
     if (!r2rmlTurtle) return new Map<string, string>();
     const map = new Map<string, string>();
@@ -350,9 +318,8 @@ export function ProposalEntitiesPanel({
     return map;
   }, [r2rmlTurtle]);
 
-  // Correctly-parsed R2RML mapping per class (source table + column mappings),
-  // keyed by class local name. Layout-independent TriplesMap-id + POM-id join
-  // over the whole document (fixes "Mapping: Unknown").
+  // Parsed R2RML mapping per class (source table + column mappings), keyed by
+  // class local name, from the TriplesMap-id + POM-id join over the whole document.
   const r2rmlMappingByClass = useMemo(
     () => parseR2rmlByClass(r2rmlTurtle),
     [r2rmlTurtle],
@@ -365,7 +332,6 @@ export function ProposalEntitiesPanel({
     [groundingMatches, r2rmlTurtle],
   );
 
-  // Open/close the split panel when selection changes
   useEffect(() => {
     if (!selectedGroup) {
       closePanel();
@@ -420,7 +386,6 @@ export function ProposalEntitiesPanel({
     t,
   ]);
 
-  // Close panel on unmount
   useEffect(() => () => closePanel(), [closePanel]);
 
   return (
@@ -559,13 +524,8 @@ export function ProposalEntitiesPanel({
               cell: (g) => g.attributes.length,
             },
             {
-              // Sibling/near-duplicate proposal classes: skos:exactMatch/
-              // closeMatch to OTHER classes in this proposal (surfaced in the
-              // card's "Related classes" sub-section). Populated for unstructured
-              // / RIGOR inductions (the class normalizer's per-run dedup emits
-              // these); 0 for the structured table_to_ontology path, which does
-              // not emit intra-proposal matches. Distinct from the card's
-              // "Grounding" tab, which counts EXTERNAL foundational candidates.
+              // Count of sibling skos matches, distinct from the card's "Grounding"
+              // tab, which counts external foundational candidates.
               id: "matches",
               header: t("Matches"),
               sortingComparator: (a, b) =>

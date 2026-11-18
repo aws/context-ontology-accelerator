@@ -594,6 +594,44 @@ def sql_ident(name: str) -> str:
     return f'"{escaped}"'
 
 
+def split_sql_ident_path_raw(literal: str) -> list[str]:
+    """Split a SQL name on its unquoted dots, keeping each segment's quotes.
+
+    The quote-preserving counterpart of :func:`split_sql_ident_path`, which
+    unquotes as it splits. :func:`normalize_sql_ident_path` needs to know whether
+    a segment arrived delimited, because an unquoted name and a quoted one are
+    different identifiers to H2 (``orders`` folds to ``ORDERS``, ``"orders"`` does
+    not), and the unquoted text alone cannot say which it was.
+
+    Args:
+        literal: A possibly-qualified, possibly-quoted SQL name.
+
+    Returns:
+        The segments, each still carrying whatever quotes it had.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    i = 0
+    while i < len(literal):
+        char = literal[i]
+        if char == '"':
+            if in_quotes and literal[i + 1 : i + 2] == '"':
+                buf.append('""')
+                i += 2
+                continue
+            in_quotes = not in_quotes
+            buf.append(char)
+        elif char == "." and not in_quotes:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(char)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
 def split_sql_ident_path(literal: str) -> list[str]:
     """Split a possibly-quoted, possibly-qualified SQL name into its bare segments.
 
@@ -609,26 +647,97 @@ def split_sql_ident_path(literal: str) -> list[str]:
     separates segments here, and ``""`` inside a quoted segment is one literal
     quote character.
     """
-    parts: list[str] = []
-    buf: list[str] = []
+    return [_unquote_sql_ident(raw) for raw in split_sql_ident_path_raw(literal)]
+
+
+def _unquote_sql_ident(segment: str) -> str:
+    """Strip the delimiters from one identifier segment.
+
+    Delimiters are dropped and ``""`` becomes one literal quote. A segment that
+    is not a well-formed delimited identifier is still reduced rather than
+    rejected, because this is the lenient reader; :func:`normalize_sql_ident_path`
+    is the one that decides whether a name may be emitted at all.
+    """
+    out: list[str] = []
     in_quotes = False
     i = 0
-    while i < len(literal):
-        char = literal[i]
+    while i < len(segment):
+        char = segment[i]
         if char == '"':
-            if in_quotes and literal[i + 1 : i + 2] == '"':
-                buf.append('"')
+            if in_quotes and segment[i + 1 : i + 2] == '"':
+                out.append('"')
                 i += 2
                 continue
             in_quotes = not in_quotes
-        elif char == "." and not in_quotes:
-            parts.append("".join(buf))
-            buf = []
         else:
-            buf.append(char)
+            out.append(char)
         i += 1
-    parts.append("".join(buf))
-    return parts
+    return "".join(out)
+
+
+_BARE_SQL_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+"""A segment that needs no delimiters: it parses as exactly one SQL identifier.
+
+Matched with ``fullmatch``, deliberately, and with no anchors of its own. ``$``
+also matches just before a final newline, so ``^…$`` with :meth:`re.match` would
+accept ``orders\\n`` — a segment that is emitted byte-for-byte, splitting the
+``CREATE SCHEMA IF NOT EXISTS orders\\n;`` it lands in across two lines and so
+missing ``load-schema.sh``'s line-based admin pattern. ``fullmatch`` is what
+makes this grammar the same one the shell applies.
+"""
+
+
+def normalize_sql_ident_path(literal: str) -> list[str] | None:
+    """Return each segment of a SQL name as text safe to splice into DDL.
+
+    ``None`` means the text is NOT a well-formed identifier path — a segment that
+    is neither a delimited ``"…"`` identifier nor a plain bare identifier, an
+    unbalanced quote, or an empty segment. The caller must then reject the value
+    rather than emit it, because there is no way to splice it into SQL without
+    either changing what the parser sees or letting it carry SQL of its own.
+
+    Why this exists, rather than concatenating the name as given: ``rr:tableName``
+    literals come from user-supplied R2RML, and what is emitted from them lands in
+    the ``CREATE TABLE`` / ``CREATE SCHEMA`` text of the generated schema.sql that
+    the VKG container feeds to H2's ``RunScript`` as a database admin. A literal
+    like ``x; CREATE ALIAS … ; --.orders`` would otherwise close the statement and
+    inject top-level ones — and H2 compiles Java in ``CREATE ALIAS``, so that is
+    code execution in the container, not just rogue DDL.
+
+    Segments are returned exactly as they must appear in SQL, so a round trip is
+    byte-identical for every path that is already well formed: a delimited segment
+    keeps its quotes and its case, and a bare one stays bare (quoting it would
+    change the identifier, since an unquoted name folds to upper case in H2 while
+    a quoted one does not).
+
+    Args:
+        literal: A possibly-qualified, possibly-quoted SQL name.
+
+    Returns:
+        The formatted segments, or ``None`` if ``literal`` is not a valid path.
+    """
+    segments: list[str] = []
+    for raw in split_sql_ident_path_raw(literal):
+        if raw.startswith('"'):
+            # A delimited segment must be ONE complete "…" token: closed, non-empty,
+            # and with every interior quote doubled. Anything else (``"x``, ``"y"x``,
+            # ``"a""``) is text the SQL parser would read as more than an identifier.
+            # A line break or NUL is refused for the same reason as ``orders\n``
+            # (see _BARE_SQL_IDENT): load-schema.sh matches schema.sql line by line.
+            inner = raw[1:-1]
+            if (
+                len(raw) < 3
+                or not raw.endswith('"')
+                or '"' in inner.replace('""', "")
+                or any(c in inner for c in "\n\r\0")
+            ):
+                return None
+            segments.append(raw)
+        elif _BARE_SQL_IDENT.fullmatch(raw):
+            segments.append(raw)
+        else:
+            return None
+    return segments
 
 
 def ontology_vector_index_name(prefix: str, namespace_id: str, default_namespace: str = "default") -> str:

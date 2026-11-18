@@ -213,10 +213,12 @@ Lake Formation.
       (Glue resource policy / AWS RAM) and, if LF-governed, grants the serve
       runtime role `SELECT`/`DESCRIBE` (LF grants flow through RAM).
 
->   A source can therefore scan and show metadata while still being
-    **non-queryable** until the catalog is shared with — and LF-granted to — the
-    serve runtime role. Complete both the discovery role *and* the
-    query-time sharing below for end-to-end access.
+>   A source whose `catalogId` names another account therefore scans and shows
+    metadata, but is always recorded **`queryable: false`** — completing the
+    owner-side sharing below does not change that flag. To query the data,
+    register the local resource link as a *same-account* Glue source; see
+    [Enable cross-account querying](#3-enable-cross-account-querying-resource-link)
+    below.
 
 Determine which mode the owner's catalog uses:
 
@@ -376,16 +378,52 @@ Athena then queries the resource link:
 SELECT * FROM "AwsDataCatalog"."hcp360_link"."patients" LIMIT 100;
 ```
 
-!!! warning "Context Ontology Accelerator does not automate cross-account query setup"
-    Context Ontology Accelerator's automatic serve-role grant
-    (`grant_consumer_select_native`) targets **only the Context Ontology Accelerator account's own
-    catalog** (`CatalogId = <accelerator-account>`) and does **not** create resource
-    links. It self-heals same-account strict-LF sources but performs no
-    cross-account grant or resource-link creation. For cross-account Glue, steps
-    1–3 above are a manual prerequisite (owner-side LF grant + RAM accept +
-    resource link + local DESCRIBE). This is a known limitation; cross-account
-    discovery works via `crossAccountRoleArn`, but cross-account *querying* must
-    be wired up manually.
+### 4. Register the resource link to make the data queryable
+
+The source registered in step 1 names the owner's `catalogId`, so Context
+Ontology Accelerator records it `queryable: false` and leaves it out of the SQL
+scope — permanently, no matter what sharing you complete (see the warning
+below). To bring the shared data into scope, register the **local resource
+link** as a second, same-account Glue source:
+
+```json
+{
+  "sourceType": "DATABASE",
+  "name": "partner-lake-queryable",
+  "databaseSource": {
+    "glueConfiguration": {
+      "databaseName": "hcp360_link",
+      "region": "<region>",
+      "catalogId": "<accelerator-account>"
+    }
+  }
+}
+```
+
+`catalogId` is this account, so the same-account path applies: Context Ontology
+Accelerator makes its native grant against the local resource link and records
+the source `queryable: true`. Reading *through* the link still depends on the
+owner-side grants from step 2 and the local `DESCRIBE` from step 3 — the local
+grant authorizes the link, not the data behind it.
+
+!!! warning "A foreign `catalogId` is never queryable"
+    A Glue source whose `glueConfiguration.catalogId` names another account is
+    always recorded **`queryable: false`**. The federation step makes no Lake
+    Formation call for it and reports:
+
+    ```
+    declared-catalog-not-grantable: the Glue catalog is in account <owner-account>,
+    and a native Lake Formation grant can only be made in <accelerator-account>
+    ```
+
+    This is deliberate. Context Ontology Accelerator's automatic serve-role grant
+    (`grant_consumer_select_native`) can only act in its **own account's root
+    catalog**, so a grant made for a source that declared a foreign catalog would
+    land on a local database of the same name — a resource the request never
+    named and the ownership check never cleared. The gate therefore refuses, and
+    completing steps 1–3 does not flip the flag. Step 4 above is the supported
+    way to query the data. Cross-account *discovery* still works via
+    `crossAccountRoleArn`; cross-account *querying* is wired up manually.
 
 ---
 
@@ -415,11 +453,14 @@ explicit owner-side grants above.
 - [ ] **Discovery:** Glue resource policy grants `glue:Get*` to `{prefix}-sources-db-connector` (+ strict-LF: LF `DESCRIBE` to the connector)
 - [ ] **Query-time (owner account):** catalog shared via AWS RAM; serve runtime role can read the underlying S3 data (+ strict-LF: LF `SELECT`/`DESCRIBE` to the serve runtime role)
 - [ ] **Query-time (Context Ontology Accelerator account):** RAM share accepted; resource link created pointing at the owner DB; serve runtime role granted `DESCRIBE` on the resource link
+- [ ] **Queryable in Context Ontology Accelerator:** the local resource link registered as a *second*, same-account Glue source (`catalogId` = this account)
 
-> `crossAccountRoleArn` only covers discovery. A source can scan and show
-> metadata yet remain non-queryable until the query-time rows above are
-> complete. Context Ontology Accelerator does not automate cross-account query setup — it is a manual
-> prerequisite.
+> `crossAccountRoleArn` only covers discovery. The source that names the owner's
+> `catalogId` stays `queryable: false` permanently — reason
+> `declared-catalog-not-grantable: ...` — even after every query-time row above
+> is complete; register the local resource link as a same-account source to get
+> a queryable one. Context Ontology Accelerator does not automate cross-account
+> query setup — it is a manual prerequisite.
 
 See [Structured Data Source Guide](index.md) for registration, scanning, review,
 and querying once access is in place.

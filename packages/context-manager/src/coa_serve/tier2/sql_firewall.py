@@ -9,15 +9,20 @@ Used by both Tier 1 (pre-compiled metric SQL) and Tier 2 (VKG-generated SQL).
 Safety checks (always enforced):
 - Only SELECT statements allowed (DDL/DML rejected via sqlglot AST).
 - Dangerous functions blocked (filesystem access, network, sleep).
+- Table functions blocked: every relation must be a named table, a subquery or
+  a row generator (``generate_series``, ``UNNEST``). A pass-through query such as
+  ``TABLE(pg.system.query(query => '...'))`` hands the source database a second
+  statement no check here can see, so it is refused in every dialect.
 
 Authorization (table/column enforcement from the principal's grant profile):
 - Table allowlist: every referenced table must appear in `tableAllowlist`.
 - Column denylist: referenced columns are evaluated per table against
   `columnDenylist`; `SELECT *` over a restricted table is rejected since the
-  denied columns cannot be proven excluded.
+  denied columns cannot be proven excluded, and so is a whole-row reference
+  (the table name or alias used as a value, e.g. ``SELECT to_json(c) FROM t c``).
 - Fail-closed: queries that cannot be parsed/analyzed are denied. Namespace
   and action-level authorization is enforced upstream (API Gateway authorizer).
-- Row-level filtering is post-MVP (Row Filter Injector).
+- Row-level filtering is not done here.
 
 Uses sqlglot for AST-based validation and table/column extraction.
 """
@@ -37,11 +42,13 @@ from coa_common.sql_safety import (
     dangerous_sql_ast_reason,
     dangerous_sql_functions,
     executable_select_shape_error,
+    table_source_reason,
 )
 
 from ..schema_visibility import request_schema_visibility
 from .cedar_authorizer import CedarAuthorizer, NullCedarAuthorizer, RealCedarAuthorizer
 from .strategy import is_bare_not_answerable_sql
+from .table_qualifier import identifiers_bind_everywhere, real_tables, resolves_to_cte
 
 logger = structlog.get_logger(__name__)
 
@@ -98,15 +105,21 @@ _DATA_DEPENDENT_NODES: tuple[type[sqlglot.exp.Expression], ...] = (
 def _references_a_table(parsed: sqlglot.exp.Expression | None) -> bool:
     """Whether ``parsed`` reads at least one real table.
 
-    CTE names and table functions (``generate_series(...)``, ``UNNEST``) parse
-    as ``Table`` nodes but read no stored data, so they do not count. ``None``
-    (nothing parsed) returns False, so the caller refuses it.
+    CTE references and row generators (``generate_series(...)``, ``UNNEST``)
+    parse as ``Table`` nodes but read no stored data, so they do not count.
+    Other table functions never reach this check: ``table_source_reason``
+    refuses them in the safety check first.
+    ``None`` (nothing parsed) returns False, so the caller refuses it.
+
+    A reference counts as a CTE here when it binds to one on *any* engine
+    (``on_any_engine``), the opposite of the table checks: Trino/Athena bind
+    ``FROM x`` to ``WITH X``, so counting it as a stored table would skip this
+    refusal for a statement that reads only its own constants.
     """
     if parsed is None:
         return False
-    cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
     return any(
-        table.name and table.name.lower() not in cte_names and not isinstance(table.this, sqlglot.exp.Func)
+        table.name and not isinstance(table.this, sqlglot.exp.Func) and not resolves_to_cte(table, on_any_engine=True)
         for table in parsed.find_all(sqlglot.exp.Table)
     )
 
@@ -179,8 +192,6 @@ def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | Non
 
     ``is not None``, not truthiness: an ABSENT allowlist means "no table
     constraint", but an explicitly EMPTY one means "no tables permitted".
-    Collapsing the two made a deny-all grant fail OPEN — the empty list was
-    falsy, so the restriction was dropped and every table was allowed.
 
     Raises:
         TypeError: If a member cannot be converted (callers fail closed).
@@ -190,16 +201,17 @@ def _normalized_table_allowlist(allowlist_raw: list[Any] | tuple[Any, ...] | Non
     return {_grant_table_key(t) for t in allowlist_raw}
 
 
-# Athena's built-in Glue catalog. A ``database.table`` grant entry names a table
-# in it, so ``awsdatacatalog.crm_db.customers`` is the same entry.
-_ROOT_CATALOG = "awsdatacatalog"
+# The root Glue Data Catalog, lower-cased: Athena's built-in ``AwsDataCatalog``
+# and Redshift's Glue auto-mount external catalog. A ``database.table`` grant
+# entry names a table in it, so ``awsdatacatalog.crm_db.customers`` is the same
+# entry. Shared by the executors' routing and rewrite checks so they cannot drift.
+AWS_DATA_CATALOG = "awsdatacatalog"
 
 
 def _grant_table_key(entry: Any) -> str:
     """One ``tableAllowlist`` / ``columnDenylist`` table entry, as references are matched against it.
 
-    A bare entry (``customers``) is only lower-cased, exactly as it was always
-    compared, so an existing grant behaves as before. A ``database.table`` entry
+    A bare entry (``customers``) is only lower-cased. A ``database.table`` entry
     is lower-cased with each part unquoted, and ``awsdatacatalog.database.table``
     reads as ``database.table``.
     """
@@ -207,7 +219,7 @@ def _grant_table_key(entry: Any) -> str:
     if "." not in lowered:
         return lowered
     parts = [part.strip().strip('"`[]') for part in lowered.strip().split(".")]
-    if len(parts) == 3 and parts[0] == _ROOT_CATALOG:
+    if len(parts) == 3 and parts[0] == AWS_DATA_CATALOG:
         parts = parts[1:]
     return ".".join(parts)
 
@@ -219,7 +231,7 @@ def _qualified_reference(catalog: str, database: str, table: str) -> str:
     catalog: ``othercat.crm_db.customers`` is not the table a ``crm_db.customers``
     grant names.
     """
-    if not database or (catalog and catalog.lower() != _ROOT_CATALOG):
+    if not database or (catalog and catalog.lower() != AWS_DATA_CATALOG):
         return ""
     return f"{database}.{table}".lower()
 
@@ -326,6 +338,121 @@ class NamespaceSQLScopeError(ValueError):
     """Raised when SQL names an object outside the requested namespace's sources."""
 
 
+def _relation_sources(select: sqlglot.exp.Select) -> list[sqlglot.exp.Expression]:
+    """The FROM and JOIN items of one SELECT (its own scope, not nested queries)."""
+    # sqlglot renamed "from" to "from_"; read both under the >=25 floor.
+    from_ = select.args.get("from_") or select.args.get("from")
+    sources = [from_.this] if from_ is not None else []
+    return sources + [join.this for join in select.args.get("joins") or []]
+
+
+def _identifier(node: sqlglot.exp.Expression) -> sqlglot.exp.Identifier:
+    """A column's name or qualifier as an Identifier, quoting kept."""
+    return node if isinstance(node, sqlglot.exp.Identifier) else sqlglot.exp.to_identifier(node.name)
+
+
+def _is_misparsed_table_statement(table: sqlglot.exp.Table) -> bool:
+    """``(TABLE customers)``: sqlglot reads a table named ``TABLE`` aliased ``customers``.
+
+    The engine reads the stored table ``customers``. Unquoted ``TABLE`` is a
+    reserved word on every engine, so it is never a real table name; a statement
+    holding it is refused as unparsable rather than checked against the wrong table.
+    """
+    ident = table.this
+    return isinstance(ident, sqlglot.exp.Identifier) and not ident.quoted and ident.this.upper() == "TABLE"
+
+
+def _parenthesized_tables(source: sqlglot.exp.Expression) -> set[str] | None:
+    """Stored tables a parenthesized table reference reads, or None when it is not one.
+
+    ``FROM (customers) c`` and ``FROM ((customers JOIN orders ON ...)) c`` parse as
+    a Subquery wrapping a Table: the alias names those stored tables, not a row
+    built by a SELECT. A wrapped CTE reference reads only what the CTE projected.
+    """
+    body = source
+    while isinstance(body, (sqlglot.exp.Subquery, sqlglot.exp.Paren)):
+        body = body.this
+    if body is source or isinstance(body, sqlglot.exp.Query):
+        return None
+    return {t.name.lower() for t in real_tables(body)}
+
+
+def _relation_names(source: sqlglot.exp.Expression) -> list[sqlglot.exp.Identifier]:
+    """The names a FROM/JOIN item declares, quoting kept: its alias first, then a stored table's own name."""
+    names = []
+    alias = source.args.get("alias")
+    if isinstance(alias, sqlglot.exp.TableAlias) and isinstance(alias.this, sqlglot.exp.Identifier):
+        names.append(alias.this)
+    if isinstance(source, sqlglot.exp.Table) and isinstance(source.this, sqlglot.exp.Identifier):
+        names.append(source.this)
+    return names
+
+
+def _source_tables(source: sqlglot.exp.Expression) -> set[str]:
+    """Stored tables a FROM/JOIN item reads directly; none for a CTE or derived query."""
+    if isinstance(source, sqlglot.exp.Table):
+        return set() if resolves_to_cte(source) else {source.name.lower()}
+    return _parenthesized_tables(source) or set()
+
+
+def _bind_relation(node: sqlglot.exp.Expression, ref: sqlglot.exp.Identifier) -> set[str] | None:
+    """Resolve ``ref`` (a table name or alias) as SQL does from ``node``.
+
+    Walks outward through the enclosing SELECTs to the first whose FROM/JOIN
+    items declare the name on every engine (``identifiers_bind_everywhere``) and
+    returns the stored tables it binds to there: several when ambiguous, none for
+    a CTE or derived table. A declaration matching only case-insensitively
+    (``"C"`` for ``c``) binds on Trino but not on Postgres, so its tables are
+    added and the walk goes on. Returns None when no scope declares the name on
+    every engine; the caller falls back to every table of that name or alias.
+    A non-LATERAL derived table cannot see its sibling FROM items, so a reference
+    inside one binds further out.
+    """
+    folded = ref.this.lower()
+    candidates: set[str] = set()
+    item: sqlglot.exp.Expression | None = None
+    child: sqlglot.exp.Expression = node
+    scope = node.parent
+    while scope is not None:
+        inside_derived_table = (
+            isinstance(child, (sqlglot.exp.From, sqlglot.exp.Join))
+            and item is child.this
+            and isinstance(item, sqlglot.exp.Subquery)
+        )
+        if isinstance(scope, sqlglot.exp.Select) and not inside_derived_table:
+            exact = False
+            for source in _relation_sources(scope):
+                names = _relation_names(source)
+                if not any(name.this.lower() == folded for name in names):
+                    continue
+                candidates |= _source_tables(source)
+                # An alias hides a stored table's own name (``orders`` in ``FROM orders o``
+                # binds further out), so only the first name, the alias when there is one,
+                # stops the walk; the own name still charges its table.
+                exact = exact or identifiers_bind_everywhere(names[0], ref)
+            if exact:
+                return candidates
+        item, child, scope = child, scope, scope.parent
+    return None
+
+
+def _unattributed_relation(parsed: sqlglot.exp.Expression) -> str | None:
+    """The first relation in ``parsed`` that names no stored table, or None.
+
+    Table functions (``TABLE(pg.system.query(query => '...'))``, ``OPENQUERY``,
+    a user-defined function in FROM) read tables the statement does not name,
+    so no table or column check can see them. The safety check refuses them in
+    every dialect (``coa_common.sql_safety.table_source_reason``); the
+    authorization and namespace-scope checks refuse them too, rather than
+    skipping a nameless Table node.
+    """
+    for node in parsed.walk():
+        reason = table_source_reason(node)
+        if reason is not None:
+            return reason
+    return None
+
+
 @dataclass(frozen=True)
 class _QueryRefs:
     """Table and column references extracted from a SQL statement.
@@ -344,6 +471,15 @@ class _QueryRefs:
     # One ``(bare, database.table)`` pair per distinct real-table reference; the
     # second is "" when the reference names no database (see `_qualified_reference`).
     table_refs: frozenset[tuple[str, str]] = frozenset()
+    # Tables whose name or alias is used as a value (a whole-row reference such as
+    # ``SELECT c FROM customers c``); like ``c.*``, it exposes every column.
+    whole_row_tables: frozenset[str] = frozenset()
+    # Tables given a column alias list (``customers AS x(id, s)``), which renames
+    # their columns by position, so a denied column can be read under another name.
+    renamed_tables: frozenset[str] = frozenset()
+    # Set when a relation names no stored table (a table function or pass-through
+    # query): the label from ``table_source_reason``, and every other field is empty.
+    unattributed_relation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -369,7 +505,7 @@ class SQLFirewall:
     Authorization enforces table/column access from the caller's grant profile
     (``tableAllowlist`` / ``columnDenylist``) and fails closed on parse errors.
 
-    a ``CedarAuthorizer`` adds a namespace-level policy gate that runs
+    A ``CedarAuthorizer`` adds a namespace-level policy gate that runs
     AFTER the structural checks pass (an additional deny, never a relaxation).
     The default is the REAL ``cedarpy``-backed ``RealCedarAuthorizer`` (evaluates
     ``query`` on the namespace vs the caller's Roles-table role policies, and
@@ -472,9 +608,7 @@ class SQLFirewall:
         carries no data-access restrictions the query is allowed (namespace and
         action authorization is enforced upstream at the API Gateway authorizer).
 
-        Comparisons are case-insensitive (SQL identifiers are case-insensitive
-        for unquoted names across Athena/Postgres/MySQL/etc.); both the profile
-        and the extracted query refs are lower-cased before set operations.
+        Comparisons are case-insensitive (see ``_normalized_table_allowlist``).
 
         Args:
             sql: The SQL statement to evaluate.
@@ -482,10 +616,10 @@ class SQLFirewall:
                 ``tableAllowlist`` (list[str]) and ``columnDenylist``
                 (dict[str, list[str]]).
             namespace: Namespace evaluated by the Cedar policy gate.
-            dialect: sqlglot read-dialect used to parse ``sql`` for the safety
-                checks. Defaults to ``"trino"`` (the canonical generation dialect);
-                the direct-JDBC path passes the engine's own dialect so an
-                already-transpiled statement isn't rejected as unparseable.
+            dialect: sqlglot read-dialect used to parse ``sql``, and so the
+                reading that is authorized: run the authorized SQL only where it
+                is read in this dialect. Defaults to ``"trino"``, the dialect
+                every executor reads NL/VKG SQL in.
 
         Returns:
             FirewallResult indicating whether the query is allowed.
@@ -493,14 +627,16 @@ class SQLFirewall:
         Raises:
             UnsafeSQLError: If SQL fails safety validation (incl. parse errors).
         """
+        # One parse feeds every check below (safety, allowlist, denylist, Cedar):
+        # a second parse in another dialect could read a construct such as a
+        # nested block comment differently and hide a table or column from them.
         parsed = self._parse_validated(sql, dialect)
 
         profile = profile or {}
         # A statement that reads no table (``SELECT 'a' UNION ALL SELECT 'b'``),
         # or projects only constants (``SELECT 'customer_id' FROM orders``),
         # answers no data question; for a schema-blind caller it is only a way to
-        # return schema names from the generation prompt as row values (ADR:
-        # decompose-viewnamespace-schema-visibility). Refused unless the caller
+        # return schema names from the generation prompt as row values. Refused unless the caller
         # holds viewSource — checked first, so a source viewer pays nothing.
         # The one exception is the writer's NOT_ANSWERABLE refusal row, matched
         # by its exact statement shape: its message is a constant result column,
@@ -531,23 +667,22 @@ class SQLFirewall:
                     return self._deny(f"Invalid columnDenylist format for table '{table}': expected list")
                 denylist[_grant_table_key(table)] = {str(c).lower() for c in cols}
 
-        # No table/column restrictions on this grant — the structural allowlist/
-        # denylist is "sparse opt-in" (an authorization miss returns a
-        # FirewallResult, never raises; the terminal-deny at the
-        # orchestration boundary only bites on a RESTRICTIVE profile). The Cedar
-        # policy gate below still runs regardless, since it is namespace/role
-        # based rather than keyed off the sparse table profile.
-        #
-        # ``allowlist is None`` rather than ``not allowlist``: an empty allowlist is
-        # a restriction (deny every table), not the absence of one.
+        # No table/column restrictions on this grant (an empty allowlist is a
+        # restriction); the Cedar gate below still runs.
         if allowlist is None and not denylist:
             logger.info("sql_firewall_evaluate", decision="allow", restricted=False)
-            return self._apply_cedar(sql, namespace, profile)
+            return self._apply_cedar(sql, namespace, profile, parsed)
 
-        # Fail-closed: deny anything we cannot fully analyze for table/column refs.
-        refs = self._analyze_refs(sql)
+        refs = self._refs_from_ast(parsed)
         if refs is None:
             return self._deny("Query could not be parsed for authorization")
+        if refs.unattributed_relation is not None:
+            # The label names the construct (``TableFunction(TABLE(system.query))``),
+            # never the SQL text.
+            logger.warning("sql_firewall_unattributed_relation", reason=refs.unattributed_relation)
+            return self._deny(
+                f"Query reads a relation the firewall cannot attribute to stored tables: {refs.unattributed_relation}"
+            )
 
         # Table allowlist — every referenced table must be permitted, by a bare
         # entry for its name (which covers every table of that name, in any
@@ -584,7 +719,7 @@ class SQLFirewall:
                 return self._deny(reason)
 
         logger.info("sql_firewall_evaluate", tables=sorted(refs.tables), decision="allow", restricted=True)
-        return self._apply_cedar(sql, namespace, profile)
+        return self._apply_cedar(sql, namespace, profile, parsed)
 
     def authorize_namespace(self, namespace: str, profile: dict[str, Any] | None = None) -> FirewallResult:
         """Coarse namespace admission gate (Cedar only), independent of any SQL.
@@ -595,7 +730,7 @@ class SQLFirewall:
         isolated ``kbSearch`` / ``graphTraverse`` / ``translate`` actions and the
         Tier-3 retrieval/synthesis path. This is their ONLY namespace
         authorization point; without it any authenticated IdP user could read any
-        namespace's chunks, graph and synthesized answers (F-2, CWE-862).
+        namespace's chunks, graph and synthesized answers (CWE-862).
 
         Fails CLOSED: an evaluator error denies, and (in prod) a caller with no
         resolved roles denies — the posture is owned by the ``CedarAuthorizer``.
@@ -604,22 +739,19 @@ class SQLFirewall:
         ns = namespace or str((profile or {}).get("namespace", ""))
         reason = self._cedar_gate(ns, profile or {}, tables=[])
         if reason is not None:
-            # Logged here rather than via ``_deny`` so the event name reflects the
-            # namespace-admission path — ``_deny`` emits ``sql_firewall_evaluate``,
-            # which would be misleading when no SQL was evaluated at all.
             logger.warning("namespace_authorize_denied", namespace=ns, reason=reason)
             return FirewallResult(denied=True, authorized_sql="", reason=reason)
         return FirewallResult(denied=False, authorized_sql="")
 
     def can_view_source(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
-        """Whether the principal holds ``viewSource`` (gates the SQL artifact) (ADR)."""
+        """Whether the principal holds ``viewSource`` (gates the SQL artifact)."""
         # A lambda so a missing method surfaces inside the probe (and fails closed).
         return self._probe_view(
             lambda **kw: self._cedar.can_view_source(**kw), "cedar_view_source_error", namespace, profile
         )
 
     def can_view_ontology(self, namespace: str, profile: dict[str, Any] | None = None) -> bool:
-        """Whether the principal holds ``viewOntology`` (gates the SPARQL artifact) (ADR)."""
+        """Whether the principal holds ``viewOntology`` (gates the SPARQL artifact)."""
         return self._probe_view(
             lambda **kw: self._cedar.can_view_ontology(**kw), "cedar_view_ontology_error", namespace, profile
         )
@@ -652,16 +784,17 @@ class SQLFirewall:
             )
             return False
 
-    def _apply_cedar(self, sql: str, namespace: str, profile: dict[str, Any]) -> FirewallResult:
+    def _apply_cedar(
+        self, sql: str, namespace: str, profile: dict[str, Any], parsed: sqlglot.exp.Expression
+    ) -> FirewallResult:
         """Apply the Cedar policy gate as a final authorization step.
 
-        Runs AFTER structural checks pass. With the default NullCedarAuthorizer
-        this is a no-op allow. Fails CLOSED: any evaluator exception denies
-        (never silently allows). Namespace is taken from the profile when not
-        passed (evaluate() does not currently receive it as a parameter).
+        Runs AFTER structural checks pass. Fails CLOSED: any evaluator exception
+        denies (never silently allows). ``parsed`` is the statement
+        :meth:`evaluate` already validated.
         """
         ns = namespace or str(profile.get("namespace", ""))
-        reason = self._cedar_gate(ns, profile, tables=_cedar_table_names(self.extract_tables(sql)))
+        reason = self._cedar_gate(ns, profile, tables=_cedar_table_names(self._tables_from_ast(parsed)))
         if reason is not None:
             return self._deny(reason)
         return FirewallResult(denied=False, authorized_sql=sql)
@@ -669,13 +802,8 @@ class SQLFirewall:
     def _cedar_gate(self, namespace: str, profile: dict[str, Any], tables: list[str]) -> str | None:
         """Run the Cedar policy decision. Returns a deny REASON, or None if allowed.
 
-        The single call site for the Cedar authorizer, shared by the SQL path
-        (:meth:`_apply_cedar`) and the SQL-free namespace gate
-        (:meth:`authorize_namespace`) so the fail-closed error handling exists
-        exactly once. Returns the reason string rather than a ``FirewallResult``
-        so each caller keeps its own ``authorized_sql`` and emits its own log
-        event (the SQL path's ``sql_firewall_evaluate`` would misdescribe the
-        namespace-admission path).
+        Shared by :meth:`_apply_cedar` and :meth:`authorize_namespace`; fails
+        closed on evaluator error.
         """
         try:
             decision = self._cedar.authorize(namespace=namespace, profile=profile, tables=tables)
@@ -705,14 +833,19 @@ class SQLFirewall:
     def _evaluate_columns(table: str, denied: set[str], refs: _QueryRefs) -> str | None:
         """Return a denial reason if the query exposes denied columns of ``table``.
 
-        Fail-closed on ``SELECT *`` / ``table.*`` (cannot prove denied columns
-        are excluded) and treats unqualified columns as potentially belonging to
+        Fail-closed on ``SELECT *`` / ``table.*``, on a whole-row reference to
+        ``table`` and on a column alias list over it (cannot prove denied columns
+        are excluded), and treats unqualified columns as potentially belonging to
         any in-scope table.
         """
         if not denied:
             return None
         if refs.bare_star or table in refs.star_tables:
             return f"Access denied: SELECT * may expose restricted columns of '{table}'"
+        if table in refs.whole_row_tables:
+            return f"Access denied: whole-row reference may expose restricted columns of '{table}'"
+        if table in refs.renamed_tables:
+            return f"Access denied: column alias list may rename restricted columns of '{table}'"
         blocked = (refs.columns_by_table.get(table, set()) | set(refs.unqualified_columns)) & denied
         if blocked:
             cols = ", ".join(f"{table}.{c}" for c in sorted(blocked))
@@ -728,6 +861,7 @@ class SQLFirewall:
         default_catalog: str,
         schema_only: bool = False,
         selected_source_schemas: frozenset[str] = frozenset(),
+        dialect: str = "trino",
     ) -> bool:
         """Authorize qualified table references against one namespace's sources.
 
@@ -739,13 +873,31 @@ class SQLFirewall:
         ``information_schema`` is denied rather than treated as a normal schema:
         querying it under ``AwsDataCatalog`` can enumerate every Glue database the
         shared runtime role can see, including other namespaces' sources.
+
+        ``dialect`` is the sqlglot read-dialect. It defaults to ``"trino"`` (the
+        generation dialect); an executor that rewrites SQL into an engine dialect
+        re-checks the final statement with that dialect, so the statement that
+        runs is the statement that was authorized.
         """
         try:
-            parsed = sqlglot.parse_one(sql, read="trino")
-        except sqlglot.errors.ParseError as exc:
+            parsed = sqlglot.parse_one(sql, read=dialect)
+        except (sqlglot.errors.SqlglotError, RecursionError) as exc:
+            # The same set requires_namespace_scope_check routes here, so a token
+            # error or a too-deep statement is a scope denial, not a raw exception.
             raise NamespaceSQLScopeError("Unable to verify SQL references") from exc
+        if parsed is None:
+            raise NamespaceSQLScopeError("Unable to verify SQL references")
 
-        cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
+        unattributed = _unattributed_relation(parsed)
+        if unattributed is not None:
+            # A pass-through query names its catalog in the function call
+            # (``pg.system.query``), not as a table qualifier this check can pin,
+            # and no namespace configuration makes it checkable.
+            raise NamespaceSQLScopeError(
+                f"Table functions and pass-through queries are not permitted: {unattributed}. "
+                "Read from named source tables instead."
+            )
+
         checked = False
         default_catalog_lc = (default_catalog or "AwsDataCatalog").lower()
         # A direct-JDBC two-part name is resolved by the selected connection, so
@@ -754,9 +906,7 @@ class SQLFirewall:
         # still use the namespace-wide catalog-pinned checks below.
         selected_source_schema_scope = {schema.lower() for schema in selected_source_schemas}
 
-        for table in parsed.find_all(sqlglot.exp.Table):
-            if not table.name or (not table.db and table.name.lower() in cte_names):
-                continue
+        for table in real_tables(parsed):
             catalog = (table.catalog or "").lower()
             database = (table.db or "").lower()
             if not catalog and not database:
@@ -772,15 +922,12 @@ class SQLFirewall:
                 allowed = bool(database) and database in selected_source_schema_scope
             else:
                 effective_catalog = catalog or default_catalog_lc
-                if effective_catalog == "awsdatacatalog":
+                if effective_catalog == AWS_DATA_CATALOG:
                     allowed = bool(database) and database in native_databases
                 else:
                     allowed = bool(database) and (effective_catalog, database) in federated_catalog_schemas
             if not allowed:
-                # Name the specific rejected reference so a denial is diagnosable
-                # from the caller's log (the caller records the authorized scope
-                # alongside it). This is a policy statement about the query, not
-                # sensitive data, so it is safe to carry in the internal message.
+                # Name the rejected reference so the denial is diagnosable.
                 rejected = (
                     f'"{database}"."{table.name.lower()}"'
                     if schema_only and not catalog
@@ -791,10 +938,29 @@ class SQLFirewall:
         return checked
 
     @staticmethod
+    def requires_namespace_scope_check(sql: str) -> bool:
+        """Whether an executor must run :meth:`validate_namespace_sql_scope` on ``sql``.
+
+        True for a dot-qualified table reference, which can override the
+        namespace's resolved catalog, and for a relation that names no stored
+        table (a table function or pass-through query), which the scope check
+        refuses. True as well when the statement does not parse, so the check
+        fails closed. Only plain bare-table SQL skips the source lookup.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, read="trino")
+        except (sqlglot.errors.SqlglotError, RecursionError):
+            return True
+        if parsed is None or _unattributed_relation(parsed) is not None:
+            return True
+        # Same test as a dot in an ``extract_tables`` entry, on the tree already parsed.
+        return any(sum(1 for part in (t.catalog, t.db, t.name) if part) > 1 for t in parsed.find_all(sqlglot.exp.Table))
+
+    @staticmethod
     def referenced_tables(sql: str, dialect: str = "trino") -> list[str]:
         """Bare, lower-cased names of the source tables ``sql`` reads, sorted.
 
-        Reads the statement the way the allowlist check does: CTE names are
+        Reads the statement the way the allowlist check does: CTE references are
         excluded and catalog/schema qualifiers are dropped. It parses with
         ``dialect`` first (Trino, the safety check's default), then with sqlglot's
         default dialect, so Trino-only syntax such as ``CAST(ROW(...) AS ROW(...))``
@@ -811,7 +977,7 @@ class SQLFirewall:
                 # e.g. a TokenError on an unterminated literal. A trace detail must
                 # not fail the request; the firewall's own checks reject such SQL.
                 refs = None
-            if refs is not None:
+            if refs is not None and refs.unattributed_relation is None:
                 return sorted(refs.tables)
         # Not the firewall's parse-error event: nothing was authorized here.
         logger.info("referenced_tables_unparsed", sql_len=len(sql))
@@ -819,20 +985,21 @@ class SQLFirewall:
 
     @staticmethod
     def _analyze_refs(sql: str, dialect: str | None = None, *, log_parse_error: bool = True) -> _QueryRefs | None:
-        """Parse ``sql`` and extract table/column references for authorization.
+        """Parse ``sql`` and extract its table/column references.
 
-        Returns None when the statement cannot be parsed (caller fails closed).
-        CTE names are excluded so they are not mistaken for source tables.
+        Returns None when the statement cannot be parsed.
+        References that bind to a CTE (see ``table_qualifier.resolves_to_cte``)
+        are excluded so they are not mistaken for source tables; a qualified or
+        out-of-scope reference sharing a CTE's name is still a source table.
 
-        All identifiers are normalized to lower-case so downstream comparisons
-        with the (also lower-cased) grant profile are case-insensitive — SQL
-        identifiers are case-insensitive for unquoted names and the firewall
-        must not be bypassed by varying case in either the query or profile.
+        All identifiers are normalized to lower-case so comparisons with the
+        grant profile are case-insensitive.
 
         Args:
             sql: The statement to analyze.
-            dialect: sqlglot read-dialect; ``None`` (the authorization path) uses
-                sqlglot's default dialect.
+            dialect: sqlglot read-dialect; ``None`` uses sqlglot's default dialect.
+                ``evaluate`` does not come through here: it reads the references
+                off the statement it already parsed (``_refs_from_ast``).
             log_parse_error: Log ``sql_firewall_parse_error`` when parsing fails.
                 ``referenced_tables`` turns it off, since its fallback parse may
                 still succeed.
@@ -846,38 +1013,87 @@ class SQLFirewall:
             return None
         if parsed is None:
             return None
+        return SQLFirewall._refs_from_ast(parsed)
 
-        cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
+    @staticmethod
+    def _refs_from_ast(parsed: sqlglot.exp.Expression) -> _QueryRefs | None:
+        """Extract the table/column references of an already-parsed statement (see :meth:`_analyze_refs`).
 
-        # alias/table-name (lowercased) -> bare table name (lowercased)
-        alias_map: dict[str, str] = {}
+        Returns None for a statement sqlglot misreads (``_is_misparsed_table_statement``).
+        """
+        if any(_is_misparsed_table_statement(t) for t in parsed.find_all(sqlglot.exp.Table)):
+            return None
+        unattributed = _unattributed_relation(parsed)
+        if unattributed is not None:
+            # A table function or pass-through query reads tables it does not
+            # name, so its columns cannot be charged to any table (fail closed).
+            return _QueryRefs(
+                tables=frozenset(),
+                columns_by_table={},
+                unqualified_columns=frozenset(),
+                star_tables=frozenset(),
+                bare_star=False,
+                unattributed_relation=unattributed,
+            )
+
+        # Only for the fallback in charged_tables below; references resolve by scope.
+        declared_cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
+
+        # alias/table-name (lowercased) -> every bare table name (lowercased) it
+        # names anywhere in the statement. An alias can be reused in another
+        # scope (``... FROM customers x UNION ALL ... FROM orders x``), so this is
+        # only the fail-closed fallback; references resolve by scope first.
+        alias_map: dict[str, set[str]] = {}
         tables: set[str] = set()
         table_refs: set[tuple[str, str]] = set()
-        for tbl in parsed.find_all(sqlglot.exp.Table):
-            name = tbl.name
-            if not name or name.lower() in cte_names:
-                continue
-            name_lc = name.lower()
+        renamed_tables: set[str] = set()
+        for tbl in real_tables(parsed):
+            name_lc = tbl.name.lower()
             tables.add(name_lc)
+            table_alias = tbl.args.get("alias")
+            if isinstance(table_alias, sqlglot.exp.TableAlias) and table_alias.columns:
+                renamed_tables.add(name_lc)
             table_refs.add((name_lc, _qualified_reference(tbl.catalog, tbl.db, name_lc)))
-            alias_map[name_lc] = name_lc
+            alias_map.setdefault(name_lc, set()).add(name_lc)
             if tbl.alias:
-                alias_map[tbl.alias.lower()] = name_lc
+                alias_map.setdefault(tbl.alias.lower(), set()).add(name_lc)
+        # ``(customers) AS c(id, s)``: the alias and its column list belong to the
+        # parenthesized stored table, not to a derived query.
+        for wrapped in parsed.find_all(sqlglot.exp.Subquery):
+            wrapped_tables = _parenthesized_tables(wrapped)
+            if not wrapped_tables:
+                continue
+            wrapped_alias = wrapped.args.get("alias")
+            if isinstance(wrapped_alias, sqlglot.exp.TableAlias) and wrapped_alias.columns:
+                renamed_tables |= wrapped_tables
+            if wrapped.alias:
+                alias_map.setdefault(wrapped.alias.lower(), set()).update(wrapped_tables)
 
-        def resolve(qualifier: str) -> str:
-            return alias_map.get(qualifier.lower(), qualifier.lower())
+        def charged_tables(bound: set[str] | None, ref: sqlglot.exp.Identifier) -> set[str]:
+            """Stored tables a relation name may denote: its binding, else every table of that name (fail closed)."""
+            if bound is not None:
+                return bound
+            relation = ref.this.lower()
+            # No enclosing SELECT declares the name, so in SQL it cannot be a row
+            # variable at all. A stored table or alias of that name anywhere is
+            # charged (fail closed); a name that is only a CTE's is skipped,
+            # because a CTE row is reachable only through a FROM item, which the
+            # scope walk would have found. Anything else is charged as a table.
+            return alias_map.get(relation, {relation} if relation not in declared_cte_names else set())
 
         star_tables: set[str] = set()
         bare_star = False
         for star in parsed.find_all(sqlglot.exp.Star):
             parent = star.parent
             if isinstance(parent, sqlglot.exp.Column) and parent.table:
-                star_tables.add(resolve(parent.table))
+                star_ref = _identifier(parent.args["table"])
+                star_tables.update(charged_tables(_bind_relation(parent, star_ref), star_ref))
             elif isinstance(parent, sqlglot.exp.Select):
                 bare_star = True  # SELECT * — exposes every column of in-scope tables
 
         columns_by_table: dict[str, set[str]] = {}
         unqualified: set[str] = set()
+        whole_row_tables: set[str] = set()
         for col in parsed.find_all(sqlglot.exp.Column):
             if isinstance(col.this, sqlglot.exp.Star):
                 continue  # handled above
@@ -885,10 +1101,17 @@ class SQLFirewall:
             if not name:
                 continue
             name_lc = name.lower()
-            qualifier = col.table
-            if qualifier and qualifier.lower() not in cte_names:
-                columns_by_table.setdefault(resolve(qualifier), set()).add(name_lc)
-            elif not qualifier:
+            qualifier = _identifier(col.args["table"]) if col.table else None
+            qualifier_bound = _bind_relation(col, qualifier) if qualifier is not None else None
+            if qualifier_bound is None:
+                # Unqualified, or the qualifier names no relation (a schema, as in public.customers): a name
+                # that denotes a stored table is a whole-row reference; a real column of that name fails closed.
+                row_bound = _bind_relation(col, _identifier(col.this))
+                whole_row_tables.update(row_bound if row_bound is not None else alias_map.get(name_lc, set()))
+            if qualifier is not None:
+                for table in charged_tables(qualifier_bound, qualifier):
+                    columns_by_table.setdefault(table, set()).add(name_lc)
+            else:
                 unqualified.add(name_lc)
 
         return _QueryRefs(
@@ -898,13 +1121,14 @@ class SQLFirewall:
             star_tables=frozenset(star_tables),
             bare_star=bare_star,
             table_refs=frozenset(table_refs),
+            whole_row_tables=frozenset(whole_row_tables),
+            renamed_tables=frozenset(renamed_tables),
         )
 
     @staticmethod
     def extract_tables(sql: str) -> list[str]:
         """Extract table names referenced in a SQL statement via AST parsing.
 
-        Uses sqlglot to parse the SQL and walk the AST for Table nodes.
         Returns a deduplicated list of fully-qualified table names (schema.table
         or just table depending on the SQL).
 
@@ -916,11 +1140,14 @@ class SQLFirewall:
             # SQL may carry caller-supplied literal values (potential PII); log length only.
             logger.warning("sql_firewall_parse_error", sql_len=len(sql))
             return []
+        return SQLFirewall._tables_from_ast(parsed)
 
+    @staticmethod
+    def _tables_from_ast(parsed: sqlglot.exp.Expression) -> list[str]:
+        """Qualified table names of an already-parsed statement (see :meth:`extract_tables`)."""
         tables: list[str] = []
         seen: set[str] = set()
         for table_node in parsed.find_all(sqlglot.exp.Table):
-            # Build qualified name: schema.table or just table
             parts = []
             if table_node.catalog:
                 parts.append(table_node.catalog)

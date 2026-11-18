@@ -33,7 +33,12 @@ from rdflib.namespace import SKOS
 from rdflib.term import Node
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogConstraint, CatalogTable, parse_referred_column
+from coa_ontology.inducer.services.data_catalog import (
+    CatalogConstraint,
+    CatalogTable,
+    parse_referred_column,
+    parse_referred_schema,
+)
 from coa_ontology.inducer.strategies.base import (
     InductionStrategy,
     add_glossary_and_tags,
@@ -228,9 +233,6 @@ class RigorOntologyStrategy(InductionStrategy):
             raise ValueError(
                 f"rigor_ontology supports only English namespaces; this namespace's language is {namespace_language}"
             )
-        # rigor_ontology uses LLM Gen+Judge rather than embedding match, so
-        # grounding_ontology_ids and grounding_mode have no effect on its
-        # current path. Accept for signature parity with the abstract base.
         del grounding_mode
         del grounding_ontology_ids
         # Every Gen/Judge/fallback LLM call flows through _call_llm; stash the
@@ -356,9 +358,6 @@ class RigorOntologyStrategy(InductionStrategy):
                 dropped_tables.append({"table_name": table.name, "reason": "parse_failed"})
 
         # Step 4b: Sanitize dual-typed properties (OWL 2 QL compliance)
-        # LLM occasionally emits a property as both owl:ObjectProperty and
-        # owl:DatatypeProperty (e.g. FK columns that are also integers).
-        # Ontop rejects this; resolve by keeping ObjectProperty (FK semantics).
         self._fix_dual_typed_properties(merged_graph)
 
         # Step 5: Novelty check
@@ -400,7 +399,7 @@ class RigorOntologyStrategy(InductionStrategy):
         """Write one table's or column's approved metadata onto ``subject``.
 
         An approved description REPLACES whatever ``rdfs:comment`` the LLM wrote:
-        two competing descriptions on one term is the failure #1118 removed, and
+        two competing ``rdfs:comment`` values on one term would conflict, and
         the approved text is the one a steward signed off. With no approved
         description the LLM's comment is kept.
         """
@@ -573,30 +572,42 @@ class RigorOntologyStrategy(InductionStrategy):
     # ── FK ordering ──────────────────────────────────────────────────
 
     def _order_by_fk(self, tables: list[CatalogTable]) -> list[CatalogTable]:
-        """Topological sort: referenced tables before referencing ones."""
-        table_map = {t.name: t for t in tables}
+        """Topological sort: referenced tables before referencing ones.
+
+        Keyed by :func:`table_identity`, not the bare name, because same-named
+        tables in different schemas or sources are different tables. An FK
+        edge points at every in-run table of the referenced name. That can order a
+        table earlier than it strictly needs to be, which is harmless, and it keeps
+        this ordering free of the resolver's warnings.
+        """
+        table_map: dict[str, CatalogTable] = {}
+        ids_by_name: dict[str, list[str]] = {}
+        for t in tables:
+            identity = table_identity(t)
+            if identity not in table_map:
+                ids_by_name.setdefault(t.name, []).append(identity)
+            table_map[identity] = t
         visited: set[str] = set()
         in_progress: set[str] = set()
         ordered: list[CatalogTable] = []
 
-        def visit(name: str):
-            if name in visited or name in in_progress:
+        def visit(identity: str) -> None:
+            if identity in visited or identity in in_progress:
                 return  # already done or cycle (skip the back-edge)
-            in_progress.add(name)
-            table = table_map.get(name)
-            if table and table.tableConstraints:
-                for tc in table.tableConstraints:
-                    if tc.constraintType == "FOREIGN_KEY" and tc.referredColumns:
-                        ref_table, _ = parse_referred_column(tc.referredColumns[0])
-                        if ref_table in table_map and ref_table != name:
-                            visit(ref_table)
-            in_progress.discard(name)
-            visited.add(name)
-            if table:
-                ordered.append(table)
+            in_progress.add(identity)
+            table = table_map[identity]
+            for tc in table.tableConstraints or []:
+                if tc.constraintType == "FOREIGN_KEY" and tc.referredColumns:
+                    ref_table, _ = parse_referred_column(tc.referredColumns[0])
+                    for ref_id in ids_by_name.get(ref_table, []):
+                        if ref_id != identity:
+                            visit(ref_id)
+            in_progress.discard(identity)
+            visited.add(identity)
+            ordered.append(table)
 
         for t in tables:
-            visit(t.name)
+            visit(table_identity(t))
         return ordered
 
     # ── RAG retrieval ────────────────────────────────────────────────
@@ -889,7 +900,6 @@ class RigorOntologyStrategy(InductionStrategy):
                         and str(target) not in novel_uris
                     ):
                         referenced_classes.add(target)
-        from rdflib import BNode
 
         for cls_ref in referenced_classes:
             for p, o in merged_graph.predicate_objects(cls_ref):
@@ -1096,7 +1106,12 @@ class RigorOntologyStrategy(InductionStrategy):
 
                 fk_target, _ = self._fk_info(col.name, table)
                 fk_constraint = self._fk_constraint(col.name, table)
-                fk_target_datasource_id = fk_constraint.targetDatasourceId if fk_constraint else None
+                fk_target_datasource_id: str | None = None
+                fk_target_schema = ""
+                if fk_constraint:
+                    fk_target_datasource_id = fk_constraint.targetDatasourceId
+                    if fk_constraint.referredColumns:
+                        fk_target_schema = parse_referred_schema(fk_constraint.referredColumns[0])
                 # Determine whether the generated property is an ObjectProperty
                 is_object_property = (
                     prop_uri,
@@ -1104,12 +1119,6 @@ class RigorOntologyStrategy(InductionStrategy):
                     OWL.ObjectProperty,
                 ) in proposal_graph
 
-                # Resolve the FK target to the SUBJECT token its own TriplesMap
-                # mints instance IRIs under, so the reference lands on the right
-                # (possibly disambiguated) target. An ambiguous bare target — two
-                # in-run tables answering to the name, neither picked by the
-                # referrer's own schema — degrades to a datatype literal rather than
-                # a join to an arbitrary same-named table, exactly as base.py does.
                 target_token = self._fk_target_token(
                     fk_target,
                     table,
@@ -1118,11 +1127,15 @@ class RigorOntologyStrategy(InductionStrategy):
                     ambiguous_names,
                     fk_target_datasource_id,
                     unmapped_ids,
+                    fk_target_schema,
                 )
                 if (
                     is_object_property
                     and fk_target
-                    and resolve_fk_target_identity(table, fk_target, ref_index, fk_target_datasource_id) in unmapped_ids
+                    and resolve_fk_target_identity(
+                        table, fk_target, ref_index, fk_target_datasource_id, fk_target_schema
+                    )
+                    in unmapped_ids
                 ):
                     # The target got no TriplesMap, so there is nothing to point an
                     # IRI at, and a literal under an owl:ObjectProperty makes Ontop
@@ -1202,9 +1215,6 @@ class RigorOntologyStrategy(InductionStrategy):
             identity = table_identity(table)
             expected_local = pascal_by_id[identity]
 
-            # Provenance and label are shared between same-named twins, so they can
-            # only re-fuse a collision. Skip straight to the disambiguated
-            # local-name match for a shared bare name.
             if table.name not in shared_names:
                 # Strategy 1: provenance match
                 for cls in gen_classes:
@@ -1276,6 +1286,7 @@ class RigorOntologyStrategy(InductionStrategy):
         ambiguous_names: set[str],
         target_datasource_id: str | None = None,
         unmapped_ids: set[str] | frozenset[str] = frozenset(),
+        target_schema: str = "",
     ) -> str | None:
         """Resolve an FK target name to the subject-IRI token of its TriplesMap.
 
@@ -1284,9 +1295,10 @@ class RigorOntologyStrategy(InductionStrategy):
         then the bare name when it is unambiguous across the run. Returns ``None``
         when two in-run tables answer to the name and the referrer's own schema
         does not pick one — the caller then emits a datatype literal instead of a
-        join to an arbitrary same-named table.
+        join to an arbitrary same-named table. A reference that names its schema
+        (``target_schema``) resolves inside that schema only.
 
-        ``target_datasource_id`` (an approved cross-source FK, #1140) goes to the
+        ``target_datasource_id`` (an approved cross-source FK) goes to the
         same :func:`resolve_fk_target_identity` call the other three artifacts
         make, so the template names the table the ontology's range does.
 
@@ -1307,6 +1319,7 @@ class RigorOntologyStrategy(InductionStrategy):
             target_name,
             ref_index,
             target_datasource_id,
+            target_schema,
         )
         if target_id is not None and target_id in unmapped_ids:
             return None
@@ -1318,12 +1331,6 @@ class RigorOntologyStrategy(InductionStrategy):
                 target_name,
             )
             return None
-        # Genuinely outside this induction run: the target table is not
-        # minted this run. An IRI-template ObjectMap pointing at a subject token
-        # whose TriplesMap is never declared is a dangling reference Ontop rejects
-        # on load, failing every query in the namespace. Degrade to a datatype
-        # literal (return None -> the caller emits rr:column), mirroring the
-        # ambiguous branch and the other three emitters.
         log.warning(
             "fk_target_out_of_run_degraded_to_literal",
             extra={"referrer": referrer.name, "target": target_name},
@@ -1437,7 +1444,7 @@ class RigorOntologyStrategy(InductionStrategy):
         """The single gate-passing FK constraint :meth:`_fk_info` reads, or ``None``.
 
         Exposed so the mapping can also read the constraint's ``targetDatasourceId``
-        (#1140) without changing :meth:`_fk_info`'s ``(table, column)`` shape.
+        without changing :meth:`_fk_info`'s ``(table, column)`` shape.
         """
         for tc in simple_fk_constraints(table, col_name):
             return tc

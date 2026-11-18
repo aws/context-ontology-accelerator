@@ -78,11 +78,8 @@ _DEFAULT_GLUE_CATALOG = "awsdatacatalog"
 
 # Catalog / schema names are interpolated into SQL as identifiers, so they are
 # validated first. sqlglot's ``quoted=True`` already neutralises an embedded
-# quote (it doubles it), so this is not the injection barrier — it is here so a
-# malformed name from source onboarding or schema discovery fails as a skipped
-# rewrite rather than as a quoted identifier that addresses nothing. Same shape
-# the registry enforces on database names (``sources_registry`` uses this exact
-# pattern before returning one).
+# quote, so this is not the injection barrier: it makes a malformed name fail as
+# a skipped rewrite rather than as a quoted identifier that addresses nothing.
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Routing-entry key the VKG translator uses to publish a reference that more than
@@ -142,25 +139,13 @@ def ambiguous_reference(
     """Return a diagnostic for the first ambiguously-routed table in ``sql``, else ``None``.
 
     The VKG translator publishes an ``AMBIGUOUS_KEY`` entry — candidates named,
-    no ``datasourceId`` — for a reference that more than one table answers to. It
-    used to withhold the entry instead, which made an ambiguous reference
-    indistinguishable from a table outside the mapping; the two need opposite
-    treatment. An out-of-mapping table is nothing to do with us. An ambiguous one
-    means the query names a table we cannot attribute, and because such an entry
-    contributes no datasource id, :func:`distinct_datasources` sees fewer sources
-    than the query really spans and the cross-source qualifier never runs — so the
-    statement executed against whatever catalog the query context defaulted to.
-
-    Checked independently of cross-source-ness for exactly that reason. The dict
+    no ``datasourceId`` — for a reference that more than one table answers to.
+    Such an entry contributes no datasource id, so :func:`distinct_datasources`
+    sees fewer sources than the query spans and the cross-source qualifier never
+    runs. This is therefore checked independently of cross-source-ness. The dict
     scan comes first so the common (unambiguous) path never pays for a parse.
 
-    Args:
-        sql: The statement about to be executed.
-        table_routing: Per-table routing from the VKG translate response.
-        dialect: sqlglot dialect for parsing.
-
-    Returns:
-        A message naming the reference and its candidates, or ``None``.
+    Returns a message naming the reference and its candidates, or ``None``.
     """
     flagged = {ref.lower(): entry[AMBIGUOUS_KEY] for ref, entry in table_routing.items() if AMBIGUOUS_KEY in entry}
     if not flagged:
@@ -170,7 +155,11 @@ def ambiguous_reference(
     except Exception as exc:  # noqa: BLE001 - unparseable SQL cannot be cleared
         return f"could not parse the SQL to check ambiguous table references ({type(exc).__name__})"
     known = {ref.lower() for ref in table_routing}
-    for table in real_tables(parsed):
+    try:
+        tables = qualifier_tables(parsed)
+    except QualificationError as exc:
+        return str(exc)
+    for table in tables:
         # Qualified form first, exactly as :func:`_match_routing` resolves: only a
         # BARE reference is ambiguous, and a marker is published under the bare
         # key beside the real entries for each qualified candidate. Testing both
@@ -186,9 +175,8 @@ def ambiguous_reference(
 def distinct_datasources(table_routing: dict[str, dict[str, str]]) -> set[str]:
     """Return the distinct, non-empty ``datasourceId`` values in ``table_routing``.
 
-    More than one means the query spans sources — which is the signal to
-    qualify, NOT (as it was previously treated) a signal that the target source
-    is unresolvable.
+    More than one means the query spans sources, which is the signal to
+    qualify.
     """
     return {v.get("datasourceId", "") for v in table_routing.values()} - {""}
 
@@ -205,7 +193,7 @@ def distinct_source_targets(table_routing: dict[str, dict[str, str]]) -> set[tup
     A superset of :func:`distinct_datasources` as the qualification trigger — it
     additionally catches a SINGLE source whose tables span two schemas, the
     adjacent limitation: ``athena.py`` pins ``discoveredSchemas[0]`` as
-    the context Database, so a table in the second schema was ``TABLE_NOT_FOUND``.
+    the context Database, so a table in the second schema is ``TABLE_NOT_FOUND``.
     Entries with no ``datasourceId`` (an ambiguity marker) are excluded, exactly
     as :func:`distinct_datasources` excludes them.
 
@@ -273,10 +261,7 @@ def schema_for_source(source: dict[str, Any]) -> str:
 
     Branches exactly as ``athena.py``'s ``_resolve_catalog_and_database`` does —
     federated sources take the first discovered schema (defaulting to
-    ``public``), Glue-native sources take the database name. Reading
-    ``discoveredSchemas`` on the Glue-native branch too, as an earlier version
-    did, made the two paths resolve the same record to different databases, and
-    this one is the value baked into the executed SQL.
+    ``public``), Glue-native sources take the database name.
 
     A source exposing more than one schema is a genuine limitation of this
     fallback: there is nothing in a bare retrieval hit to say which schema the
@@ -284,14 +269,9 @@ def schema_for_source(source: dict[str, Any]) -> str:
     per-table ``sourceSchema`` (the VKG path) never reach it.
 
     A federated source with NO ``discoveredSchemas`` returns ``""`` (not an
-    invented ``public``): ``sql_namespace_scope`` builds the federated authorized
-    set exclusively from ``discoveredSchemas``, so a schema this source never
-    discovered can never be in scope. Because the rewrite turns a bare statement
-    into a qualified one, a qualified reference then runs through
-    ``_authorize_qualified_references`` and would be DENIED rather than merely
-    failing at Athena. Returning ``""`` makes the caller take its documented
-    ``qualification_incomplete_no_schema`` path, which raises
-    ``QualificationError`` so the statement is refused rather than executed bare.
+    invented ``public``), because ``sql_namespace_scope`` authorizes only
+    discovered schemas; the caller then refuses the statement through its
+    ``qualification_incomplete_no_schema`` path.
     """
     if source.get("athenaDataCatalogName"):
         discovered = [str(s) for s in source.get("discoveredSchemas") or []]
@@ -306,39 +286,130 @@ def schema_for_source(source: dict[str, Any]) -> str:
     return str(source.get("athenaDatabase") or source.get("glueDatabaseName") or "")
 
 
-def _is_cte_reference(table: exp.Table, cte_names: set[str]) -> bool:
-    """True when ``table`` resolves to a CTE rather than to a real table.
+def resolves_to_cte(table: exp.Table, *, on_any_engine: bool = False) -> bool:
+    """Whether ``table`` names a CTE in scope rather than a stored table.
 
-    Scope-correct rather than name-only: SQL binds a BARE reference whose name
-    matches a ``WITH`` alias to the CTE, but a reference carrying a schema or
-    catalog always names the real table. Testing the name alone made a CTE named
-    after a table it wraps (``WITH customers AS (SELECT * FROM crm.customers)``)
-    shadow the real ``crm.customers``, which produced a partial rewrite — the one
-    outcome the all-or-nothing contract forbids — and made
-    :func:`is_fully_catalog_qualified` certify the result as fully qualified.
+    The CTE-resolution rule for every Tier-2 *table* reference. Column qualifiers
+    in the firewall's denylist check are bound by the firewall itself, in the
+    column's own scope. It follows SQL name binding instead of matching a name
+    against every ``WITH`` alias in the statement:
 
-    Inside a non-recursive CTE's own body, its name is not yet bound: in
-    ``WITH customers AS (SELECT * FROM customers)`` the inner reference reads the
-    real ``customers`` table. Treating it as the CTE hid that bare reference from
-    the ambiguity check, so it ran against whichever table the default context
-    resolved.
+    - A schema- or catalog-qualified reference (``crm.customers``) always names a
+      stored table; a CTE is only ever referenced by its bare name.
+    - A bare reference binds to a CTE only when an enclosing ``WITH`` declares
+      that name. A ``WITH`` inside a subquery does not cover the outer query.
+    - Inside a CTE's own body only the CTEs declared before it are bound; in
+      ``WITH customers AS (SELECT * FROM customers)`` the inner reference reads
+      the stored table. Under ``WITH RECURSIVE`` it also sees itself; a later
+      sibling is checked as a stored table because Trino forbids forward
+      references and MySQL resolves them to the stored table.
+
+    Anything this does not recognise as a CTE is treated as a stored table, so an
+    unexpected shape over-checks rather than escaping. Names are compared the
+    strictest way any engine does (:func:`_names_bind_everywhere`).
+
+    ``on_any_engine=True`` asks the opposite question: whether ``table`` binds to
+    a CTE on at least one engine, comparing names case-insensitively the way
+    Trino/Athena do and, under ``WITH RECURSIVE``, seeing later siblings the way
+    Postgres does. The table qualifier uses it to refuse a reference the readings
+    disagree on (see :func:`qualifier_tables`), and the firewall's no-table
+    refusal uses it so a CTE reference never counts as reading stored data.
     """
-    if table.db or table.catalog or table.name.lower() not in cte_names:
+    binds = _names_bind_somewhere if on_any_engine else _names_bind_everywhere
+    if table.db or table.catalog or not table.name or not isinstance(table.this, exp.Identifier):
         return False
-    name = table.name.lower()
+    ref = table.this
+    child: exp.Expression = table
     node = table.parent
     while node is not None:
-        if isinstance(node, exp.CTE) and node.alias_or_name.lower() == name:
-            with_ = node.parent
-            return isinstance(with_, exp.With) and bool(with_.args.get("recursive"))
-        node = node.parent
-    return True
+        if isinstance(node, exp.With) and isinstance(child, exp.CTE):
+            # ``child`` is one CTE of this WITH: its body sees only earlier siblings.
+            ctes = list(node.expressions)
+            position = next((i for i, cte in enumerate(ctes) if cte is child), None)
+            recursive = bool(node.args.get("recursive"))
+            if position is None:
+                visible = []
+            elif recursive and on_any_engine:
+                visible = ctes  # Postgres binds any sibling under WITH RECURSIVE
+            else:
+                visible = ctes[: position + (1 if recursive else 0)]
+            if any(binds(cte, ref) for cte in visible):
+                return True
+        else:
+            # ``child`` is in the body a WITH on ``node`` covers: every CTE is visible.
+            # sqlglot renamed this arg from ``with`` to ``with_``; read both so an
+            # older sqlglot does not silently turn every CTE into a stored table.
+            with_ = node.args.get("with_") or node.args.get("with")
+            if isinstance(with_, exp.With) and child is not with_ and any(binds(cte, ref) for cte in with_.expressions):
+                return True
+        child, node = node, node.parent
+    return False
+
+
+def _names_bind_everywhere(cte: exp.CTE, ref: exp.Identifier) -> bool:
+    """Whether bare reference ``ref`` names ``cte`` on every engine the SQL can run on.
+
+    Engines fold identifiers differently: Trino/Athena ignore case entirely;
+    Postgres (and Redshift with case-sensitive identifiers) fold unquoted names
+    to lower case and keep quoted ones exact, so ``WITH "Customers"`` does not
+    cover ``FROM customers``; MySQL and SQL Server can compare table names
+    case-sensitively. A reference binds to the CTE only when it does so on all
+    of them: same spelling, and, if exactly one side is quoted, a spelling that
+    is already lower case. Anything else is checked as the stored table.
+    """
+    alias = cte.args.get("alias")
+    name = alias.this if isinstance(alias, exp.TableAlias) else None
+    return isinstance(name, exp.Identifier) and identifiers_bind_everywhere(name, ref)
+
+
+def identifiers_bind_everywhere(name: exp.Identifier, ref: exp.Identifier) -> bool:
+    """Whether reference ``ref`` names the relation declared as ``name`` on every engine.
+
+    The rule of :func:`_names_bind_everywhere`, for any declared relation name.
+    """
+    if name.this != ref.this:
+        return False
+    return bool(name.quoted) == bool(ref.quoted) or ref.this == ref.this.lower()
 
 
 def real_tables(parsed: exp.Expression) -> list[exp.Table]:
     """Return the table nodes in ``parsed`` that name real tables, not CTEs."""
-    cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
-    return [t for t in parsed.find_all(exp.Table) if t.name and not _is_cte_reference(t, cte_names)]
+    return [t for t in parsed.find_all(exp.Table) if t.name and not resolves_to_cte(t)]
+
+
+def _names_bind_somewhere(cte: exp.CTE, ref: exp.Identifier) -> bool:
+    """Whether bare reference ``ref`` names ``cte`` on Trino/Athena, which ignore case."""
+    alias = cte.args.get("alias")
+    name = alias.this if isinstance(alias, exp.TableAlias) else None
+    return isinstance(name, exp.Identifier) and name.this.lower() == ref.this.lower()
+
+
+def qualifier_tables(parsed: exp.Expression) -> list[exp.Table]:
+    """:func:`real_tables` for the table qualifier, refusing a reference it would misread.
+
+    The firewall's CTE rule is strict on purpose: a bare reference whose spelling
+    or quoting differs from the CTE's (``WITH Orders ... FROM ORDERS``) is checked
+    as the stored table, because some engine reads it that way. Athena does not:
+    it ignores case and binds that reference to the CTE. Qualifying it as a
+    stored table would turn ``FROM ORDERS`` into ``"catalog"."schema".ORDERS``,
+    dropping the CTE and its filter, and a CTE whose name has no routing entry
+    would be refused as unrouted. Neither reading is safe to pick, so such a
+    statement is refused rather than rewritten.
+
+    Raises:
+        QualificationError: if a bare reference binds to a CTE on some engine
+            but not on every engine (case or quoting, or a forward reference
+            under ``WITH RECURSIVE``).
+    """
+    tables = real_tables(parsed)
+    for table in tables:
+        if resolves_to_cte(table, on_any_engine=True):
+            raise QualificationError(
+                f"table reference {table.name!r} differs from a common table expression of the same "
+                "name only in case or quoting, or names a later WITH RECURSIVE sibling; spell it exactly "
+                "as the WITH clause does and declare it before use"
+            )
+    return tables
 
 
 def is_fully_catalog_qualified_ast(parsed: exp.Expression) -> bool:
@@ -377,20 +448,13 @@ def restore_source_schemas(
 
     Runs for EVERY statement, single-source included, and performs no I/O.
 
-    When two datasources expose the same ``schema.table``, no real qualifier
-    separates them, so the inducer mints a synthetic schema token
-    (``public__1a2b3c4d``) for the ``rr:tableName`` literal and the matching H2
-    validation schema (``inducer/strategies/base.py:disambiguated_refs``, case
-    3). That token keeps the two logical tables distinct — without it Ontop
-    validates both TriplesMaps against whichever table H2 created first — but it
-    names no schema in the real database, so Ontop's SQL arrives here addressing
-    something that does not exist.
-
-    Gating this on "the query spans sources" would fix cross-source queries and
-    break every single-source query over the same table, since a one-table
-    statement never reaches the qualifier. The real schema travels beside the
-    synthetic one in the routing entry's ``coa:sourceSchema``, so restoring it
-    needs nothing but the routing map.
+    When two datasources expose the same ``schema.table``, the inducer mints a
+    synthetic schema token (``public__1a2b3c4d``) for the ``rr:tableName`` literal
+    and the matching H2 validation schema. That token keeps the two logical
+    tables distinct, but it names no schema in the real database, so Ontop's SQL
+    arrives here addressing something that does not exist. This runs for every
+    statement, single-source included; the real schema travels beside the
+    synthetic one in the routing entry's ``coa:sourceSchema``.
 
     Returns ``sql`` unchanged when there is nothing to restore, and is
     idempotent: a reference already carrying its real schema is left alone.
@@ -410,15 +474,10 @@ def restore_source_schemas(
     for table in real_tables(parsed):
         if not table.db:
             continue
-        # A synthetic token whose BARE name is claimed by more than one target
-        # (two datasources, or two schemas of one source, sharing the real
-        # schema+table) must NOT be restored here. Restoring it collapses the two
-        # references to an identical ``real.table`` and destroys the only token
-        # that told them apart — after which qualify_cross_source_sql can no longer
-        # attribute either and refuses a query it could have qualified.
-        # Leave it for the qualifier: it matches on the synthetic key and sets the
-        # schema from ``sourceSchema`` in the same pass, so the schema is restored
-        # AND the catalog attributed together.
+        # A synthetic token whose BARE name is claimed by more than one target must
+        # not be restored here: that would collapse the two references to one
+        # ``real.table``. qualify_cross_source_sql matches on the synthetic key and
+        # restores the schema and catalog together.
         if table.name.lower() in ambiguous_bare:
             continue
         # Only the QUALIFIED key can carry a logical schema: a bare reference has
@@ -452,19 +511,13 @@ async def prepare_execution_sql(
 ) -> PreparedSQL:
     """Make ``sql`` executable: restore real schemas, then qualify if cross-source.
 
-    The single entry point for both Tier-2 strategies. Each strategy compiles its
-    own SQL but the post-authorization rewrite is one policy, so it lives here
-    rather than being restated per strategy — a fix applied to one strategy and
-    not the other is the class of bug this module exists to remove.
+    The single entry point for both Tier-2 strategies' post-authorization rewrite.
 
     Refuses only the genuinely UNRESOLVABLE case: a BARE reference that more than
     one ``(datasource, schema)`` answers to sets ``error`` and must not be
     executed, because guessing which physical table is meant can return a wrong
-    answer as success (the same bare name in two schemas of one source).
-    Both strategies now reach this refusal: the VKG path via the mapping's
-    ``AMBIGUOUS_KEY`` marker, the NL->SQL path via
-    :func:`~..nl_to_sql.sql_generator.sql_table_routing`, which emits the same
-    marker for a name its retrieval hits attribute to two classes.
+    answer as success. :func:`ambiguous_reference` runs first, before either
+    rewrite.
 
     Every OTHER incompleteness in a statement that requires cross-source
     qualification — an unattributed reference, a missing registry/source/schema,
@@ -474,10 +527,9 @@ async def prepare_execution_sql(
     successful result. Single-target statements and already fully catalog-qualified
     statements remain unchanged.
 
-    :func:`ambiguous_reference` runs FIRST, before either rewrite, because an
-    ambiguously-routed table contributes no datasource id — so it would otherwise
-    slip past the cross-source test that gates the qualifier and execute
-    unqualified.
+    A rewritten statement must reference the same bare tables and columns as the
+    authorized input, or it is refused: the rewrites run after the firewall, so a
+    reference they added or dropped would never be authorized.
     """
     ambiguous = ambiguous_reference(sql, table_routing, dialect=dialect)
     if ambiguous:
@@ -489,7 +541,51 @@ async def prepare_execution_sql(
         )
     except QualificationError as exc:
         return PreparedSQL(sql=restored, error=str(exc))
+    if qualified != sql:
+        before = _reference_signature(sql, dialect)
+        after = _reference_signature(qualified, dialect)
+        if before is None or after is None or before != after:
+            # Log identifier differences only; when one side failed to parse the
+            # set difference is the whole statement, so log counts instead.
+            b_tables, b_cols = before or (frozenset(), frozenset())
+            a_tables, a_cols = after or (frozenset(), frozenset())
+            unparseable = before is None or after is None
+            logger.warning(
+                "prepared_sql_reference_drift",
+                namespace=namespace,
+                unparseable=unparseable,
+                **(
+                    {"tables": len(b_tables | a_tables), "columns": len(b_cols | a_cols)}
+                    if unparseable
+                    else {
+                        "added_tables": sorted(a_tables - b_tables),
+                        "dropped_tables": sorted(b_tables - a_tables),
+                        "added_columns": sorted(a_cols - b_cols),
+                        "dropped_columns": sorted(b_cols - a_cols),
+                    }
+                ),
+            )
+            return PreparedSQL(sql=sql, error=_REFERENCE_DRIFT_ERROR)
     return PreparedSQL(sql=qualified)
+
+
+_REFERENCE_DRIFT_ERROR = "the rewritten SQL no longer references the same tables and columns that were authorized"
+
+
+def _reference_signature(sql: str, dialect: str) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Bare real-table names and column names ``sql`` references, lowercased.
+
+    Qualifiers are deliberately ignored: they are exactly what the post-authorization
+    rewrites are allowed to change. ``None`` when ``sql`` does not parse or is nested
+    too deeply to walk, which never equals the signature of a statement that does.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read=dialect)
+        tables = frozenset(t.name.lower() for t in real_tables(parsed))
+        columns = frozenset(c.name.lower() for c in parsed.find_all(exp.Column) if c.name)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return None
+    return tables, columns
 
 
 async def qualify_cross_source_sql(
@@ -509,8 +605,7 @@ async def qualify_cross_source_sql(
       connection (direct JDBC), so naming it would only break the direct-JDBC
       route, whose dialect cannot resolve an Athena DataCatalog name.
     - spans TWO OR MORE datasources → ``"catalog"."schema"."table"`` (three-part),
-      the only form that can name two catalogs at once. This is the original
-      cross-source rewrite, unchanged and verified live.
+      the only form that can name two catalogs at once.
 
     Returns ``sql`` unchanged only when qualification is unnecessary or already
     complete:
@@ -538,12 +633,7 @@ async def qualify_cross_source_sql(
         return sql
 
     targets = distinct_source_targets(table_routing)
-    # A bare name owned by two datasources needs its catalog even in a statement
-    # that references only ONE of the same-named tables: the context's single
-    # (catalog, database) default cannot tell the two apart, so a caller pinned to
-    # the other source's context would read the wrong physical table. Such a name
-    # is a qualification trigger in its own right, independent of how many distinct
-    # (datasource, schema) targets the referenced tables span.
+    # A bare name owned by two datasources also triggers qualification.
     cross_source_shared = bare_names_shared_across_datasources(table_routing)
     if len(targets) < 2 and not cross_source_shared:
         return sql
@@ -563,7 +653,7 @@ async def qualify_cross_source_sql(
     # Pass 1 — attribute every reference. No I/O, so both abandon paths below
     # are free, and a namespace with an incomplete routing map costs nothing.
     plan: list[tuple[exp.Table, str, str]] = []
-    for table in real_tables(parsed):
+    for table in qualifier_tables(parsed):
         entry = _match_routing(table, lookup, ambiguous_bare)
         if entry is None:
             # Unattributable reference — abandon the whole rewrite (see docstring).
@@ -598,15 +688,10 @@ async def qualify_cross_source_sql(
             logger.warning("qualification_source_not_found", namespace=namespace, datasource_id=ds_id)
             raise QualificationError(f"cross-source datasource {ds_id!r} was not found")
         if source.get("queryable") is False:
-            # Leave the SQL UNQUALIFIED for a non-queryable source. The actual
-            # Lake Formation gate is enforced by Athena at execution time, not by
-            # the serve code here: athena.py:_resolve_catalog_and_database does NOT
-            # deny a non-queryable source — it declines to assert the source's
-            # catalog and falls back to the default context, letting Athena + LF
-            # make the access decision. Qualifying here would be the actual
-            # mistake: it asserts a catalog the LF grant may not permit, turning a
-            # clean downstream denial into a malformed reference. Returning the
-            # statement bare keeps that enforcement where it belongs.
+            # Leave the SQL unqualified for a non-queryable source: Athena + Lake
+            # Formation make the access decision at execution, and asserting a
+            # catalog the LF grant may not permit would turn a clean denial into a
+            # malformed reference.
             logger.warning("qualification_source_not_queryable", namespace=namespace, datasource_id=ds_id)
             return sql
         catalogs[ds_id] = catalog_for_source(source)
@@ -631,44 +716,22 @@ async def qualify_cross_source_sql(
             raise QualificationError(f"cross-source routing for table {table.name!r} has an invalid catalog or schema")
         resolved.append((table, catalog, schema))
 
-    # A statement confined to ONE datasource that merely spans two of its schemas
-    # needs the SCHEMA made explicit, not the catalog: the single catalog is
-    # supplied by the Athena QueryExecutionContext (athena.py resolves it from the
-    # one data_source_id) or by the direct-JDBC connection, and both routes accept
-    # a bare "schema"."table". Prepending the Athena DataCatalog name instead would
-    # push a direct-JDBC source onto SQL its own dialect cannot resolve (the
-    # federated catalog is not an object in the source database), so the
-    # single-catalog case is deliberately TWO-part. A query that genuinely spans
-    # datasources keeps the three-part "catalog"."schema"."table" form — the only
-    # form that can name two catalogs at once, and the one verified live.
-    #
-    # A single-datasource statement whose table name is ALSO owned by another
-    # datasource is the exception: it must carry its catalog too, so that a context
-    # pinned to the other same-named source cannot resolve the bare name against
-    # the wrong catalog. The schema alone does not separate them once the two live
-    # in different catalogs, so this case is three-part even though the statement
-    # references one datasource.
+    # One datasource spanning two schemas is two-part (the context or connection
+    # supplies the catalog); two or more datasources, or a name another datasource
+    # also owns, is three-part.
     references_shared_name = any(t.name.lower() in cross_source_shared for t, _, _ in resolved)
     qualify_catalog = len(referenced) > 1 or references_shared_name
     for table, catalog, schema in resolved:
-        # quoted=True: an Athena DataCatalog name may contain hyphens (the
-        # onboarding-provisioned connector catalogs routinely do), which Trino
-        # would not parse unquoted. Athena accepts the quoted form for both
-        # catalog and schema (verified live), so quoting is unconditional rather
-        # than conditional on the characters present.
+        # quoted=True: catalog names may contain hyphens; Athena accepts quoted
+        # catalog and schema.
         table.set("db", exp.to_identifier(schema, quoted=True))
         if qualify_catalog:
             table.set("catalog", exp.to_identifier(catalog, quoted=True))
 
     qualified = parsed.sql(dialect=dialect)
-    # Make the all-or-nothing invariant executable rather than trusting it by
-    # construction. The rewrite mutates AST nodes in place and re-renders the WHOLE
-    # statement, so a sqlglot round-trip bug could in principle drop or duplicate a
-    # table reference. Re-parse the output and confirm the real (non-CTE) table set
-    # is preserved: same count, and every rewritten reference carries its intended
-    # (catalog?, schema, name). On any mismatch, abandon to the untouched input —
-    # the documented safe path — and log for diagnosis. (Structural firewall rules
-    # are separately re-run on this output by the executor's _firewall.validate.)
+    # The rewrite re-renders the whole statement, so re-parse the output and
+    # confirm the real (non-CTE) table count is preserved; on a mismatch, refuse.
+    # (Structural firewall rules are re-run on this output by the executor.)
     try:
         reparsed = sqlglot.parse_one(qualified, read=dialect)
         after = real_tables(reparsed)
@@ -702,16 +765,10 @@ def _routing_index(
 
     A bare key is registered only while every qualified ref answering to it would
     qualify the SAME way. Ambiguity is therefore measured on the
-    ``(datasourceId, sourceSchema)`` pair each ref resolves to — NOT on the
-    datasource id alone, which missed two schemas of ONE source colliding on a
-    bare name (``public.claims`` vs ``restricted.claims``) and silently attributed
-    the reference to whichever indexed first. Two refs that would produce
-    identical SQL are not ambiguous, so this adds no false positives. This
-    mirrors the rule ``packages/vkg/translate-server.py:_load_table_routing``
-    applies when it marks a bare key ambiguous upstream; the two are independent
-    because ``_resolve_routing`` sends only the entries the statement's own refs
-    matched, so the entries needed to re-derive a collision here may be absent —
-    which is what :func:`ambiguous_reference` covers.
+    ``(datasourceId, sourceSchema)`` pair each ref resolves to, not on the
+    datasource id alone (two schemas of one source can collide on a bare name).
+    Entries needed to re-derive a collision here may be absent from the routing
+    map, which is what :func:`ambiguous_reference` covers.
 
     Returns:
         ``(index, ambiguous_bare)`` where ``ambiguous_bare`` maps a withheld bare
@@ -743,23 +800,15 @@ def _match_routing(
 ) -> dict[str, str] | None:
     """Resolve ``table`` against the routing index, qualified form first.
 
-    Returns ``None`` when the reference is simply unrouted — the caller abandons
-    the whole rewrite, which degrades to today's behaviour.
+    Returns ``None`` when the reference is unrouted; the caller then raises
+    ``QualificationError``.
 
     Raises:
         QualificationError: when the reference is BARE and that bare name is
-            claimed by two ``(datasource, schema)`` pairs. Nothing downstream can
-            recover: the collision destroyed information UPSTREAM, at induction
-            time. A mapping produced before this fix emits ``rr:tableName`` bare, so both sources'
-            TriplesMaps declare the same logical table, the VKG routing map keeps
-            only the last one, and the H2 validation schema — ``CREATE TABLE IF
-            NOT EXISTS`` — silently skips the second, leaving Ontop to reason over
-            the FIRST table's column set. The SQL that arrives here may already
-            name columns belonging to the other source's table, so guessing a
-            catalog risks reading the wrong physical table. Re-inducing the
-            namespace makes the mapping emit ``"schema"."table"`` for the shared
-            name (``inducer/strategies/base.py:logical_table_names``), after which
-            the reference carries its schema and resolves here without raising.
+            claimed by two ``(datasource, schema)`` pairs: the collision lost
+            information at induction time, so guessing a catalog risks reading
+            the wrong physical table. Re-inducing the namespace makes the mapping
+            emit ``"schema"."table"`` for the shared name.
     """
     name = table.name.lower()
     if table.db:

@@ -1,12 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Answer language is resolved once per agentic session and named in later prompts.
-
-Asking each model call to "match the question's language" let the planner's
-JSON-only assess call re-guess the language, and it sometimes wrote an English
-question's working answer in Spanish or Italian, which synthesis then copied.
-"""
+"""Answer language is resolved once per agentic session and named in later prompts."""
 
 import json
 

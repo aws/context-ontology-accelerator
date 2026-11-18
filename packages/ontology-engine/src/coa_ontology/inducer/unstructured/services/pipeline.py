@@ -3,29 +3,15 @@
 
 """Unstructured ontology induction pipeline orchestrator.
 
-This module defines :class:`UnstructuredInductionPipeline`, the
-sequencer that wires the parent-spec services into one runnable job.
-The orchestrator emits :class:`InductionJobStatus` stage transitions
-via an optional callback BEFORE each stage's work begins, runs each
-existing service in turn, merges per-rule rdflib graphs, and returns
-a fully-populated :class:`UnstructuredInductionReport`.
-
-The orchestrator is deliberately thin. Every actual induction
-behaviour lives in the underlying services; this file just sequences
-calls and adapts argument names. See `design.md` § "Orchestrator" for
-the reference shape and § "Open Implementation Questions" for the
-keyword reconciliations adopted here.
-
-Stage progression (Requirement 2.4 / Requirement 9.1)::
+:class:`UnstructuredInductionPipeline` runs the services in order, emitting an
+:class:`InductionJobStatus` via an optional callback BEFORE each stage, merges
+the per-rule rdflib graphs, and returns an :class:`UnstructuredInductionReport`::
 
     QUERYING_NEPTUNE → SAMPLING → GENERATING_DESCRIPTIONS →
         RESOLVING_IRIS → APPLYING_RULES → ENTAILMENT → SERIALIZING
 
-The terminal STORING / COMPLETED / FAILED stages are owned by the
-worker thread (per design doc). FAILED is also emitted by the
-orchestrator's own exception handler before re-raising, so a stage
-exception always reaches ``on_status`` even when the worker is not
-yet attached.
+The worker thread owns STORING / COMPLETED / FAILED. FAILED is also emitted
+here before re-raising, so a stage exception always reaches ``on_status``.
 
 Usage::
 
@@ -90,9 +76,7 @@ from coa_ontology.inducer.unstructured.services.serializer import serialize
 log = logging.getLogger(__name__)
 
 
-# v0 limitation strings surfaced to clients via UnstructuredInductionReport.warnings.
-# Per Requirement 10.3, every run pre-populates these so consumers know
-# which axiom shapes are intentionally absent in v0.
+# v0 limitations surfaced to clients on every run via UnstructuredInductionReport.warnings.
 V0_WARNINGS: list[str] = [
     "entailment stage is a pass-through in v0",
     "datatype property output may be sparse — see parent spec Task 12B",
@@ -116,40 +100,20 @@ class UnstructuredInductionPipeline:
     ) -> UnstructuredInductionReport:
         """Execute the full unstructured induction pipeline.
 
-        Args:
-            config: An already-built :class:`UnstructuredInductionConfig`
-                carrying the lexical store, Bedrock embedding client,
-                LLM description client, IRI resolver, and per-run
-                parameters (sampling, description mode, gate flags).
-            on_status: Optional callback invoked with each
-                :class:`InductionJobStatus` value BEFORE the matching
-                stage starts. The callback is also invoked with
-                ``InductionJobStatus.FAILED`` on any stage exception
-                before the exception is re-raised.
-
-        Returns:
-            A fully-populated :class:`UnstructuredInductionReport` with
-            counts derived from the merged graph, the serialized
-            Turtle, and the v0 limitation warnings.
-
-        Raises:
-            Re-raises any exception raised by an underlying service.
-            ``on_status(InductionJobStatus.FAILED)`` is invoked first
-            so the worker thread / caller can persist the terminal
-            state.
+        ``on_status`` gets each stage BEFORE it starts, and ``FAILED`` before any
+        stage exception is re-raised.
         """
         run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC)
         warnings = list(V0_WARNINGS)
 
         # entailment_enabled=True is a forward-compat field; v0 logs
-        # and records a warning but otherwise behaves identically
-        # (Requirement 9.3).
+        # and records a warning but otherwise behaves identically.
         if config.entailment_enabled:
             log.warning("entailment_enabled=True is not yet implemented; treating as False")
             warnings.append("entailment_enabled=True is not yet implemented; treating as False")
 
-        emit = on_status if on_status is not None else _noop_status
+        emit = on_status or (lambda _status: None)
 
         try:
             # ── Stage 1 — querying_neptune ──────────────────────────
@@ -209,18 +173,10 @@ class UnstructuredInductionPipeline:
             )
 
             # ── Stage 4 — resolving_iris ────────────────────────────
-            #
-            # The class normalizer mints one IRI per class via the
-            # configured IRIResolver. We rebuild a fresh
-            # InMemoryClassEmbeddingIndex per run — the persistent
-            # backend (parent-spec Task 10A) is a documented v0
-            # limitation.
             emit(InductionJobStatus.RESOLVING_IRIS)
-            # TODO(parent-spec-task-10A): replace InMemoryClassEmbeddingIndex
-            # with a persistent backend for cross-run convergence.
-            # We hold the index instance so its embed_cache (label+description
-            # → vector) can be reused for foundational grounding below,
-            # avoiding a second embedding pass over the class population.
+            # TODO: replace InMemoryClassEmbeddingIndex with a persistent
+            # backend for cross-run convergence. The instance is held so its
+            # embed_cache can be reused for foundational grounding below.
             class_index = InMemoryClassEmbeddingIndex()
             normalizer_results = class_normalize(
                 classes=descriptions,
@@ -272,10 +228,6 @@ class UnstructuredInductionPipeline:
                 namespace_language=config.namespace_language,
             )
 
-            # Rule 4 — owl:DatatypeProperty declarations from SPC facts.
-            # NOTE: dev-graph data gap (parent-spec-task-12B) — datatype
-            # property output may be sparse. The warning is surfaced in
-            # the report regardless.
             graph += induce_datatype_properties(
                 facts=facts,
                 class_iris=class_iris,
@@ -323,13 +275,7 @@ class UnstructuredInductionPipeline:
                 graph += grounding_graph
 
             # ── Stage 6 — entailment ────────────────────────────────
-            #
-            # Pass-through in v0 (Requirement 9.2): zero hierarchy
-            # axioms emitted regardless of entailment_enabled. The
-            # warning is already on the report's `warnings` list when
-            # entailment_enabled=True.
-            #
-            # TODO(parent-spec-task-13): wire the OntoEKG-style entailment LLM here when entailment_enabled=True
+            # TODO: wire an entailment LLM here; v0 is a pass-through.
             emit(InductionJobStatus.ENTAILMENT)
 
             # ── Stage 7 — serializing ───────────────────────────────
@@ -341,7 +287,7 @@ class UnstructuredInductionPipeline:
                 timestamp=datetime.now(UTC),
             )
 
-            # Compute counts from the merged graph (Requirement 1.5).
+            # Compute counts from the merged graph.
             tbox_class_count = _count_subjects(graph, OWL.Class)
             object_property_count = _count_subjects(graph, OWL.ObjectProperty)
             datatype_property_count = _count_subjects(graph, OWL.DatatypeProperty)
@@ -382,18 +328,9 @@ class UnstructuredInductionPipeline:
             )
 
         except Exception:
-            # Per Requirement 1.4: emit FAILED before re-raising so the
-            # worker thread / caller can persist terminal state. The
-            # original exception (and its traceback) propagates intact.
+            # Emit FAILED before re-raising so the caller can persist terminal state.
             emit(InductionJobStatus.FAILED)
             raise
-
-
-# ── Internal helpers ────────────────────────────────────────────────────
-
-
-def _noop_status(_status: InductionJobStatus) -> None:
-    """Default on_status callback when the caller didn't provide one."""
 
 
 def _build_grounding_inputs(
@@ -456,17 +393,8 @@ def _resolve_sampled_entities(
     can iterate per-class without making N additional graph
     round-trips.
 
-    Args:
-        sampled: Mapping from spaced-class-label (e.g. ``"Financial
-            Instrument"``) to the list of sampled entity IDs.
-        store: A :class:`LexicalGraphStore` used to look up the entity
-            records via ``get_entities_by_class``.
-
-    Returns:
-        A dict with the same keys as ``sampled``; values are the
-        :class:`EntityRecord` instances corresponding to the sampled
-        IDs (in store-fetch order, NOT necessarily input order).
-        Classes whose sampled IDs failed to resolve are dropped.
+    Results are in store-fetch order, not input order; classes whose IDs did
+    not resolve are dropped.
     """
     out: dict[str, list] = {}
     for class_label, entity_ids in sampled.items():
@@ -505,20 +433,8 @@ def _generate_descriptions(
 ) -> dict[str, str]:
     """Dispatch to the right description-generator function.
 
-    The schema-context mode requires building the per-class T-Box
-    schema fingerprints first (via
-    :func:`build_class_schema_contexts_from_schema_result`); the
-    label-only / instance modes can use the simpler
-    :func:`generate_descriptions` directly.
-
-    The "instance" mode currently shares the label-only path: the
-    enriched-context API
-    (:func:`generate_descriptions_with_context`) requires
-    ``EntityContext`` records with per-entity facts that the v0
-    orchestrator does not yet build. This is an acceptable degradation
-    — clients explicitly select mode and the report records the
-    actual mode used (per Requirement 7.3 the proposal metadata
-    surfaces this).
+    ``schema`` mode builds per-class T-Box schema contexts first. ``instance`` mode
+    uses the label-only path, like ``label_only``.
     """
     if description_mode == "schema":
         # Build the per-class schema fingerprint from the
@@ -540,10 +456,6 @@ def _generate_descriptions(
             namespace_language=namespace_language,
         )
 
-    # label_only / instance — both share the bare label-list path in
-    # v0. The instance enrichment lives behind a separate
-    # generate_descriptions_with_context API that requires
-    # per-entity facts the orchestrator does not yet assemble.
     return generate_descriptions(
         class_entities=class_to_entity_labels,
         llm_client=description_llm,

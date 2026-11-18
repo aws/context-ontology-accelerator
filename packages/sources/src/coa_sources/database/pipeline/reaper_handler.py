@@ -55,6 +55,8 @@ from coa_common.constants import SOURCE_ACTIVE_STATUSES
 from coa_common.dao import DynamoDBDAO
 from coa_control_plane_server.models.source_status import SourceStatus
 
+from coa_sources.database.scan_run import CURRENT_SCAN_JOB_FIELD, scan_run_fence
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
 
@@ -78,10 +80,6 @@ def handler(event: dict[str, Any], context: Any) -> None:
     is still in an active status, marks it ``SCAN_FAILED``. A malformed event
     (unparseable input or missing keys) is logged and ignored — never raised —
     so a single bad event cannot poison the rule for every subsequent one.
-
-    Args:
-        event: EventBridge "Step Functions Execution Status Change" event.
-        context: Lambda context (unused).
     """
     detail = event.get("detail", {})
     status = detail.get("status", "UNKNOWN")
@@ -171,6 +169,22 @@ def handler(event: dict[str, Any], context: Any) -> None:
         )
         return
 
+    # An active status can belong to a newer run that started after this one
+    # failed; that run is still going and is not this execution's to fail. An
+    # execution with no scanJobSK cannot be matched to a run, so it is not fenced.
+    scan_job_sk = str(execution_input.get("scanJobSK") or "")
+    recorded_run = str(item.get(CURRENT_SCAN_JOB_FIELD) or "")
+    if scan_job_sk and recorded_run > scan_job_sk:
+        logger.info(
+            "Reaper: source %s belongs to a newer scan run (%s) than execution %s (%s, scan job %s); no-op.",
+            source_key,
+            recorded_run,
+            execution_arn,
+            status,
+            scan_job_sk,
+        )
+        return
+
     logger.warning(
         "Reaper: execution %s ended %s with source %s still active (status=%s); marking SCAN_FAILED.",
         execution_arn,
@@ -179,17 +193,34 @@ def handler(event: dict[str, Any], context: Any) -> None:
         current_status,
     )
     # Mirror discovery_handler's failure-path write: conditional on the row
-    # still existing, non-raising so a concurrent delete does not turn cleanup
-    # into an error.
-    _get_dao().update(
-        key=source_key,
-        update_fields={
-            "status": SourceStatus.SCAN_FAILED,
-            "lastScanAt": datetime.now(UTC).isoformat(),
-            "errorMessage": (
-                f"Scan execution ended {status} with no terminal-status write; reaper marked SCAN_FAILED."
-            ),
-        },
-        condition="attribute_exists(PK)",
-        raise_on_error=False,
-    )
+    # still existing and, when the run is known, on no newer run having taken it
+    # since the read above. A concurrent delete or re-scan is logged as expected;
+    # any other DynamoDB error is logged as an error. Neither raises, as above.
+    try:
+        _get_dao().update(
+            key=source_key,
+            update_fields={
+                "status": SourceStatus.SCAN_FAILED,
+                "lastScanAt": datetime.now(UTC).isoformat(),
+                "errorMessage": (
+                    f"Scan execution ended {status} with no terminal-status write; reaper marked SCAN_FAILED."
+                ),
+            },
+            **scan_run_fence(scan_job_sk),
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info(
+                "Reaper: left source %s as it is (deleted, or taken by a newer scan run) for execution %s (%s).",
+                source_key,
+                execution_arn,
+                status,
+            )
+        else:
+            logger.exception(
+                "Reaper: could not mark source %s SCAN_FAILED for execution %s (%s, scan job %s).",
+                source_key,
+                execution_arn,
+                status,
+                scan_job_sk,
+            )

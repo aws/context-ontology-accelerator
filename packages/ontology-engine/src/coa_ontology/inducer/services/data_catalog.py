@@ -39,7 +39,7 @@ class CatalogConstraint(BaseModel):
     columns: list[str]
     referredColumns: list[str] | None = None
     relationshipType: str | None = None
-    # Governance (#1088). Optional/defaulted so any catalog source that does not
+    # Governance. Optional/defaulted so any catalog source that does not
     # populate them (HTTP data-catalog, fixtures, pre-existing payloads) parses
     # unchanged and is treated as authoritative/grandfathered by the gate.
     reviewStatus: str | None = None
@@ -51,7 +51,8 @@ def parse_referred_column(ref: str) -> tuple[str, str | None]:
 
     The catalog reports an FK target as a dotted identifier whose LAST TWO
     segments are ``TABLE.COLUMN``. Everything before them is qualification
-    (database, schema, catalog) and is dropped:
+    (database, schema, catalog) and is dropped here; the schema segment is read
+    separately by :func:`parse_referred_schema`, which FK resolution needs:
 
         ``"orders.order_id"``               → ``("orders", "order_id")``
         ``"public.orders.order_id"``        → ``("orders", "order_id")``
@@ -86,20 +87,35 @@ def parse_referred_column(ref: str) -> tuple[str, str | None]:
     former yields the SCHEMA name, so the mapping pointed ``rr:parentTriplesMap``
     at a TriplesMap that does not exist while the ontology and shapes correctly
     referenced the table — the artifacts described different graphs.
-
-    Args:
-        ref: A ``referredColumns`` entry.
-
-    Returns:
-        ``(target_table, target_column)``; ``target_column`` is ``None`` when
-        ``ref`` has no dot.
     """
     if "." not in ref:
         return ref, None
-    # Only the trailing TABLE.COLUMN pair carries meaning; the leading
-    # qualification segments (database/schema/catalog) are discarded.
     *_qualification, target_table, target_column = ref.split(".")
     return target_table, target_column
+
+
+def parse_referred_schema(ref: str) -> str:
+    """Return the schema a ``referredColumns`` entry names, or ``""`` when it names none.
+
+    The schema is the segment just before ``TABLE.COLUMN``, the same segment
+    ``schema_from_fqn`` reads off a table's ``fullyQualifiedName`` (the catalog's
+    database name, i.e. the source schema):
+
+        ``"orders.order_id"``               → ``""``
+        ``"CRM.CUSTOMERS.ID"``              → ``"CRM"``
+        ``"db.public.orders.order_id"``     → ``"public"``
+
+    An empty schema segment (``".orders.order_id"``, ``"db..orders.order_id"``)
+    also returns ``""`` and so means "no schema named": the reference resolves like
+    a bare ``TABLE.COLUMN``.
+
+    Sources write ``SCHEMA.TABLE`` only for a target outside the referrer's own
+    schema (a Snowflake key into another schema, a steward key, an inferred key
+    whose bare name repeats), so the schema decides which same-named table the key
+    points at.
+    """
+    parts = ref.split(".")
+    return parts[-3] if len(parts) >= 3 else ""
 
 
 class CatalogTable(BaseModel):
@@ -145,14 +161,3 @@ class DataCatalogClient:
             resp = client.get(f"{self.base_url}/api/v1/tables/{table_id}")
             resp.raise_for_status()
             return CatalogTable(**resp.json())
-
-    def list_tables(self) -> list[CatalogTable]:
-        """Fetch metadata for all tables in the catalog.
-
-        Returns:
-            A list of :class:`CatalogTable` for every table the catalog exposes.
-        """
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(f"{self.base_url}/api/v1/tables")
-            resp.raise_for_status()
-            return [CatalogTable(**t) for t in resp.json()]

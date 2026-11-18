@@ -5,23 +5,14 @@
 
 Every path that runs generated SQL needs the same two steps in the same order:
 the :class:`~coa_serve.tier2.sql_firewall.SQLFirewall` gate (structural safety
-plus grant/Cedar authorization), then :meth:`QueryExecutor.execute`. This module
-composes exactly that pair, so no caller needs an arbitrary-SQL execution entry
-point of its own — in particular the NL→SQL agent
-(:mod:`coa_serve.agents.sql_agent`) runs its generated queries through here
-instead of exposing a raw ``run_sql`` tool to the model.
+plus grant/Cedar authorization), then :meth:`QueryExecutor.execute`. The NL→SQL
+agent runs its generated queries through here rather than a raw ``run_sql`` tool.
 
-It sits UNDER the tiers: it holds no retrieval, no generation and no prompt, and
-never decides WHAT to run — it only refuses or runs the statement it is handed.
-
-Error contract (deliberately different from the client protocols in
-:mod:`coa_serve.clients.base`, which raise): expected failures — structurally
+Error contract: unlike the client protocols, which raise, expected failures —
 unsafe SQL, a policy denial, an engine error — come back as a
-:class:`SqlExecutionOutcome` with a non-OK :class:`SqlExecutionStatus` rather
-than as an exception, because the callers are self-correcting loops that must
-feed the observation back into the next generation. Which statuses are terminal
-is the caller's decision: the agent path raises ``AccessDeniedError`` for a
-denial once its loop has finished, mirroring ``NLtoSQLStrategy``.
+:class:`SqlExecutionOutcome` with a non-OK :class:`SqlExecutionStatus`, because
+the callers are self-correcting loops that feed the observation back into the
+next generation. Callers decide which statuses are terminal.
 """
 
 from __future__ import annotations
@@ -39,9 +30,9 @@ from .tier2.sql_firewall import SQLFirewall, UnsafeSQLError
 
 logger = structlog.get_logger(__name__)
 
-# Canonical generation dialect: the SQL writer is prompted for Trino/Presto and
-# the firewall parses with sqlglot's ``trino`` reader unless a caller knows the
-# statement is already transpiled for a specific engine.
+# Canonical generation dialect: the SQL writer is prompted for Trino/Presto, and
+# every executor behind this service reads the authorized SQL as Trino before
+# running or transpiling it, so the firewall authorizes that same parse.
 DEFAULT_READ_DIALECT = "trino"
 
 
@@ -119,7 +110,6 @@ class SqlExecutionService:
         data_source_resolver: Callable[[str], str] | None = None,
         max_rows: int = 1000,
         timeout_seconds: int = 35,
-        dialect: str = DEFAULT_READ_DIALECT,
     ) -> SqlExecutionOutcome:
         """Run ``sql`` through the firewall and, if allowed, the query executor.
 
@@ -135,7 +125,6 @@ class SqlExecutionService:
                 will run. Its result takes precedence over ``data_source_id``.
             max_rows: Row cap handed to the executor.
             timeout_seconds: Per-statement execution timeout.
-            dialect: sqlglot read-dialect for the firewall's safety parse.
 
         Returns:
             A :class:`SqlExecutionOutcome`; expected failures are statuses, not
@@ -154,7 +143,7 @@ class SqlExecutionService:
             )
 
         try:
-            fw = self._firewall.evaluate(sql, profile or {}, namespace=namespace, dialect=dialect)
+            fw = self._firewall.evaluate(sql, profile or {}, namespace=namespace, dialect=DEFAULT_READ_DIALECT)
         except UnsafeSQLError as e:
             logger.warning("sql_execution_unsafe", namespace=namespace, security_event="unsafe_sql_attempt")
             return SqlExecutionOutcome(status=SqlExecutionStatus.UNSAFE, reason=str(e)[:200], duration_ms=elapsed_ms())

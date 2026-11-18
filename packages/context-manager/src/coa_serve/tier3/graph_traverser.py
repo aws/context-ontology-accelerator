@@ -19,14 +19,19 @@ import structlog
 from coa_common.constants import GOVERNED_METRICS_ONTOLOGY_ID
 
 from ..clients.base import GraphClient
+from ..deadline import Deadline
 from ..namespace_language import current_label_preference, row_label
 from ..query_utils import (
+    _MAX_INLINED_GRAPHS,
     MAX_QUERY_CODEPOINTS,
     MAX_SEARCH_TOKEN_CODEPOINTS,
+    SPARQL_PREFIXES,
     build_query_search_plan,
     escape_sparql_string_literal,
     get_graph_uri_template,
+    graph_scoped_body,
     is_semantic_search_token,
+    named_graphs_sparql,
     namespace_graph_prefix,
     normalize_label_match_text,
     validate_namespace,
@@ -40,31 +45,16 @@ logger = structlog.get_logger(__name__)
 # Safety gate for a keyword before it is interpolated into a SPARQL string
 # literal (``CONTAINS(LCASE(?label), "…")`` in _build_label_query).
 #
-# Defined by what is DANGEROUS rather than by an ASCII allowlist. The previous
-# ``^[a-z0-9][a-z0-9_-]{0,63}$`` rejected every keyword in a non-Latin script and
-# every accented Latin one, so a Japanese or German query reached this stage with
-# tokens and left it with none — Tier-3's keyword hop then returned nothing, for
-# the languages the feature exists to serve.
-#
-# What the gate has to stop is escaping the literal. ``_build_label_query``
-# already escapes backslash and double-quote, which covers the direct break-out;
-# what escaping does NOT handle is a raw line terminator, because a SPARQL short
-# string literal (''STRING_LITERAL2'') may not contain one — so a newline would
-# end the literal and put the rest of the token into query position. Control
-# characters are rejected here for that reason, and because no legitimate keyword
-# contains one.
-#
-# The length bound stays: it is a cost guard on the generated query, not a
-# character-class judgement. Counted in characters, so a CJK keyword is not
-# penalised for encoding to more bytes.
+# ``_build_label_query`` escapes backslash and double-quote; a raw line terminator
+# would still end a SPARQL short string literal, so control characters are
+# rejected. The length bound (in characters) is a cost guard on the query.
 _UNSAFE_ENTITY_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 # URI safety gate for SPARQL <uri> interpolation. Permits the '#' fragment
 # separator — ontology class/property URIs are of the form
 # "https://.../pcinsurance#Claim", and '#' is a legal URI character that is
 # safe inside a <...> IRI ref. The genuinely dangerous characters for IRI-ref
 # injection (whitespace, angle brackets, quotes, braces, pipe, backslash,
-# caret, backtick) remain excluded. (Dropping '#' here silently rejected every
-# induced-ontology seed URI, making Tier-3 URI-hop return 0.)
+# caret, backtick) remain excluded.
 #
 # Mirrors ``TraversalStartUri`` in ``serve.smithy`` (the GraphTraverse ``startUri``
 # contract); ``test_graph_traverse_contract`` fails if the two drift. Matched with
@@ -80,15 +70,73 @@ def is_traversable_uri(uri: object) -> bool:
 
 
 _MAX_TRAVERSAL_RESULTS = 50
-# Row cap for the URI-hop query. Raised 100→300 when _build_hop_query grew from
-# 2 UNION arms to 8 (property-node, class-neighborhood, and 2-hop bridged arms):
-# each arm emits one row PER domain/range relationship per entity, across up to
-# 10 seeds, so the pre-dedup row count is now several-fold higher. At 100 the
-# LIMIT truncated the UNION before enough distinct entities/relationships
-# survived _parse_hop_results' de-dup, starving the synthesizer; 300 keeps the
-# richer neighborhood while _GRAPH_QUERY_TIMEOUT_S still bounds worst-case cost.
+# Row cap for the URI-hop query. Its 8 UNION arms emit one row per domain/range
+# relationship per seed, so the cap must exceed the distinct-entity target;
+# _GRAPH_QUERY_TIMEOUT_S bounds worst-case cost.
 _MAX_HOP_RESULTS = 300
 _GRAPH_QUERY_TIMEOUT_S = 15.0
+
+# ── GraphTraverse (the public API, ``traverse_graph``) ──────────────────────────
+# One edge query per depth, so a fixed per-query timeout would multiply by
+# ``maxDepth``. The whole traversal shares this budget instead, which stays under
+# the 29 s REST ceiling.
+_API_TRAVERSAL_BUDGET_S = 25.0
+# Below this much budget a further query cannot usefully finish.
+_MIN_QUERY_BUDGET_S = 1.0
+# Frontier entities per edge query. Each becomes a ``VALUES`` entry, so this
+# bounds one query; a larger frontier is expanded in several queries, so no
+# admitted entity is left unexpanded.
+_FRONTIER_BATCH_SIZE = 50
+# Backstop on named-graph resolution: a namespace holds one graph per published
+# ontology.
+_MAX_NAMESPACE_GRAPHS = 50
+# Relationships returned per entity the caller asked for, with a floor so
+# ``maxResults: 1`` still shows a node's edges. The ceiling keeps the response
+# under the ~6 MB transport limit: 5,000 relationships with ~150-character IRIs
+# are about 3 MB.
+_RELATIONSHIPS_PER_REQUESTED_ENTITY = 20
+_MIN_API_RELATIONSHIPS = 50
+_MAX_API_RELATIONSHIPS = 5_000
+# Label and type rows read for the returned entities and predicates.
+_MAX_METADATA_ROWS = 10_000
+# Followed by default: every predicate except these. ``rdf:type`` would link every
+# instance to its class, and ``rdfs:label`` objects are literals.
+_NON_RELATIONSHIP_PREDICATES = (
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+    "http://www.w3.org/2000/01/rdf-schema#label",
+)
+# Vocabulary terms are never traversed to. The inducer writes ``rdfs:range xsd:*``
+# for every column, so following ``xsd:string`` would join every string column of
+# every table; ``owl:Thing`` and ``rdfs:Class`` are hubs in the same way.
+_VOCABULARY_NAMESPACES = (
+    "http://www.w3.org/2001/XMLSchema#",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "http://www.w3.org/2000/01/rdf-schema#",
+    "http://www.w3.org/2002/07/owl#",
+)
+# A lone surrogate passes the IRI pattern but cannot be encoded into the query.
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def _is_interpolable(iri: object) -> bool:
+    """Whether ``iri`` can go into a ``<...>`` IRI ref of a GraphTraverse query.
+
+    ``is_traversable_uri`` plus no control characters: its pattern admits
+    U+0001 to U+0008, which would make the query a syntax error rather than a
+    value that matches nothing. A lone surrogate is refused for the same reason:
+    the query cannot be encoded to send.
+    """
+    return is_traversable_uri(iri) and not _UNSAFE_ENTITY_RE.search(str(iri)) and not _SURROGATE_RE.search(str(iri))
+
+
+def _is_vocabulary(iri: str) -> bool:
+    """Whether ``iri`` is an XSD, RDF, RDFS or OWL term, which a traversal never visits."""
+    return iri.startswith(_VOCABULARY_NAMESPACES)
+
+
+def _relationship_cap(max_results: int) -> int:
+    """Most relationships a GraphTraverse request that asked for ``max_results`` entities returns."""
+    return max(_MIN_API_RELATIONSHIPS, min(_MAX_API_RELATIONSHIPS, max_results * _RELATIONSHIPS_PER_REQUESTED_ENTITY))
 
 
 @dataclass(frozen=True)
@@ -110,48 +158,6 @@ class GraphEntity:
     type: str
     relationships: tuple[dict, ...] = ()
     properties: dict[str, str] = field(default_factory=dict)
-
-
-def _relationship_from_row(row: dict) -> dict | None:
-    """Build one canonical directed relationship from a graph result row."""
-    source_uri = row.get("sourceUri")
-    predicate_uri = row.get("predicateUri")
-    target_uri = row.get("targetUri")
-    if not source_uri or not predicate_uri or not target_uri:
-        return None
-    return {
-        "source_uri": source_uri,
-        "source_label": row.get("sourceLabel", ""),
-        "predicate_uri": predicate_uri,
-        "predicate_label": row.get("predicateLabel", ""),
-        "target_uri": target_uri,
-        "target_label": row.get("targetLabel", ""),
-    }
-
-
-def _append_unique_relationship(
-    relationships: list[dict],
-    positions: dict[tuple[str, str, str], int],
-    row: dict,
-) -> None:
-    """Append or label-enrich a relationship keyed by directed triple identity."""
-    relationship = _relationship_from_row(row)
-    if relationship is None:
-        return
-    identity = (
-        relationship["source_uri"],
-        relationship["predicate_uri"],
-        relationship["target_uri"],
-    )
-    if identity not in positions:
-        positions[identity] = len(relationships)
-        relationships.append(relationship)
-        return
-
-    existing = relationships[positions[identity]]
-    for label_field in ("source_label", "predicate_label", "target_label"):
-        if not existing.get(label_field) and relationship.get(label_field):
-            existing[label_field] = relationship[label_field]
 
 
 class GraphTraverser:
@@ -243,6 +249,283 @@ class GraphTraverser:
         )
         return parsed
 
+    async def traverse_graph(
+        self,
+        start_uri: str,
+        namespace: str,
+        *,
+        max_hops: int = 2,
+        direction: str = "both",
+        relationship_filter: tuple[str, ...] = (),
+        max_results: int = 100,
+        hide_governed: bool = False,
+    ) -> list[GraphEntity]:
+        """Breadth-first traversal from ``start_uri`` for the GraphTraverse API.
+
+        Each depth expands every entity the previous depth admitted, and the walk
+        stops at ``max_results`` entities or the relationship cap. Queries name the
+        namespace's graphs as ``GRAPH <iri>`` blocks and order rows before every
+        ``LIMIT``, so the same request returns the same entities.
+
+        Args:
+            start_uri: The entity to start from; it is not returned itself.
+            namespace: Namespace whose named graphs may be read.
+            max_hops: Depth, 1 to 5.
+            direction: ``outgoing``, ``incoming`` or ``both``.
+            relationship_filter: Predicate IRIs to follow, or empty for all but
+                ``rdf:type`` and ``rdfs:label``. A filter with no usable IRI
+                returns nothing.
+            max_results: Most entities to discover.
+            hide_governed: Leave the governed-metrics graph out.
+
+        Returns:
+            The discovered entities in breadth-first order, each carrying the
+            relationships found when it was reached.
+
+        Raises:
+            TimeoutError: The traversal budget ran out before the traversal ended.
+        """
+        validate_namespace(namespace)
+
+        if not self._graph_uri_template:
+            logger.warning("graph_traverser_no_template", namespace=namespace)
+            return []
+        if not _is_interpolable(start_uri):
+            return []
+        predicates = tuple(dict.fromkeys(iri for iri in relationship_filter if _is_interpolable(iri)))
+        if relationship_filter and not predicates:
+            logger.info("graph_traverse_relationship_filter_unmatchable", namespace=namespace)
+            return []
+
+        deadline = Deadline.from_budget(_API_TRAVERSAL_BUDGET_S)
+        prefix = self._graph_uri_prefix(namespace)
+        graph_chunks = await self._namespace_graph_chunks(namespace, prefix, deadline, hide_governed=hide_governed)
+        if not graph_chunks:
+            return []
+
+        relationship_cap = _relationship_cap(max_results)
+        visited = {start_uri}
+        discovered: list[str] = []
+        # Directed edge -> the returned entity it is reported under.
+        edges: dict[tuple[str, str, str], str] = {}
+        frontier = [start_uri]
+        for depth in range(1, max_hops + 1):
+            if not frontier or len(discovered) >= max_results or len(edges) >= relationship_cap:
+                break
+            rows: list[dict] = []
+            for start in range(0, len(frontier), _FRONTIER_BATCH_SIZE):
+                batch = frontier[start : start + _FRONTIER_BATCH_SIZE]
+                rows.extend(
+                    await self._run_chunked(
+                        lambda graphs, batch=batch: self._build_edge_query(
+                            prefix, graphs, batch, direction, predicates, limit=relationship_cap + len(edges)
+                        ),
+                        graph_chunks,
+                        deadline,
+                        sort_key=lambda row: (row["frontier"], row["neighbour"], row["predicate"], row["way"]),
+                        stage=f"edge query at depth {depth}",
+                    )
+                )
+            rows.sort(key=lambda row: (row["frontier"], row["neighbour"], row["predicate"], row["way"]))
+            new = sorted(
+                {
+                    row["neighbour"]
+                    for row in rows
+                    if row["neighbour"] not in visited
+                    and _is_interpolable(row["neighbour"])
+                    and not _is_vocabulary(row["neighbour"])
+                }
+            )
+            admitted = new[: max_results - len(discovered)]
+            visited.update(admitted)
+            for row in rows:
+                frontier_uri, neighbour = row["frontier"], row["neighbour"]
+                if neighbour not in visited or len(edges) >= relationship_cap:
+                    continue
+                source, target = (frontier_uri, neighbour) if row["way"] == "out" else (neighbour, frontier_uri)
+                holder = neighbour if neighbour != start_uri else frontier_uri
+                key = (source, row["predicate"], target)
+                if holder != start_uri and key not in edges:
+                    edges[key] = holder
+            # An entity whose every edge came after the relationship cap was reached
+            # is not returned.
+            holders = set(edges.values())
+            admitted = [uri for uri in admitted if uri in holders]
+            discovered.extend(admitted)
+            frontier = admitted
+
+        if not discovered:
+            return []
+        # A predicate the store returned is interpolated only if it is safe; another
+        # keeps its edge with an empty label.
+        predicates_seen = (predicate for _, predicate, _ in edges if _is_interpolable(predicate))
+        resources = list(dict.fromkeys([start_uri, *discovered, *predicates_seen]))
+        metadata_rows = await self._run_chunked(
+            lambda graphs: self._build_metadata_query(prefix, graphs, resources),
+            graph_chunks,
+            deadline,
+            sort_key=lambda row: (row["resource"], row.get("type", ""), row.get("label", ""), row.get("labelLang", "")),
+            stage="label lookup",
+        )
+        if len(metadata_rows) >= _MAX_METADATA_ROWS:
+            logger.info("graph_traverse_label_rows_capped", namespace=namespace, limit=_MAX_METADATA_ROWS)
+        preference = current_label_preference()
+        labels: dict[str, list[tuple[str, str]]] = {}
+        types: dict[str, list[str]] = {}
+        for row in metadata_rows:
+            label = row_label(row, "label")
+            if label[0]:
+                labels.setdefault(row["resource"], []).append(label)
+            if row.get("type"):
+                types.setdefault(row["resource"], []).append(row["type"])
+
+        def label_of(uri: str) -> str:
+            return preference.pick(labels.get(uri, []))
+
+        held: dict[str, list[dict]] = {}
+        for (source, predicate, target), holder in edges.items():
+            held.setdefault(holder, []).append(
+                {
+                    "source_uri": source,
+                    "source_label": label_of(source),
+                    "predicate_uri": predicate,
+                    "predicate_label": label_of(predicate),
+                    "target_uri": target,
+                    "target_label": label_of(target),
+                }
+            )
+        logger.info(
+            "graph_traverse_api_done",
+            namespace=namespace,
+            max_hops=max_hops,
+            direction=direction,
+            filtered=bool(predicates),
+            entity_count=len(discovered),
+            relationship_count=len(edges),
+        )
+        return [
+            GraphEntity(
+                uri=uri,
+                label=label_of(uri),
+                type=min(types.get(uri, [""])),
+                relationships=tuple(held.get(uri, [])),
+            )
+            for uri in discovered
+        ]
+
+    async def _namespace_graph_chunks(
+        self, namespace: str, prefix: str, deadline: Deadline, *, hide_governed: bool
+    ) -> list[list[str]]:
+        """Resolve the namespace's named graphs, in groups ``graph_scoped_body`` inlines.
+
+        These are the graphs that declare an ``owl:Ontology``, plus the
+        governed-metrics graph unless ``hide_governed``. A graph under the prefix
+        with neither is not read.
+
+        Each group stays within the number of graphs that helper names as constants,
+        so it never falls back to the cluster-wide ``GRAPH ?g`` + ``STRSTARTS`` form
+        that pinned Neptune's CPU at 99% on a ~30-namespace cluster. Every IRI is
+        re-checked against the namespace prefix, because these become the scope of
+        every later query.
+        """
+        rows = await self._run_query(
+            named_graphs_sparql(prefix, limit=_MAX_NAMESPACE_GRAPHS + 1), deadline, stage="graph resolution"
+        )
+        if len(rows) > _MAX_NAMESPACE_GRAPHS:
+            raise RuntimeError(f"Namespace has more than {_MAX_NAMESPACE_GRAPHS} ontology graphs")
+        graphs = sorted(
+            {
+                str(row.get("g", ""))
+                for row in rows
+                if str(row.get("g", "")).startswith(prefix) and _is_interpolable(str(row.get("g", "")))
+            }
+        )
+        # The metric service writes the governed-metrics graph without an
+        # ``owl:Ontology`` subject, so resolution never finds it. It has a fixed
+        # IRI under the prefix, which is named as a constant like the others.
+        governed = f"{prefix}{_GOVERNED_GRAPH_SEGMENT}"
+        if hide_governed:
+            graphs = [iri for iri in graphs if iri != governed]
+        elif governed not in graphs and _is_interpolable(governed):
+            graphs = sorted([*graphs, governed])
+        if not graphs:
+            logger.info("graph_traverse_no_published_graph", namespace=namespace)
+        return [graphs[index : index + _MAX_INLINED_GRAPHS] for index in range(0, len(graphs), _MAX_INLINED_GRAPHS)]
+
+    async def _run_chunked(self, build, graph_chunks, deadline: Deadline, *, sort_key, stage: str) -> list[dict]:
+        """Run one query per graph group and merge the rows in ``sort_key`` order."""
+        rows: list[dict] = []
+        for graphs in graph_chunks:
+            rows.extend(await self._run_query(build(graphs), deadline, stage=stage))
+        return sorted(rows, key=sort_key)
+
+    async def _run_query(self, sparql: str, deadline: Deadline, *, stage: str) -> list[dict]:
+        """Run one query inside the traversal's remaining budget."""
+        remaining = deadline.remaining_s()
+        if remaining < _MIN_QUERY_BUDGET_S:
+            raise TimeoutError(f"Graph traversal budget exhausted before the {stage}")
+        return await asyncio.wait_for(self._graph.query(sparql), timeout=min(_GRAPH_QUERY_TIMEOUT_S, remaining))
+
+    @staticmethod
+    def _build_edge_query(
+        prefix: str,
+        graphs: list[str],
+        frontier: list[str],
+        direction: str,
+        predicates: tuple[str, ...],
+        *,
+        limit: int,
+    ) -> str:
+        """One hop from ``frontier``: the edges ``direction`` follows, in a stable order."""
+        outgoing = '{ ?frontier ?predicate ?neighbour . BIND("out" AS ?way) }'
+        incoming = '{ ?neighbour ?predicate ?frontier . BIND("in" AS ?way) }'
+        hop = {"outgoing": outgoing, "incoming": incoming}.get(
+            direction, f"{outgoing}\n            UNION\n            {incoming}"
+        )
+        if predicates:
+            predicate_filter = f"FILTER(?predicate IN ({', '.join(f'<{iri}>' for iri in predicates)}))"
+        else:
+            predicate_filter = (
+                f"FILTER(?predicate NOT IN ({', '.join(f'<{iri}>' for iri in _NON_RELATIONSHIP_PREDICATES)}))"
+            )
+        vocabulary_filter = " && ".join(f'!STRSTARTS(STR(?neighbour), "{ns}")' for ns in _VOCABULARY_NAMESPACES)
+        body = f"""            VALUES ?frontier {{ {" ".join(f"<{uri}>" for uri in frontier)} }}
+            {hop}
+            FILTER(isIRI(?neighbour))
+            FILTER({vocabulary_filter})
+            {predicate_filter}"""
+        return f"""{SPARQL_PREFIXES}
+        SELECT DISTINCT ?frontier ?predicate ?neighbour ?way
+        WHERE {{
+{graph_scoped_body(body, prefix, graphs)}
+        }}
+        ORDER BY STR(?frontier) STR(?neighbour) STR(?predicate) ?way
+        LIMIT {int(limit)}
+        """
+
+    @staticmethod
+    def _build_metadata_query(prefix: str, graphs: list[str], resources: list[str]) -> str:
+        """Labels (with language) and types of ``resources``, in a stable order."""
+        # ``VALUES`` sits inside each ``GRAPH`` block, as in the edge query, so the
+        # lookup is bound to these resources rather than to every label triple.
+        values = f"            VALUES ?resource {{ {' '.join(f'<{uri}>' for uri in resources)} }}"
+        label_body = f"{values}\n            ?resource rdfs:label ?label ."
+        type_body = f"{values}\n            ?resource a ?type ."
+        return f"""{SPARQL_PREFIXES}
+        SELECT DISTINCT ?resource ?label (LANG(?label) AS ?labelLang) ?type
+        WHERE {{
+          {{
+{graph_scoped_body(label_body, prefix, graphs)}
+          }}
+          UNION
+          {{
+{graph_scoped_body(type_body, prefix, graphs)}
+          }}
+        }}
+        ORDER BY STR(?resource) COALESCE(STR(?type), "") COALESCE(STR(?label), "") COALESCE(LANG(?label), "")
+        LIMIT {_MAX_METADATA_ROWS}
+        """
+
     @staticmethod
     def _sanitize_entities(entities: list[str]) -> list[str]:
         """Keep bounded semantic keywords that are safe in a SPARQL literal.
@@ -319,8 +602,7 @@ class GraphTraverser:
         # arms want opposite orders — a forward match is most specific when the
         # label is SHORTEST (an exact hit), a reverse match when the label is
         # LONGEST (a short one may have matched by straddling a word boundary) — so
-        # any single sort key demotes one of them. Sorting by label length was tried
-        # and put the exact ``claim`` hit last. ?entity keeps truncation reproducible
+        # any single sort key demotes one of them. ?entity keeps truncation reproducible
         # across identical requests without claiming a relevance order the query
         # cannot express.
         return f"""
@@ -351,19 +633,12 @@ class GraphTraverser:
         values_clause = " ".join(f"<{uri}>" for uri in uris)
         graph_uri_prefix = self._graph_uri_prefix(namespace)
 
-        # Induced (schema-only / T-Box) ontologies express class↔class edges NOT
-        # as direct labelled ?seed→?class triples, but through property definition
-        # nodes: a property P carries `P rdfs:domain ClassA` and `P rdfs:range
-        # ClassB`, linking ClassA↔ClassB. The keyword path returns these property
-        # nodes WITH their domain/range edges; the original hop pattern matched
-        # only direct outgoing edges, so from a seed *class* it returned 0.
-        #
-        # Fix: surface the property nodes attached to the seed as first-class
-        # ?entity results and expose EACH property's domain/range targets as its
-        # explicitly directed source/predicate/target relationship — mirroring the keyword
-        # path so the synthesizer sees the same class↔property↔class structure.
-        # The direct-edge arms are retained for non-induced ontologies that DO
-        # carry labelled class→class triples.
+        # Induced (schema-only / T-Box) ontologies link classes through property
+        # nodes (`P rdfs:domain ClassA`, `P rdfs:range ClassB`), not direct
+        # ?seed→?class triples. So the arms surface the property nodes attached to
+        # the seed as ?entity results, with each property's domain/range targets as a
+        # directed relationship, mirroring the keyword path. The direct-edge arms
+        # cover ontologies that DO carry labelled class→class triples.
         dr = "(rdfs:domain|rdfs:range)"
 
         # ── 1-hop arms: the seed's immediate neighborhood ──────────────────

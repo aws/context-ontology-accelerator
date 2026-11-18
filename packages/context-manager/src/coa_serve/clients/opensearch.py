@@ -9,9 +9,8 @@ only the serve-specific concerns:
 
   - async surface (the shared client is sync — calls run in a thread executor);
   - the proxy-Lambda transport for AgentCore containers that cannot reach AOSS
-    directly (see aoss-troubleshooting.md);
+    directly;
   - ``VectorHit`` shaping and the ``_SOURCE_FIELDS`` projection;
-  - hybrid BM25 + k-NN search;
   - the serve health-check contract.
 
 Server-side filtering (Faiss/HNSW ``knn.embedding.filter``), SigV4 auth,
@@ -69,7 +68,7 @@ _SOURCE_FIELDS = [
 
 
 def _source_document_id(source: dict) -> str:
-    """Resolve the unique document identity of a GraphRAG chunk hit (#985).
+    """Resolve the unique document identity of a GraphRAG chunk hit.
 
     A flat ``source_doc`` field wins when present. GraphRAG chunk documents
     written by the ingest pipeline have no such field; their unique identity is
@@ -90,7 +89,7 @@ def _source_document_id(source: dict) -> str:
 
 
 def _source_document_name(source: dict) -> str:
-    """Resolve the human-readable document name of a chunk hit (#985).
+    """Resolve the human-readable document name of a chunk hit.
 
     The name users recognize is the UPLOADED document's — the basename of the
     raw ``source_s3_key``. The ingest ``filename`` is the STAGING artifact's
@@ -145,7 +144,6 @@ class OpenSearchVectorClient(VectorClient):
         self._timeout = timeout
         if not self._endpoint:
             raise ValueError("OpenSearch endpoint must be provided via constructor arg or OPENSEARCH_ENDPOINT env var")
-        # TODO(aoss-proxy): Remove proxy fields when AgentCore supports AOSS directly
         self._proxy_lambda_arn = os.environ.get("OPENSEARCH_PROXY_LAMBDA_ARN", "")
         self._lambda_client: Any = None
         if self._proxy_lambda_arn:
@@ -160,13 +158,8 @@ class OpenSearchVectorClient(VectorClient):
             transport=self._proxy_transport if self._proxy_lambda_arn else None,
         )
 
-    # ── proxy transport ─────────────────────────────────────────────────
-
     def _proxy_transport(self, action: str, index: str, body: dict) -> dict:
-        """Synchronous search-proxy Lambda call (runs inside the thread executor).
-
-        TODO(aoss-proxy): Remove when AgentCore supports AOSS directly.
-        """
+        """Synchronous search-proxy Lambda call (runs inside the thread executor)."""
         payload = json.dumps({"action": action, "index": index, "body": body or {}})
         response = self._lambda_client.invoke(
             FunctionName=self._proxy_lambda_arn,
@@ -191,8 +184,6 @@ class OpenSearchVectorClient(VectorClient):
         """Run a sync shared-client call in the thread executor."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_EXECUTOR, lambda: fn(*args, **kwargs))
-
-    # ── searches ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _backend_filter(backend: StructuredBackend) -> dict[str, Any]:
@@ -255,31 +246,6 @@ class OpenSearchVectorClient(VectorClient):
         )
         return [self._to_hit(s) for s in raw]
 
-    async def hybrid_search(
-        self,
-        query_text: str,
-        query_vector: list[float],
-        *,
-        namespace: str = "",
-        top_k: int = 5,
-        index: str | None = None,
-    ) -> list[VectorHit]:
-        """Hybrid BM25 + k-NN search."""
-        body: dict[str, Any] = {
-            "size": top_k,
-            "query": {
-                "bool": {
-                    "should": [
-                        {"match": {"text": {"query": query_text, "boost": 0.3}}},
-                        {"knn": {"embedding": {"vector": query_vector, "k": top_k}}},
-                    ]
-                }
-            },
-            "_source": _SOURCE_FIELDS,
-        }
-        results = await self._run(self._aoss.search_raw, index or self._index, body)
-        return self._parse_hits(results)
-
     async def phrase_search(self, phrases: list[str], *, index: str, size: int = 50) -> list[dict[str, Any]]:
         """Keyword (BM25) search for exact phrases over the raw chunk text field.
 
@@ -336,8 +302,6 @@ class OpenSearchVectorClient(VectorClient):
             )
         return hits
 
-    # ── hit shaping ──────────────────────────────────────────────────────
-
     def _to_hit(self, source: dict) -> VectorHit:
         """Shape a shared-client hit dict (``_source`` + ``_score``/``_id``) into a VectorHit."""
         return VectorHit(
@@ -368,13 +332,11 @@ class OpenSearchVectorClient(VectorClient):
         """Parse a raw OpenSearch response into VectorHit objects.
 
         Hits with no ``_source`` still yield a VectorHit carrying only the id and
-        score, preserving prior behaviour.
+        score.
         """
         hits = []
         for hit in results.get("hits", {}).get("hits", []):
             if "_source" not in hit:
-                # Preserve prior behaviour: a hit with no _source still yields a
-                # VectorHit with empty fields (id/score retained).
                 hits.append(VectorHit(id=hit.get("_id", ""), text="", score=hit.get("_score", 0.0) or 0.0))
                 continue
             source = {**hit["_source"], "_id": hit.get("_id", ""), "_score": hit.get("_score", 0.0)}
@@ -395,6 +357,5 @@ class OpenSearchVectorClient(VectorClient):
     async def close(self) -> None:
         """No-op close kept for VectorClient interface compatibility."""
         # The shared client holds a lazily-built opensearch-py client; there's no
-        # public close on it, and AOSS connections are short-lived HTTP — nothing
-        # to tear down. Kept for VectorClient interface compatibility.
+        # public close on it, and AOSS connections are short-lived HTTP.
         return None

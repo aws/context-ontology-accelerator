@@ -73,18 +73,10 @@ class MySQLAdapter(EngineAdapter):
             # the query with a stale-socket failure.
             pool_pre_ping=True,
             echo=False,
-            # aiomysql accepts an ssl.SSLContext directly. Managed MySQL (RDS)
-            # commonly requires TLS. NOTE: SSL_CONTEXT is intentionally permissive
-            # (CERT_NONE, no hostname check) — it gives transport encryption WITHOUT
-            # peer-identity verification, so it is LESS strict than the discovery
-            # connector's verifying ssl.create_default_context(). The security
-            # boundary here is credentials + VPC/SG, not TLS pinning (see
-            # base.build_ssl_context for the full rationale and hardening path).
+            # aiomysql accepts an ssl.SSLContext directly; SSL_CONTEXT is
+            # intentionally permissive (see base.build_ssl_context).
             #
-            # connect_timeout bounds the TCP+handshake: aiomysql defaults it to
-            # None (unbounded), so without this an unreachable-but-SG-open host
-            # hangs the connect forever (pool_timeout only bounds waiting for a free
-            # pooled slot, NOT the underlying connect).
+            # connect_timeout bounds the TCP+handshake (see _CONNECT_TIMEOUT_S).
             connect_args={"ssl": SSL_CONTEXT, "connect_timeout": _CONNECT_TIMEOUT_S},
         )
 
@@ -118,13 +110,7 @@ class MySQLAdapter(EngineAdapter):
         timeout_ms: int,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         async with engine.begin() as db:
-            # Per-statement server-side timeout. MySQL 5.7.8+ uses SESSION
-            # max_execution_time (milliseconds, SELECT-only — exactly our workload);
-            # MariaDB has no such variable and instead uses max_statement_time
-            # (SECONDS, float). Try the MySQL form, then fall back to the MariaDB
-            # form so the timeout is actually enforced on both — a silently-unset
-            # timeout (the previous best-effort-swallow behavior) let a hung query
-            # run unbounded on MariaDB.
+            # Per-statement server-side timeout (see _set_statement_timeout).
             if not await self._set_statement_timeout(db, timeout_ms):
                 logger.warning("mysql_statement_timeout_unset", timeout_ms=timeout_ms)
             # No search_path: the URL's database is the active schema. Unqualified
@@ -145,9 +131,6 @@ class MySQLAdapter(EngineAdapter):
             await db.execute(text(f"SET SESSION max_execution_time = {int(timeout_ms)}"))
             return True
         except SQLAlchemyError as exc:
-            # Expected on MariaDB (no max_execution_time var) — fall through to the
-            # max_statement_time form below. Log at debug so the fallback path is
-            # traceable without noise on every MariaDB query.
             logger.debug("mysql_max_execution_time_unsupported_trying_maria", error=str(exc))
         try:
             # MariaDB expects seconds (float); convert from ms.

@@ -3,10 +3,7 @@
 
 """Client-facing error messages carry no backend exception text and no echoed input (CWE-209).
 
-The graph routes used to append the store's exception (``{e}``) to their 501s
-and to put the caller's URI back into 400/404 details; the ontology fetch path
-named the private address a hostname resolved to — an internal-DNS oracle. Each
-now answers a fixed message and logs the detail.
+Each route answers a fixed message and logs the detail.
 """
 
 from __future__ import annotations

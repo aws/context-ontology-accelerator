@@ -4,9 +4,6 @@
 /**
  * Display helpers for ontology records, shared by the Ontology page, the
  * Explorer inventory and the induced-ontology detail page.
- *
- * These lived in `OntologyPage.tsx`; importing them from there pulled that
- * whole module — and its Cloudscape tree — into every consumer's chunk.
  */
 
 import type { AppMessage } from "../i18n/appMessages";

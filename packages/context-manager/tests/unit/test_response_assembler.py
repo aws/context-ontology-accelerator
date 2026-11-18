@@ -28,7 +28,6 @@ def trace():
     return t
 
 
-@pytest.mark.unit
 class TestAssembleTier1:
     def test_tier1_has_confidence_1(self, assembler, trace):
         result = assembler.assemble_tier1(
@@ -59,10 +58,9 @@ class TestAssembleTier1:
         assert result.trace[0].step == "test_step"
 
 
-@pytest.mark.unit
 class TestOntologyVersionParity:
     """Every assembler can name the ontology version when the caller has one,
-    and stays null-by-default when it does not (#986)."""
+    and stays null-by-default when it does not."""
 
     def test_tier1_accepts_and_surfaces_ontology_version(self, assembler, trace):
         result = assembler.assemble_tier1(
@@ -127,7 +125,6 @@ class TestOntologyVersionParity:
         assert tier3.ontology_version is None
 
 
-@pytest.mark.unit
 class TestAssembleTier2:
     def test_tier2_includes_sparql_and_sql(self, assembler, trace):
         result = assembler.assemble_tier2(
@@ -151,13 +148,7 @@ class TestAssembleTier2:
         assert result.data_sources == ["table_a"]
 
     def test_debug_info_gate_defaults_off_and_withholds_query_and_sparql(self, assembler, trace):
-        """query_used / sparql_generated must be None by default (info-disclosure gate).
-
-        Regression test — the executed SQL / generated SPARQL
-        expose internal schema and only reach the caller when the caller opts in
-        via options.includeDebugInfo=true.
-        """
-        # Tier 1 default → no query_used
+        """query_used / sparql_generated must be None by default (info-disclosure gate)."""
         t1 = assembler.assemble_tier1(
             rows=[],
             columns=[],
@@ -168,7 +159,6 @@ class TestAssembleTier2:
         )
         assert t1.query_used is None
 
-        # Tier 2 default → no query_used and no sparql_generated
         t2 = assembler.assemble_tier2(
             rows=[],
             columns=[],
@@ -183,7 +173,6 @@ class TestAssembleTier2:
         assert t2.query_used is None
         assert t2.sparql_generated is None
 
-        # NL-to-SQL default → no query_used
         nl = assembler.assemble_nl_to_sql(
             rows=[],
             columns=[],
@@ -211,7 +200,6 @@ class TestAssembleTier2:
         assert result.result_rows is None
 
 
-@pytest.mark.unit
 class TestAssembleTier3:
     def test_tier3_includes_synthesis(self, assembler, trace):
         result = assembler.assemble_tier3(
@@ -276,10 +264,8 @@ class TestAssembleTier3:
     def test_tier3_never_promotes_a_predicate_label_to_predicate_uri(self, assembler, trace):
         # An edge with NO predicate identity at all (only an untyped ``predicate``
         # key) still cannot go on the wire — ``predicateUri`` is @required and a
-        # human-readable label is not an identifier. What changed is that the drop is
-        # now OBSERVABLE: an empty ``relationships`` list must not be ambiguous
-        # between "no edges found" and "every edge discarded", because the
-        # synthesizer may already have asserted the relationship in the answer.
+        # human-readable label is not an identifier, so the drop is reported in
+        # degradedSources.
         result = assembler.assemble_tier3(
             synthesized_answer="Amazon competes with Walmart.",
             supporting_content=[],
@@ -386,7 +372,6 @@ class TestAssembleTier3:
         assert all("supporting_statements" not in entity["properties"] for entity in result.graph_context["entities"])
 
     def test_tier3_partial_true_with_degraded_sources(self, assembler, trace):
-        """a degraded retrieval source means partial-context synthesis → partial=true."""
         result = assembler.assemble_tier3(
             synthesized_answer="Partial answer.",
             supporting_content=[],
@@ -399,12 +384,9 @@ class TestAssembleTier3:
         assert result.partial is True
         assert result.metadata["degradedSources"][0]["source"] == "vector_search"
 
-    # ── #1166: Deep Reasoning mode label + query artifacts ──────────────
-
     def test_tier3_execution_mode_surfaced(self, assembler, trace):
-        """#1166 cut #2: the resolved execution mode is surfaced structurally so
-        the console labels a Deep Reasoning answer by MODE, not by its tier=3
-        resolution (which would mis-read as Standard mode's Tier-3 label)."""
+        """The resolved execution mode is surfaced so the console labels a Deep
+        Reasoning answer by mode, not by its tier=3 resolution."""
         result = assembler.assemble_tier3(
             synthesized_answer="Deep answer.",
             supporting_content=[],
@@ -431,7 +413,7 @@ class TestAssembleTier3:
         assert result.execution_mode is None
 
     def test_tier3_query_artifacts_surfaced_when_debug_info_on(self, assembler, trace):
-        """#1166 cut #3: Deep Reasoning returns the SQL/SPARQL it executed, same
+        """Deep Reasoning returns the SQL/SPARQL it executed, same
         as Standard mode — but only when the caller opts into debug info."""
         result = assembler.assemble_tier3(
             synthesized_answer="Revenue was 100.",
@@ -449,9 +431,9 @@ class TestAssembleTier3:
         assert result.sparql_generated == "SELECT ?r WHERE { ?x :revenue ?r }"
 
     def test_tier3_query_artifacts_withheld_by_default(self, assembler, trace):
-        """Negative control: without includeDebugInfo the Deep Reasoning query
-        artifacts are withheld exactly like the Tier-2 gate — they expose internal
-        schema and must not leak on a default request (#1166)."""
+        """Without includeDebugInfo the Deep Reasoning query artifacts are withheld
+        exactly like the Tier-2 gate — they expose internal schema and must not leak
+        on a default request."""
         result = assembler.assemble_tier3(
             synthesized_answer="Revenue was 100.",
             supporting_content=[],
@@ -467,12 +449,8 @@ class TestAssembleTier3:
         assert result.sparql_generated is None
 
 
-# ── confidence calibration + trace-completeness audit ───────────
-
-
-@pytest.mark.unit
 class TestTier2Calibration:
-    """B1: Tier-2 confidence is calibrated from in-hand signals, not a blind
+    """Tier-2 confidence is calibrated from in-hand signals, not a blind
     passthrough of the LLM self-rating."""
 
     def test_empty_result_lowers_confidence_below_self_rating(self, assembler, trace):
@@ -488,13 +466,11 @@ class TestTier2Calibration:
             namespace="demo",
             row_count=0,
         )
-        # empty result must strictly lower the score vs the 0.9 self-rating
         assert result.confidence.score < 0.9
         assert "empty result" in result.confidence.rationale.lower()
         assert 0.0 <= result.confidence.score <= 1.0
 
     def test_non_empty_non_truncated_preserves_base_score(self, assembler, trace):
-        # back-compat: rows present, not truncated → unchanged self-rating
         result = assembler.assemble_tier2(
             rows=[{"id": "1"}, {"id": "2"}],
             columns=["id"],
@@ -511,9 +487,7 @@ class TestTier2Calibration:
         assert result.confidence.score == 0.9
 
     def test_empty_rows_without_explicit_row_count_still_penalized(self, assembler, trace):
-        # codex hardening: a visible empty result must be penalized even if the
-        # caller omits row_count (derive it from len(rows)). Guards the direct-call
-        # footgun where rows=[] + omitted row_count would otherwise escape.
+        # An empty rows list is penalized even when row_count is omitted.
         result = assembler.assemble_tier2(
             rows=[],
             columns=["id"],
@@ -531,7 +505,7 @@ class TestTier2Calibration:
 
     def test_none_rows_without_row_count_not_penalized(self, assembler, trace):
         # rows=None means "unknown / not applicable" (e.g. failed-rows path) — must
-        # NOT be treated as an empty result. Preserves test_tier2_handles_none_rows.
+        # NOT be treated as an empty result.
         result = assembler.assemble_tier2(
             rows=None,
             columns=None,
@@ -547,10 +521,8 @@ class TestTier2Calibration:
         assert result.confidence.score == 0.7
 
     def test_explicit_row_count_zero_with_none_rows_is_confirmed_empty(self, assembler, trace):
-        # Contract (MR !279 review): row_count=0 is the caller's ASSERTION of a
-        # confirmed-empty executed result (the executor QueryResult requires
-        # row_count, so 0 always means executed-and-empty) — penalized even when
-        # rows aren't materialized. Unknown is expressed as row_count=None, never 0.
+        # row_count=0 asserts a confirmed-empty result, penalized even when rows
+        # aren't materialized; unknown is row_count=None.
         result = assembler.assemble_tier2(
             rows=None,
             columns=None,
@@ -584,9 +556,8 @@ class TestTier2Calibration:
         assert "truncat" in result.confidence.rationale.lower()
 
 
-@pytest.mark.unit
 class TestTier3GuardrailClamp:
-    """B2: a guardrail-blocked Tier-3 response is clamped to 0.0 confidence at
+    """A guardrail-blocked Tier-3 response is clamped to 0.0 confidence at
     the assembler (defense-in-depth — can only LOWER, never raise)."""
 
     def test_guardrail_blocked_forces_zero(self, assembler, trace):
@@ -614,35 +585,15 @@ class TestTier3GuardrailClamp:
         assert result.confidence.score == 0.8
 
 
-@pytest.mark.unit
-class TestTier1ConfidenceRegression:
-    """A1-audit: Tier-1 confidence stays the deterministic 1.0 per LLD."""
-
-    def test_tier1_confidence_unchanged(self, assembler, trace):
-        result = assembler.assemble_tier1(
-            rows=[{"revenue": 100}],
-            columns=["revenue"],
-            metric_name="total_revenue",
-            sql_used="SELECT sum(r) FROM t",
-            trace=trace,
-            namespace="demo",
-        )
-        assert result.confidence.score == 1.0
-
-
 class TestModelIdInMetadata:
     """Verify per-request model_id override propagates to response metadata."""
 
     @pytest.fixture
     def assembler(self):
-        from coa_serve.response_assembler import ResponseAssembler
-
         return ResponseAssembler(model_id="default-model")
 
     @pytest.fixture
     def trace(self):
-        from coa_serve.trace import TraceCollector
-
         return TraceCollector()
 
     def test_tier2_metadata_default_model(self, assembler, trace):

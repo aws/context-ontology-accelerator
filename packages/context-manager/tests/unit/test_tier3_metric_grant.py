@@ -160,11 +160,11 @@ class TestGraphTraverseAction:
         from coa_serve.main import _handle_graph_traverse
 
         orch = MagicMock()
-        orch._knowledge_retriever._graph.traverse_from_uris = AsyncMock(return_value=[])
+        orch._knowledge_retriever._graph.traverse_graph = AsyncMock(return_value=[])
         with patch("coa_serve.main._orchestrator", orch):
             result = await _handle_graph_traverse({"namespace": NS, "options": {"startUri": CUSTOMER}}, "req", profile)
         assert result["statusCode"] == 200
-        return orch._knowledge_retriever._graph.traverse_from_uris.call_args.kwargs
+        return orch._knowledge_retriever._graph.traverse_graph.call_args.kwargs
 
     async def test_a_restricted_caller_traverses_without_governed_metrics(self):
         from coa_serve.role_resolver import ResolvedProfile

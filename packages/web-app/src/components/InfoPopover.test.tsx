@@ -13,7 +13,6 @@ describe("InfoPopover", () => {
         Data-quality rules for this ontology.
       </InfoPopover>,
     );
-    // Trigger is present and labelled; body is not shown until the user opens it.
     expect(screen.getByLabelText("About SHACL")).toBeInTheDocument();
     expect(
       screen.queryByText("Data-quality rules for this ontology."),

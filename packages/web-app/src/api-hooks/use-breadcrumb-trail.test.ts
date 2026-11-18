@@ -146,10 +146,6 @@ describe("useBreadcrumbTrail", () => {
   });
 
   it("re-links a namespace crumb once GetNamespace resolves after the first render", () => {
-    // Models the real sequence: on first render GetNamespace is still
-    // loading, so canAccess is false and the crumb is trimmed to plain text;
-    // once it resolves successfully, canAccess flips to true and the crumb
-    // must become a link.
     mockNamespace.mockReturnValue({
       name: "My NS",
       canAccess: false,
@@ -165,10 +161,8 @@ describe("useBreadcrumbTrail", () => {
       },
     );
 
-    // First render: GetNamespace not yet resolved → plain text, no navigation.
     expect(published()[1].onClick).toBeUndefined();
 
-    // GetNamespace resolves: access confirmed.
     mockNamespace.mockReturnValue({
       name: "My NS",
       canAccess: true,

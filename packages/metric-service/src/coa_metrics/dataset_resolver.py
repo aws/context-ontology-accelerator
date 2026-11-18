@@ -71,13 +71,6 @@ def resolve_datasets(
     MVP: all datasets must resolve to an existing data source.
     Resolution uses the dataset's `data_source_id` field if present,
     otherwise attempts name-based matching.
-
-    Args:
-        datasets: Parsed OSI dataset entries.
-        lookup: Data source lookup implementation.
-
-    Returns:
-        DatasetResolutionResult with resolved datasets and/or errors.
     """
     resolved: list[ResolvedDataset] = []
     errors: list[ResolutionError] = []
@@ -86,7 +79,6 @@ def resolve_datasets(
         data_source_id = dataset.data_source_id
 
         if data_source_id:
-            # Explicit ID provided — verify it exists
             if lookup.data_source_exists(data_source_id):
                 resolved.append(
                     ResolvedDataset(
@@ -116,7 +108,6 @@ def resolve_datasets(
                     reason="not_found",
                 )
         else:
-            # No explicit ID — try name-based resolution
             # Convention: dataset name may match a data source ID directly
             if lookup.data_source_exists(dataset.name):
                 resolved.append(

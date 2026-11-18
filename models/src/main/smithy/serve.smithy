@@ -676,14 +676,14 @@ operation Query {
 
         /// When true, include the generated SQL (`queryUsed`) and SPARQL
         /// (`sparqlGenerated`) in the response for debugging and observability.
-        /// Defaults to false; when unset or false, both fields are omitted.
+        /// Defaults to false on this API; when unset or false, both fields are
+        /// omitted. The MCP `query` tool and the Playground default it to true.
         ///
-        /// **Security:** these fields expose internal schema (table and column
-        /// names, joins), so the flag is honoured only for a caller who already
-        /// administers that schema: a platform admin, or a namespace owner,
-        /// maintainer or data steward of the queried namespace. For any other
-        /// caller the request still succeeds, but both fields are omitted as if
-        /// the flag were false.
+        /// **Security:** these fields expose internal schema, so each is gated on
+        /// the right to see the schema it reveals: `queryUsed` (table and column
+        /// names, joins) on `viewSource`, and `sparqlGenerated` (ontology class
+        /// and property names) on `viewOntology`. A caller lacking a right still
+        /// gets a successful response, with that field omitted.
         includeDebugInfo: Boolean
 
         /// Maximum number of result rows to return.

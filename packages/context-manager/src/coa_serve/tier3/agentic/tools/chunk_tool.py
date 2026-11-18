@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Chunk_Expansion_Tool: physical chunk-window expansion (improvement idea 6).
+"""Chunk_Expansion_Tool: physical chunk-window expansion.
 
 When the reasoning agent decides one or more retrieved chunks are particularly
 relevant, this tool returns the chunks **physically adjacent to them in the source
@@ -24,13 +24,13 @@ So seeds are matched and neighbors returned via ``id(...)``. Seed chunk ids come
 from prior chunk/semantic retrieval results (``ChunkResult.chunk_id``), which the
 planner sees listed in its context summary.
 
-Import discipline (Requirement 12.3): module load imports only the dependency-free
+Import discipline: module load imports only the dependency-free
 ``.base`` contract, the template strings, and the sibling ``ChunkResult``
 dataclass — none of which import ``graphrag_toolkit``. The toolkit
 ``GraphStoreFactory`` and ``TenantId`` are imported LAZILY inside the first
 invocation.
 
-Per-Tool failure tolerance (Req 9.1-9.2): :meth:`ChunkExpansionTool.invoke` never
+Per-Tool failure tolerance: :meth:`ChunkExpansionTool.invoke` never
 raises for an expected failure. A bad/empty parameter set, an out-of-bounds id
 count, an unconfigured store, a backend error, or a timeout all yield a (possibly
 empty) :class:`ToolResult` whose ``detail`` records the degradation.
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -112,7 +113,7 @@ class ChunkExpansionTool:
             graph_store_uri: The same ``neptune-db://<host>:8182`` (or
                 ``neptune-graph://g-…``) URI the strategy/graph tools use. The
                 toolkit ``GraphStore`` is constructed from it lazily inside the
-                first invocation (Req 12.3).
+                first invocation.
             query_timeout_s: Wall-clock cap applied around each graph query.
         """
         self.name = TOOL_NAME
@@ -122,15 +123,39 @@ class ChunkExpansionTool:
         self._graph_store_uri = graph_store_uri
         self._query_timeout_s = query_timeout_s
         self._store: Any = None
+        self._store_lock = threading.Lock()
 
     def _get_store(self) -> Any:
-        """Build (once) and return the toolkit ``GraphStore``; lazy toolkit import."""
-        if self._store is None:
-            from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory  # lazy
+        """Build (once) and return the toolkit ``GraphStore``; lazy toolkit import.
 
-            self._store = GraphStoreFactory.for_graph_store(self._graph_store_uri)
-            logger.info("agentic_chunk_store_built", uri=self._graph_store_uri)
+        Blocking: the first call in a process imports graphrag-toolkit and builds the
+        embedding model (seconds). Async code reaches it through :meth:`_ensure_store`.
+        """
+        if self._store is not None:
+            return self._store
+        with self._store_lock:
+            if self._store is None:
+                from ....lexical.baseline_retriever import ensure_graphrag_configured  # lazy
+
+                # Same process-wide toolkit config (region, models) the lexical retriever
+                # applies; this store may be the first toolkit object the process builds.
+                ensure_graphrag_configured()
+
+                from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory  # lazy
+
+                self._store = GraphStoreFactory.for_graph_store(self._graph_store_uri)
+                logger.info("agentic_chunk_store_built", uri=self._graph_store_uri)
         return self._store
+
+    async def _ensure_store(self) -> Any:
+        """Return the store, building it on the worker pool so the event loop never blocks.
+
+        The build imports the toolkit, which also makes the lazy ``TenantId`` import in
+        ``_format_label`` a cheap ``sys.modules`` lookup afterwards.
+        """
+        if self._store is not None:
+            return self._store
+        return await asyncio.get_running_loop().run_in_executor(_EXECUTOR, self._get_store)
 
     @staticmethod
     def _chunk_label(namespace: str) -> str:
@@ -152,7 +177,7 @@ class ChunkExpansionTool:
 
     async def _run_cypher(self, cypher: str, params: dict) -> list[dict]:
         """Execute openCypher on the toolkit store under the query timeout."""
-        store = self._get_store()
+        store = await self._ensure_store()
         loop = asyncio.get_running_loop()
         fut = loop.run_in_executor(_EXECUTOR, lambda: store.execute_query_with_retry(cypher, params))
         rows = await asyncio.wait_for(asyncio.shield(fut), timeout=self._query_timeout_s)
@@ -169,11 +194,10 @@ class ChunkExpansionTool:
     ) -> ToolResult:
         """Return the chunks adjacent to ``chunk_ids`` in the source document.
 
-        Validates the id count (1-50) and clamps ``hops`` to ``[1, 5]`` and ``limit`` to
-        ``[1, 100]`` before
-        building the query. Never raises for an expected failure: invalid params,
+        Validates the id count (1-50) and clamps ``hops`` to ``[1, 5]`` and ``limit``
+        to ``[1, 100]`` before building the query. Never raises for an expected failure: invalid params,
         an unconfigured store, a backend error, or a timeout all return a degraded
-        :class:`ToolResult` whose ``detail`` records the reason (Req 9.1-9.2).
+        :class:`ToolResult` whose ``detail`` records the reason.
         """
         ids = [c for c in (chunk_ids or []) if isinstance(c, str) and c]
         if not (MIN_CHUNK_IDS <= len(ids) <= MAX_CHUNK_IDS):
@@ -182,18 +206,20 @@ class ChunkExpansionTool:
             )
         hops = max(1, min(int(hops), MAX_CHUNK_WINDOW_HOPS))
 
-        cypher = CHUNK_WINDOW_EXPANSION.format(
-            chunk_label=self._chunk_label(namespace),
-            source_label=self._source_label(namespace),
-            hops=hops,
-            limit=bounded_limit(limit, default=DEFAULT_CHUNK_WINDOW_LIMIT, ceiling=MAX_CHUNK_WINDOW_LIMIT),
-        )
         try:
+            # Off-loop first-use toolkit import, before _format_label needs the toolkit.
+            await self._ensure_store()
+            cypher = CHUNK_WINDOW_EXPANSION.format(
+                chunk_label=self._chunk_label(namespace),
+                source_label=self._source_label(namespace),
+                hops=hops,
+                limit=bounded_limit(limit, default=DEFAULT_CHUNK_WINDOW_LIMIT, ceiling=MAX_CHUNK_WINDOW_LIMIT),
+            )
             rows = await self._run_cypher(cypher, {"chunk_ids": ids})
         except TimeoutError:
             logger.warning("chunk_tool_timeout", tool=self.name)
             return ToolResult(detail=f"{self.name} timeout")
-        except Exception as exc:  # noqa: BLE001 - a Tool must never raise (Req 9.1)
+        except Exception as exc:  # noqa: BLE001 - a Tool must never raise
             logger.warning("chunk_tool_invoke_error", tool=self.name, error=str(exc), error_type=type(exc).__name__)
             return ToolResult(detail=f"{self.name} error: {type(exc).__name__}")
 
@@ -266,13 +292,6 @@ def build_chunk_expansion_tool(registry: Any, graph_store_uri: str) -> str:
 
     Mirrors :func:`build_graph_tool`: a thin builder the factory calls when the
     Neptune graph endpoint is configured. Returns the registered Tool name.
-
-    Args:
-        registry: The :class:`ToolRegistry` to register the tool into.
-        graph_store_uri: The graphrag-toolkit graph-store URI the tool queries.
-
-    Returns:
-        The registered Tool name (``"chunk_window"``).
     """
     tool = ChunkExpansionTool(graph_store_uri)
     registry.register(tool)

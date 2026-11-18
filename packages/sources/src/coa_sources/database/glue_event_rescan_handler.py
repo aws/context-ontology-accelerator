@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Glue event → rescan consumer (event-driven rescan, #683 R8).
+"""Glue event → rescan consumer (event-driven rescan).
 
 Drains the Glue-event SQS queue, which is fed by per-source EventBridge rules
 matching Glue Data Catalog state changes for a source's database. Each message

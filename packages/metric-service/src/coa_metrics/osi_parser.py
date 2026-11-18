@@ -7,16 +7,6 @@ Parses OSI YAML documents into internal metric representations and
 serializes internal metrics back to OSI YAML format.
 
 OSI spec version: v1.0 (pinned in manifest as osi_spec_version: "1.0").
-
-Dialect mapping (internal → OSI):
-  POSTGRESQL, TRINO, REDSHIFT → ANSI_SQL
-  SNOWFLAKE → SNOWFLAKE
-  DATABRICKS → DATABRICKS
-
-Dialect mapping (OSI → internal):
-  ANSI_SQL → POSTGRESQL (default; caller can override)
-  SNOWFLAKE → SNOWFLAKE
-  DATABRICKS → DATABRICKS
 """
 
 from __future__ import annotations
@@ -31,8 +21,6 @@ from coa_metrics.constants import VALID_SQL_DIALECTS, SqlDialect
 
 logger = structlog.get_logger(__name__)
 
-# ── OSI Spec Constants ──────────────────────────────────────────────────
-
 OSI_SPEC_VERSION = "1.0"
 OSI_VENDOR_NAME = "COA"
 # Keep OSI imports aligned with the Smithy SqlExpression contract. Unlike the
@@ -41,9 +29,6 @@ OSI_VENDOR_NAME = "COA"
 # parsing or safety analysis.
 MAX_SQL_EXPRESSION_LENGTH = 10_000
 
-# ── Dialect Mapping ─────────────────────────────────────────────────────
-
-# Internal dialect → OSI dialect
 _INTERNAL_TO_OSI: dict[str, str] = {
     SqlDialect.POSTGRESQL: "ANSI_SQL",
     SqlDialect.TRINO: "ANSI_SQL",
@@ -53,7 +38,6 @@ _INTERNAL_TO_OSI: dict[str, str] = {
     SqlDialect.MYSQL: "ANSI_SQL",
 }
 
-# OSI dialect → internal dialect (default mapping for import)
 _OSI_TO_INTERNAL: dict[str, str] = {
     "ANSI_SQL": SqlDialect.POSTGRESQL,
     "SNOWFLAKE": SqlDialect.SNOWFLAKE,
@@ -64,20 +48,12 @@ _OSI_TO_INTERNAL: dict[str, str] = {
 def osi_dialect_to_internal(osi_dialect: str) -> str:
     """Map an OSI dialect identifier to the internal dialect name.
 
-    Args:
-        osi_dialect: OSI dialect string (e.g., "ANSI_SQL", "SNOWFLAKE").
-
-    Returns:
-        Internal dialect name as SqlDialect value (e.g., "POSTGRESQL", "SNOWFLAKE").
-
     Raises:
         ValueError: If the OSI dialect is not recognized.
     """
     normalized = osi_dialect.strip().upper()
-    # A real internal dialect named directly (REDSHIFT, TRINO, MYSQL, POSTGRESQL,
-    # ...) is legitimate OSI input — a hand-authored or third-party document need
-    # not go through COA's own ANSI_SQL/SNOWFLAKE/DATABRICKS export aliases. Pass
-    # it through case-normalized before consulting the wire-alias map (#140).
+    # An internal dialect named directly (REDSHIFT, TRINO, ...) is legitimate OSI
+    # input; pass it through case-normalized before the wire-alias map.
     if normalized in VALID_SQL_DIALECTS:
         return normalized
     internal = _OSI_TO_INTERNAL.get(normalized)
@@ -91,12 +67,6 @@ def osi_dialect_to_internal(osi_dialect: str) -> str:
 def internal_dialect_to_osi(internal_dialect: str) -> str:
     """Map an internal dialect name to the OSI dialect identifier.
 
-    Args:
-        internal_dialect: Internal dialect as SqlDialect value (e.g., "POSTGRESQL", "SNOWFLAKE").
-
-    Returns:
-        OSI dialect string (e.g., "ANSI_SQL", "SNOWFLAKE").
-
     Raises:
         ValueError: If the internal dialect has no OSI mapping.
     """
@@ -108,9 +78,6 @@ def internal_dialect_to_osi(internal_dialect: str) -> str:
             f"Supported: {', '.join(sorted(_INTERNAL_TO_OSI.keys()))}"
         )
     return osi
-
-
-# ── OSI Data Models ─────────────────────────────────────────────────────
 
 
 @dataclass
@@ -180,9 +147,6 @@ class OsiDocument:
     metrics: list[OsiMetric] = field(default_factory=list)
 
 
-# ── Parser ──────────────────────────────────────────────────────────────
-
-
 def _opt_str(mapping: dict[str, Any], key: str) -> str:
     """Read an optional scalar as a string, treating an explicit YAML ``null`` as absent.
 
@@ -239,18 +203,10 @@ class ParseResult:
 
 
 def parse_osi_yaml(content: str) -> ParseResult:
-    """Parse an OSI YAML string into an OsiDocument.
-
-    Args:
-        content: Raw YAML string in OSI v1.0 format.
-
-    Returns:
-        ParseResult with the parsed document or errors.
-    """
+    """Parse an OSI YAML string into an OsiDocument (ParseResult carries the document or errors)."""
     errors: list[ParseError] = []
     warnings: list[ParseWarning] = []
 
-    # Parse YAML
     try:
         raw = yaml.safe_load(content)
     except yaml.YAMLError as exc:
@@ -265,7 +221,6 @@ def parse_osi_yaml(content: str) -> ParseResult:
             errors=[ParseError(path="$", message="OSI document must be a YAML mapping")],
         )
 
-    # Validate spec version
     spec_version = raw.get("osi_spec_version", "")
     if not spec_version:
         errors.append(ParseError(path="$.osi_spec_version", message="Missing required field 'osi_spec_version'"))
@@ -277,10 +232,8 @@ def parse_osi_yaml(content: str) -> ParseResult:
             )
         )
 
-    # Parse datasets
     datasets = _parse_datasets(raw.get("datasets", []), errors)
 
-    # Parse metrics
     metrics = _parse_metrics(raw.get("metrics", []), errors, warnings)
 
     if errors:
@@ -356,13 +309,9 @@ def _parse_metrics(raw_metrics: Any, errors: list[ParseError], warnings: list[Pa
 
 
 def _warn_vendor_prefixed_keys(raw: dict[str, Any], path: str, warnings: list[ParseWarning]) -> None:
-    """Flag `x_*` keys on a metric — they are not OSI v1.0 and are otherwise dropped silently.
+    """Flag `x_*` keys on a metric — they are not OSI v1.0 and would otherwise be dropped silently.
 
-    The shipped samples once carried COA metadata (data_source_id, source_table, unit,
-    return_type, time_dimension, ontology_concepts) under `x_coa:`. Nothing reads that
-    key, so the metric imported with its ontology binding stripped and Check 6 had
-    nothing to validate. Surface it so the author can move the block to the
-    spec-defined `custom_extensions` list.
+    COA metadata belongs under the spec-defined `custom_extensions` list.
     """
     for key in raw:
         if not (isinstance(key, str) and key.lower().startswith("x_")):
@@ -405,7 +354,6 @@ def _parse_single_metric(
         errors.append(ParseError(path=f"{path}.description", message="Metric 'description' is required"))
         return None
 
-    # Parse expression dialects
     expression_raw = raw.get("expression", {})
     dialects_raw = expression_raw.get("dialects", []) if isinstance(expression_raw, dict) else []
 
@@ -445,7 +393,6 @@ def _parse_single_metric(
     if not dialect_expressions:
         return None
 
-    # Parse custom extensions (COA vendor)
     custom_ext = _parse_custom_extensions(raw.get("custom_extensions", []), path)
 
     return OsiMetric(
@@ -475,13 +422,9 @@ def _parse_ai_context(raw: Any) -> OsiAiContext | None:
 
 def _parse_custom_extensions(raw_extensions: Any, path: str) -> OsiCustomExtension | None:
     """Parse COA custom extensions from a metric."""
-    if not raw_extensions:
-        return None
-
     if not isinstance(raw_extensions, list):
         return None
 
-    # Find the COA vendor extension
     for ext in raw_extensions:
         if not isinstance(ext, dict):
             continue
@@ -512,27 +455,15 @@ def _parse_custom_extensions(raw_extensions: Any, path: str) -> OsiCustomExtensi
     return None
 
 
-# ── Serializer (Export) ─────────────────────────────────────────────────
-
-
 def serialize_osi_yaml(document: OsiDocument) -> str:
-    """Serialize an OsiDocument to OSI YAML string.
-
-    Args:
-        document: The OsiDocument to serialize.
-
-    Returns:
-        YAML string in OSI v1.0 format.
-    """
+    """Serialize an OsiDocument to an OSI v1.0 YAML string."""
     output: dict[str, Any] = {
         "osi_spec_version": document.osi_spec_version,
     }
 
-    # Datasets
     if document.datasets:
         output["datasets"] = [_serialize_dataset(ds) for ds in document.datasets]
 
-    # Metrics
     output["metrics"] = [_serialize_metric(m) for m in document.metrics]
 
     return yaml.dump(output, default_flow_style=False, sort_keys=False, allow_unicode=True)

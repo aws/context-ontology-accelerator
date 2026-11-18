@@ -113,7 +113,7 @@ Cedar (at query execution time by the SQL Firewall) — see the
 | Field | Type | Effect |
 |-------|------|--------|
 | `tableAllowlist` | `list[string]` | Only these tables can be queried. Any other table reference is denied, and other tables' names are left out of the query trace and response metadata. |
-| `columnDenylist` | `map[string, list[string]]` | These columns cannot be projected. `SELECT *` on a restricted table is denied. For a graph (`RDF_SPARQL`) source, key the entry by the source id and list full predicate IRIs; see [Denying predicates of a graph source](sources.md#denying-predicates-of-a-graph-source). |
+| `columnDenylist` | `map[string, list[string]]` | These columns cannot be projected. `SELECT *` on a restricted table is denied, and so is a whole-row reference such as `SELECT to_json(c) FROM customers c` or a column alias list such as `FROM customers AS c(id, s)`. For a graph (`RDF_SPARQL`) source, key the entry by the source id and list full predicate IRIs; see [Denying predicates of a graph source](sources.md#denying-predicates-of-a-graph-source). |
 | `allowedMetrics` | `list[string]` | Only these metric IDs can be evaluated. |
 
 A table entry can be a bare name or `database.table`:

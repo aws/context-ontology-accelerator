@@ -15,9 +15,6 @@ from coa_metrics.source_status import SourceValidationUnavailableError
 pytestmark = pytest.mark.unit
 
 
-# ── Test helpers ────────────────────────────────────────────────────────
-
-
 def _make_event(body: dict | None = None, namespace: str = "test-ns") -> dict:
     """Build a minimal API Gateway proxy event for POST /namespaces/{ns}/metrics/validate."""
     path_params = {"namespaceId": namespace} if namespace else {}
@@ -43,7 +40,7 @@ def _valid_body() -> dict:
     }
 
 
-# Patch lookups to None so only Check 1 (SQL syntax) runs — keeps tests hermetic.
+# Patch lookups to None so only the SQL syntax check runs.
 _no_lookups = patch.multiple(
     "coa_metrics.api.validate_metric",
     _get_data_source_lookup=MagicMock(return_value=None),
@@ -51,9 +48,6 @@ _no_lookups = patch.multiple(
     check_source_approved=MagicMock(return_value=None),
     check_source_table_exists=MagicMock(return_value=None),
 )
-
-
-# ── Request validation tests ────────────────────────────────────────────
 
 
 class TestRequestValidation:
@@ -82,9 +76,6 @@ class TestRequestValidation:
         assert resp["statusCode"] == 400
 
 
-# ── Success tests ───────────────────────────────────────────────────────
-
-
 class TestSuccess:
     def test_valid_metric_reports_unconfigured_catalog(self) -> None:
         with _no_lookups:
@@ -111,8 +102,6 @@ class TestSuccess:
         assert len(warnings) >= 1
         warning = warnings[0]
         assert warning["field"] == "sql_syntax"
-        # #617/#1050: blocking checks surface as ERROR so validate predicts
-        # the create/serve rejection (was misleadingly downgraded to WARNING).
         assert warning["severity"] == "ERROR"
         assert "message" in warning
 
@@ -153,9 +142,6 @@ class TestSuccess:
         assert resp["statusCode"] == 200
         warnings = json.loads(resp["body"])["warnings"]
         assert {"field": "sourceTable", "message": table_message, "severity": "ERROR"} in warnings
-
-
-# ── Error handling tests ────────────────────────────────────────────────
 
 
 class TestErrorHandling:
@@ -213,13 +199,8 @@ class TestErrorHandling:
             resp = handler(_make_event(body=_valid_body()), None)
         warnings = json.loads(resp["body"])["warnings"]
         by_field = {w["field"]: w["severity"] for w in warnings}
-        # #617/#1050: blocking checks (result.errors) surface as ERROR; soft
-        # findings (result.warnings) stay INFO.
         assert by_field["sql_syntax"] == "ERROR"
         assert by_field["ontology_linkage"] == "INFO"
-
-
-# ── Shape severity (#617/#1050) ─────────────────────────────────────────
 
 
 class TestShapeSeverity:
@@ -238,9 +219,6 @@ class TestShapeSeverity:
         assert len(shape) == 1
         assert shape[0]["severity"] == "ERROR"
         assert "full SELECT statement" in shape[0]["message"]
-
-
-# ── Declared sourceTable: one verdict, one wording ──────────────────────
 
 
 class TestKnownButRejectedSourceTable:

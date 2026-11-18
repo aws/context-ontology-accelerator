@@ -92,9 +92,6 @@ class TestAccumulateEmbeddingsDataSourceExtraction:
 
         g = _build_r2rml_graph_with_datasource(str(EX.Customer), "ds-123-abc")
 
-        # New contract: the class→datasource map is derived from the R2RML by
-        # the caller and passed in (not scanned from the ontology graph, which
-        # never carries TriplesMaps at accept time).
         result = _accumulate_embeddings(
             vector_store=mock_vector_store,
             graph=g,
@@ -131,11 +128,8 @@ class TestAccumulateEmbeddingsDataSourceExtraction:
 
         g = _build_r2rml_graph_multi_datasource()
 
-        # Multi-datasource map passed in by the caller. Here we deliberately omit
-        # Product from the map to exercise the embedding side: a class absent from
-        # the map (or with an empty id) gets NO data_source_id field written, so
-        # the NL->SQL presence filter drops it. (Map DERIVATION — where Product is
-        # now included with an empty id — is covered in TestClassDatasourceMapFromR2rml.)
+        # Product is deliberately absent from the map, so it gets NO
+        # data_source_id field and the NL->SQL presence filter drops it.
         result = _accumulate_embeddings(
             vector_store=mock_vector_store,
             graph=g,
@@ -185,28 +179,12 @@ class TestClassDatasourceMapFromR2rml:
             str(EX.Product): "",
         }
 
-    def test_class_without_datasource_id_is_mapped_with_empty_value(self):
-        """A TriplesMap with rr:class but no coa:datasourceId → class is MAPPED
-        (present, drives isMapped=True) with an empty ds-id (NL->SQL will drop
-        it, Ontop can still answer it). Regression guard for the decoupling of
-        membership from the routing id."""
-        from coa_ontology.catalog.ingest import _class_datasource_map_from_r2rml
-
-        r2rml = _build_r2rml_graph_multi_datasource().serialize(format="turtle")
-        mapping = _class_datasource_map_from_r2rml(r2rml)
-
-        assert str(EX.Product) in mapping  # mapped (rr:class present)
-        assert mapping[str(EX.Product)] == ""  # but no routable datasource id
-
     def test_multiple_triplesmaps_keep_last_nonempty_datasource_id(self):
         """A class mapped by several TriplesMaps keeps the LAST NON-EMPTY id; an
         id-less TriplesMap never blanks out an id already found."""
         from coa_ontology.catalog.ingest import _class_datasource_map_from_r2rml
-        from rdflib import BNode, Graph, Literal, Namespace, URIRef
-        from rdflib.namespace import RDF
+        from rdflib import BNode
 
-        RR = Namespace("http://www.w3.org/ns/r2rml#")
-        SCL = Namespace(f"{GRAPH_BASE_URI}/vocab/coa#")
         cls = URIRef("http://example.org/ontology#Shared")
 
         def _tmap(g: Graph, name: str, ds_id: str | None) -> None:
@@ -354,7 +332,6 @@ class TestClassDatasourceMapFromR2rml:
         assert "Table: Customer" in class_text
         assert "Columns:" in class_text
         assert "name" in class_text
-        assert "name:string" not in class_text
         assert ":string" not in class_text
 
         # STORED context_text (for the generation prompt): carries the type.
@@ -365,12 +342,8 @@ class TestClassDatasourceMapFromR2rml:
 
 @pytest.mark.unit
 class TestDistinctValuesNotInClassText:
-    """coa:distinctValues must NOT leak into the class *embedding* text. Sampled
-    enum values are a signal for the serve NL→SPARQL *generation* prompt
-    (injected via the Tier-2 TBoxContextBuilder), not for the retrieval vector —
-    putting them in the embedded text would pollute recall without helping
-    generation. The values still live on the property in the graph
-    (coa:distinctValues); this test guards that the embedding text stays clean."""
+    """coa:distinctValues must NOT leak into the class *embedding* text; sampled
+    enum values feed the generation prompt, not the retrieval vector."""
 
     @patch("coa_ontology.bedrock_embeddings.BedrockEmbeddingClient")
     def test_distinct_values_do_not_render_in_class_text(self, mock_bedrock_cls):

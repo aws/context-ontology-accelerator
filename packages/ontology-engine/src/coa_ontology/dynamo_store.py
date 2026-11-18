@@ -7,7 +7,6 @@ Table: ontology-engine (PK/SK single-table design, override via DYNAMODB_TABLE e
 
 Item patterns (namespace-prefixed for multi-tenant isolation):
   PK={namespace}#JOB#{job_id}         SK=STATUS              — induction job status + details
-  PK={namespace}#JOB#{job_id}         SK=PROPOSAL#ontology   — proposal artifact under job
   PK={namespace}#PROPOSAL#{id}        SK=META                — standalone proposal record
 
 Namespace registry patterns (one partition per namespace, sort key patterns):
@@ -43,21 +42,9 @@ _log = logging.getLogger(__name__)
 def resolve_ontology_bucket() -> str:
     """Resolve the ontology-artifacts S3 bucket name.
 
-    Deployed environments always set ``ONTOLOGY_ARTIFACTS_BUCKET`` (wired in
-    ``ontology-stack.ts``). The fallback used to hardcode a fixed account id,
-    so a missing env var silently pointed reads/writes at *another account's*
-    bucket — a cross-account data footgun. Instead we derive the name from the
-    **current** account via STS, matching the CDK naming pattern
-    ``{prefix}-{env}-ontology-artifacts-{account}``. If even that can't be
-    resolved we return "" so the first S3 call fails loudly rather than
-    touching the wrong account.
-
-    The prefix comes from ``RESOURCE_PREFIX``, NOT from a hardcoded brand: the
-    bucket is a physical resource, so its name tracks the deployment's
-    ``resource_prefix``. Hardcoding ``coa-`` here meant a deployment using any
-    other prefix (CI/dev deploy with ``scl``) derived a bucket that does not
-    exist — surfacing as NoSuchBucket for any caller outside the deployed
-    compute, where the env var is unset (e.g. integ tests).
+    ``ONTOLOGY_ARTIFACTS_BUCKET`` if set, else ``{RESOURCE_PREFIX}-{env}-ontology-artifacts-{account}``
+    with the account from STS (matching the CDK name), else ``""`` so the first S3
+    call fails loudly instead of touching another account.
     """
     env_val = os.getenv("ONTOLOGY_ARTIFACTS_BUCKET")
     if env_val:
@@ -89,13 +76,7 @@ _s3 = None
 def _get_s3():
     global _s3
     if _s3 is None:
-        # Force SigV4. Under the default SigV2 signing, ``Content-Type`` is part
-        # of the string-to-sign, so a presigned PUT (which signs an empty
-        # Content-Type) is rejected the moment the browser sends
-        # ``Content-Type: text/turtle`` (SignatureDoesNotMatch / 403). SigV4 only
-        # signs declared headers, so the browser may send any Content-Type — which
-        # is what the presign_proposal_artifact_put contract relies on.
-        # Regional hostname: see regional_s3_client.
+        # SigV4 (set by regional_s3_client) lets a presigned PUT accept any Content-Type.
         _s3 = regional_s3_client(REGION)
     return _s3
 
@@ -215,7 +196,7 @@ def write_and_presign_ontology_download(
     """Write serialized ontology Turtle to the artifacts bucket, return a presigned GET URL.
 
     ``/download`` must not inline a large ontology: a 6+ MB Turtle body exceeds
-    the API Gateway / Lambda response limit and 502s the call (#143). Mirroring
+    the API Gateway / Lambda response limit and 502s the call. Mirroring
     the proposal read path, the graph is serialized, written to S3, and served
     out-of-band via a presigned URL the client fetches directly. The graph is
     the source of truth (it reflects post-acceptance edits), so this writes fresh
@@ -292,35 +273,16 @@ def _ontology_sk(ontology_id: str) -> str:
 
 # ── Per-namespace induction lock (PK={namespace}#INDUCTIONLOCK) ──────────
 #
-# Enforces "one in-flight induction per namespace" WITHOUT the old race: the
-# previous guard listed for a pending/updated PROPOSAL row, which does not exist
-# during the in-flight window (the proposal row is written only at worker end),
-# so a second trigger slipped through. This lock is a single sentinel item
-# acquired with a conditional put at trigger time — it exists ONLY for the
-# active-run window and is released when the worker exits (success OR failure).
-# The complementary "block until reviewed" limit (a completed-but-unreviewed
-# proposal also blocks a new run) is enforced separately, and disjointly, by
-# start_induction's pending/updated PROPOSAL check — so the lock does not need
-# to survive past worker completion.
-#
-# Stale-takeover: if the worker's task is recycled mid-run the lock would
-# otherwise wedge the namespace forever, so acquire also succeeds when the
-# existing lock is older than ``_STALE_INDUCTION_LOCK_SECONDS``.
+# One sentinel item per namespace, acquired with a conditional put at trigger
+# time and released when the worker exits. Acquire also succeeds when the
+# existing lock is older than ``_STALE_INDUCTION_LOCK_SECONDS`` (worker recycled).
 
 
 class InductionLockHeldError(Exception):
-    """Raised by ``acquire_induction_lock`` when a live lock already exists.
-
-    Carries the ``job_id`` of the in-flight induction so the caller can surface
-    it in the 409 response body (mirrors the old guard's ``proposal_id``).
-    """
+    """Raised by ``acquire_induction_lock`` when a live lock exists; carries the in-flight ``job_id``."""
 
     def __init__(self, job_id: str) -> None:
-        """Store the in-flight job id and build the error message.
-
-        Args:
-            job_id: ID of the induction job currently holding the lock.
-        """
+        """Store the in-flight job id and build the error message."""
         super().__init__(f"induction already in flight (job {job_id})")
         self.job_id = job_id
 
@@ -396,13 +358,7 @@ def put_job(
     namespace: str = DEFAULT_NAMESPACE,
     source_type: str = "STRUCTURED",
 ):
-    """Write initial induction job record when job starts.
-
-    ``source_type`` is the structured/unstructured discriminator added in
-    the unstructured-induction-api wiring. It defaults to ``"STRUCTURED"``
-    so existing structured callers keep working at the call-site level
-    even before they are explicitly updated to pass the value through.
-    """
+    """Write the initial induction job record; ``source_type`` defaults to ``"STRUCTURED"``."""
     _get_table().put_item(
         Item={
             "PK": _job_pk(namespace, job_id),
@@ -427,15 +383,8 @@ def put_job(
 def update_job_status(job_id: str, status: str, namespace: str = DEFAULT_NAMESPACE, **extra):
     """Update job status and optional extra fields.
 
-    Every ``**extra`` attribute name is aliased through
-    ``ExpressionAttributeNames`` (an aliased ``#name`` placeholder in the
-    ``UpdateExpression``) so DynamoDB reserved keywords are legal in the SET
-    clause. ``error`` in particular is a reserved keyword: the worker failure
-    path calls ``update_job_status(..., error=...)``, and embedding the bare
-    name (``error = :error``) makes DynamoDB reject the write with
-    ``ValidationException: Attribute name is a reserved keyword`` — silently
-    losing the job's ``failed`` status and error message. Aliasing uniformly
-    keeps any future reserved-keyword attribute safe too.
+    Every ``**extra`` name is aliased through ``ExpressionAttributeNames`` because
+    DynamoDB rejects reserved words such as ``error`` in a SET clause.
     """
     expr_parts = ["#s = :s", "updated_at = :ts"]
     names = {"#s": "status"}
@@ -456,19 +405,10 @@ def update_job_status(job_id: str, status: str, namespace: str = DEFAULT_NAMESPA
 def touch_job(job_id: str, namespace: str = DEFAULT_NAMESPACE) -> None:
     """Bump an induction job's ``updated_at`` liveness timestamp — nothing else.
 
-    Called by the induction worker's watchdog thread (see
-    ``induce_catalog._run_induction``) so a long-running-but-alive job keeps
-    its ``updated_at`` fresh and is never mistaken for an orphan by the
-    age-gated stale sweep. It deliberately SETs **only** ``updated_at`` and
-    never touches ``status``: a late watchdog tick that lands after the worker
-    has already written a terminal status must not clobber it back to a
-    non-terminal value (which would make the age-gate re-sweep a finished job).
-    Bumping ``updated_at`` on an already-terminal row is harmless — terminal
-    rows are never swept regardless of age.
+    Never touches ``status``, so a late watchdog tick cannot un-terminate a job.
 
     Raises:
-        botocore.exceptions.ClientError: On DynamoDB failures (throttling,
-            network, permission). The watchdog caller catches this per-tick.
+        botocore.exceptions.ClientError: On DynamoDB failures.
     """
     _get_table().update_item(
         Key={"PK": _job_pk(namespace, job_id), "SK": "STATUS"},
@@ -498,15 +438,7 @@ def put_job_datasources_s3(namespace: str, job_id: str, datasources: list[dict])
 
 
 def get_job(job_id: str, namespace: str = DEFAULT_NAMESPACE) -> dict | None:
-    """Fetch a job's STATUS item from DynamoDB.
-
-    Args:
-        job_id: ID of the job to fetch.
-        namespace: Namespace the job belongs to.
-
-    Returns:
-        The job item, or None if no such job exists.
-    """
+    """Fetch a job's STATUS item from DynamoDB."""
     return _get_table().get_item(Key={"PK": _job_pk(namespace, job_id), "SK": "STATUS"}).get("Item")
 
 
@@ -529,14 +461,8 @@ def put_ingest_job(
 ) -> None:
     """Write the initial async ontology-ingest job record.
 
-    Mirrors ``put_job`` but on a separate ``#INGESTJOB#`` partition. Persisting
-    to DynamoDB (rather than an in-process dict) means the status survives ECS
-    task restarts/redeploys and is readable regardless of which task instance
-    serves the poll — the in-memory dict 404'd forever if the worker task and
-    the polling task differed, or if the task recycled mid-ingest.
-
-    Uses the shared ``DynamoDBDAO`` (lib/common) for read/write so the reserved-
-    word aliasing + condition handling live in one place.
+    Like ``put_job`` but on a separate ``#INGESTJOB#`` partition, written through
+    the shared ``DynamoDBDAO``.
     """
     now = datetime.now(UTC).isoformat()
     _get_dao().put(
@@ -576,15 +502,7 @@ def update_ingest_job(job_id: str, status: str, namespace: str = DEFAULT_NAMESPA
 
 
 def get_ingest_job(job_id: str, namespace: str = DEFAULT_NAMESPACE) -> dict | None:
-    """Fetch an async ontology-ingest job's STATUS item.
-
-    Args:
-        job_id: ID of the ingest job to fetch.
-        namespace: Namespace the ingest job belongs to.
-
-    Returns:
-        The ingest job item, or None if no such job exists.
-    """
+    """Fetch an async ontology-ingest job's STATUS item."""
     return _get_dao().get({"PK": _ingest_job_pk(namespace, job_id), "SK": "STATUS"})
 
 
@@ -630,47 +548,23 @@ def list_ingest_jobs(namespace: str, status: str | None = None, limit: int = 100
 
 # ── Generic async-job persistence (validate / infer-constraints / …) ───────
 #
-# Proposal-scoped async jobs (SHACL validation, constraint inference) used to
-# live ONLY in per-process dicts. That is lost on any ECS task restart/redeploy:
-# the poll then 404s forever (work that may still be running or already done),
-# and a burst past the in-memory cap could evict a still-running job. These
-# helpers persist the job to DynamoDB (same table, distinct ``#ASYNCJOB#``
-# partition) so status survives restarts and cross-instance polls — mirroring
-# the ingest-job pattern.
+# Proposal-scoped async jobs (SHACL validation, constraint inference) persist
+# under a ``#ASYNCJOB#`` partition so status survives task restarts.
 
 # Statuses past which a job never changes. A job stuck in a non-terminal state
 # with no live worker (task recycled mid-run) is swept to ``failed`` on read.
 #
-# Single source of truth for the terminal-status UNION across every job family.
-# ``induce_catalog`` imports this (it depends on dynamo_store, not vice versa,
-# so the constant lives here to avoid a circular import). The union covers:
-# induction jobs' ``ingested`` (set on proposal-accept, proposals.py) plus the
-# async-job set ``completed``/``failed``/``cancelled``. Unioning is safe — an
-# async job never reaches ``ingested``, so a wider terminal set only prevents a
-# false-positive sweep, never causes a missed one. Collapsing to any single
-# family's set would regress another (get_job would re-sweep ``ingested``;
-# count_active_jobs would count ``cancelled`` as active forever).
+# Union of every job family's terminal states (induction ``ingested`` plus the
+# async-job set). Lives here because ``induce_catalog`` imports this module.
 TERMINAL_JOB_STATUSES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "ingested"})
 
 # A non-terminal job whose ``updated_at`` is older than this is considered
 # orphaned (its worker thread died with the task) and reported as failed.
 _STALE_JOB_SECONDS = int(os.getenv("ASYNC_JOB_STALE_SECONDS", "1800"))  # 30 min
 
-# Proposal accept runs on a fire-and-forget daemon thread (see proposals.py
-# accept_proposal). If that worker dies mid-run — the ECS task recycled, an
-# unhandled crash, Neptune/Bedrock hanging past the task's lifetime — the
-# proposal is left in a non-terminal ``accepting``/``embeddings_sync`` state
-# forever: the Accept button stays disabled and there is no path to recover it.
-# Mirror the async-job sweep: on read, a proposal stuck in an in-progress accept
-# state past ``_ACCEPT_STALE_SECONDS`` (with no ``updated_at`` heartbeat — the
-# accept pipeline bumps updated_at at every step checkpoint, so a live-but-slow
-# accept keeps resetting the clock and is NOT swept) is moved to the terminal
-# ``accept_failed`` state with an ``accept_error`` so the user can retry.
-#
-# Taken from the Smithy-generated ProposalStatus enum, NOT hardcoded and not
-# imported from proposals.py (which would be circular — proposals depends on this
-# module). The generated enum is a leaf dependency both modules can import, so
-# there is exactly one definition of these statuses and no "keep in sync" risk.
+# A proposal in an in-progress accept state with no ``updated_at`` heartbeat for
+# ``_ACCEPT_STALE_SECONDS`` is swept to ``accept_failed`` on read. Statuses come
+# from the generated enum because proposals.py imports this module.
 _PROPOSAL_IN_PROGRESS_STATUSES: frozenset[str] = frozenset(
     {ProposalStatus.ACCEPTING.value, ProposalStatus.EMBEDDINGS_SYNC.value}
 )
@@ -734,21 +628,8 @@ def sweep_stale_record(
     ``max_age_seconds`` is written to ``terminal_status`` with ``error_message``
     on ``error_field``.
 
-    Single implementation for what used to be two byte-identical copies of this
-    algorithm — async jobs (:func:`_sweep_if_stale`) and proposal accepts
-    (:func:`_sweep_proposal_if_stale`). They differ only in the parameters above,
-    so a fix to the timestamp parsing or the staleness rule lands in one place.
-
-    Induction jobs run the same rule through ``induce_catalog._sweep_job_if_stale``
-    rather than this helper, because that path additionally serves the
-    ``count_active_jobs`` self-heal and carries induction-specific behaviour (it
-    deliberately does not release the induction lock). Worth folding together if a
-    third caller appears; not worth forcing today.
-
-    ``write`` performs the store update and is called with the field dict; it is
-    best-effort — a transient DDB failure is logged and swallowed so it cannot
-    500 the very poll the user relies on to observe the stuck state (the next
-    read retries the sweep). The older copies let that failure escape.
+    ``write`` is called with the field dict and is best-effort: a DDB failure is
+    logged and swallowed so it cannot 500 the poll (the next read retries).
 
     Returns the same ``item``, mutated when swept, so callers can return it
     directly.
@@ -772,12 +653,7 @@ def sweep_stale_record(
     except Exception:  # noqa: BLE001 — transient write failure; next read retries the sweep
         _log.exception("%s: failed to mark stale record as %s", label, terminal_status)
         return item
-    # Mirror EVERY written field onto the returned item, ``extra_fields`` included.
-    # ``fields`` is exactly what went to DDB, so reusing it keeps the two from
-    # diverging: the caller is usually the very poll that triggered this sweep, and
-    # updating only status/error left it reporting the pre-sweep ``accept_progress``
-    # (e.g. the last completed step) even though DDB already said
-    # ``{step: unknown, state: stale}``.
+    # Mirror exactly what was written to DDB onto the returned item.
     item.update(fields)
     return item
 
@@ -958,59 +834,6 @@ def _scan_page(
     return _read_page(_get_table().scan, kwargs, limit, exclusive_start_key, max_calls=max_calls)
 
 
-def put_proposal(job_id: str, ontology_turtle: str, r2rml_turtle: str, namespace: str = DEFAULT_NAMESPACE):
-    """Persist proposal ontology and R2RML to S3, store keys in DynamoDB."""
-    ts = datetime.now(UTC).isoformat()
-    pk = _job_pk(namespace, job_id)
-
-    onto_key = _put_artifact_s3(namespace, job_id, "ontology", ontology_turtle)
-    r2rml_key = _put_artifact_s3(namespace, job_id, "r2rml", r2rml_turtle) if r2rml_turtle else ""
-
-    _get_table().put_item(
-        Item={
-            "PK": pk,
-            "SK": "PROPOSAL#ontology",
-            "s3_key": onto_key,
-            "format": "text/turtle",
-            "created_at": ts,
-        }
-    )
-    _get_table().put_item(
-        Item={
-            "PK": pk,
-            "SK": "PROPOSAL#r2rml",
-            "s3_key": r2rml_key,
-            "format": "text/turtle",
-            "created_at": ts,
-        }
-    )
-
-
-def get_proposal(job_id: str, kind: str = "ontology", namespace: str = DEFAULT_NAMESPACE) -> dict | None:
-    """Retrieve a proposal artifact. kind: 'ontology' or 'r2rml'."""
-    resp = _get_table().get_item(Key={"PK": _job_pk(namespace, job_id), "SK": f"PROPOSAL#{kind}"})
-    item = resp.get("Item")
-    if not item:
-        return None
-    # Hydrate from S3 if content was offloaded
-    if "s3_key" in item and "content" not in item:
-        item["content"] = _get_artifact_s3(namespace, job_id, kind) or ""
-    return item
-
-
-def put_reviewed_proposal(
-    job_id: str,
-    ontology_turtle: str | None = None,
-    r2rml_turtle: str | None = None,
-    namespace: str = DEFAULT_NAMESPACE,
-):
-    """Store/overwrite user-reviewed proposal artifacts — overwrites 'latest' in S3."""
-    if ontology_turtle is not None:
-        _put_artifact_s3(namespace, job_id, "ontology", ontology_turtle, version="latest")
-    if r2rml_turtle is not None:
-        _put_artifact_s3(namespace, job_id, "r2rml", r2rml_turtle, version="latest")
-
-
 def get_reviewed_proposal(job_id: str, kind: str = "ontology", namespace: str = DEFAULT_NAMESPACE) -> dict | None:
     """Retrieve a user-reviewed proposal artifact record.
 
@@ -1043,15 +866,8 @@ def create_proposal(
 ):
     """Create a new proposal record. Turtle content is stored in S3.
 
-    ``source_type`` is the structured/unstructured discriminator added in
-    the unstructured-induction-api wiring. It is persisted as a top-level
-    item attribute (not nested in ``metadata``) so ``list_proposals`` can
-    apply a server-side ``FilterExpression`` against it.
-
-    Default is ``"STRUCTURED"`` so existing call sites keep working
-    unchanged. Pre-delta items written before the schema delta lack the
-    attribute entirely; ``list_proposals(source_type="STRUCTURED")``
-    treats those as structured for backward compatibility.
+    ``source_type`` is a top-level attribute so ``list_proposals`` can filter on
+    it server-side; an item without it counts as ``"STRUCTURED"``.
     """
     ts = datetime.now(UTC).isoformat()
 
@@ -1075,18 +891,12 @@ def create_proposal(
         r2rml_key = ""
 
     # Store matches in S3 if present (can be large with candidates + definitions).
-    # Shares put_proposal_matches_s3 with the grounding-override/edit paths so
-    # key construction + Decimal-safe serialization stay in one place.
     matches_s3_key = ""
     if metadata and "matches" in metadata:
         matches_s3_key = put_proposal_matches_s3(proposal_id, metadata.pop("matches"), namespace=namespace)
 
-    # Preserve the trigger-time created_at if an in-progress stub row already
-    # exists (create_proposal_stub wrote one at induction start). This is a
-    # full put_item overwrite, so without this the row's age would reset to the
-    # worker-end time, making the proposal look freshly created instead of
-    # created when the user triggered it. Best-effort — a missing/failed read
-    # just falls back to ``ts``.
+    # A full put overwrites the row, so carry over the stub's trigger-time
+    # created_at (best-effort; falls back to ``ts``).
     created_at = ts
     try:
         existing = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"}).get("Item")
@@ -1126,18 +936,10 @@ def create_proposal_stub(
 ) -> None:
     """Write an in-progress PROPOSAL stub row at induction TRIGGER time.
 
-    This is what makes a running induction visible in the proposals list
-    immediately and survive a browser refresh: the list query scans
-    ``{ns}#PROPOSAL#`` / ``META`` rows, and previously no such row existed
-    until the worker finished (``create_proposal``). The stub carries
-    ``status="inducing"`` and empty S3 keys — the worker upserts it into the
-    real proposal (``status="pending"``) via ``create_proposal`` on success,
-    preserving this row's ``created_at``; on failure it is flipped to
-    ``status="failed"`` via ``update_proposal``.
-
-    ``proposal_id`` is the job_id (1:1, matching both worker paths). No S3
-    artifacts exist yet, so ``get_proposal`` presigns to ``None`` cleanly and
-    the list view has nothing large to strip.
+    Makes a running induction visible in the proposals list. The stub has
+    ``status="inducing"`` and empty S3 keys; the worker upserts it to ``pending``
+    via ``create_proposal`` (keeping ``created_at``) or flips it to ``failed`` via
+    ``update_proposal``. ``proposal_id`` is the job_id.
     """
     ts = datetime.now(UTC).isoformat()
     _get_table().put_item(
@@ -1200,13 +1002,11 @@ def put_proposal_matches_s3(
     writing them inline into ``metadata``, or the UpdateItem fails with
     ``Item size has exceeded the maximum allowed size``.
     """
-    import json as _json
-
     key = _proposal_matches_s3_key(namespace, proposal_id, version)
     _get_s3().put_object(
         Bucket=_S3_BUCKET,
         Key=key,
-        Body=_json.dumps({"matches": matches}, default=_matches_json_default).encode("utf-8"),
+        Body=json.dumps({"matches": matches}, default=_matches_json_default).encode("utf-8"),
         ContentType="application/json",
     )
     return key
@@ -1290,26 +1090,7 @@ def presign_proposal_constraints(
 
 
 def _sweep_proposal_if_stale(proposal_id: str, namespace: str, item: dict) -> dict:
-    """Move a proposal stuck in an in-progress accept state to ``accept_failed``.
-
-    The accept worker is a fire-and-forget daemon thread; if it dies mid-run
-    (task recycled, crash, or a Neptune/Bedrock call hanging past the task's
-    lifetime) the proposal sits in ``accepting``/``embeddings_sync`` forever with
-    no recovery path. On read, if such a proposal has had no ``updated_at``
-    heartbeat for ``_ACCEPT_STALE_SECONDS``, move it to the terminal
-    ``accept_failed`` state with an ``accept_error`` so the UI surfaces it and the
-    user can re-accept (the pipeline is idempotent on re-run). Mirrors
-    :func:`_sweep_if_stale` for async jobs.
-
-    The accept pipeline checkpoints every step, refreshing ``updated_at`` each
-    time, so a genuinely-live-but-slow accept keeps resetting the staleness clock
-    and is never swept — only a worker that has made no progress for the whole
-    window is treated as dead.
-
-    Returns the (possibly updated) item. Best-effort: a write error is swallowed
-    (the next read retries) so a transient DDB hiccup can't 500 the poll the user
-    relies on to observe the stuck state.
-    """
+    """Sweep a proposal stuck in an in-progress accept past ``_ACCEPT_STALE_SECONDS`` to ``accept_failed``."""
     return sweep_stale_record(
         item,
         is_in_progress=lambda s: s in _PROPOSAL_IN_PROGRESS_STATUSES,
@@ -1361,14 +1142,7 @@ def get_proposal_by_id(
     # Recover a proposal orphaned by a dead accept worker before anything else
     # reads its status (the GET poll, the accept in-progress guard, etc.).
     item = _sweep_proposal_if_stale(proposal_id, namespace, item)
-    # Hydrate turtle content from S3 when an S3 key is present. The S3 copy is
-    # authoritative — always re-read it (rather than trusting any inline
-    # ``ontology_turtle``), so an edit that rewrote the S3 object is reflected
-    # even if a prior read left a stale inline copy on the item.
-    #
-    # ``hydrate_turtle=False`` skips this potentially multi-MB read for callers
-    # that only need metadata (e.g. the detail endpoint, which serves the
-    # Turtle out-of-band via a presigned S3 URL rather than inlining it).
+    # The S3 copy is authoritative, so it is always re-read.
     if hydrate_turtle and item.get("ontology_s3_key"):
         item["ontology_turtle"] = _get_s3_text(item["ontology_s3_key"]) or ""
     if hydrate_turtle and item.get("r2rml_s3_key"):
@@ -1394,8 +1168,6 @@ def get_proposal_by_id(
                 if "metadata" not in item:
                     item["metadata"] = {}
                 item["metadata"]["constraint_config"] = json.loads(raw)
-        # Narrow to the actual failure modes (S3 transport, corrupt JSON) so a
-        # programming error surfaces instead of being swallowed as a graceful degrade.
         except (ClientError, BotoCoreError, json.JSONDecodeError) as e:
             _log.warning("constraint_config hydration failed for %s in %s: %s", proposal_id, namespace, e)
     return item
@@ -1414,8 +1186,7 @@ def list_proposals(
     Results are ordered newest first by ``created_at``, and ``limit`` keeps the
     NEWEST ``limit`` matches. Pass ``limit=None`` to return ALL matches — used
     by cleanup paths that must not silently truncate (e.g. deleting every
-    proposal grounded against an ontology). ``source_type`` filter semantics (added in
-    the unstructured-induction-api wiring):
+    proposal grounded against an ontology). ``source_type`` filter semantics:
       - ``None`` (default): no filter on source_type — every proposal
         regardless of source type is returned.
       - ``"STRUCTURED"``: items whose ``source_type`` attribute equals
@@ -1539,26 +1310,12 @@ def update_proposal(
 ) -> None:
     """Update proposal fields.
 
-    When ``expected_status`` is supplied, the update runs as a
-    DynamoDB conditional write (``ConditionExpression: #s = :exp``).
-    The kwarg is keyword-only so ``status=...`` continues to flow
-    through ``**fields`` unchanged. Used by the accept-proposal
-    handler to atomically transition ``pending|updated → accepting``
-    so concurrent accepts can't both spawn workers — the second
-    request gets ``ConditionalCheckFailedException`` which the route
-    converts to 409.
-
-    ``expected_status_not`` is the inverse guard: the write only applies while
-    the stored status is NOT that value. Used by ``_accept_fail`` so a late
-    pipeline-step failure can never downgrade an already-``accepted`` proposal
-    (which would drop it out of the ``status="accepted"`` queries that rebuild
-    the ontology's R2RML). The caller catches
-    ``ConditionalCheckFailedException`` and records diagnostics only.
-
-    The two are mutually exclusive — passing both is a programming error.
-
-    All other call sites (cancel, reject, the worker's own status
-    flip after ingest) remain unconditional.
+    ``expected_status`` makes the write conditional on the stored status (the
+    accept handler's ``pending|updated → accepting`` transition, so concurrent
+    accepts cannot both spawn workers). ``expected_status_not`` applies the write
+    only while the status is NOT that value (``_accept_fail`` cannot downgrade an
+    ``accepted`` proposal). A failed condition raises
+    ``ConditionalCheckFailedException``. Passing both is a programming error.
     """
     if expected_status is not None and expected_status_not is not None:
         raise ValueError("expected_status and expected_status_not are mutually exclusive")
@@ -1634,14 +1391,7 @@ def put_namespace_meta(namespace: str, data: dict | None = None) -> dict:
 
 
 def get_namespace_meta(namespace: str) -> dict | None:
-    """Fetch a namespace's META item.
-
-    Args:
-        namespace: Namespace whose metadata row to fetch.
-
-    Returns:
-        The namespace META item, or None if the namespace has no row.
-    """
+    """Fetch a namespace's META item."""
     resp = _get_table().get_item(Key={"PK": _namespace_pk(namespace), "SK": "META"})
     return resp.get("Item")
 
@@ -1679,15 +1429,7 @@ def put_ontology_registry(namespace: str, ontology_id: str, data: dict) -> dict:
 
 
 def get_ontology_registry(namespace: str, ontology_id: str) -> dict | None:
-    """Fetch a single ontology's registry row from a namespace.
-
-    Args:
-        namespace: Namespace the ontology belongs to.
-        ontology_id: Ontology identifier (its IRI within the namespace).
-
-    Returns:
-        The ontology registry item, or None if it does not exist.
-    """
+    """Fetch a single ontology's registry row from a namespace."""
     resp = _get_table().get_item(Key={"PK": _namespace_pk(namespace), "SK": _ontology_sk(ontology_id)})
     return resp.get("Item")
 
@@ -1818,10 +1560,8 @@ def update_ontology_registry(namespace: str, ontology_id: str, **fields) -> dict
         return get_ontology_registry(namespace, ontology_id)
     fields["updated_at"] = datetime.now(UTC).isoformat()
 
-    # Alias EVERY attribute name via #placeholder. Ontology registry rows use
-    # several DynamoDB reserved words (status, name, format, uri, version,
-    # license, source, ...); a hand-curated reserved set is fragile and silently
-    # broke on `format`. Aliasing everything is always valid and future-proof.
+    # Alias every attribute name: registry rows use DynamoDB reserved words
+    # (status, name, format, uri, version, license, source, ...).
     expr_parts: list[str] = []
     values: dict[str, Any] = {}
     names: dict[str, str] = {}
@@ -1879,10 +1619,8 @@ def extend_ontology_registry(
     names: dict[str, str] = {}
     reserved = {"status", "namespace", "name"}
 
-    # SET updated_at
     set_parts.append("updated_at = :ts")
 
-    # SET arbitrary fields
     for k, v in set_fields.items():
         placeholder = k.replace("#", "_")
         if k in reserved:
@@ -1892,13 +1630,11 @@ def extend_ontology_registry(
             set_parts.append(f"{k} = :{placeholder}")
         values[f":{placeholder}"] = v
 
-    # SET source_proposals = list_append(if_not_exists(source_proposals, :empty), :new)
     if source_proposal is not None:
         values[":sp_new"] = [source_proposal]
         values[":sp_empty"] = []
         set_parts.append("source_proposals = list_append(if_not_exists(source_proposals, :sp_empty), :sp_new)")
 
-    # ADD counts (atomic accumulate)
     count_fields = [
         ("class_count", add_class_count),
         ("property_count", add_property_count),
@@ -1970,7 +1706,6 @@ def delete_proposal(namespace: str, proposal_id: str) -> bool:
     """
     existing = _get_table().get_item(Key={"PK": _proposal_pk(namespace, proposal_id), "SK": "META"}).get("Item")
 
-    # Best-effort S3 teardown: delete every object under the proposal's prefix.
     _best_effort_delete_s3_prefix(
         f"{_S3_PROPOSALS_PREFIX}/{namespace}/{proposal_id}/", f"proposal {proposal_id} in {namespace}"
     )

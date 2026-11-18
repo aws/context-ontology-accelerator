@@ -134,9 +134,6 @@ def _tool(graph=None, catalog=None, template=TEMPLATE):
     return OntologyGraphTool(graph or _MockGraph(), catalog, namespace=NS, graph_uri_template=template)
 
 
-# ── pure helpers ─────────────────────────────────────────────────────────────
-
-
 @pytest.mark.unit
 def test_normalize_node_types_defaults_to_all():
     assert _normalize_node_types(None) == ("table", "column")
@@ -186,9 +183,6 @@ def test_bfs_respects_hop_bound():
     assert _iri("Shop_Products") in two and two[_iri("Shop_Products")][0] == 2
     # DB boundary: hr tables are never reached from a shop seed.
     assert _iri("Hr_Departments") not in two
-
-
-# ── explore_graph() ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -267,9 +261,7 @@ class TestExploreGraph:
         assert graph.calls == []
 
     async def test_a_non_latin_seed_label_resolves(self):
-        # Regression: an ASCII-only allow-list rejected non-Latin labels, so a CJK
-        # (or accented, or Cyrillic) schema reported "seed table not found" and the
-        # tool silently did nothing on every question. The literal is still escaped.
+        # Non-Latin labels must resolve, and the literal is still escaped.
         for label in ("会員", "회원", "Kundenübersicht", "клиенты"):
             graph = _MockGraph(label_rows={label.lower(): [_iri("Shop_Customers")]})
             r = await _tool(graph).explore_graph(label, hops=1, node_types=["table"])
@@ -355,12 +347,9 @@ _GRAPHS = [f"https://ontology-workbench.local/{NS}/g1", f"https://ontology-workb
 class TestGraphScoping:
     """The named-graph binding: cost proportional to the namespace, not the cluster.
 
-    ``GRAPH ?g`` + ``STRSTARTS`` matches in every graph on the cluster and filters
-    afterwards. That is correct but priced by the whole store: at ~30 ingested
-    namespaces the FK-edge query pinned Neptune at 99% CPU and stopped fitting in
-    its 25 s timeout — and since a failed load is never cached, ``explore_graph``
-    then errored on *every* call. Binding ``?g`` to the namespace's resolved graphs
-    lets the quad index serve them directly.
+    ``GRAPH ?g`` + ``STRSTARTS`` scans every graph on the cluster and filters
+    afterwards. Binding a constant ``GRAPH <iri>`` to the namespace's resolved
+    graphs lets the quad index serve them directly.
     """
 
     async def test_resolved_graphs_are_named_instead_of_filtered(self):

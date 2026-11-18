@@ -20,10 +20,6 @@ There are two trusted sources of user identity, depending on the caller:
 Priority: JWT sub > JWT email > profile.userId. The JWT takes precedence because
 it is cryptographically validated by AgentCore before the request reaches this code.
 The profile path is a fallback for edge cases where no JWT is forwarded.
-
-_resolve_user_id does NOT perform token validation itself. It trusts that
-upstream infrastructure (AgentCore Runtime) already verified the token before
-the request reached this code.
 """
 
 from __future__ import annotations
@@ -82,24 +78,15 @@ def resolve_principal(
 ) -> tuple[str, list[str]]:
     """Resolve the authoritative ``(user_id, groups)`` for authorization.
 
-    The single source of truth for the JWT-over-body precedence that both the
-    namespace admission gate and the Tier-1/2/3 query path feed into
-    ``resolve_profile`` / Cedar. Extending :func:`resolve_user_id` to also return
-    ``groups`` keeps that trust decision in one place instead of duplicated inline.
-
-    Precedence (JWT is authoritative — the body is attacker-controlled for direct
-    Playground callers, so it must never override the AgentCore-validated token):
+    JWT is authoritative; the body is attacker-controlled for direct Playground
+    callers, so it must never override the AgentCore-validated token:
 
     * ``user_id``: JWT sub → JWT email → ``profile.userId`` → ``profile.email``.
     * ``groups``: the JWT groups whenever a JWT identity was extracted (even if the
-      list is empty — an authenticated caller with no groups is not the same as an
-      unauthenticated one); only with NO JWT at all do we fall back to
+      list is empty); only with NO JWT at all do we fall back to
       ``profile.groups``. A comma-joined string is normalized to a list, and any
-      other type is discarded — ``profile`` is attacker-controlled on the direct
-      path, so a malformed ``groups`` (int, dict, nested list) must not escape this
-      function and violate the ``list[str]`` contract its callers rely on.
-
-    Does NOT validate the token — AgentCore did that upstream (see module docstring).
+      other type is discarded, so a malformed ``groups`` cannot violate the
+      ``list[str]`` contract.
     """
     profile = profile or {}
     user_id = jwt_user_id or jwt_email or profile.get("userId") or profile.get("email") or ""
@@ -121,23 +108,10 @@ def resolve_principal(
 def display_principal(profile: dict | None) -> str | None:
     """Human-readable caller identity for response metadata and trace details.
 
-    ``profile["userId"]`` is the JWT ``sub`` — a Cognito UUID or equivalent, and
-    the right key for grant lookup, Cedar, and session tracking, since it is the
-    one claim every IdP guarantees. It means nothing to the person reading it, so
-    prefer the ``email`` claim when the role resolver injected one: the Playground
-    renders these values verbatim, and "alice@example.com" tells the reader whose
-    grants produced the answer where a UUID does not.
-
-    A display label only — it never feeds authorization, which reads ``userId``.
-    The substitution is honest rather than cosmetic: email IS a principal identity
-    in the grant model (:func:`role_resolver.build_principal_keys` resolves grants
-    under both ``User::<sub>`` and ``User::<email>``), so the two name the same
-    principal. Only the JWT-derived email reaches the profile — ``main.py`` strips
-    a client-supplied ``email`` before ``ResolvedProfile.inject_into`` writes the
-    validated one — so this cannot be spoofed by the request body.
-
-    Accepts ``None`` so no call site needs its own ``profile or {}`` guard;
-    forgetting that guard is what kept the Tier-3 paths on the raw sub.
+    Prefers the ``email`` claim over ``profile["userId"]`` (the JWT ``sub``). A
+    display label only — it never feeds authorization, which reads ``userId``.
+    Only the JWT-derived email reaches the profile (``main.py`` strips a
+    client-supplied ``email``), so this cannot be spoofed by the request body.
     """
     p = profile or {}
     return p.get("email") or p.get("userId")

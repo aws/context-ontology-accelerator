@@ -8,26 +8,20 @@ engine + retriever configuration. Both the runtime factory/adapter and the
 eval harness resolve strategies through this registry, so the adapter, the
 request API, and the benchmark all agree on what each name means.
 
-The exposed set is the **seven non-deprecated** graphrag-toolkit retrievers,
-each built through the non-deprecated ``for_traversal_based_search`` engine
-(2026-06-15 real-graph verification on the coa-dev kg-build NDB+AOSS graph —
-tasks.md task 16; design.md "UPDATE 2026-06-15"):
+The seven traversal strategies are built through the non-deprecated
+``for_traversal_based_search`` engine; ``topic_beam`` constructs its retriever
+directly. The deployment default is ``topic_beam`` (``LEXICAL_RETRIEVER_STRATEGY``):
 
   | Strategy               | Retriever(s)                                          |
   |------------------------|-------------------------------------------------------|
   | ``chunk_based``        | ``ChunkBasedSearch``                                  |
-  | ``chunk_based_semantic`` (default) | ``ChunkBasedSemanticSearch``              |
+  | ``chunk_based_semantic`` | ``ChunkBasedSemanticSearch``                        |
   | ``entity_based``       | ``EntityBasedSearch``                                 |
   | ``entity_context``     | ``EntityContextSearch``                               |
   | ``entity_network``     | ``EntityNetworkSearch``                               |
   | ``topic_based``        | ``TopicBasedSearch``                                  |
   | ``traversal``          | weighted ``ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5`` |
-
-The earlier semantic-guided "chunk-only" strategy is **removed**: it returned
-the "No relevant context" sentinel even on a healthy graph and is subsumed by
-``ChunkBasedSemanticSearch``. ``engine_family`` is therefore always
-``"traversal"`` — the deprecated semantic-guided engine entry point is no
-longer used by any strategy.
+  | ``topic_beam``         | ``TopicBeamSearch``                                   |
 
 Engine-construction notes (verified against the real graph):
   - All builders construct the engine WITHOUT an explicit ``BedrockContextFormat``
@@ -60,8 +54,7 @@ logger = structlog.get_logger(__name__)
 class RetrieverStrategy(StrEnum):
     """Named graphrag-toolkit retrieval strategies selectable per request.
 
-    Exactly the seven non-deprecated graphrag-toolkit retrievers, each built
-    through the non-deprecated ``for_traversal_based_search`` engine.
+    Seven non-deprecated traversal retrievers plus ``topic_beam``.
     """
 
     CHUNK_BASED = "chunk_based"
@@ -73,11 +66,8 @@ class RetrieverStrategy(StrEnum):
     TRAVERSAL = "traversal"
     # TopicGraphRAG (graphrag-lexical-graph PR #318, introduced 3.18.7; pinned 3.20.0).
     # Unlike the seven above it is constructed as the engine's retriever directly
-    # (engine_family="direct"),
-    # and it REQUIRES a populated ``topic`` vector index — ingests before the
-    # chunk,topic index change (EMBEDDING_INDEXES in kg-build) have no topic vectors and
-    # it will seed empty. Registered so the agentic ToolRegistry can expose it as an
-    # A/B arm; kept out of the default rotation until measured.
+    # (engine_family="direct"), and it REQUIRES a populated ``topic`` vector index;
+    # a graph ingested without topic vectors seeds empty.
     TOPIC_BEAM = "topic_beam"
 
 
@@ -130,32 +120,15 @@ class StrategySpec:
     build_engine: Callable[..., object]
 
 
-# ---------------------------------------------------------------------------
-# Benchmarked retrieval hyperparameters (ProcessorArgs), pinned EXPLICITLY.
-#
-# ``for_traversal_based_search(..., **kwargs)`` forwards these to the toolkit's
-# ``ProcessorArgs``. We pin them rather than inherit library defaults so:
-#   (1) our retrieval matches the toolkit team's benchmark config (reranker=tfidf,
-#       vss_top_k=10, max_search_results=10, max_statements=200,
-#       derive_subqueries=False — the config behind the published correctness
-#       numbers for chunk_based_semantic and the other non-topic retrievers); and
-#   (2) a graphrag-toolkit version bump cannot silently move a default and shift
-#       our results (the reproducibility guarantee the benchmark harness records
-#       per run).
-#
-# Note the toolkit's own generation-time knobs (max_context_tokens / token
-# truncation mode) are intentionally NOT set here: we build with
-# ``post_processors=[]`` / ``context_format="raw"`` and do our own synthesis
-# (``Synthesizer`` with ``max_prompt_chunks``), so the toolkit never generates and
-# those knobs would be inert. Topic-beam-specific knobs are likewise omitted —
-# TopicBeamSearch is not in the pinned toolkit release yet.
+# Benchmarked retrieval hyperparameters (ProcessorArgs), pinned EXPLICITLY so
+# retrieval matches the toolkit team's benchmark config (reranker=tfidf,
+# max_statements=200, derive_subqueries=False) and a graphrag-toolkit bump cannot
+# silently move a default. Generation-time knobs (max_context_tokens) are not set:
+# we build with ``post_processors=[]`` and do our own synthesis, so they are inert.
 #
 # Deviations from the installed 3.20.0 defaults: ``max_search_results`` (5 → 10,
 # per the benchmark config) and ``vss_top_k`` (10 → 20, a deliberate recall-widening
-# override above the benchmarked 10 — surfaces more seed chunks to the beam /
-# statement expansion). The rest re-assert current defaults so a toolkit upgrade
-# cannot silently drift them. Kept as a module constant so the runtime adapter and
-# the eval harness use one source of truth.
+# override that surfaces more seed chunks to the beam / statement expansion).
 _BENCHMARK_PROCESSOR_ARGS: dict = {
     "reranker": "tfidf",
     "vss_top_k": 20,
@@ -237,17 +210,8 @@ def _install_score_preserving_processors(engine: Any) -> Any:
     return engine
 
 
-# ---------------------------------------------------------------------------
-# Engine builders. graphrag_toolkit imports are LAZY (inside each function).
-#
-# Every builder calls ``for_traversal_based_search(graph_store, vector_store,
-# *, tenant_id, retrievers=[...], post_processors=[], context_format="raw",
-# **_BENCHMARK_PROCESSOR_ARGS)``. ``post_processors=[]`` / ``context_format="raw"``
-# drops ``BedrockContextFormat`` (it raises ``KeyError: 'source'`` on the nested
-# traversal node shape; the adapter's ``_map_results`` parses the raw
-# ``result``/``entity_contexts`` nodes directly). The ProcessorArgs kwargs pin the
-# benchmarked hyperparameters (see above).
-# ---------------------------------------------------------------------------
+# Engine builders. graphrag_toolkit imports are LAZY (inside each function); see
+# the module docstring for ``post_processors=[]`` / ``context_format="raw"``.
 
 
 def _build_chunk_based_engine(graph_store, vector_store, *, tenant_id):
@@ -272,11 +236,7 @@ def _build_chunk_based_semantic_engine(graph_store, vector_store, *, tenant_id):
     """``chunk_based_semantic`` (default): single ``ChunkBasedSemanticSearch`` retriever.
 
     ``ChunkBasedSemanticSearch`` wraps ``ChunkCosineSimilaritySearch`` +
-    ``SemanticChunkBeamGraphSearch`` + chunk->statement expansion. Verified on
-    the real coa-dev kg-build graph (2026-06-15): the by-id chunk-embedding
-    lookup hits because real kg-build index keys are lowercase (the earlier
-    ``text``-vs-``keyword`` 0-node failure was specific to the NA toolkit-example
-    graph and is out of scope here).
+    ``SemanticChunkBeamGraphSearch`` + chunk->statement expansion.
     """
     from graphrag_toolkit.lexical_graph import LexicalGraphQueryEngine
     from graphrag_toolkit.lexical_graph.retrieval.retrievers import (
@@ -409,22 +369,10 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
     (``benchmarks/eval_newproc.py`` "topic-beam-rework"). TopicBeamSearch subclasses
     ``TraversalBasedBaseRetriever``, NOT ``SemanticGuidedRetriever``.
 
-    An earlier version built this through ``for_semantic_guided_search`` on the
-    mistaken belief that it was a semantic-guided retriever. That factory ignores a
-    traversal retriever's contract and the engine returned the "No relevant context"
-    sentinel — 1 supporting node at confidence 0.0 — on a namespace where
-    ``chunk_based_semantic`` and ``topic_based`` both answered correctly.
-
-    Params are the graphrag-toolkit
-    benchmark's best SEC-10-Q config (``topic-beam-chunk_only``, 45.6% — the top
-    toolkit retriever on this dataset), restricted to the kwargs 3.20.0's
-    ``TopicBeamSearch.__init__`` actually accepts (verified against the pinned source;
-    the benchmark's extra v2 kwargs — use_mmr / cross_doc / entity_seed_boost — are
-    from an unreleased graphrag and would be silently swallowed by ``**kwargs``, so
-    they are intentionally omitted rather than passed misleadingly):
-
-      beam_width=100, max_depth=6, top_k=50, scoring_mode="path_weighted"
-      chunk_only neighbours: same-chunk ON, entity + adjacent OFF.
+    Params are the graphrag-toolkit benchmark's best SEC-10-Q config, restricted to
+    the kwargs 3.20.0's ``TopicBeamSearch.__init__`` actually accepts (extra kwargs
+    would be silently swallowed by ``**kwargs``): beam_width=100, max_depth=6,
+    top_k=50, scoring_mode="path_weighted", all three neighbour strategies on.
 
     REQUIRES a populated ``topic`` vector index (kg-build EMBEDDING_INDEXES must
     include ``topic``); against a graph built before that change it seeds empty.
@@ -439,7 +387,7 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
 
     # Wrap the stores OURSELVES, because we pass the retriever as an INSTANCE.
     # ``LexicalGraphQueryEngine.__init__`` wraps its stores (MultiTenant + ReadOnly) and
-    # then, at :313-317, only threads those wrapped stores into the retriever when
+    # then only threads those wrapped stores into the retriever when
     # ``retriever`` is a CLASS it instantiates; an instance is taken as-is. So a retriever
     # built from the raw stores keeps them, which breaks two things at once:
     #   * no MultiTenant wrapper -> it queries the untenanted ``topic`` index instead of
@@ -447,8 +395,6 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
     #   * no ReadOnly wrapper -> ``writeable`` stays True, so the toolkit's ``index_exists``
     #     treats that miss as a cue to CREATE the index, which AOSS NEXTGEN rejects
     #     ("Field parameter 'engine' is not supported").
-    # Observed live as topic_beam returning 0-1 nodes at confidence 0.0 while
-    # chunk_based_semantic and topic_based answered correctly on the same namespace.
     # ``to_tenant_id`` first: ``wrap`` compares against the default-tenant sentinel and
     # needs a real TenantId, not the raw string the caller passes. Both wraps are
     # idempotent, so the engine's own wrapping below is then a no-op.
@@ -464,10 +410,7 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
     # processor (10/topic) rather than truncated twice.
     #
     # ``include_chunk_details`` is threaded through too: without it the toolkit's
-    # statements query returns each chunk as ``{chunkId, value: NULL, metadata: {}}``
-    # (``TraversalBasedBaseRetriever.get_statements_by_topic_and_source``), so every
-    # source node reaches ``_source_level_chunks`` with no text and is counted as a
-    # dropped anonymous chunk — topic_beam answered with no citations at all.
+    # statements query returns each chunk with ``value: NULL``, so no chunk is citable.
     processor_args = ProcessorArgs(
         reranker=_BENCHMARK_PROCESSOR_ARGS["reranker"],
         max_search_results=_BENCHMARK_PROCESSOR_ARGS["max_search_results"],
@@ -484,18 +427,8 @@ def _build_topic_beam_engine(graph_store, vector_store, *, tenant_id):
         max_depth=6,
         top_k=50,
         scoring_mode="path_weighted",
-        # All three neighbour strategies ON — the benchmark harness's own base config
-        # (benchmarks/eval.py tb_kwargs) and the toolkit's ProcessorArgs defaults for
-        # same-chunk + adjacent-chunk.
-        #
-        # The narrow ``chunk_only`` variant (entity + adjacent OFF) was tried first
-        # because it is the toolkit's best-scoring SEC-10-Q *variant name*, but on OUR
-        # graph it starved the beam: a live standard-mode topic_beam query seeded 10
-        # semantically-perfect topics ("Net Sales by Reportable Segment for Apple Inc.
-        # in 2022 Q3") and still returned only 1 node, because same-chunk co-occurrence
-        # alone gave the beam almost nothing to expand into. Entity-overlap is the
-        # widest signal and is what connects topics across filings.
-        # max_entity_neighbors / max_chunk_neighbors (default 100 each) bound the fan-out.
+        # All three neighbour strategies ON: same-chunk alone starves the beam on our
+        # graph. max_entity_neighbors / max_chunk_neighbors (default 100 each) bound the fan-out.
         use_entity_neighbors=True,
         use_same_chunk_neighbors=True,
         use_adjacent_chunk_neighbors=True,
@@ -568,13 +501,10 @@ def resolve_strategy(request_value: str | None, config_default: str | None) -> R
     deployment default).
 
     ``config_default`` is the per-deployment default and may be ``None`` when
-    the deployment does not force a graphrag strategy (e.g. the default
-    ``hand-rolled`` Tier 3 path). In that case, with no request value, this
-    returns ``None`` to signal "no graphrag strategy" — the caller then runs
-    the hand-rolled path. A non-``None`` but *unrecognized* deployment default
-    warns and falls back to :data:`DEFAULT_STRATEGY` (graphrag still engaged,
-    matching the prior validate-or-warn behavior). No strategy other than the
-    resolved one is ever run silently.
+    the deployment does not force a graphrag strategy. In that case, with no
+    request value, this returns ``None`` to signal "no graphrag strategy". A
+    non-``None`` but *unrecognized* deployment default warns and falls back to
+    :data:`DEFAULT_STRATEGY`.
 
     Args:
         request_value: The per-request ``options.retrieverStrategy`` value (or
@@ -587,7 +517,6 @@ def resolve_strategy(request_value: str | None, config_default: str | None) -> R
         The resolved :class:`RetrieverStrategy`, or ``None`` when neither a
         request value nor a deployment default selects one.
     """
-    # Precedence 1: request-level override (already validated upstream; guard defensively).
     if request_value is not None:
         try:
             return RetrieverStrategy(request_value)
@@ -598,7 +527,6 @@ def resolve_strategy(request_value: str | None, config_default: str | None) -> R
                 action="treating as absent; falling back to deployment default",
             )
 
-    # Precedence 2: deployment default (may be absent).
     if config_default is not None:
         try:
             return RetrieverStrategy(config_default)
@@ -610,6 +538,4 @@ def resolve_strategy(request_value: str | None, config_default: str | None) -> R
             )
             return DEFAULT_STRATEGY
 
-    # No request value and no deployment default → no graphrag strategy
-    # (caller runs the hand-rolled path).
     return None

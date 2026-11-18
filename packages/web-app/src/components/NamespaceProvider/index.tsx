@@ -12,6 +12,8 @@ import React, {
 import { useLocation, useNavigate } from "react-router-dom";
 import { useGetNamespace, useListNamespaces } from "@api-hooks";
 import type { NamespaceDetail, NamespaceSummary } from "@api-hooks";
+import { namespaceLookupFailure } from "@utils/namespace-status";
+import type { NamespaceUnavailable } from "@utils/namespace-status";
 
 interface NamespaceContextValue {
   current: NamespaceSummary | undefined;
@@ -19,6 +21,8 @@ interface NamespaceContextValue {
   namespaces: NamespaceSummary[];
   setNamespace: (namespaceId: string) => void;
   isLoading: boolean;
+  /** Set when there is no current namespace because its lookup failed. */
+  unavailable: NamespaceUnavailable | undefined;
 }
 
 const NamespaceContext = createContext<NamespaceContextValue | undefined>(
@@ -115,7 +119,7 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
     if (listed) return listed;
     if (lookedUp) return toSummary(lookedUp);
     // A remembered choice the server no longer returns (deleted, or access
-    // removed) falls back to the first namespace, as before. A namespace that
+    // removed) falls back to the first namespace. A namespace that
     // is still being resolved, or the one named in the URL, never falls back:
     // a Playground question must not go to a different namespace.
     if (lookupFailed && activeId !== urlId) return namespaces[0];
@@ -125,6 +129,10 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
   const namespaceId = current?.namespaceId ?? "";
   const isLoading =
     isListLoading || (!!activeId && !current && lookup.isLoading);
+  // Tell the switcher why nothing is current, so it does not look the same as
+  // having no namespace at all.
+  const unavailable =
+    !current && lookupFailed ? namespaceLookupFailure(lookup.error) : undefined;
 
   const setNamespace = useCallback(
     (id: string) => {
@@ -138,8 +146,15 @@ export const NamespaceProvider: React.FC<React.PropsWithChildren> = ({
   );
 
   const value = useMemo<NamespaceContextValue>(
-    () => ({ current, namespaceId, namespaces, setNamespace, isLoading }),
-    [current, namespaceId, namespaces, setNamespace, isLoading],
+    () => ({
+      current,
+      namespaceId,
+      namespaces,
+      setNamespace,
+      isLoading,
+      unavailable,
+    }),
+    [current, namespaceId, namespaces, setNamespace, isLoading, unavailable],
   );
 
   return (

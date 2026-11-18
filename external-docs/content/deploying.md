@@ -247,7 +247,8 @@ grounding region follows `LLM_REGION` (the deploy region). Like the other model 
 geography-validated at `cdk synth`.
 
 GraphRAG lexical retrieval calls the model through llama-index's `BedrockConverse`, which accepts only
-the models in its own table (Claude Sonnet 4.6 and Sonnet 5 in the pinned version). If `bedrockLlmModelId`
+the models in its own table (in the 0.15.x releases serve installs: the Claude 4.5, 4.6, 4.7, 4.8, 5 and
+5.5 models, among others). If `bedrockLlmModelId`
 names another model, the Tier 3 lexical retrieval strategies fail when they start, while the rest of serve
 keeps working.
 
@@ -717,7 +718,8 @@ names; there is no `AGENTIC_*` alias for them.
 Serve reads the values once, when the runtime starts. A malformed or
 out-of-range value logs a warning and falls back to the default. Changing a
 value is an AgentCore runtime update: redeploy the serve stack, after which new
-sessions start with the new values.
+sessions start with the new values. An MCP client keeps its Context Manager
+session for as long as its MCP session is active, so reconnect it to pick them up.
 
 #### NL→SPARQL translation budget
 
@@ -857,9 +859,22 @@ SCL_GRAPH_SOURCES=on make deploy-dev
   - Turning the switch on again restores them. A graph source that was still waiting for its verify when the switch went off stays `REGISTERED`; once the switch is on again and the source has been unchanged for more than 15 minutes, it can be re-verified from the console, the API or a scheduled re-verify.
 - **Export `SCL_GRAPH_SOURCES`.** `scripts/deploy.sh` maps it to the CDK context parameter `graph_sources`. On a direct `cdk deploy`, pass `--context graph_sources=on` instead.
 
-Running AgentCore sessions keep the previous runtime version until they go idle (about 15 minutes), so test from a new session after deploying.
+Running AgentCore sessions keep the previous runtime version until they go idle (about 15 minutes), so test from a new session after deploying. Through MCP, a new session means a new MCP session: reconnect the MCP client.
 
 The API model always lists the `RDF_SPARQL` sub-type and the `nl_to_sparql` strategy. The switch decides whether a deployment accepts them.
+
+#### IPv4 preference in the service images
+
+The Python images that run in the VPC (Serve, MCP, ontology engine, database scan enrichment and document KG build) prefer IPv4 when an endpoint resolves to both IPv4 and IPv6 addresses. It is **on by default** because it changes nothing where IPv4 works, and it fixes dual-stack subnets without IPv6 egress to AWS, where each IPv6 connect stalls for minutes and signed OpenSearch Serverless requests expire with `403 Forbidden`. Turn it off only if your subnets route IPv6 to AWS and you want IPv6 tried first.
+
+```bash
+# Keep glibc's IPv6-first address order (default: prefer IPv4)
+SCL_PREFER_IPV4=false make deploy-dev
+```
+
+The value must be `true` or `false`; CDK fails synth otherwise. `scripts/deploy.sh` maps it to the CDK context parameter `prefer_ipv4`, so on a direct `cdk deploy` pass `--context prefer_ipv4=false` instead. It is a Docker build argument, so changing it rebuilds the images that CDK builds.
+
+Images passed in pre-built through the `*_image_uri` context keys (`context_manager_image_uri`, `ontology_engine_image_uri`, `sources_db_enrichment_image_uri`, `sources_kg_build_image_uri`), as CI and `scripts/deploy-serve.sh` do, were built without this argument and keep the Dockerfile default, so they prefer IPv4. `prefer_ipv4=false` cannot change them: synth still checks the value and prints a warning naming each such image. To opt out there, build the image with `--build-arg PREFER_IPV4=false`.
 
 ### VKG Task Sizing
 
@@ -945,6 +960,7 @@ when tuning a large or pathological source.
 | Variable | Set By | Purpose |
 |----------|--------|---------|
 | `OOPS_ENDPOINT` | `ontology-stack.ts`, from the `oops_endpoint` context | REST endpoint of the OoPS! pitfall scanner used by Tier-3 ontology validation. **Unset by default**, which turns the scan off (no outbound request). When set, the serialised ontology is sent to it — see *Configuration Options*. |
+| `SCL_CM_SESSION_SCOPE` | MCP server `config.py` default | How MCP tool calls map onto Context Manager runtime sessions. `mcp_session` (default): one per (caller, MCP session). `caller`: one per (caller, namespace), shared across that caller's MCP sessions, for clients that open a new MCP session per tool call. Not set by `mcp-stack.ts`; to change it, add it to the MCP runtime's environment there. |
 | `SCL_MCP_MODE` | `mcp-stack.ts` | Switches the container entrypoint between Context Manager (default) and MCP Server. When set to `"true"`, the container starts in MCP mode. |
 | `SERVE_TIER1_LOOKUP_TTL_S` | `metric_resolver.py` default | Seconds (default `300`, accepted range 1–3600) a query-serving instance uses a namespace's cached metrics before reading them again, so a created, updated or deleted metric reaches queries within this time of the instance's last read of that namespace. Besides the hourly full refresh, each instance reads a namespace on its own at most once per interval, including after a failed read (so a metric created during a failed read can take up to two intervals to appear); concurrent questions share one read, and a question waits at most 2 seconds for a namespace read. That limit doesn't cover the first full load on a newly started instance, which a question waits for in full. Each namespace read is scoped to that namespace's metric graph. Not set by the stack; a malformed or out-of-range value logs `tier1_setting_ignored` and falls back to the default. |
 | `SERVE_TIER1_MAX_CONCURRENT_READS` | `metric_resolver.py` default | Namespace metric reads a query-serving instance runs at once (default `2`, a whole number from 1 to 16); further reads wait for a slot, within the same 2-second limit per question, so while slow reads hold every slot a question on another stale namespace waits the full 2 seconds. Not set by the stack; a malformed or out-of-range value logs `tier1_setting_ignored` and falls back to the default. |
@@ -1917,6 +1933,20 @@ group, so its history, including logs older than 30 days, then expires.
 Deleting a namespace deletes both groups, and their logs
 are gone for good. `make destroy-dev` deletes neither: the prefixed groups expire,
 and you delete legacy groups that never got retention by hand.
+
+A service at zero tasks stays there until something sets its desired count
+again: a forced deployment keeps the count, and the CPU target-tracking policy
+cannot scale out from zero. So when a reload or a sweep finds a service at zero,
+the Lambda registers the service's auto scaling again with the settings it gets
+at provision time (MinCapacity 1, MaxCapacity 3 and the CPU target-tracking
+policy), which replaces any change made to them by hand, and then sets the
+desired count to 1. That brings back a service someone scaled to zero by hand,
+and one that a newer release scaled down before it was rolled back. The
+`reload_triggered` log event then has `"scaled_up_from_zero": true` and
+`"min_capacity_restored"`. If registering the auto scaling fails, the service
+still gets its task, but MinCapacity stays 0, so the Lambda also emits
+`ReloadFailed` and the reload alarm fires; the `autoscaling_failed` log event has
+the error.
 
 **Runtime-only services expand the IAM and regional surface.** The services in
 [A.2](#a2-services-called-at-runtime-but-not-provisioned) — Athena, Glue, Lake

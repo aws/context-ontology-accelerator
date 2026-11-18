@@ -1,13 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Security tests for TraceStep serialization — CWE-209 detail truncation.
-
-Validates that trace steps with exception details are properly sanitized
-when serialized via model_dump(). The @field_serializer on TraceStep.detail
-truncates long strings to prevent infrastructure secrets from leaking to
-clients via SSE streaming events.
-"""
+"""Security tests for TraceStep serialization: CWE-209 detail truncation."""
 
 from __future__ import annotations
 

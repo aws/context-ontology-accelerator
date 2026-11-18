@@ -17,9 +17,8 @@ import { geoPrefixOf, regionGeographies } from "../lib/utils/model-region";
  * libs/ts-shared (what the stacks deploy), the Python runtimes (what a
  * container falls back to when its env var is missing), and
  * scripts/preflight-deploy.sh (what the operator is warned about before any
- * of that runs). #1020 was a case of all of them agreeing on a value that is
- * wrong outside the US; the next drift would be them disagreeing with each
- * other. This test pins them together, source text against exported value.
+ * of that runs). This test pins them together, source text against
+ * exported value.
  */
 
 const REPO = path.join(__dirname, "..", "..");
@@ -102,8 +101,7 @@ describe("model-id defaults agree across TypeScript, Python and preflight", () =
 
   it("induction model: ts-shared = preflight", () => {
     // The ontology-engine container always receives LLM_MODEL_ID from the
-    // stack, so there is no Python fallback to pin here (its in-process
-    // fallback is a different, older id — tracked separately).
+    // stack, so there is no Python fallback to pin here.
     expect(preflightDefault("INDUCTION")).toBe(
       DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
     );

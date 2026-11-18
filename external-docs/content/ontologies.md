@@ -421,6 +421,43 @@ proposal at that revision. A missing or invalid artifact leaves the proposal's
 current revision unchanged. Keep grounding-choice changes in a separate
 **UpdateProposal** request.
 
+### R2RML table names must be SQL identifiers
+
+`rr:tableName` values must be a plain SQL identifier (`orders`) or a
+double-quoted one (`"Orders"`), optionally schema-qualified with `.`
+(`sales."Orders"`). Inside a double-quoted name, write an embedded quote twice
+(`"we""ird"`).
+
+Any other value — one containing `;`, spaces, a comment marker, unbalanced
+quotes, or a trailing newline — returns `422` listing the rejected names, and
+nothing is saved:
+
+```
+422 Invalid R2RML: rr:tableName must be a SQL identifier path
+    (e.g. "schema"."table"); rejected ['x; CREATE ALIAS …']
+```
+
+This applies to both inline `r2rmlTurtle` and `r2rmlUploaded` revisions. The
+reason the rule is this strict: these literals are written into the SQL schema
+the virtual knowledge graph container loads at startup, where a value the SQL
+parser reads as more than one identifier would be executable SQL rather than a
+table name.
+
+!!! note "A proposal saved before this check may fail at accept"
+    The `422` guards the edit path only. A pending proposal whose R2RML was
+    stored before this validation existed, and whose `rr:tableName` is not a
+    valid identifier path, now fails when its schema is generated at
+    **AcceptProposal** — the error names the offending literals. Fix it the same
+    way: edit the mapping to a valid identifier path, save it with
+    **UpdateProposal**, then accept.
+
+A logical table must name a table (`rr:tableName`); an `rr:sqlQuery` view is
+refused, because its SQL would run inside the virtual knowledge graph
+container with admin rights. **UpdateProposal** and **AcceptProposal** both
+return `422` for a mapping that declares one. A mapping already accepted with
+a view is left out of the published VKG mappings, and the error log names the
+proposal; the rest of the ontology still publishes.
+
 ## Ontology Lifecycle
 
 | Action | Description |

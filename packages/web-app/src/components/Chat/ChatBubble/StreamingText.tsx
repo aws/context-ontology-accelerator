@@ -19,7 +19,7 @@ export interface StreamingTextProps {
 
 /**
  * Renders streaming AI text with a blinking cursor.
- * Uses memoized markdown blocks for O(1) re-renders on token append.
+ * Uses memoized markdown blocks so only the trailing block re-renders on token append.
  */
 export const StreamingText: React.FC<StreamingTextProps> = memo(
   ({ text, isStreaming, messageId }) => {

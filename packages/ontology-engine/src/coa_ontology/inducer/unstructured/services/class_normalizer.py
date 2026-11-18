@@ -71,8 +71,7 @@ local linear-scan kNN over a list of ``(label, description, vector,
 iri)`` tuples. This is appropriate for the populations the unstructured
 induction pipeline targets (dozens to low hundreds of classes per
 graph). For larger populations, swap in a persistent vector backend
-that satisfies the same :class:`ClassEmbeddingIndex` Protocol — see
-the OPTIONAL Task 10A.3 in tasks.md.
+that satisfies the same :class:`ClassEmbeddingIndex` Protocol.
 
 ## Usage
 
@@ -119,8 +118,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Cosine similarity thresholds for the three match bands. The defaults
-# match Requirement 9 (acceptance criteria 9.3 / 9.4 / 9.5).
+# Cosine similarity thresholds for the three match bands.
 EXACT_THRESHOLD: float = 0.95
 CLOSE_MATCH_THRESHOLD: float = 0.80
 
@@ -145,8 +143,7 @@ class NormalizationResult:
             ordering, not as a metric to average.
         matched_existing_iri: The IRI of the top-1 match when present —
             populated for the ``exact`` and ``close_match`` bands. ``None``
-            for ``novel`` (per spec Req 9.5: novel is "no link to
-            existing classes") and ``None`` when the index was empty
+            for ``novel`` (novel means no link to existing classes) and ``None`` when the index was empty
             when the class was processed.
         source_mode: A free-form string identifying which description-
             generator mode produced the input description (e.g.
@@ -335,7 +332,7 @@ class InMemoryClassEmbeddingIndex:
 def _build_embedding_text(label: str, description: str) -> str:
     """Produce the canonical input text for the embedding model.
 
-    Per Requirement 9.8 the embedding is computed over both the class
+    The embedding is computed over both the class
     label AND the generated description, concatenated as
     ``"{label}: {description}"`` so semantically similar classes with
     different surface labels still match.
@@ -434,8 +431,8 @@ def normalize(
     6. For ``exact``: reuse ``hit.iri``; do NOT add to the index.
        For ``close_match`` / ``novel``: mint a fresh IRI via
        ``iri_resolver.resolve(label, "class")`` (the literal ``"class"``
-       token disambiguates T-Box class IRIs from A-Box individual IRIs;
-       see Req 10.2) and add the new entry to the index so subsequent
+       token disambiguates T-Box class IRIs from A-Box individual IRIs)
+       and add the new entry to the index so subsequent
        classes in the same call (or later calls sharing the index)
        can match against it.
 
@@ -572,9 +569,9 @@ def normalize(
             )
             continue
 
-        # close_match (Req 9.4) or novel (Req 9.5): mint and add to index.
+        # close_match or novel: mint and add to index.
         try:
-            # Per Req 10.2, class IRIs use the literal token ``"class"``
+            # Class IRIs use the literal token ``"class"``
             # in the classification slot — distinguishes T-Box class IRIs
             # from A-Box individual IRIs that would otherwise collide
             # when an entity is literally named "Person" of class Person.
@@ -609,8 +606,7 @@ def normalize(
             class_iri=class_iri,
             band=band,
             similarity_score=score,
-            # Per spec Req 9.5: novel = "no link to existing classes",
-            # so we don't surface the matched_existing_iri there.
+            # novel means no link to existing classes.
             matched_existing_iri=matched_iri if band == "close_match" else None,
             source_mode=source_mode,
             preferred_label=label,
@@ -643,8 +639,6 @@ def _resolve_novel(
     can detect the hard failure.
     """
     try:
-        # Per Req 10.2, class IRIs use the literal token ``"class"`` in
-        # the classification slot.
         class_iri = iri_resolver.resolve(label, "class")
     except Exception as exc:  # noqa: BLE001
         log.warning(

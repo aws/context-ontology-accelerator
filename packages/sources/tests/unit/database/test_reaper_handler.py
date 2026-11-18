@@ -13,12 +13,20 @@ the in-machine error chain having already run.
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Iterator
+from typing import Any
 from unittest.mock import patch
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
+from coa_common.dao import DynamoDBDAO
 from coa_control_plane_server.models.source_status import SourceStatus
+from coa_sources.database.pipeline.reaper_handler import handler as reap
+from moto import mock_aws
 
-from tests.unit.conftest import dao_double  # noqa: E402
+from tests.unit.conftest import dao_double
 
 MODULE = "coa_sources.database.pipeline.reaper_handler"
 
@@ -83,7 +91,6 @@ class TestReaperHandler:
         assert "lastScanAt" in kwargs["update_fields"]
         assert "TIMED_OUT" in kwargs["update_fields"]["errorMessage"]
         assert kwargs["condition"] == "attribute_exists(PK)"
-        assert kwargs["raise_on_error"] is False
 
     @patch(f"{MODULE}._get_dao")
     def test_reaper_terminal_source_no_update(self, mock_get_dao):
@@ -185,3 +192,102 @@ class TestReaperHandler:
 
         dao.get.assert_called_once()
         dao.update.assert_not_called()
+
+
+# Scan-job SKs: the failed execution's run, and a re-scan started after it failed.
+_THIS_RUN = "2026-11-06T01:00:00.000000Z"
+_NEWER_RUN = "2026-11-06T01:00:20.000000Z"
+_KEY = {"PK": "NS#ns-1", "SK": "SRC#src-1"}
+
+
+def _run_input(scan_job_sk: str) -> str:
+    return json.dumps({"namespaceId": "ns-1", "sourceId": "src-1", "scanType": "full", "scanJobSK": scan_job_sk})
+
+
+@pytest.fixture()
+def sources() -> Iterator[tuple[Any, DynamoDBDAO]]:
+    """A moto sources table behind the reaper's DAO, so its conditions are really evaluated."""
+    with mock_aws():
+        table = boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="test-sources",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("PK", "SK")],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        dao = DynamoDBDAO("test-sources", region="us-east-1")
+        with patch(f"{MODULE}._get_dao", return_value=dao):
+            yield table, dao
+
+
+def _row(table: Any) -> dict[str, Any]:
+    return table.get_item(Key=_KEY)["Item"]
+
+
+class TestReaperOnlyFailsItsOwnRun:
+    def test_reaper_source_taken_by_newer_run_left_scanning(self, sources):
+        """The failed run's execution ends after a re-scan took the source: the newer scan keeps running."""
+        table, _dao = sources
+        table.put_item(Item={**_KEY, "status": SourceStatus.SCANNING, "currentScanJobId": _NEWER_RUN})
+
+        reap(_event(status="FAILED", input_payload=_run_input(_THIS_RUN)), None)
+
+        assert _row(table)["status"] == SourceStatus.SCANNING
+
+    def test_reaper_newer_run_taking_source_after_the_read_left_scanning(self, sources):
+        """A re-scan that takes the source between the reaper's read and its write still wins."""
+        table, dao = sources
+        table.put_item(Item={**_KEY, "status": SourceStatus.SCANNING, "currentScanJobId": _NEWER_RUN})
+        read_before_the_rescan = {**_KEY, "status": SourceStatus.SCANNING, "currentScanJobId": _THIS_RUN}
+
+        with patch.object(dao, "get", return_value=read_before_the_rescan):
+            reap(_event(status="TIMED_OUT", input_payload=_run_input(_THIS_RUN)), None)
+
+        assert _row(table)["status"] == SourceStatus.SCANNING
+
+    @patch(f"{MODULE}._get_dao")
+    def test_reaper_newer_run_recorded_no_write_attempted(self, mock_get_dao):
+        """Read-side check: an expected skip makes no doomed write (and no failed-write warning)."""
+        dao = dao_double()
+        dao.get.return_value = {"status": SourceStatus.SCANNING, "currentScanJobId": _NEWER_RUN}
+        mock_get_dao.return_value = dao
+
+        reap(_event(status="FAILED", input_payload=_run_input(_THIS_RUN)), None)
+
+        dao.update.assert_not_called()
+
+    def test_reaper_own_run_still_active_marks_scan_failed(self, sources):
+        table, _dao = sources
+        table.put_item(Item={**_KEY, "status": SourceStatus.ENRICHING, "currentScanJobId": _THIS_RUN})
+
+        reap(_event(status="TIMED_OUT", input_payload=_run_input(_THIS_RUN)), None)
+
+        row = _row(table)
+        assert row["status"] == SourceStatus.SCAN_FAILED
+        assert "TIMED_OUT" in row["errorMessage"]
+
+    def test_reaper_row_without_recorded_run_marks_scan_failed(self, sources):
+        """No run recorded: not fenced, so the source is reaped."""
+        table, _dao = sources
+        table.put_item(Item={**_KEY, "status": SourceStatus.SCANNING})
+
+        reap(_event(status="ABORTED", input_payload=_run_input(_THIS_RUN)), None)
+
+        assert _row(table)["status"] == SourceStatus.SCAN_FAILED
+
+    @pytest.mark.parametrize(
+        ("code", "level"), [("ConditionalCheckFailedException", logging.INFO), ("ThrottlingException", logging.ERROR)]
+    )
+    @patch(f"{MODULE}._get_dao")
+    def test_reaper_write_error_is_logged_by_cause_without_raising(self, mock_get_dao, caplog, code, level):
+        """A failed fence is expected; any other DynamoDB error is logged as an error with the run."""
+        dao = dao_double()
+        dao.get.return_value = {"status": SourceStatus.SCANNING, "currentScanJobId": _THIS_RUN}
+        dao.update.side_effect = ClientError({"Error": {"Code": code}}, "UpdateItem")
+        mock_get_dao.return_value = dao
+
+        with caplog.at_level(logging.INFO, logger=MODULE):
+            reap(_event(status="TIMED_OUT", input_payload=_run_input(_THIS_RUN)), None)
+
+        record = caplog.records[-1]
+        assert record.levelno == level
+        assert "src-1" in record.getMessage()

@@ -13,10 +13,6 @@ import {
   useExportOsi,
 } from "./use-metrics";
 
-// ---------------------------------------------------------------------------
-// Mocks
-// ---------------------------------------------------------------------------
-
 const { mockPost, mockGet, apiClient } = vi.hoisted(() => {
   const mockPost = vi.fn();
   const mockGet = vi.fn();
@@ -42,21 +38,9 @@ function makeHarness() {
   return { wrapper, queryClient };
 }
 
-function makeFile(content: string, size?: number): File {
-  const file = new File([content], "metrics.yaml", {
-    type: "application/x-yaml",
-  });
-  // jsdom doesn't implement Blob.text(); stub it so the inline path is deterministic.
-  vi.spyOn(file, "text").mockResolvedValue(content);
-  if (size !== undefined) {
-    Object.defineProperty(file, "size", { value: size });
-  }
-  return file;
+function makeFile(content: string): File {
+  return new File([content], "metrics.yaml", { type: "application/x-yaml" });
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("useImportOsiFile", () => {
   beforeEach(() => {
@@ -65,8 +49,7 @@ describe("useImportOsiFile", () => {
   });
 
   it("always uses the pre-signed S3 path (never an inline content POST)", async () => {
-    // Even a tiny file goes via S3 now: the inline {content} POST hit API
-    // Gateway's WAF SizeRestrictions_BODY (8 KB) and 403'd (issue 103).
+    // An inline {content} POST would hit the API Gateway WAF 8 KB body limit.
     const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
     vi.stubGlobal("fetch", fetchSpy);
     mockPost
@@ -109,44 +92,6 @@ describe("useImportOsiFile", () => {
     for (const call of mockPost.mock.calls) {
       expect(call[1]).not.toHaveProperty("content");
     }
-  });
-
-  it("falls back to the pre-signed S3 upload flow for large files", async () => {
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
-    vi.stubGlobal("fetch", fetchSpy);
-    mockPost
-      .mockResolvedValueOnce({
-        uploadUrl: "https://s3.example/put",
-        s3Key: "ns/imports/x/metrics.yaml",
-      })
-      .mockResolvedValueOnce({
-        status: "COMPLETED",
-        metricsCreated: 99,
-        metricsUpdated: 0,
-        datasetsResolved: 1,
-      });
-
-    const { wrapper } = makeHarness();
-    const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-
-    await result.current.mutateAsync(makeFile("x", 6 * 1024 * 1024)); // > 5 MB
-
-    expect(mockPost).toHaveBeenNthCalledWith(
-      1,
-      `/namespaces/${NS_ID}/import-osi/upload-url`,
-      expect.objectContaining({ filename: "metrics.yaml" }),
-    );
-    expect(fetchSpy).toHaveBeenCalledWith(
-      "https://s3.example/put",
-      expect.objectContaining({ method: "PUT" }),
-    );
-    expect(mockPost).toHaveBeenNthCalledWith(
-      2,
-      `/namespaces/${NS_ID}/import-osi`,
-      {
-        s3Key: "ns/imports/x/metrics.yaml",
-      },
-    );
   });
 
   it("invalidates the metrics cache on a COMPLETED import", async () => {
@@ -202,18 +147,18 @@ describe("useImportOsiFile", () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
-  it("rejects when the upload-url request fails (large file)", async () => {
+  it("rejects when the upload-url request fails", async () => {
     vi.stubGlobal("fetch", vi.fn());
     mockPost.mockRejectedValueOnce(new Error("upload-url failed"));
     const { wrapper } = makeHarness();
 
     const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-    await expect(
-      result.current.mutateAsync(makeFile("x", 6 * 1024 * 1024)),
-    ).rejects.toThrow(/upload-url failed/);
+    await expect(result.current.mutateAsync(makeFile("x"))).rejects.toThrow(
+      /upload-url failed/,
+    );
   });
 
-  it("rejects when the large-file S3 upload fails", async () => {
+  it("rejects when the S3 upload fails", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue({ ok: false, status: 403 }),
@@ -225,9 +170,9 @@ describe("useImportOsiFile", () => {
     const { wrapper } = makeHarness();
 
     const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-    await expect(
-      result.current.mutateAsync(makeFile("x", 6 * 1024 * 1024)),
-    ).rejects.toThrow(/S3 upload failed: 403/);
+    await expect(result.current.mutateAsync(makeFile("x"))).rejects.toThrow(
+      /S3 upload failed: 403/,
+    );
   });
 
   it("rejects when the final import POST fails after a successful S3 upload", async () => {
@@ -244,9 +189,9 @@ describe("useImportOsiFile", () => {
     const { wrapper } = makeHarness();
 
     const { result } = renderHook(() => useImportOsiFile(NS_ID), { wrapper });
-    await expect(
-      result.current.mutateAsync(makeFile("x", 6 * 1024 * 1024)),
-    ).rejects.toThrow(/import-osi failed/);
+    await expect(result.current.mutateAsync(makeFile("x"))).rejects.toThrow(
+      /import-osi failed/,
+    );
   });
 });
 

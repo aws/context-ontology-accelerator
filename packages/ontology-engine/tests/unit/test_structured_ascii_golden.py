@@ -11,7 +11,7 @@ untouched.
 
 The golden files under ``tests/fixtures/structured_ascii_golden/`` are the output
 of the engine at ``main`` commit ``e674953673f61ed6051b345276e965479613f5c3``,
-the merge base of the Unicode identifier change (#927 Part B1), so this guard
+the merge base of the Unicode identifier change, so this guard
 compares the current engine against pre-change behavior rather than against
 itself. The fixture exercises the naming paths that matter: separators of every
 kind, mixed case, PK / UNIQUE / NOT NULL, a simple FK, a composite FK with an
@@ -247,7 +247,7 @@ def test_fixture_exercises_the_naming_paths():
 
 
 def test_fixture_stays_inside_the_unchanged_ascii_domain():
-    """Keep out the names whose IRIs #927 Part B1 changed on purpose.
+    """Keep out the names whose IRIs the Unicode identifier change changed on purpose.
 
     A golden taken from ``e67495367`` is only a valid regression guard for names
     that change left alone. Adding a non-ASCII name, two columns of one table that

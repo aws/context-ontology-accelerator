@@ -267,8 +267,25 @@ describe("spill", () => {
     // Never a shared bucket: one connector's read grant would cover another's spilled rows, and spilled
     // rows are query results.
     const template = synth();
-    template.resourceCountIs("AWS::S3::Bucket", 1);
+    // The spill bucket and its server-access-log target.
+    template.resourceCountIs("AWS::S3::Bucket", 2);
     template.resourceCountIs("AWS::KMS::Key", 1);
+  });
+
+  it("logs the spill bucket's server access to its own log bucket", () => {
+    const template = synth();
+    // The spill bucket (the one with the expire-spill rule) logs to the created log bucket.
+    const buckets = Object.entries(template.findResources("AWS::S3::Bucket"));
+    const logBucketIds = buckets.map(([id]) => id).filter((id) => id.includes("SpillAccessLogsBucket"));
+    expect(logBucketIds).toHaveLength(1);
+    const spill = buckets.filter(([, bucket]) =>
+      JSON.stringify(bucket.Properties?.LifecycleConfiguration ?? {}).includes("expire-spill"),
+    );
+    expect(spill).toHaveLength(1);
+    expect(spill[0][1].Properties.LoggingConfiguration).toEqual({
+      DestinationBucketName: { Ref: logBucketIds[0] },
+      LogFilePrefix: "spill/databricks/",
+    });
   });
 
   it("tags the spill key coa:connector-spill, which COA's key policy matches", () => {

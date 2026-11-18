@@ -94,18 +94,6 @@ describe("McpStack", () => {
     );
   });
 
-  it("has tracing disabled (pending XRay destination setup)", () => {
-    // tracingEnabled is currently false (see TODO in mcp-stack.ts).
-    // This test documents the current state and will need updating
-    // when tracing is enabled.
-    template.hasResourceProperties(
-      "AWS::BedrockAgentCore::Runtime",
-      Match.objectLike({
-        AgentRuntimeName: "coa_dev_mcp_server",
-      }),
-    );
-  });
-
   it("sets required environment variables (thin proxy)", () => {
     template.hasResourceProperties(
       "AWS::BedrockAgentCore::Runtime",
@@ -152,11 +140,8 @@ describe("McpStack", () => {
   });
 
   it("authorizer accepts exactly the audience the server's JWT check accepts", () => {
-    // Regression (GH #331): the authorizer allowed [web client, MCP client]
-    // while JWT_CLIENT_ID was the MCP client only, so a web-client ID token
-    // passed initialize and then failed every tool call with "Token audience
-    // mismatch". Both layers must accept the same ID-token audience, so a
-    // web-client token gets a 401 at the edge instead.
+    // Both layers must accept the same ID-token audience, otherwise a
+    // web-client token passes initialize and fails later tool calls.
     const runtimes = Object.values(
       template.findResources("AWS::BedrockAgentCore::Runtime"),
     );
@@ -188,13 +173,9 @@ describe("McpStack", () => {
   });
 
   it("resolves GROUP_CLAIM_NAME from SSM (not a hardcoded Cognito default)", () => {
-    // Regression: this used to be a hardcoded DEFAULT_GROUP_CLAIM
-    // ("cognito:groups") passed from app.ts regardless of idpType, which
-    // silently broke group-based role resolution on the direct-OIDC path
-    // (external IdPs configure their own claim name, e.g. plain "groups").
-    // Must be an SSM dynamic reference resolved from
-    // /authentication-group-token-name (written by idp-authentication-stack.ts
-    // on both the Cognito/SAML and OIDC paths), not a literal string.
+    // External IdPs configure their own claim name (e.g. plain "groups"), so
+    // this must be an SSM dynamic reference to /authentication-group-token-name
+    // (written by idp-authentication-stack.ts on every path), not a literal.
     template.hasResourceProperties(
       "AWS::BedrockAgentCore::Runtime",
       Match.objectLike({

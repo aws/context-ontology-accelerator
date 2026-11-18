@@ -15,10 +15,12 @@ from coa_common.constants import (
     graphrag_index_names,
     namespace_tag_condition_patterns,
     namespace_tag_key,
+    normalize_sql_ident_path,
     ontology_artifact_s3_key,
     ontology_vector_index_name,
     parse_namespace_tag,
     split_sql_ident_path,
+    split_sql_ident_path_raw,
     sql_ident,
     to_graphrag_tenant_id,
     validate_id,
@@ -323,6 +325,103 @@ class TestSplitSqlIdentPath:
     def test_round_trips_through_sql_ident(self, segments):
         literal = ".".join(sql_ident(s) for s in segments)
         assert split_sql_ident_path(literal) == segments
+
+
+class TestSplitSqlIdentPathRaw:
+    """Same scan as :func:`split_sql_ident_path`, but segments keep their quotes."""
+
+    def test_keeps_the_delimiters(self):
+        assert split_sql_ident_path_raw('"public"."customers"') == ['"public"', '"customers"']
+
+    def test_dot_inside_one_identifier_is_not_a_separator(self):
+        assert split_sql_ident_path_raw('"q1.results"') == ['"q1.results"']
+
+    def test_doubled_quotes_stay_doubled(self):
+        assert split_sql_ident_path_raw('"a""b"') == ['"a""b"']
+
+    def test_unquoted_name_still_splits(self):
+        assert split_sql_ident_path_raw("public.customers") == ["public", "customers"]
+
+
+class TestNormalizeSqlIdentPath:
+    """The gate in front of every identifier spliced into generated DDL.
+
+    Callers emit the returned segments verbatim, so the contract has two halves:
+    a well-formed name must come back byte-identical (re-quoting ``orders`` into
+    ``"orders"`` would rename the table, because SQL folds only *unquoted* names
+    to upper case), and anything the SQL parser would read as more than one
+    identifier must come back ``None`` rather than escaped.
+    """
+
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            '"orders"',
+            '"public"."customers"',
+            "orders",
+            "db.orders",
+            '"q1.results"',
+            '"we""ird"',
+            "_leading_underscore",
+            "with$dollar",
+            "t123",
+        ],
+    )
+    def test_well_formed_names_are_returned_unchanged(self, literal: str):
+        segments = normalize_sql_ident_path(literal)
+
+        assert segments is not None
+        assert ".".join(segments) == literal
+
+    @pytest.mark.parametrize(
+        "literal",
+        [
+            # Injection: each of these would end the CREATE TABLE statement and
+            # start another one, and CREATE ALIAS compiles Java (RCE in H2).
+            "x; CREATE ALIAS EXEC AS $$ void f() {} $$; --.orders",
+            "customers (id INTEGER); DROP TABLE t; --",
+            "orders\nCREATE ALIAS a AS $$ x $$;",
+            "orders -- trailing comment",
+            # Malformed delimiters: text the parser would not read as exactly
+            # one identifier per segment.
+            '"x',
+            'x"',
+            '"y"x',
+            '"a""',
+            '""',
+            # Empty / unquoted-but-not-an-identifier segments.
+            "a..b",
+            ".orders",
+            "orders.",
+            "tbl-with-dash",
+            "Mixed Case",
+            "1st_table",
+            "",
+            # A single trailing newline, which `^…$` with `re.match` would have
+            # let through: `$` matches just before a final `\n`. Nothing more can
+            # follow it, so it is not injection — but the segment is emitted
+            # verbatim, and `CREATE SCHEMA IF NOT EXISTS orders\n;` is then two
+            # lines, which load-schema.sh's line-based admin pattern does not
+            # match. The name has to be refused here, with a 422, instead of
+            # pushing the namespace into degraded mode at load time.
+            "orders\n",
+            "db\n.orders",
+            "db.orders\n",
+            # The same split inside a delimited segment, and a NUL that makes
+            # grep treat schema.sql as binary and print no lines at all.
+            '"a\nb".orders',
+            'db."or\r\nders"',
+            '"x\x00".orders',
+        ],
+    )
+    def test_anything_else_is_rejected(self, literal: str):
+        assert normalize_sql_ident_path(literal) is None
+
+    def test_accepts_everything_sql_ident_produces(self):
+        for segments in (["customers"], ["public", "customers"], ["q1.results"], ['a"b', "c.d"]):
+            literal = ".".join(sql_ident(s) for s in segments)
+
+            assert normalize_sql_ident_path(literal) == [sql_ident(s) for s in segments]
 
 
 class TestIndexNameHelpers:

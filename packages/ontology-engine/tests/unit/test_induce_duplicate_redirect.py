@@ -1,17 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit test: duplicate-induction sets ``duplicate_of`` on the in-memory job.
-
-Regression for the "proposal does not exist" redirect: re-inducing a source
-whose structural fingerprint matches an already-accepted proposal short-circuits
-the run WITHOUT creating a new proposal. The client polls ``/induce/jobs/{id}``,
-which returns the in-memory ``JobResponse`` while the worker thread is alive, and
-redirects to ``duplicate_of``. If that field is only written to the DDB job row
-(not the in-memory object), the client never sees it, falls back to the job id —
-which has no proposal row — and 404s. This test pins ``duplicate_of`` onto the
-in-memory job object and asserts the phantom stub is cleaned up.
-"""
+"""Unit test: duplicate-induction sets ``duplicate_of`` on the in-memory job."""
 
 from __future__ import annotations
 
@@ -27,7 +17,6 @@ def _tbl(name: str, cols: list[CatalogColumn]) -> CatalogTable:
     return CatalogTable(id=f"t-{name}", name=name, fullyQualifiedName=f"db.{name}", columns=cols)
 
 
-@pytest.mark.unit
 def test_duplicate_induction_sets_duplicate_of_on_inmemory_job() -> None:
     from coa_ontology.induce_catalog import (
         WorkbenchInductionRequest,
@@ -52,7 +41,6 @@ def test_duplicate_induction_sets_duplicate_of_on_inmemory_job() -> None:
     body = WorkbenchInductionRequest(
         datasource_ids=["ds-1"],
         ontology_uri_prefix="http://test.org/ontology/induced#",
-        grounding_ontologies=[],
     )
 
     with (
@@ -108,3 +96,75 @@ def _find_completed_update(call_args_list):
         if len(args) >= 2 and args[1] == "completed":
             return args, kwargs
     raise AssertionError("no update_job_status(..., 'completed', ...) call found")
+
+
+def test_fk_into_another_schema_is_not_a_duplicate() -> None:
+    """An accepted proposal keyed to ``CRM.customers`` does not dedupe a run keyed to ``MARKETING.customers``."""
+    from coa_ontology.induce_catalog import (
+        WorkbenchInductionRequest,
+        _compute_structural_fingerprint,
+        _jobs,
+        _run_induction,
+    )
+    from coa_ontology.inducer.schemas import JobResponse, JobStatus
+
+    def _tables(target_schema: str) -> list[dict]:
+        return [
+            {
+                "id": "t-customers",
+                "name": "customers",
+                "fullyQualifiedName": "db.customers",
+                "columns": [{"name": "id", "dataType": "INTEGER"}],
+            },
+            {
+                "id": "t-orders",
+                "name": "orders",
+                "fullyQualifiedName": "db.orders",
+                "columns": [{"name": "customer_id", "dataType": "INTEGER"}],
+                "tableConstraints": [
+                    {
+                        "constraintType": "FOREIGN_KEY",
+                        "columns": ["customer_id"],
+                        "referredColumns": [f"{target_schema}.customers.id"],
+                    }
+                ],
+            },
+        ]
+
+    accepted_fingerprint = _compute_structural_fingerprint([CatalogTable(**t) for t in _tables("CRM")])
+    job = JobResponse(job_id="job-mkt", status=JobStatus.PENDING, created_at="2026-01-01T00:00:00Z")
+    _jobs["job-mkt"] = job
+    body = WorkbenchInductionRequest(datasource_ids=["ds-1"], ontology_uri_prefix="http://test.org/ontology/induced#")
+
+    with (
+        patch(
+            "coa_ontology.induce_catalog._fetch_catalog_from_smus",
+            return_value={"databases": [{"name": "db"}], "sourceType": "POSTGRES"},
+        ),
+        patch("coa_ontology.induce_catalog._catalog_to_tables", return_value=_tables("MARKETING")),
+        patch("coa_ontology.induce_catalog.dynamo_store") as mock_dynamo,
+    ):
+        mock_dynamo.list_proposals.return_value = [
+            {
+                "proposal_id": "accepted-crm",
+                "ontology_id": "http://test.org/ontology/induced#",
+                "metadata": {"structural_fingerprint": accepted_fingerprint},
+            }
+        ]
+        _run_induction(
+            job_id="job-mkt",
+            body=body,
+            namespace="test-ns",
+            config={"catalog_source": "smus"},
+            # Induction past the duplicate check starts by building the pipeline;
+            # stopping there keeps the test to the dedup decision.
+            build_pipeline_fn=MagicMock(side_effect=RuntimeError("past the duplicate check")),
+            schemas_mod=__import__("coa_ontology.inducer.schemas", fromlist=["JobStatus", "InductionReport"]),
+            catalog_table_cls=CatalogTable,
+        )
+
+    assert job.duplicate_of is None
+    assert job.status == JobStatus.FAILED
+    assert "past the duplicate check" in (job.error or "")
+
+    _jobs.pop("job-mkt", None)

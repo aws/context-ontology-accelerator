@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests: catalog fetch matches a datasource regardless of DS#/SRC# key prefix.
-
-The sources pipeline keys datasources as ``DS#{uuid}`` / ``SRC#{uuid}`` while the
-``datasource_ids`` recorded on accepted proposals (and passed to the schema.sql
-re-fetch) carry the bare uuid. An exact ``==`` match dropped the sources-pipeline
-source, so its tables were absent from schema.sql, its ``rr:tableName`` literals
-were uncoverable, and schema.sql generation failed closed — leaving a stale
-schema.sql and breaking every Tier-2 query in the namespace (regression from the
-sources cross-source work exposed by the schema.sql coverage guard).
-"""
+"""Unit tests: catalog fetch matches a datasource regardless of DS#/SRC# key prefix."""
 
 from __future__ import annotations
 
@@ -45,7 +36,6 @@ def test_smus_fetch_matches_prefixed_source_for_bare_id() -> None:
         }
         got = induce_catalog._fetch_catalog_from_smus(config, bare, namespace="ns")
 
-    # Matched the DS#-prefixed source despite the caller passing the bare uuid.
     assert got.get("databases"), f"expected the DS#-keyed source to match the bare id, got {got!r}"
     assert got["databases"][0]["name"] == "hcp360"
     # The reader is called with the bare id, so DataZone resolution does not miss either.

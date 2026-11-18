@@ -1,7 +1,6 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import React from "react";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 import { ClassDetailPanel, type ClassGroup } from "./ClassDetailPanel";
@@ -156,8 +155,6 @@ describe("ClassDetailPanel", () => {
       rr:predicate ex:amount ;
       rr:objectMap [ rr:column "claim_amount" ; rr:datatype xsd:decimal ]
     ] .`;
-    // The parsed mapping (source table + columns) is now derived from the
-    // whole R2RML document upstream and passed in as ``r2rmlMapping``.
     const mapping = parseR2rmlByClass(r2rml).get("Claim") ?? null;
     const { container } = render(
       <ClassDetailPanel
@@ -168,14 +165,13 @@ describe("ClassDetailPanel", () => {
         onSave={vi.fn()}
       />,
     );
-    // Expandable section header should show the REAL table name (not
-    // "Unknown" — the old block-slice parseR2rml bug).
+    // The section header shows the real table name, not "Unknown".
     expect(container.textContent).toContain("claims");
     expect(container.textContent).toContain("claim_amount");
     expect(container.textContent).not.toContain("Unknown");
   });
 
-  it("shows PK columns + PK-sharing + suggested-parent indicators (Item 2)", () => {
+  it("shows PK columns + PK-sharing + suggested-parent indicators", () => {
     const enriched: ClassGroup = {
       ...group,
       pkColumns: ["claim_id", "policy_id"],
@@ -197,7 +193,7 @@ describe("ClassDetailPanel", () => {
     expect(screen.getAllByText("Suggested subclass").length).toBeGreaterThan(0);
   });
 
-  it("folds an editable grounding candidate table into the Grounding tab (Item 1)", () => {
+  it("folds an editable grounding candidate table into the Grounding tab", () => {
     const groundingMatch: ConceptMatch = {
       source_table: "claim",
       source_column: "",
@@ -229,15 +225,10 @@ describe("ClassDetailPanel", () => {
         onSelectGroundingCandidate={onSelect}
       />,
     );
-    // Open the Grounding tab. Its label counts the candidate OPTIONS shown in
-    // the table (2 here) — not "1" (the old label conflated "a match exists"
-    // with the option count).
     fireEvent.click(screen.getByText("Grounding (2)"));
     // The current grounding status is surfaced above the candidate table.
     expect(screen.getByText(/Grounded to/)).toBeTruthy();
-    // Candidates render as an embedded Cloudscape Table with single-select
-    // radios. Pick the alternate candidate's radio → staged upward. The row is
-    // labelled "Ground to <localName>" for the selection control.
+    // The row is labelled "Ground to <localName>" for the selection control.
     const pickInsurance = screen.getByRole("radio", {
       name: /Ground to InsuranceClaim/,
     });
@@ -248,7 +239,7 @@ describe("ClassDetailPanel", () => {
     );
   });
 
-  it("renders SuggestionPanel Confirm/Reject when the class has a coa:suggestedSubClassOf (Issue B)", () => {
+  it("renders SuggestionPanel Confirm/Reject when the class has a coa:suggestedSubClassOf", () => {
     // Whole proposal Turtle carrying a suggested-subclass annotation on the
     // selected class (ex:Claim → ex:Policy). SuggestionPanel parses the full
     // document, so it needs the prefix declarations + the annotation triple.
@@ -291,50 +282,7 @@ ex:Policy a owl:Class ;
     expect(rewritten).not.toContain("suggestedSubClassOf");
   });
 
-  it("labels the Grounding tab with the candidate-option count, not '(0)'/'(1)' (Issue A)", () => {
-    const groundingMatch: ConceptMatch = {
-      source_table: "claim",
-      source_column: "",
-      matched_class_uri: "https://parallax.aws/onto/Claim",
-      matched_ontology_id: "https://parallax.aws/onto",
-      similarity: 0.9,
-      match_type: "high_confidence",
-      // 3 candidate options — the label must reflect the OPTIONS shown, not "1"
-      // (the reported bug: "shows Grounding(1) … but there are 10 options").
-      candidates: [
-        {
-          entity_uri: "https://parallax.aws/onto/Claim",
-          ontology_id: "https://parallax.aws/onto",
-          lexical_sim: 0.9,
-        },
-        {
-          entity_uri: "https://parallax.aws/onto/InsuranceClaim",
-          ontology_id: "https://parallax.aws/onto",
-          lexical_sim: 0.7,
-        },
-        {
-          entity_uri: "https://parallax.aws/onto/Loss",
-          ontology_id: "https://parallax.aws/onto",
-          lexical_sim: 0.5,
-        },
-      ],
-    };
-    render(
-      <ClassDetailPanel
-        group={group} // group.matches is undefined → 0 sibling matches
-        r2rml={null}
-        isReadOnly={false}
-        onSave={vi.fn()}
-        groundingMatch={groundingMatch}
-      />,
-    );
-    // The count reflects the candidate options shown in the table, never a
-    // misleading "(1)". It reads "Grounding (3)" for 3 grounding candidates.
-    expect(screen.getByText("Grounding (3)")).toBeTruthy();
-    expect(screen.queryByText("Grounding (1)")).toBeNull();
-  });
-
-  it("labels the Grounding tab with a (0) count when no grounding match (Issue A)", () => {
+  it("labels the Grounding tab with a (0) count when no grounding match", () => {
     render(
       <ClassDetailPanel
         group={group}

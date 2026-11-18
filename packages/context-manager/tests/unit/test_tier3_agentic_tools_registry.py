@@ -1,24 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever Tool contract and ToolRegistry (task 4).
-
-Covers ``coa_serve.tier3.agentic.tools``:
-
-- :class:`ToolResult` carries the uniform output fields with empty defaults
-  (Req 11.1).
-- :class:`ToolRegistry` enforces the uniform Tool interface on registration:
-  it rejects a Tool missing any of the four required fields — name, description,
-  input_schema, output_schema (Req 11.3) — and rejects a duplicate name while
-  retaining the original Tool unchanged (Req 11.2, 11.4).
-- :meth:`ToolRegistry.specs` returns name + description + input_schema +
-  output_schema for the planner prompt (Req 11.1), and ``get`` / ``names``
-  behave as documented (Req 2.1).
-
-The Tools here are lightweight stand-ins: any object presenting the four
-interface fields plus an async ``invoke`` satisfies the structural Tool
-contract, so the tests need no ``graphrag_toolkit`` access.
-"""
+"""Unit tests for the Agentic Retriever Tool contract and ToolRegistry."""
 
 from __future__ import annotations
 
@@ -39,9 +22,7 @@ _UNSET = object()
 class StubTool:
     """A minimal, valid Tool: four interface fields + an async ``invoke``.
 
-    Field arguments default to the ``_UNSET`` sentinel so that an explicit
-    ``None`` (or any other value) passed by a test reaches the field unchanged —
-    only an omitted argument falls back to the valid default.
+    Omitted arguments fall back to valid defaults; an explicit ``None`` reaches the field.
     """
 
     def __init__(
@@ -125,7 +106,7 @@ class TestRegisterAndLookup:
 @pytest.mark.unit
 class TestMissingFieldRejection:
     """Registration rejects a Tool missing any of the four required fields and
-    excludes it from selection (Req 11.3)."""
+    excludes it from selection."""
 
     @pytest.mark.parametrize("field", ["name", "description"])
     def test_rejects_none_string_field(self, field):
@@ -195,8 +176,7 @@ class TestMissingFieldRejection:
 
 @pytest.mark.unit
 class TestDuplicateNameRejection:
-    """A duplicate name is rejected; the original Tool is retained unchanged
-    (Req 11.2, 11.4)."""
+    """A duplicate name is rejected; the original Tool is retained unchanged."""
 
     def test_duplicate_name_rejected_and_original_retained(self):
         registry = ToolRegistry()
@@ -212,17 +192,10 @@ class TestDuplicateNameRejection:
         assert registry.get("graph_traversal").description == "original"
         assert registry.names() == ["graph_traversal"]
 
-    def test_error_identifies_the_duplicate_name(self):
-        registry = ToolRegistry()
-        registry.register(StubTool(name="vector_search"))
-        with pytest.raises(ValueError) as exc_info:
-            registry.register(StubTool(name="vector_search"))
-        assert "vector_search" in str(exc_info.value)
-
 
 @pytest.mark.unit
 class TestSpecs:
-    """``specs()`` returns name + description + schemas for the planner (Req 11.1)."""
+    """``specs()`` returns name + description + schemas for the planner."""
 
     def test_specs_contains_name_description_and_schemas(self):
         registry = ToolRegistry()

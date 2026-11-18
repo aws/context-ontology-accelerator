@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the NL→SQL structured tool and its composition gating (iteration 3).
+"""Tests for the NL→SQL structured tool and its composition gating.
 
 The tool wraps ``StructuredQueryTier`` and produces on ``ToolResult.rows`` so a
 structured answer counts as progress in the loop. Gating is done by excluding the
@@ -42,9 +42,7 @@ class _FakeStrategyResult:
         self.rows = rows
         self.confidence = confidence
         self.strategy_name = strategy_name
-        # StrategyResult.sparql defaults to "" (empty for the NL→SQL path, set on
-        # the VKG/ontop path). The structured tool reads it to capture query
-        # artifacts (#1166), so the stand-in must expose it too.
+        # The structured tool reads .sparql to capture query artifacts.
         self.sparql = sparql
 
 
@@ -80,7 +78,7 @@ class TestNlToSqlTool:
         assert result.items == ({"type": "row", "a": 1},)
 
     async def test_captures_sql_query_artifact(self):
-        """#1166 cut #3: the tool captures the SQL it executed so Deep Reasoning
+        """The tool captures the SQL it executed so Deep Reasoning
         can return it. NL→SQL has no SPARQL, so only a single SQL artifact."""
         tier = _FakeTier(_FakeStrategyResult([{"a": 1}]))
         result = await NlToSqlTool(tier).invoke(namespace="ns", query="q")
@@ -113,7 +111,7 @@ class TestNlToSqlTool:
         assert "0 rows" in result.detail
 
     async def test_exception_is_swallowed_into_empty_result(self):
-        """A Tool must never raise into the reasoning loop (Req 9.1)."""
+        """A Tool must never raise into the reasoning loop."""
         result = await NlToSqlTool(_FakeTier(RuntimeError("db down"))).invoke(namespace="ns", query="q")
         assert result.rows == ()
         assert "error" in result.detail
@@ -221,7 +219,7 @@ class TestBidirectionalCompositionGating:
 
 @pytest.mark.unit
 class TestSparqlToolAndEmbedding:
-    """The two review findings: NL→SPARQL is its own selectable tool, and the tools
+    """NL→SPARQL is its own selectable tool, and the tools
     pass a SUB-QUESTION embedding so Ontop gets its ontology vector context."""
 
     def test_both_structured_tools_registered_separately(self):
@@ -235,8 +233,6 @@ class TestSparqlToolAndEmbedding:
         assert by_name[NL_TO_SQL_TOOL] != by_name[NL_TO_SPARQL_TOOL]
 
     async def test_each_tool_pins_its_own_strategy_option(self):
-        """Previously only nl_to_sql existed and it fell through to the tier's default
-        (nl_to_sql_first), so the Ontop/SPARQL path was never selectable on purpose."""
         reg = ToolRegistry()
         tier = _FakeTier(_FakeStrategyResult([{"a": 1}]))
         build_structured_tools(reg, tier)
@@ -292,13 +288,7 @@ class TestSparqlToolAndEmbedding:
 class TestOutOfBandRequestContext:
     """profile / options / model_id must reach StrategyContext.
 
-    Before this, the controller invoked tools with only ``namespace`` + planner
-    inputs, so ``profile`` was always None -> ``StrategyContext(profile={})`` ->
-    SQLFirewall/Cedar resolved no roles -> fail-CLOSED AccessDeniedError, which the
-    tool's blanket ``except`` rendered as a plain "0 rows" retrieval miss. The deny
-    is also RE-RAISED by ``_resolve_sequential``, so it aborted the whole strategy
-    sequence, not just one leg. (The fail-closed behavior itself is already covered
-    by tests/unit/test_sql_firewall.py::test_no_roles_prod_fails_closed.)
+    Without the profile, SQLFirewall/Cedar resolve no roles and fail closed.
     """
 
     async def test_profile_reaches_strategy_context(self):
@@ -311,7 +301,7 @@ class TestOutOfBandRequestContext:
 
     async def test_options_and_model_id_reach_strategy_context(self):
         """options carries the row cap; model_id the per-request model override —
-        both honored on the standard Tier-2 path and previously dropped here."""
+        both honored as on the standard Tier-2 path."""
         tier = _FakeTier(_FakeStrategyResult([{"a": 1}]))
 
         await NlToSqlTool(tier).invoke(namespace="ns", query="q", options={"maxRows": 25}, model_id="some-model")
@@ -344,10 +334,8 @@ class TestOutOfBandRequestContext:
 class TestAuthorizationDenialsPropagate:
     """An authorization denial is NOT a retrieval failure.
 
-    AccessDeniedError is the firewall/Cedar 403 (exceptions.py:33) and main.py maps
-    it to a 403 response. Swallowing it into an empty ToolResult would turn a 403
-    into a 200 with "0 rows" — hiding a misconfigured grant behind a plausible
-    "no data found". The standard Tier-2 path raises it; the agentic path must too.
+    AccessDeniedError maps to a 403; swallowing it into an empty ToolResult would turn
+    it into a 200 with "0 rows". The standard Tier-2 path raises it; the agentic path must too.
     """
 
     async def test_access_denied_is_reraised_not_swallowed(self):
@@ -359,7 +347,7 @@ class TestAuthorizationDenialsPropagate:
 
     async def test_ordinary_failure_is_still_degraded(self):
         """Only auth denials propagate — a real retrieval failure must still map to
-        an empty result so the loop can escalate (Req 9.1-9.2)."""
+        an empty result so the loop can escalate."""
         result = await NlToSqlTool(_FakeTier(RuntimeError("db down"))).invoke(namespace="ns", query="q")
         assert result.rows == ()
         assert "RuntimeError" in result.detail

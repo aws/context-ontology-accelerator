@@ -55,14 +55,6 @@ describe("ChatBubble", () => {
         screen.getByText("Resolving query · Searching knowledge base"),
       ).toBeInTheDocument();
     });
-
-    it("uses StatusIndicator with loading type", () => {
-      const { container } = render(
-        <ChatBubble role="assistant" state="loading" {...baseProps} />,
-      );
-      // StatusIndicator renders a span with the loading state
-      expect(container.textContent).toContain("Resolving query");
-    });
   });
 
   describe("assistant messages - error state", () => {
@@ -126,7 +118,7 @@ describe("ChatBubble", () => {
           response={{ ...guardrailResponse, synthesizedAnswer: markdownAnswer }}
         />,
       );
-      // Markdown must be parsed into real elements — the bug was raw "##"/"-"/"`" text.
+      // Markdown is parsed into real elements, not raw "##"/"-"/"`" text.
       expect(container.querySelector("h2")?.textContent).toBe("Analysis");
       expect(container.querySelectorAll("ul > li").length).toBe(2);
       expect(container.querySelector("code")?.textContent).toBe(
@@ -344,9 +336,7 @@ describe("ChatBubble", () => {
     });
 
     it("drops the '(Tier 2)' framing in the caption for Deep Reasoning artifacts", () => {
-      // Deep Reasoning also emits SPARQL+SQL but not via the Tier-2 cascade, so
-      // labelling its artifacts "(Tier 2)" is wrong (#1166 Cut #3). Same fixture
-      // as the Tier-2 case, only executionMode flipped.
+      // Deep Reasoning emits SPARQL+SQL but not via the Tier-2 cascade.
       const artifactsResponse = {
         ...response,
         sparqlGenerated: "SELECT ?x WHERE { ?x rdf:type :Claim }",

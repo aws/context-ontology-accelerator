@@ -30,9 +30,6 @@ def _permissive_source_lookup(monkeypatch: pytest.MonkeyPatch):
     yield
 
 
-# ── import_job_store tests ──────────────────────────────────────────────
-
-
 class TestImportJobStore:
     """Tests for the DynamoDB job store."""
 
@@ -896,9 +893,6 @@ class TestImportJobStore:
         )
 
 
-# ── get_import_job handler tests ────────────────────────────────────────
-
-
 class TestGetImportJobHandler:
     """Tests for the GET /import-jobs/{jobId} handler."""
 
@@ -950,9 +944,6 @@ class TestGetImportJobHandler:
         result = handler(event, None)
 
         assert result["statusCode"] == 400
-
-
-# ── import_osi async decision tests ─────────────────────────────────────
 
 
 class TestImportOsiAsyncDecision:
@@ -1194,9 +1185,6 @@ class TestImportOsiAsyncDecision:
             metrics_total=1,
             source_version_id="source-version",
         )
-
-
-# ── DLQ recovery tests ──────────────────────────────────────────────────
 
 
 class TestImportDlqHandler:
@@ -1612,9 +1600,6 @@ class TestImportDlqHandler:
         mock_get_job.assert_not_called()
         mock_sqs.assert_not_called()
         mock_fail_job.assert_not_called()
-
-
-# ── import worker tests ─────────────────────────────────────────────────
 
 
 class TestImportWorker:
@@ -2044,8 +2029,6 @@ class TestImportWorker:
 
         self._run_shape_gate_chunk(mock_get_job, mock_s3, mock_parse, mock_claim, "COUNT(*)")
 
-        # The fragment never reaches Neptune: it is recorded as a durable ERROR
-        # in the plan and skipped when the plan is applied.
         mock_neptune.return_value.get_metric.assert_not_called()
         mock_neptune.return_value.create_metric.assert_not_called()
         plan = mock_store_job_offset_plan.call_args.kwargs["plan"]
@@ -2082,7 +2065,6 @@ class TestImportWorker:
         oversized = "SELECT 1 FROM orders WHERE " + ("x" * MAX_SQL_EXPRESSION_LENGTH)
         self._run_shape_gate_chunk(mock_get_job, mock_s3, mock_parse, mock_claim, oversized)
 
-        # The oversize bound is enforced before analysis, so nothing is persisted.
         mock_neptune.return_value.get_metric.assert_not_called()
         mock_neptune.return_value.create_metric.assert_not_called()
         plan = mock_store_job_offset_plan.call_args.kwargs["plan"]

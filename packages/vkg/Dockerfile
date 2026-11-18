@@ -54,8 +54,10 @@ RUN useradd -r -s /sbin/nologin ontop && \
   chown -R ontop:ontop /app
 
 COPY --chown=ontop:ontop entrypoint.sh /app/entrypoint.sh
+COPY --chown=ontop:ontop load-schema.sh /app/load-schema.sh
 COPY --chown=ontop:ontop translate-server.py /app/translate-server.py
-RUN chmod +x /app/entrypoint.sh && sed -i 's/\r$//' /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh /app/load-schema.sh && \
+  sed -i 's/\r$//' /app/entrypoint.sh /app/load-schema.sh
 
 USER ontop
 WORKDIR /app

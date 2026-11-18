@@ -6,11 +6,10 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { serviceError } from "../../../tests/helpers/service-error";
 import { NamespaceProvider, useCurrentNamespace } from "./index";
 
-// ---------------------------------------------------------------------------
-// Mocks: the real list/get hooks run against a fake control-plane client.
-// ---------------------------------------------------------------------------
+// The real list/get hooks run against a fake control-plane client.
 
 interface FakeCommand {
   kind: "list" | "get";
@@ -36,9 +35,7 @@ vi.mock("@coa/control-plane-client", async (importOriginal) => {
   };
 });
 
-// ---------------------------------------------------------------------------
-// Fixtures: a 2-page list, 25 on page 1 (the API's page size) and 3 on page 2.
-// ---------------------------------------------------------------------------
+// A 2-page list, 25 on page 1 (the API's page size) and 3 on page 2.
 
 function ns(i: number) {
   const id = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
@@ -57,6 +54,14 @@ const TOKEN = "page-2-token";
 
 const never = () => new Promise<never>(() => undefined);
 
+/** Both list pages; GetNamespace answers with `status` for any id. */
+function rejectLookupWith(status: number) {
+  return (command: FakeCommand) =>
+    command.kind === "get"
+      ? Promise.reject(serviceError(status))
+      : serveBothPages(command);
+}
+
 /** Default backend: both pages and GetNamespace for any listed id. */
 function serveBothPages(command: FakeCommand): Promise<unknown> {
   if (command.kind === "list") {
@@ -71,7 +76,7 @@ function serveBothPages(command: FakeCommand): Promise<unknown> {
   );
   return found
     ? Promise.resolve({ namespace: { ...found, owner: "o", createdAt: "t" } })
-    : Promise.reject(new Error("NotFoundError"));
+    : Promise.reject(serviceError(404));
 }
 
 function listCalls(nextToken: string | undefined) {
@@ -86,12 +91,15 @@ function getCalls(namespaceId: string) {
   ).length;
 }
 
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
 function Probe() {
-  const { current, namespaceId, namespaces, isLoading } = useCurrentNamespace();
+  const {
+    current,
+    namespaceId,
+    namespaces,
+    isLoading,
+    unavailable,
+    setNamespace,
+  } = useCurrentNamespace();
   const navigate = useNavigate();
   return (
     <div>
@@ -99,14 +107,20 @@ function Probe() {
       <span data-testid="current-name">{current?.name ?? ""}</span>
       <span data-testid="count">{namespaces.length}</span>
       <span data-testid="loading">{String(isLoading)}</span>
+      <span data-testid="unavailable">{unavailable ?? ""}</span>
       <button onClick={() => navigate("/playground")}>to playground</button>
+      <button onClick={() => setNamespace(PAGE_1[2]!.namespaceId)}>
+        pick ns-03
+      </button>
     </div>
   );
 }
 
 function renderAt(path: string) {
+  // retry: false is the default for the list; GetNamespace sets its own retry
+  // rule, so make its retries immediate rather than 1 s + 2 s + 4 s.
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, retryDelay: 0 } },
   });
   render(
     <QueryClientProvider client={client}>
@@ -121,10 +135,6 @@ function renderAt(path: string) {
 }
 
 const text = (id: string) => screen.getByTestId(id).textContent;
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("NamespaceProvider", () => {
   beforeEach(() => {
@@ -251,6 +261,116 @@ describe("NamespaceProvider", () => {
     await waitFor(() =>
       expect(text("namespace-id")).toBe(PAGE_1[0]!.namespaceId),
     );
+    expect(text("unavailable")).toBe("");
+  });
+
+  describe("why the URL namespace is not current", () => {
+    const missing = "00000000-0000-4000-8000-999999999999";
+
+    it("says not found when the lookup answers 404 (deleted)", async () => {
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("not-found"));
+      expect(text("namespace-id")).toBe("");
+      expect(text("loading")).toBe("false");
+      expect(getCalls(missing)).toBe(1);
+    });
+
+    it("says not found when the lookup still answers 403 after its retries", async () => {
+      // An expired token also gets 403, so the lookup asks again first.
+      mockSend.mockImplementation(rejectLookupWith(403));
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("not-found"));
+      expect(text("namespace-id")).toBe("");
+      expect(getCalls(missing)).toBe(4);
+    });
+
+    it("opens the URL namespace when a 403 passes on retry (token refreshed)", async () => {
+      // Page 2 never arrives, so only the lookup can make it current.
+      let denied = false;
+      mockSend.mockImplementation((command) => {
+        if (command.kind === "list" && command.input.nextToken === TOKEN) {
+          return never();
+        }
+        if (command.kind === "get" && !denied) {
+          denied = true;
+          return Promise.reject(serviceError(403, "Signature has expired"));
+        }
+        return serveBothPages(command);
+      });
+      renderAt(`/namespaces/${ON_PAGE_2.namespaceId}`);
+      await waitFor(() =>
+        expect(text("namespace-id")).toBe(ON_PAGE_2.namespaceId),
+      );
+      expect(text("current-name")).toBe(ON_PAGE_2.name);
+      expect(text("unavailable")).toBe("");
+      expect(getCalls(ON_PAGE_2.namespaceId)).toBe(2);
+    });
+
+    it("says not found when the id is not a namespace id (400)", async () => {
+      mockSend.mockImplementation(rejectLookupWith(400));
+      renderAt("/namespaces/not-a-uuid");
+      await waitFor(() => expect(text("unavailable")).toBe("not-found"));
+      expect(text("namespace-id")).toBe("");
+      expect(getCalls("not-a-uuid")).toBe(1);
+    });
+
+    it("says it could not be loaded when the lookup fails with 500", async () => {
+      mockSend.mockImplementation(rejectLookupWith(500));
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("error"));
+      expect(text("namespace-id")).toBe("");
+      expect(getCalls(missing)).toBe(4);
+    });
+
+    it("says it could not be loaded when the lookup answers 401", async () => {
+      // An expired session says nothing about the namespace.
+      mockSend.mockImplementation(rejectLookupWith(401));
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("error"));
+      expect(text("namespace-id")).toBe("");
+      expect(getCalls(missing)).toBe(4);
+    });
+
+    it("says it could not be loaded when the request never got an answer", async () => {
+      mockSend.mockImplementation((command) =>
+        command.kind === "get"
+          ? Promise.reject(new TypeError("Failed to fetch"))
+          : serveBothPages(command),
+      );
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("error"));
+      expect(text("namespace-id")).toBe("");
+      expect(getCalls(missing)).toBe(4);
+    });
+
+    it("gives no reason while the lookup is still running", async () => {
+      mockSend.mockImplementation((command) =>
+        command.kind === "get" ? never() : serveBothPages(command),
+      );
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("count")).toBe("28"));
+      await waitFor(() => expect(getCalls(missing)).toBe(1));
+      expect(text("loading")).toBe("true");
+      expect(text("unavailable")).toBe("");
+      expect(text("namespace-id")).toBe("");
+    });
+
+    it("gives no reason for a namespace that is found", async () => {
+      renderAt(`/namespaces/${ON_PAGE_2.namespaceId}`);
+      await waitFor(() => expect(text("count")).toBe("28"));
+      expect(text("namespace-id")).toBe(ON_PAGE_2.namespaceId);
+      expect(text("unavailable")).toBe("");
+    });
+
+    it("clears the reason after switching to a namespace that exists", async () => {
+      renderAt(`/namespaces/${missing}`);
+      await waitFor(() => expect(text("unavailable")).toBe("not-found"));
+      await act(async () => screen.getByText("pick ns-03").click());
+      await waitFor(() =>
+        expect(text("namespace-id")).toBe(PAGE_1[2]!.namespaceId),
+      );
+      expect(text("unavailable")).toBe("");
+    });
   });
 
   it("does not treat /namespaces/create as a namespace id", async () => {

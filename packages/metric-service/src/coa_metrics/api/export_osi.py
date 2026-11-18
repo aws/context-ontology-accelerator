@@ -5,12 +5,7 @@
 
 GET /namespaces/{namespaceId}/export-osi → 200 OK
 
-Flow:
-1. List all metrics in the namespace from Neptune
-2. Convert each internal MetricDefinition to OSI format
-3. Map internal dialects to OSI dialects
-4. Assemble OSI YAML document on-the-fly
-5. Return content inline OR write to S3 and return pre-signed download URL
+Returns the YAML inline, or writes it to S3 and returns a pre-signed download URL.
 """
 
 from __future__ import annotations
@@ -46,8 +41,6 @@ setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
 logger = structlog.get_logger(__name__)
 
 
-# ── Singleton clients ───────────────────────────────────────────────────
-
 _neptune: MetricNeptuneClient | None = None
 
 
@@ -58,9 +51,6 @@ def _get_neptune() -> MetricNeptuneClient:
     return _neptune
 
 
-# ── Handler ─────────────────────────────────────────────────────────────
-
-
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """API Gateway proxy-integration Lambda handler for GET /namespaces/{ns}/export-osi."""
     namespace = event.get("pathParameters", {}).get("namespaceId", "")
@@ -69,8 +59,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
     # API Gateway REST APIs deliver a repeated query param (?names=a&names=b)
     # via multiValueQueryStringParameters, not queryStringParameters (which
-    # only keeps the last occurrence). Omitting `names` exports every metric
-    # in the namespace — the pre-existing, unchanged behavior.
+    # only keeps the last occurrence). Omitting `names` exports every metric.
     multi_value_params = event.get("multiValueQueryStringParameters") or {}
     names = multi_value_params.get("names") or None
 
@@ -90,11 +79,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             {"message": f"Invalid format. Must be '{ExportFormat.INLINE}' or '{ExportFormat.S3}'."},
         )
 
-    # Fetch metrics from Neptune. get_metrics_bulk() issues a single SPARQL
-    # round-trip for every matching metric (vs. list_metrics()'s N+1 —  one
-    # query per metric), which is what previously caused API Gateway 29s
-    # timeouts on namespaces with 100+ metrics. Passing `names` scopes the
-    # single query to just that subset; omitting it fetches everything.
+    # One SPARQL round trip for all matching metrics; `names` scopes the query.
     neptune = _get_neptune()
     try:
         metrics = neptune.get_metrics_bulk(namespace, names=names)
@@ -106,10 +91,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         message = "No matching metrics found in namespace" if names else "No metrics found in namespace"
         return api_response(404, {"message": message})
 
-    # Convert to OSI document
     osi_doc = _build_osi_document(metrics)
 
-    # Serialize to YAML
     try:
         yaml_content = serialize_osi_yaml(osi_doc)
     except Exception as exc:
@@ -129,7 +112,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         format=export_format,
     )
 
-    # Return based on format
     if export_format == ExportFormat.S3:
         result = _write_to_s3(namespace, yaml_content)
         if result is None:
@@ -139,20 +121,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     return api_response(200, {"content": yaml_content})
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
 def _build_osi_document(metrics: list[MetricDefinition]) -> OsiDocument:
     """Build an OSI document from internal metric definitions."""
     osi_metrics: list[OsiMetric] = []
     datasets_seen: dict[str, OsiDataset] = {}
 
     for metric in metrics:
-        # Collect unique datasets — in OSI, a dataset represents a table/view
-        # name = short logical name, source = fully qualified table reference
         dataset_key = metric.source_table or metric.data_source_id
         if dataset_key and dataset_key not in datasets_seen:
-            # Derive short name from the last segment of the qualified table name
             short_name = dataset_key.rsplit(".", 1)[-1] if "." in dataset_key else dataset_key
             datasets_seen[dataset_key] = OsiDataset(
                 name=short_name,
@@ -160,7 +136,6 @@ def _build_osi_document(metrics: list[MetricDefinition]) -> OsiDocument:
                 data_source_id=metric.data_source_id,
             )
 
-        # Convert metric
         osi_metric = _metric_to_osi(metric)
         osi_metrics.append(osi_metric)
 
@@ -172,7 +147,6 @@ def _build_osi_document(metrics: list[MetricDefinition]) -> OsiDocument:
 
 def _metric_to_osi(metric: MetricDefinition) -> OsiMetric:
     """Convert an internal MetricDefinition to OSI format."""
-    # Map dialects to OSI
     osi_dialects: list[OsiDialectExpression] = []
     for d in metric.expression_dialects:
         try:
@@ -182,7 +156,6 @@ def _metric_to_osi(metric: MetricDefinition) -> OsiMetric:
             osi_dialect = d.dialect.upper()
         osi_dialects.append(OsiDialectExpression(dialect=osi_dialect, expression=d.expression))
 
-    # Build ai_context as structured OSI object
     osi_ai_context: OsiAiContext | None = None
     if metric.ai_context and (
         metric.ai_context.synonyms or metric.ai_context.instructions or metric.ai_context.examples
@@ -193,17 +166,12 @@ def _metric_to_osi(metric: MetricDefinition) -> OsiMetric:
             examples=metric.ai_context.examples,
         )
 
-    # Build custom extensions
-    time_dimension = ""
-    if metric.default_time_grain:
-        time_dimension = metric.default_time_grain.lower()
-
     custom_ext = OsiCustomExtension(
         data_source_id=metric.data_source_id,
         source_table=metric.source_table,
         unit=metric.unit or "",
         return_type=metric.return_type or "",
-        time_dimension=time_dimension,
+        time_dimension=(metric.default_time_grain or "").lower(),
         ontology_concepts=metric.ontology_concepts,
         defined_by=metric.defined_by or "",
         effective_from=metric.effective_from or "",
@@ -218,8 +186,6 @@ def _metric_to_osi(metric: MetricDefinition) -> OsiMetric:
         custom_extensions=custom_ext,
     )
 
-
-# ── S3 helpers ──────────────────────────────────────────────────────────
 
 PRESIGN_EXPIRY_SECONDS = 900  # 15 minutes
 

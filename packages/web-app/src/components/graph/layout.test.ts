@@ -15,16 +15,15 @@ import {
 } from "./layout";
 
 /**
- * Shape of the real "cross-source-uat" proposal (df41a4a3): several
- * disconnected FK sub-schemas of different sizes plus a long tail of classes
- * with no relationships at all. Node names are illustrative.
+ * Several disconnected FK sub-schemas of different sizes plus a long tail of
+ * classes with no relationships at all. Node names are illustrative.
  */
 function proposalLikeGraph(): { ids: string[]; edges: LayoutEdge[] } {
   const edges: LayoutEdge[] = [];
   const ids: string[] = [];
   const link = (a: string, b: string) => edges.push({ source: a, target: b });
 
-  // F1 cluster (12 nodes, hub-and-spoke on races/drivers/constructors)
+  // F1 cluster (13 nodes, hub-and-spoke on races/drivers/constructors)
   const f1 = [
     "races",
     "drivers",
@@ -251,8 +250,7 @@ describe("layoutForceGraph", () => {
         expect(d).toBeGreaterThan(nodeSize * 0.9);
       }
     }
-    // Landscape-ish extent: nowhere near the old single-row strip, whose
-    // width/height ratio for 88 nodes was >20.
+    // Landscape-ish extent: width/height ratio between 1 and 4.
     const xs = pts.map((p) => p.x);
     const ys = pts.map((p) => p.y);
     const width = Math.max(...xs) - Math.min(...xs) + nodeSize;

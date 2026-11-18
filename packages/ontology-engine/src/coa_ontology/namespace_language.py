@@ -3,7 +3,7 @@
 
 """Namespace language for ontology induction.
 
-The namespace owns one immutable language (``internal-docs/adrs/namespace-language-adr.md``).
+The namespace owns one immutable language.
 Induction entry points resolve it once, from the namespace item, after the route
 has bound the authorized namespace, and pass the canonical value to the worker.
 Requests and source records never carry a language.

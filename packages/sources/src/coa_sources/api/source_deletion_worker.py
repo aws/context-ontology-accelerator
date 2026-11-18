@@ -3,22 +3,15 @@
 
 """SQS worker that finishes deleting a database source.
 
-Why this exists: a database source's teardown includes one DataZone
-``delete_asset`` per discovered table. That is work proportional to source size,
-and it used to run inside the ``DELETE`` request on a Lambda with a 30-second
-timeout. An 860-table source could not finish, so the request was killed
-mid-cleanup — and because the row was dropped regardless of progress, the
-remaining assets were orphaned with no handle left to retry them.
+A database source's teardown includes one DataZone ``delete_asset`` per
+discovered table, which is too slow for the 30-second ``DELETE`` request. The API
+does the bounded teardown whose only handle is the row (catalog/federation
+deregistration), flips the source to ``DELETING`` and enqueues here. This Lambda
+has a 15-minute envelope and deletes the row LAST, so an incomplete cleanup
+leaves a retryable ``DELETING`` / ``DELETE_FAILED`` source rather than orphans.
 
-The API now validates, does the bounded teardown whose only handle is the row
-(catalog/federation deregistration), flips the source to ``DELETING`` and
-enqueues here. This Lambda gets a 15-minute envelope and, critically, deletes
-the row LAST — so an incomplete cleanup leaves a retryable ``DELETING`` /
-``DELETE_FAILED`` source rather than invisible orphans.
-
-Idempotent by construction: every step is a delete, and the shared
-``finish_database_source_deletion`` tolerates already-absent assets, scan jobs
-and rows, so an SQS redelivery is safe.
+Idempotent: every step is a delete, and ``finish_database_source_deletion``
+tolerates already-absent assets, scan jobs and rows, so SQS redelivery is safe.
 
 The message is a trigger, not an authority. Before acting, the worker reads the
 source row and proceeds only when an accepted ``DELETE`` has put it in a delete
@@ -88,9 +81,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """Process deletion messages, reporting per-message failures to SQS.
 
     Uses partial batch response (``batchItemFailures``) so one source's failure
-    redrives only its own message. Without it a single bad message would redeliver
-    the whole batch and re-run cleanup for sources that already finished — safe,
-    since every step is idempotent, but wasteful and noisy.
+    redrives only its own message.
     """
     failures: list[dict[str, str]] = []
 
@@ -98,7 +89,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         message_id = record.get("messageId", "")
         try:
             body = json.loads(record.get("body") or "{}")
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             # Can never succeed, but report it as a failure anyway: a record left
             # out of batchItemFailures counts as success and SQS deletes it. Failing
             # it lands it in the DLQ after maxReceiveCount, payload kept and alarmed.

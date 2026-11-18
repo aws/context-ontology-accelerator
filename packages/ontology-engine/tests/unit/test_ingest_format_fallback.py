@@ -51,12 +51,7 @@ class TestIngestParseFallback:
         from coa_ontology.catalog.ingest import IngestMetadata, ingest_ontology
 
         graph_store, vector_store = MagicMock(), MagicMock()
-        vector_store.store_embeddings_batch.return_value = 0
-        # These tests verify PARSE behaviour, not persistence/embedding. Patch:
-        #  - dynamo_store: registry reads/writes (no existing row → no conflict).
-        #  - _accumulate_embeddings: returns success so no real Bedrock/AOSS call
-        #    is made (CI has no AWS credentials — otherwise this raises
-        #    NoCredentialsError → IngestStoreError, unrelated to the parse path).
+        # Patch the registry and embeddings so no AWS call is made.
         with (
             patch("coa_ontology.catalog.ingest.dynamo_store") as ds,
             patch(

@@ -89,7 +89,6 @@ def test_build_rescan_backup_no_changes_is_empty() -> None:
 
 def test_backup_s3_key_is_per_source_and_stable() -> None:
     assert backup_s3_key("src-1") == "src-1/rescan-backup/current.json"
-    assert backup_s3_key("src-1") == backup_s3_key("src-1")
 
 
 def test_build_rescan_backup_captures_prior_summary() -> None:

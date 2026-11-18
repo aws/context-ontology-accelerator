@@ -65,11 +65,6 @@ def is_direct_query_engine(engine_type: str | None) -> bool:
     return engine_type.upper() in _ADAPTERS
 
 
-def supported_engines() -> frozenset[str]:
-    """Engine tokens with a direct-JDBC adapter (used by tests/introspection)."""
-    return frozenset(_ADAPTERS)
-
-
 __all__ = [
     "ConnHandle",
     "DBCredentials",
@@ -80,5 +75,4 @@ __all__ = [
     "SqlServerAdapter",
     "get_adapter",
     "is_direct_query_engine",
-    "supported_engines",
 ]

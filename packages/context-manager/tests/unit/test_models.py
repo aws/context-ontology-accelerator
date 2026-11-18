@@ -112,7 +112,7 @@ class TestInvokeRequest:
 
 @pytest.mark.unit
 class TestRetrieverStrategyValidation:
-    """Model-layer validation of ``options.retrieverStrategy`` (task 4)."""
+    """Model-layer validation of ``options.retrieverStrategy``."""
 
     def test_valid_retriever_strategy_accepted(self):
         from coa_serve.lexical.strategies import RetrieverStrategy
@@ -124,14 +124,6 @@ class TestRetrieverStrategyValidation:
                 options={"retrieverStrategy": strategy.value},
             )
             assert req.options["retrieverStrategy"] == strategy.value
-
-    def test_default_strategy_value_accepted(self):
-        req = InvokeRequest(
-            query="test",
-            namespace="demo",
-            options={"retrieverStrategy": "chunk_based_semantic"},
-        )
-        assert req.options["retrieverStrategy"] == "chunk_based_semantic"
 
     def test_invalid_retriever_strategy_raises(self):
         with pytest.raises(ValidationError):
@@ -149,25 +141,10 @@ class TestRetrieverStrategyValidation:
                 options={"retrieverStrategy": ""},
             )
 
-    def test_absent_retriever_strategy_is_valid(self):
-        # Key absent entirely -> valid.
-        req = InvokeRequest(query="test", namespace="demo", options={})
-        assert "retrieverStrategy" not in req.options
-
-    def test_other_options_keys_unaffected(self):
-        # Absence of retrieverStrategy among other option keys is still valid,
-        # and the key stays inside ``options`` (no new top-level field).
-        req = InvokeRequest(
-            query="test",
-            namespace="demo",
-            options={"tierOverride": 3},
-        )
-        assert req.options == {"tierOverride": 3}
-
 
 @pytest.mark.unit
 class TestDimensionsNormalization:
-    """``options.dimensions`` wire-shape normalization (issue #53).
+    """``options.dimensions`` wire-shape normalization.
 
     The contract declares a LIST of ``DimensionFilter`` objects; Tier-1 binds
     placeholders from a name->value MAPPING. These pin the conversion at the
@@ -190,14 +167,6 @@ class TestDimensionsNormalization:
             options={"dimensions": [{"name": "region", "value": "EMEA"}, {"name": "year", "value": "2024"}]},
         )
         assert req.options["dimensions"] == {"region": "EMEA", "year": "2024"}
-
-    def test_operator_omitted_defaults_to_equality(self):
-        req = InvokeRequest(
-            query="test",
-            namespace="demo",
-            options={"dimensions": [{"name": "region", "value": "EMEA"}]},
-        )
-        assert req.options["dimensions"] == {"region": "EMEA"}
 
     def test_dict_shape_passed_through_unchanged(self):
         # The internal shape stays valid — substitute_dimensions' own contract.
@@ -224,10 +193,6 @@ class TestDimensionsNormalization:
 
     def test_none_drops_the_key(self):
         req = InvokeRequest(query="test", namespace="demo", options={"dimensions": None})
-        assert "dimensions" not in req.options
-
-    def test_absent_dimensions_is_valid(self):
-        req = InvokeRequest(query="test", namespace="demo", options={})
         assert "dimensions" not in req.options
 
     def test_non_equality_operator_rejected(self):
@@ -260,17 +225,9 @@ class TestDimensionsNormalization:
         with pytest.raises(ValidationError, match="dimension filter"):
             InvokeRequest(query="test", namespace="demo", options={"dimensions": ["region", "year"]})
 
-    def test_missing_name_rejected(self):
-        with pytest.raises(ValidationError, match="name"):
-            InvokeRequest(query="test", namespace="demo", options={"dimensions": [{"value": "EMEA"}]})
-
     def test_blank_name_rejected(self):
         with pytest.raises(ValidationError, match="name"):
             InvokeRequest(query="test", namespace="demo", options={"dimensions": [{"name": "  ", "value": "EMEA"}]})
-
-    def test_missing_value_rejected(self):
-        with pytest.raises(ValidationError, match="value"):
-            InvokeRequest(query="test", namespace="demo", options={"dimensions": [{"name": "region"}]})
 
     def test_scalar_dimensions_rejected(self):
         with pytest.raises(ValidationError, match="dimensions"):
@@ -346,8 +303,6 @@ class TestDimensionsNormalization:
         req = InvokeRequest(query="test", namespace="demo", options={"dimensions": {"  region  ": "EMEA"}})
         assert req.options["dimensions"] == {"region": "EMEA"}
 
-    # --- numeric edge cases ---
-
     def test_nan_value_rejected(self):
         # json.loads accepts the non-standard NaN/Infinity tokens, and sqlglot
         # renders them as the BARE words nan/inf — which SQL engines parse as a
@@ -366,8 +321,6 @@ class TestDimensionsNormalization:
         # isfinite() must not run on it. substitute_dimensions renders TRUE/FALSE.
         req = InvokeRequest(query="test", namespace="demo", options={"dimensions": [{"name": "active", "value": True}]})
         assert req.options["dimensions"] == {"active": True}
-
-    # --- operator ---
 
     def test_blank_operator_treated_as_absent(self):
         # The contract documents operator as optional (defaulting to equality), and

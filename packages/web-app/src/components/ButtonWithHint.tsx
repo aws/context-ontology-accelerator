@@ -13,9 +13,6 @@ export type ButtonWithHintProps = ButtonProps & { hint: ReactNode };
  * A Button that reveals an explanatory hint on hover/focus, via a Cloudscape
  * Tooltip anchored to the button. Keeps the explanation off the button's own
  * accessible name and avoids a separate info icon next to actionable controls.
- *
- * Extracted from the scan flow (SourceDetail) so the induction flow can use the
- * same idiom for its action buttons (Save changes, Validate, Accept, etc.).
  */
 export function ButtonWithHint({ hint, ...buttonProps }: ButtonWithHintProps) {
   const [showHint, setShowHint] = useState(false);

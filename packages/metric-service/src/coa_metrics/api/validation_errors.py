@@ -1,32 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared formatting for Pydantic ValidationError -> API 400 message.
-
-Known friction points, all surfaced by adding hints to Pydantic's
-default (unhelpful) validation messages rather than changing the request
-models:
-
-- The metric request models require a NESTED expression
-  shape (``expression: { dialects: [{ dialect, expression }] }``), not a flat
-  top-level ``dialects`` array. Pydantic's default message for that mistake
-  is the generic ``"Field required"`` (missing ``expression`` key) or
-  ``"Input should be a valid dictionary or instance of MetricExpression"``
-  (``expression`` present but wrong shape) — neither hints at the correct
-  shape, so callers have to read the Smithy-generated model to discover it.
-- ``SqlDialect`` has no ``ATHENA`` value (and per team
-  decision will not get one — Athena's engine roadmap may drop its current
-  Trino backend, so aliasing ``ATHENA`` -> ``TRINO`` would become wrong).
-  Pydantic's enum-validation error for an unrecognized ``dialect`` value
-  doesn't say what execution engines map to which dialect today. The
-  generated ``dialect: SqlDialect`` enum rejects it BEFORE the handler-level
-  ``VALID_SQL_DIALECTS`` check ever runs, so the hint has to live here too.
-- A ``dataSourceId`` outside the ``DataSourceId`` @pattern fails with the
-  generated "must validate the regular expression" text, which does not name
-  the field; it gets the same message ``check_source_approved`` returns.
-- ``label`` length, type and @pattern failures get a message that names the
-  field; Pydantic's defaults do not, and the pattern one is the raw regex.
-"""
+"""Shared formatting for Pydantic ValidationError -> API 400 message."""
 
 from __future__ import annotations
 

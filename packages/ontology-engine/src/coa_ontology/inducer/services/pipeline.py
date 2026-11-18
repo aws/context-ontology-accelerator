@@ -1,72 +1,30 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Core induction pipeline.
+"""Source-concept extraction, embedding and grounding match for structured induction.
 
-Steps:
-  1. Fetch table metadata from data-catalog
-  2. Build source concepts (column name + description → text for embedding)
-  3. Generate lexical embeddings for source concepts via embedding-generator
-  4. VSS against ontology-catalog to find grounding matches
-  5. Build OWL ontology (rdflib): matched → imports/alignment, unmatched → novel classes
-  6. Store induced ontology + new embeddings back to ontology-catalog
-
-Only steps 2–4 are on the service path. ``main.py`` wires
-``induce_catalog.router``, whose strategies call ``extract_concepts``,
-``embed_concepts`` and ``match_concepts`` on an :class:`InductionPipeline` built by
-``routers/induce.py:_build_pipeline``. The other steps (``fetch_tables``,
-``build_ontology``, ``store_induced_ontology`` and ``run``) are reached only from
-``routers/induce.py``'s own router, which ``main.py`` never mounts, and from tests.
-They are a retired reference and must not be used to mint IRIs: the service mints
-class and property local names with
-:func:`~coa_ontology.inducer.strategies.base.pascal_names_for` and
-:func:`~coa_ontology.inducer.strategies.base.camel_names_for`.
+``induce_catalog`` strategies call ``extract_concepts``, ``embed_concepts`` and
+``match_concepts`` on an :class:`InductionPipeline` built by
+``routers/induce.py:_build_pipeline``.
 """
 
 from __future__ import annotations
 
 import math
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from coa_common.bedrock import FALLBACK_CHAT_MODEL_ID
 from coa_common.bedrock_metrics import CostTracker
-from rdflib import OWL, RDF, RDFS, XSD, Graph, Literal, Namespace, URIRef
-from rdflib.namespace import SKOS
 
-from coa_ontology.inducer.schemas import ConceptMatch, InductionReport
+from coa_ontology.inducer.schemas import ConceptMatch
 from coa_ontology.inducer.services.data_catalog import CatalogTable, DataCatalogClient
 from coa_ontology.inducer.services.embedding_generator import EmbeddingGeneratorClient
 from coa_ontology.inducer.services.grounding import GroundingService
 from coa_ontology.inducer.services.ontology_catalog import OntologyCatalogClient
 from coa_ontology.inducer.strategies.base import table_identity as catalog_table_identity
-
-# Mapping from data-catalog SQL types to XSD datatypes
-_SQL_TO_XSD = {
-    "INT": XSD.integer,
-    "BIGINT": XSD.long,
-    "SMALLINT": XSD.short,
-    "TINYINT": XSD.byte,
-    "FLOAT": XSD.float,
-    "DOUBLE": XSD.double,
-    "DECIMAL": XSD.decimal,
-    "NUMERIC": XSD.decimal,
-    "VARCHAR": XSD.string,
-    "TEXT": XSD.string,
-    "CHAR": XSD.string,
-    "STRING": XSD.string,
-    "BOOLEAN": XSD.boolean,
-    "DATE": XSD.date,
-    "TIMESTAMP": XSD.dateTime,
-    "DATETIME": XSD.dateTime,
-    "TIME": XSD.time,
-    "BINARY": XSD.hexBinary,
-    "BLOB": XSD.hexBinary,
-    "UUID": XSD.string,
-}
 
 
 def _grounding_workers() -> int:
@@ -129,13 +87,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 class InductionPipeline:
-    """Reference table-to-ontology pipeline: fetch, embed, match, build, and store.
-
-    Wraps the data-catalog, embedding-generator, and ontology-catalog clients to turn
-    catalog tables into an induced OWL ontology with grounding matches. The service
-    uses only the concept extraction, embedding and matching steps; see the module
-    docstring before calling anything else here.
-    """
+    """Extract, embed and ground source concepts against the ontology catalog."""
 
     def __init__(
         self,
@@ -145,37 +97,12 @@ class InductionPipeline:
         llm_region: str = "us-east-1",
         grounding_llm_model_id: str = FALLBACK_CHAT_MODEL_ID,
     ):
-        """Wire up the data-catalog, embedding-generator, and ontology-catalog clients.
-
-        Args:
-            data_catalog: Client used to fetch source table metadata.
-            embedding_generator: Client used to embed source concepts.
-            ontology_catalog: Client used to match against and store ontologies.
-            llm_region: AWS region for the grounding rerank's Bedrock client.
-            grounding_llm_model_id: Bedrock model id for the grounding rerank
-                (a cheap, high-volume call, so it defaults to the Haiku-class
-                chat model, not the heavier induction model; GH #236).
-        """
+        """Wire up the clients; the high-volume grounding rerank defaults to the Haiku-class model."""
         self.dc = data_catalog
         self.eg = embedding_generator
         self.oc = ontology_catalog
         self.llm_region = llm_region
         self.grounding_llm_model_id = grounding_llm_model_id
-
-    # ── Step 1: Fetch metadata ──────────────────────────────────────
-
-    def fetch_tables(self, table_ids: list[str]) -> list[CatalogTable]:
-        """Fetch metadata for the given catalog table ids.
-
-        Args:
-            table_ids: Catalog table ids or fully qualified names to fetch.
-
-        Returns:
-            The fetched :class:`CatalogTable` objects, in input order.
-        """
-        return [self.dc.get_table(tid) for tid in table_ids]
-
-    # ── Step 2: Extract source concepts ─────────────────────────────
 
     def extract_concepts(self, tables: list[CatalogTable]) -> list[SourceConcept]:
         """Derive table- and column-level source concepts with embedding text.
@@ -250,7 +177,6 @@ class InductionPipeline:
         table_concepts = [c for c in concepts if c.is_table_level]
         col_concepts = [c for c in concepts if not c.is_table_level]
 
-        # Embed tables as before
         if table_concepts:
             table_inputs = [
                 {"class_uri": f"source:{c.table_name}", "labels": [c.embedding_text], "comments": []}
@@ -698,368 +624,3 @@ class InductionPipeline:
                 cost_tracker.record_stage_duration("ColumnMatch", (time.perf_counter() - _col_match_t0) * 1000)
 
         return [m for m in matches if m is not None]
-
-    # ── Step 5: Build OWL ontology ──────────────────────────────────
-
-    def build_ontology(
-        self,
-        uri_prefix: str,
-        tables: list[CatalogTable],
-        concepts: list[SourceConcept],
-        matches: list[ConceptMatch],
-    ) -> Graph:
-        """Build an OWL RDF graph from tables, concepts, and grounding matches.
-
-        Matched concepts emit alignment/subclass axioms to their foundational classes;
-        unmatched concepts become novel classes and properties.
-
-        Retired reference path, unused by the service (see the module docstring). It
-        mints class names with this module's ASCII-only :func:`_to_pascal`, which
-        reduces a non-Latin or symbol-only table name to ``""`` so the class IRI is
-        the bare namespace. Property names come from :func:`_to_camel` with no
-        per-table dedupe, so two columns that differ only in case (``OrderID`` /
-        ``orderId``) fuse onto one property. Do not use it to mint IRIs; the
-        service's builder is ``TableToOntologyStrategy._build_proposal_ontology``,
-        which names classes with
-        :func:`~coa_ontology.inducer.strategies.base.pascal_names_for` and columns
-        with :func:`~coa_ontology.inducer.strategies.base.camel_names_for`.
-
-        Args:
-            uri_prefix: Namespace prefix for minting induced URIs.
-            tables: Source tables providing columns and constraints.
-            concepts: Source concepts aligned with ``matches``.
-            matches: Grounding matches aligned positionally with ``concepts``.
-
-        Returns:
-            The populated :class:`rdflib.Graph`.
-        """
-        g = Graph()
-        ns = Namespace(uri_prefix)
-        g.bind("ind", ns)
-        g.bind("owl", OWL)
-        g.bind("rdfs", RDFS)
-        g.bind("xsd", XSD)
-        g.bind("skos", SKOS)
-
-        # Ontology declaration
-        ont_uri = URIRef(uri_prefix.rstrip("#").rstrip("/"))
-        g.add((ont_uri, RDF.type, OWL.Ontology))
-        g.add((ont_uri, RDFS.label, Literal("Induced Domain Ontology")))
-
-        # Custom annotation property for match confidence scores
-        match_confidence = ns["matchConfidence"]
-        g.add((match_confidence, RDF.type, OWL.AnnotationProperty))
-        g.add((match_confidence, RDFS.label, Literal("match confidence")))
-        g.add(
-            (
-                match_confidence,
-                RDFS.comment,
-                Literal("Cosine similarity score from embedding-based matching during induction"),
-            )
-        )
-
-        # Build a match lookup: (table_name, column_name) → ConceptMatch
-        match_map = {(m.source_table, m.source_column): m for m in matches}
-
-        for table in tables:
-            # ── Table → OWL Class ──
-            table_match = match_map.get((table.name, ""))
-            table_cls = ns[_to_pascal(table.name)]
-            g.add((table_cls, RDF.type, OWL.Class))
-            g.add((table_cls, RDFS.label, Literal(table.name)))
-
-            if table_match and table_match.matched_class_uri:
-                grounding_cls = URIRef(table_match.matched_class_uri)
-                conf = Literal(table_match.similarity, datatype=XSD.float)
-                # Skip a self-match (grounding_cls == table_cls): a reflexive
-                # rdfs:subClassOf is a Tier-1 taxonomy-cycle self-loop and a self
-                # skos:* match is vacuous. (build_ontology is the retired
-                # reference path — not the active TableToOntologyStrategy — but
-                # the guard mirrors it defensively.)
-                if grounding_cls != table_cls:
-                    g.add((grounding_cls, RDF.type, OWL.Class))
-                    g.add((grounding_cls, RDFS.label, Literal(_label_from_uri(str(grounding_cls)))))
-
-                    if table_match.match_type == "exact":
-                        g.add((table_cls, RDFS.subClassOf, grounding_cls))
-                        g.add((table_cls, SKOS.exactMatch, grounding_cls))
-                        g.add((table_cls, match_confidence, conf))
-                    elif table_match.match_type == "high_confidence":
-                        g.add((table_cls, RDFS.subClassOf, grounding_cls))
-                        g.add((table_cls, SKOS.closeMatch, grounding_cls))
-                        g.add((table_cls, match_confidence, conf))
-                    elif table_match.match_type == "ambiguous":
-                        g.add((table_cls, SKOS.relatedMatch, grounding_cls))
-                        g.add((table_cls, match_confidence, conf))
-
-            if table.description:
-                g.add((table_cls, RDFS.comment, Literal(table.description)))
-
-            # ── Columns → Datatype or Object Properties ──
-            for col in table.columns:
-                col_match = match_map.get((table.name, col.name))
-                prop_uri = ns[f"{_to_camel(table.name)}_{_to_camel(col.name)}"]
-
-                # Determine if this is an FK (object property) or datatype property
-                is_fk = False
-                fk_target_table = None
-                if table.tableConstraints:
-                    for tc in table.tableConstraints:
-                        if tc.constraintType == "FOREIGN_KEY" and col.name in tc.columns and tc.referredColumns:
-                            is_fk = True
-                            # Extract target table name from FQN
-                            ref_parts = tc.referredColumns[0].split(".")
-                            fk_target_table = ref_parts[-2] if len(ref_parts) >= 2 else ref_parts[0]
-                            break
-
-                if is_fk and fk_target_table:
-                    # Object property
-                    fk_cls = ns[_to_pascal(fk_target_table)]
-                    g.add((prop_uri, RDF.type, OWL.ObjectProperty))
-                    g.add((prop_uri, RDFS.domain, table_cls))
-                    g.add((prop_uri, RDFS.range, fk_cls))
-                    # Ensure FK target class is declared (may not be in induction request)
-                    g.add((fk_cls, RDF.type, OWL.Class))
-                    g.add((fk_cls, RDFS.label, Literal(fk_target_table)))
-                else:
-                    # Datatype property
-                    g.add((prop_uri, RDF.type, OWL.DatatypeProperty))
-                    g.add((prop_uri, RDFS.domain, table_cls))
-                    xsd_type = _SQL_TO_XSD.get(col.dataType.upper(), XSD.string)
-                    g.add((prop_uri, RDFS.range, xsd_type))
-
-                g.add((prop_uri, RDFS.label, Literal(col.name)))
-                if col.description:
-                    g.add((prop_uri, RDFS.comment, Literal(col.description)))
-
-                # ── Cardinality axioms from constraints ──
-                is_not_null = col.constraint in ("NOT_NULL", "PRIMARY_KEY")
-                is_unique = col.constraint in ("UNIQUE", "PRIMARY_KEY")
-                # Also check table-level UNIQUE constraints
-                if not is_unique and table.tableConstraints:
-                    for tc in table.tableConstraints:
-                        if tc.constraintType == "UNIQUE" and col.name in tc.columns and len(tc.columns) == 1:
-                            is_unique = True
-                            break
-
-                if is_not_null and is_unique:
-                    restriction = _cardinality_restriction(g, prop_uri, OWL.cardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
-                elif is_not_null:
-                    restriction = _cardinality_restriction(g, prop_uri, OWL.minCardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
-                elif is_unique:
-                    restriction = _cardinality_restriction(g, prop_uri, OWL.maxCardinality, 1)
-                    g.add((table_cls, RDFS.subClassOf, restriction))
-
-                if col.constraint == "PRIMARY_KEY":
-                    g.add((table_cls, OWL.hasKey, prop_uri))
-
-                # Alignment annotation if matched
-                if col_match and col_match.matched_class_uri:
-                    matched_uri = URIRef(col_match.matched_class_uri)
-                    conf = Literal(col_match.similarity, datatype=XSD.float)
-
-                    # Declare the matched property's type, label, and domain/range
-                    # so the ontology is self-contained (fixes OoPS P08-A, P11, P35)
-                    matched_type = OWL.ObjectProperty if is_fk else OWL.DatatypeProperty
-                    g.add((matched_uri, RDF.type, matched_type))
-                    g.add((matched_uri, RDFS.label, Literal(_label_from_uri(str(matched_uri)))))
-                    if table_match and table_match.matched_class_uri:
-                        g.add((matched_uri, RDFS.domain, URIRef(table_match.matched_class_uri)))
-                    if is_fk and fk_target_table:
-                        fk_match = match_map.get((fk_target_table, ""))
-                        if fk_match and fk_match.matched_class_uri:
-                            g.add((matched_uri, RDFS.range, URIRef(fk_match.matched_class_uri)))
-                    else:
-                        xsd_type = _SQL_TO_XSD.get(col.dataType.upper(), XSD.string)
-                        g.add((matched_uri, RDFS.range, xsd_type))
-
-                    # Skip a self-match (prop_uri == matched_uri): a reflexive
-                    # owl:equivalentProperty / skos:* link is vacuous. (Retired
-                    # reference path; guarded defensively.)
-                    if prop_uri != matched_uri:
-                        if col_match.match_type == "exact":
-                            g.add((prop_uri, OWL.equivalentProperty, matched_uri))
-                            g.add((prop_uri, SKOS.exactMatch, matched_uri))
-                            g.add((prop_uri, match_confidence, conf))
-                        elif col_match.match_type == "high_confidence":
-                            g.add((prop_uri, OWL.equivalentProperty, matched_uri))
-                            g.add((prop_uri, SKOS.closeMatch, matched_uri))
-                            g.add((prop_uri, match_confidence, conf))
-                        elif col_match.match_type == "ambiguous":
-                            g.add((prop_uri, SKOS.relatedMatch, matched_uri))
-                            g.add((prop_uri, match_confidence, conf))
-
-        # NOTE: deliberately do NOT emit owl:imports for grounding ontologies — a
-        # live import of a non-dereferenceable foundational URI makes Ontop/OWLAPI
-        # network-resolve it at VKG load and fail every query (Ontop #337). The
-        # grounding linkage is carried by rdfs:subClassOf + skos:* (this reference
-        # path does not emit coa:groundedTo — that is the production strategy).
-
-        return g
-
-    # ── Step 6: Store results ───────────────────────────────────────
-
-    def store_induced_ontology(
-        self,
-        uri_prefix: str,
-        label: str,
-        graph: Graph,
-        matches: list[ConceptMatch],
-    ) -> dict:
-        """Persist the induced ontology to the catalog and upload its Turtle file.
-
-        Args:
-            uri_prefix: Ontology URI, used as its catalog identifier.
-            label: Human-readable title for the catalog record.
-            graph: The RDF graph to serialize and upload.
-            matches: Grounding matches, used to derive imports and the description.
-
-        Returns:
-            The ontology-catalog record created (or found) for the ontology.
-        """
-        owl_turtle = graph.serialize(format="turtle")
-        ontology_data = {
-            "uri": uri_prefix,
-            "title": label,
-            "ontology_type": "induced",
-            "description": f"Induced ontology with {len(matches)} concept mappings",
-            "format": "turtle",
-            "license": "proprietary",
-            "license_tier": "restricted",
-            "source_registry": "induced",
-            "domain_tags": ["induced"],
-            "imports": list(
-                {
-                    m.matched_class_uri.rsplit("#", 1)[0]
-                    for m in matches
-                    if m.matched_class_uri and m.match_type in ("exact", "high_confidence")
-                }
-            ),
-        }
-        result = self.oc.create_ontology(ontology_data)
-        if not result.get("file_path"):
-            # New record — upload the OWL file
-            owl_bytes = owl_turtle.encode("utf-8") if isinstance(owl_turtle, str) else owl_turtle
-            self.oc.upload_ontology_file(result["id"], owl_bytes)
-        return result
-
-    # ── Full pipeline ───────────────────────────────────────────────
-
-    def run(
-        self,
-        table_ids: list[str],
-        uri_prefix: str,
-        label: str = "Induced Structured Ontology",
-        confidence_threshold: float = 0.80,
-        embedding_backend: str | None = None,
-        scoring_strategy: str = "lexical",
-        structural_weight: float = 0.3,
-    ) -> tuple[InductionReport, Graph]:
-        """Run the full table-to-ontology pipeline end to end.
-
-        Fetches tables, extracts and embeds concepts, matches them against the catalog,
-        builds the OWL graph, stores it, and assembles a summary report.
-
-        Args:
-            table_ids: Catalog table ids or FQNs to induce an ontology from.
-            uri_prefix: Namespace prefix for minting induced URIs.
-            label: Catalog title for the stored ontology.
-            confidence_threshold: Minimum similarity to accept a high-confidence match.
-            embedding_backend: Optional embedding backend override.
-            scoring_strategy: "lexical" or "structural_fusion" scoring.
-            structural_weight: Weight of the structural signal when fusing scores.
-
-        Returns:
-            The :class:`InductionReport` summarizing the run and the built RDF graph.
-        """
-        # 1. Fetch
-        tables = self.fetch_tables(table_ids)
-
-        # 2. Extract concepts
-        concepts = self.extract_concepts(tables)
-
-        # 3. Embed
-        concepts, model_id = self.embed_concepts(concepts, backend=embedding_backend)
-
-        # 4. Match
-        matches = self.match_concepts(
-            concepts,
-            confidence_threshold,
-            model_id=model_id,
-            scoring_strategy=scoring_strategy,
-            structural_weight=structural_weight,
-        )
-
-        # 5. Build OWL
-        graph = self.build_ontology(uri_prefix, tables, concepts, matches)
-
-        # 6. Store
-        stored = self.store_induced_ontology(uri_prefix, label, graph, matches)
-
-        novel_count = sum(1 for m in matches if m.match_type == "novel" and m.source_column == "")
-        grounding = list(
-            {
-                m.matched_class_uri.rsplit("#", 1)[0]
-                for m in matches
-                if m.matched_class_uri and m.match_type in ("exact", "high_confidence")
-            }
-        )
-
-        report = InductionReport(
-            job_id="",  # filled by caller
-            ontology_uri_prefix=uri_prefix,
-            tables_processed=len(tables),
-            columns_processed=sum(len(t.columns) for t in tables),
-            matches=matches,
-            novel_classes_created=novel_count,
-            grounding_ontologies_used=grounding,
-            induced_ontology_id=stored.get("id"),
-            induced_ontology_uri=uri_prefix,
-        )
-        return report, graph
-
-
-def _cardinality_restriction(g: Graph, prop_uri: URIRef, cardinality_type: URIRef, value: int):
-    """Create an anonymous OWL restriction node for cardinality."""
-    from rdflib import BNode
-
-    restriction = BNode()
-    g.add((restriction, RDF.type, OWL.Restriction))
-    g.add((restriction, OWL.onProperty, prop_uri))
-    g.add((restriction, cardinality_type, Literal(value, datatype=XSD.nonNegativeInteger)))
-    return restriction
-
-
-def _label_from_uri(uri: str) -> str:
-    """Extract a human-readable label from a URI's local name."""
-    local = uri.rsplit("#", 1)[-1].rsplit("/", 1)[-1]
-    # Split camelCase: 'dateCreated' → 'date Created'
-    import re
-
-    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", local).lower()
-
-
-def _to_pascal(s: str) -> str:
-    r"""ASCII-only PascalCase for the retired :meth:`InductionPipeline.build_ontology`.
-
-    Deletes every character outside ``[a-zA-Z0-9\s_\-]`` and has no ``Entity``
-    fallback, so a non-Latin or symbol-only name becomes ``""``. It is NOT the
-    service's normalizer. Mint IRIs with
-    :func:`~coa_ontology.inducer.strategies.base.pascal_names_for` /
-    :func:`~coa_ontology.inducer.strategies.base.camel_names_for` instead.
-    """
-    return "".join(w.capitalize() for w in re.split(r"[\s_\-]+", re.sub(r"[^a-zA-Z0-9\s_\-]", "", s)) if w)
-
-
-def _to_camel(name: str) -> str:
-    """Return camelCase for the retired :meth:`InductionPipeline.build_ontology`.
-
-    Splits only on ``_`` and ``-`` and keeps every other character, symbols
-    included. Nothing dedupes the result, so names that differ only in case mint
-    one local name. Mint IRIs with
-    :func:`~coa_ontology.inducer.strategies.base.camel_names_for` instead.
-    """
-    parts = name.replace("-", "_").split("_")
-    return parts[0].lower() + "".join(w.capitalize() for w in parts[1:])

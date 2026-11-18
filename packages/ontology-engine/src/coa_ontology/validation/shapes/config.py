@@ -19,7 +19,7 @@ from rdflib.namespace import RDF
 
 # Reuse the canonical SQL→XSD map + naming helpers rather than redefining them
 # (they lived in 3+ places). ``base.py`` owns the authoritative copies.
-from coa_ontology.inducer.services.data_catalog import parse_referred_column
+from coa_ontology.inducer.services.data_catalog import parse_referred_column, parse_referred_schema
 from coa_ontology.inducer.strategies.base import ambiguous_target_names as _ambiguous_target_names
 from coa_ontology.inducer.strategies.base import camel_names_for as _camel_names_for
 from coa_ontology.inducer.strategies.base import composite_fk_anchors as _composite_fk_anchors
@@ -107,6 +107,12 @@ class ConstraintConfig(BaseModel):
 # ── Config generation from DB constraints ─────────────────────────────────
 
 
+def _fk_target_tuple(ref: str, target_datasource_id: str | None) -> tuple[str, str | None, str | None, str]:
+    """``(target table, target datasource id, target column, named schema or "")`` of one FK reference."""
+    target_name, target_col = parse_referred_column(ref)
+    return target_name, target_datasource_id, target_col, parse_referred_schema(ref)
+
+
 def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
     """Produce a ConstraintConfig from CatalogTable constraints (deterministic)."""
     ns_str = uri_prefix
@@ -126,12 +132,13 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
 
         pk_cols: set[str] = set()
         unique_cols: set[str] = set()
-        # column -> the FK targets it carries: (target table name, target datasource id).
-        # EVERY gate-passing single-column FK (#1088 follow-up), through the same
+        # column -> the FK targets it carries: (target table name, target datasource id,
+        # target column, schema the reference names or "").
+        # EVERY gate-passing single-column FK, through the same
         # selection the ontology and the mapping use, so the shape asserts
         # sh:class on exactly the properties those two artifacts made references —
         # and nothing on a withheld (pending/rejected) relationship.
-        fk_targets: dict[str, list[tuple[str, str | None, str | None]]] = {}
+        fk_targets: dict[str, list[tuple[str, str | None, str | None, str]]] = {}
 
         if table.tableConstraints:
             for tc in table.tableConstraints:
@@ -153,19 +160,14 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                     continue
                 if not _fk_edge_allowed(tc.relationshipType, tc.reviewStatus):
                     continue
-                fk_target, fk_target_col = parse_referred_column(tc.referredColumns[0])
-                fk_targets[anchor_col] = [(fk_target, tc.targetDatasourceId, fk_target_col)]
+                fk_targets[anchor_col] = [_fk_target_tuple(tc.referredColumns[0], tc.targetDatasourceId)]
             for col in table.columns:
                 if col.name in absorbed or col.name in fk_targets:
                     continue
                 simple = _simple_fk_constraints(table, col.name)
                 if simple:
                     fk_targets[col.name] = [
-                        (
-                            parse_referred_column(tc.referredColumns[0])[0],  # type: ignore[index]
-                            tc.targetDatasourceId,
-                            parse_referred_column(tc.referredColumns[0])[1],  # type: ignore[index]
-                        )
+                        _fk_target_tuple(tc.referredColumns[0], tc.targetDatasourceId)  # type: ignore[index]
                         for tc in simple
                     ]
 
@@ -185,12 +187,12 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
             resolved: list[
                 tuple[str, str, str, str | None, str | None]
             ] = []  # (class IRI, target local, target name, target column, target ds)
-            for fk_target_name, target_ds, target_col in fk_targets.get(col.name, []):
+            for fk_target_name, target_ds, target_col, target_schema in fk_targets.get(col.name, []):
                 target_local: str | None = None
                 # The relationship's targetDatasourceId goes to the SAME resolver the
                 # ontology and the mapping use, so sh:class names the table they do
                 # (and nothing when several same-named tables sit in that datasource).
-                target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index, target_ds)
+                target_id = _resolve_fk_target_identity(table, fk_target_name, ref_index, target_ds, target_schema)
                 if target_id in pascal_by_id:
                     target_local = pascal_by_id[target_id]
                 elif fk_target_name in ambiguous_names:
@@ -200,14 +202,16 @@ def generate_config_from_db(tables, uri_prefix: str) -> ConstraintConfig:
                     target_local = None
                 else:
                     # Genuinely outside this run: the target table is not
-                    # minted this run. A sh:class pointing at a bare ind:<Target>
+                    # minted this run (or, for a schema-qualified reference, not in
+                    # the schema it names; see ``resolve_fk_target_identity``).
+                    # A sh:class pointing at a bare ind:<Target>
                     # that is never declared asserts a class-typed reference the
                     # mapping emits as a literal — a false-positive violation on
                     # every row. Degrade to the datatype constraint, mirroring the
                     # ontology's range and the R2RML parentTriplesMap.
                     _log.warning(
                         "fk_target_out_of_run_degraded_to_literal",
-                        extra={"referrer": table.name, "target": fk_target_name},
+                        extra={"referrer": table.name, "target": fk_target_name, "schema": target_schema},
                     )
                     target_local = None
                 if target_local is not None:

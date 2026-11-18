@@ -9,11 +9,9 @@ from unittest.mock import MagicMock
 
 import pytest
 from botocore.exceptions import ClientError
-from coa_common.language_tags import LanguageTagError
+from coa_common.language_tags import LanguageTagError, describe_language, needs_language_instruction
 from coa_sources.namespace_language import (
     NamespaceNotFoundError,
-    describe_language,
-    needs_language_instruction,
     require_language_snapshot,
     resolve_namespace_language,
 )

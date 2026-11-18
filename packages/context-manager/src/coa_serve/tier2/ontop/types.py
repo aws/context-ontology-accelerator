@@ -18,11 +18,7 @@ from typing import Any
 
 @dataclass
 class VectorHit:
-    """A typed vector search result for the Ontop Tier-2 path.
-
-    Extends the base search hit with entity type information needed
-    for routing (metric vs ontology_class vs ontology_property).
-    """
+    """A typed vector search result for the Ontop Tier-2 path."""
 
     type: str  # "metric", "ontology_class", "ontology_property"
     score: float

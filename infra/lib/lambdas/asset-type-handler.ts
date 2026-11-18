@@ -150,22 +150,11 @@ async function pinnedFormRevision(
 
 /**
  * Update: make the asset type pin the form-type revision CloudFormation just
- * produced.
- *
- * A changed form model (e.g. a new optional member) yields a new form-type
- * revision, but assets validate against the forms their asset type pins.
- * Create's "ConflictException means it already exists" shortcut would report
- * SUCCESS while the asset type kept pinning the old revision, so Update
- * instead:
- *   1. returns immediately when the asset type already pins the target
- *      revision (idempotent re-runs and unrelated property changes);
- *   2. otherwise calls CreateAssetType with the same name, which records a
- *      new asset-type revision pinning the new form revision;
- *   3. re-reads the asset type and fails the update (so CloudFormation rolls
- *      back) unless the new revision is pinned. It never reports a
- *      propagation that did not happen.
- * The physical resource id is unchanged, so CloudFormation never issues a
- * Delete for the existing asset type.
+ * produced. Assets validate against the form revision their asset type pins,
+ * so Create's "ConflictException means it already exists" shortcut would
+ * report a stale pin as success. Instead, call CreateAssetType again to record
+ * a new revision, then re-read and fail (rolling back) unless it is pinned.
+ * The physical resource id is unchanged.
  */
 async function handleUpdate(
   event: CloudFormationCustomResourceEvent,

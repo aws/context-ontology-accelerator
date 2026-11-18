@@ -34,7 +34,8 @@ with the wrong type or outside its documented range is rejected with `400`
 rather than clamped or ignored.
 
 Options:
-- `execute: false` — return the generated SQL without executing it
+- `execute` — accepted but not yet honoured: with `execute: false` the query
+  still runs. To get the generated SQL, use `includeDebugInfo`
 - `tierOverride` — force a specific resolution tier (integer 1–3)
 - `mode` — choose the execution policy: the Standard tier cascade or Deep
   Reasoning (see below)
@@ -52,7 +53,10 @@ Options:
   [Schema-blind callers](#schema-blind-callers) for everything else such a
   caller sees differently. The Playground always requests them, so every role
   holding the right sees the SQL/SPARQL under **Compiled artifacts** by default
-  and a `data-analyst` never does.
+  and a `data-analyst` never does. The MCP `query` tool does the same: its
+  `includeDebugInfo` parameter defaults to `true` (a `null` value also means
+  the default) and goes through the same serve check. Send `false` to leave
+  both fields out. REST and streaming requests default to `false`.
 - `includeLlmUsage` — include provider-reported text-LLM token usage in
   `result.llmUsage`. Usage is grouped by exact model ID so an external
   reporting layer can apply its own versioned prices. It contains no prompts,
@@ -108,7 +112,7 @@ final `done` event — see below.)
 
 A caller without `viewSource` or `viewOntology` on the namespace — the built-in
 `data-analyst` role — gets results, the synthesized answer and confidence, but no
-schema. On both REST and streaming:
+schema. On REST, streaming and MCP:
 
 - **Debug and context fields are empty.** `queryUsed`, `sparqlGenerated`,
   `metadata.retrieved_tables` / `expanded_tables`, `graphContext` entities and
@@ -836,10 +840,27 @@ and `entityFilter` are not supported yet: a non-empty value is rejected with
 `400` rather than returning unfiltered chunks.
 
 `GraphTraverse` requires `startUri`, an absolute `http(s)` IRI or a `urn:` name
-of at most 2048 characters. `maxDepth` (1–5, default 2; depths above 2 currently
-traverse 2 hops) and `maxResults` (1–1000 entities, default 100) are applied.
-`direction` and `relationshipFilter` are validated but not yet applied:
-traversal currently follows every relationship in both directions.
+of at most 2048 characters. Traversal follows edges up to `maxDepth` hops from
+`startUri` (1–5, default 2) and returns at most `maxResults` entities (1–1000,
+default 100), the same results for the same request. Every hop follows
+`direction` (`outgoing`, `incoming`, or `both`, default `both`) and, when
+`relationshipFilter` is non-empty, only the listed predicates; otherwise every
+predicate except `rdf:type` and `rdfs:label` is followed. A `relationshipFilter`
+value that is not an absolute `http(s)` IRI or a `urn:` name matches no
+predicate. XSD, RDF, RDFS and OWL terms such as `xsd:string` or `owl:Thing` are
+never visited, so a shared datatype does not link unrelated classes.
+
+The response lists the discovered entities, not `startUri` itself. Each entity's
+`label` is its `rdfs:label` in the namespace language, or `""` when it has none.
+Traversal reads the namespace's published ontology graphs (those that declare an
+`owl:Ontology`) and its governed-metrics graph.
+
+Two ceilings bound a response. Every entity admitted at one depth is expanded at
+the next, but a request returns at most `maxResults` × 20 relationships (at
+least 50, at most 5,000); once that many are found, traversal stops, so entities
+reachable only beyond them are not returned. The whole traversal shares a
+25-second budget, and a traversal that cannot finish within it fails with
+`DataSourceUnavailableError` instead of returning a partial result.
 
 Query responses expose graph evidence in `graphContext`, using the existing
 Smithy shape:

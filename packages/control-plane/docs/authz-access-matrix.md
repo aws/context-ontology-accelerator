@@ -364,6 +364,6 @@ SQL Firewall ──► safety check (SELECT-only, dangerous funcs)
 - **Independent enforcement points.** The Cedar layer runs at the edge (authorizer Lambda); the data layer runs deep in the request flow inside `context-manager`. Bypassing one does not bypass the other.
 - **Sparse, opt-in.** Data-level restrictions are optional fields on a grant. When they are absent, only the Cedar layer applies — every query allowed at the action level is also allowed at the data layer.
 - **Case-insensitive comparisons.** SQL identifiers are case-insensitive for unquoted names; the firewall normalizes both query references and profile entries to lower-case so casing variations cannot bypass the rules.
-- **Fail-closed.** Parse failures, `SELECT *` over a restricted table, or malformed grant profiles all deny. See `packages/context-manager/src/coa_serve/tier2/sql_firewall.py`.
+- **Fail-closed.** Parse failures, `SELECT *` or a whole-row reference (`to_json(c)`) over a restricted table, a table function or pass-through query (`TABLE(system.query(...))`, refused for every caller), or malformed grant profiles all deny. See `packages/context-manager/src/coa_serve/tier2/sql_firewall.py`.
 
 For the field schema and DynamoDB persistence, see [Grants API — Data Access Restrictions](../README.md#grants-api--data-access-restrictions) and the `ResourceRoleMappings` table docs.
