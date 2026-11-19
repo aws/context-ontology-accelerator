@@ -48,3 +48,14 @@ class TestLogToolInvocation:
         assert event["log_level"] == "warning"
         assert event["success"] is False
         assert event["error"] == "boom"
+
+    @pytest.mark.parametrize("flag", [True, False])
+    def test_include_debug_info_recorded_when_given(self, flag):
+        with structlog.testing.capture_logs() as logs:
+            log_tool_invocation(_caller(), "query", "sales", include_debug_info=flag)
+        assert logs[0]["include_debug_info"] is flag
+
+    def test_include_debug_info_absent_for_other_tools(self):
+        with structlog.testing.capture_logs() as logs:
+            log_tool_invocation(_caller(), "list_metrics", "sales")
+        assert "include_debug_info" not in logs[0]

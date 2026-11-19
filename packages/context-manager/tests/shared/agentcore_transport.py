@@ -6,11 +6,8 @@
 Extracted here (outside ``tests/integ/``) so the unit suite can pin its retry
 behaviour in environments where integ tests are stripped (the public mirror).
 
-Each suite used to carry its own ``requests.post(...).iter_lines()`` loop, and they
-had drifted: the conftest retried gateway 5xx before the response, but a read timeout
-raised while CONSUMING the stream escaped it, and the session/streaming/metric suites
-retried nothing at all. That is how one slow microVM failed tests as
-``ConnectionError: Read timed out`` and one gateway blip as ``HTTPError: 504``.
+Retry covers gateway 5xx and connection or read failures, including a read timeout
+raised while consuming the stream.
 
 Retry is whole-request: a failed attempt's partial frames are discarded and the POST
 is re-issued, so callers never see a stitched stream. That is safe for what these

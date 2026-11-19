@@ -113,14 +113,11 @@ class TestUpdateActivity:
         tbl.update_item.assert_called_once()
         call_kwargs = tbl.update_item.call_args[1]
 
-        # UpdateExpression must use the alias, not the raw attribute name
         assert "#nsla = :nsc" in call_kwargs["UpdateExpression"]
         assert "nsLastActiveAt = :nsc" not in call_kwargs["UpdateExpression"]
 
-        # ExpressionAttributeNames must define the alias
         assert call_kwargs["ExpressionAttributeNames"]["#nsla"] == "nsLastActiveAt"
 
-        # ExpressionAttributeValues must include the composite value
         assert ":nsc" in call_kwargs["ExpressionAttributeValues"]
         composite = call_kwargs["ExpressionAttributeValues"][":nsc"]
         assert composite.startswith("ns-1#")
@@ -133,7 +130,6 @@ class TestUpdateActivity:
         tbl.update_item.assert_called_once()
         call_kwargs = tbl.update_item.call_args[1]
 
-        # Neither the alias nor the raw name should appear
         assert "#nsla" not in call_kwargs["UpdateExpression"]
         assert "nsLastActiveAt" not in call_kwargs["UpdateExpression"]
         assert ":nsc" not in call_kwargs["ExpressionAttributeValues"]
@@ -167,13 +163,9 @@ class TestDelete:
 
 @pytest.fixture
 def moto_store():
-    """A SessionMetadataStore backed by a REAL (moto) DynamoDB table.
+    """A SessionMetadataStore backed by a moto DynamoDB table.
 
-    The MagicMock-based tests above never execute the UpdateExpression, so a malformed
-    expression passes them. This fixture runs update_item against a real table so DynamoDB
-    validates the expression syntax — the only way to catch the ADD/SET clause-ordering
-    bug where a SET assignment appended after "ADD messageCount :inc" is rejected with
-    ValidationException.
+    DynamoDB parses the UpdateExpression here; the MagicMock tests never execute it.
     """
     with mock_aws():
         ddb = boto3.resource("dynamodb", region_name="us-east-1")
@@ -195,13 +187,10 @@ def moto_store():
 
 @pytest.mark.asyncio
 class TestUpdateActivityAgainstRealTable:
-    """Execute update_activity against a real DynamoDB (moto) so the UpdateExpression
-    is actually parsed — catches the SET-after-ADD clause-ordering ValidationException."""
+    """Execute update_activity against moto so DynamoDB parses the UpdateExpression."""
 
     async def test_update_activity_with_namespace_is_valid_expression(self, moto_store):
-        """Regression: a namespaced update must build a VALID UpdateExpression (all SET
-        assignments contiguous, ADD last). Before the fix this raised
-        ValidationException: Syntax error; token: '=', near: '#nsla = :nsc'."""
+        """A namespaced update builds a valid UpdateExpression (SET clauses contiguous, ADD last)."""
         created = await moto_store.create("user-1", namespace_id="ns-1")
         # Must not raise — this is the exact call _persist_turn makes on every turn.
         await moto_store.update_activity("user-1", created.session_id, namespace_id="ns-1")

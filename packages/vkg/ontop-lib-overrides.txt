@@ -12,6 +12,32 @@
 # and swaps it in for every bundled lib/<artifactId>-<version>.jar, refusing to
 # replace a bundled JAR newer than the pin. Drop an entry once a newer Ontop
 # release bundles that version or later.
+#
+# Residual CVEs, accepted as risk until Ontop moves off Spring Boot 2.7. The
+# JARs below are already at the last open-source release of their line on Maven
+# Central (Spring Framework is pinned to it below; spring-boot, micrometer and
+# logback are bundled at it), and the fixes ship only in the next major version (Spring 6 / Boot 3
+# move javax to jakarta, logback 1.3 needs SLF4J 2, Micrometer 1.10+ drops the
+# Boot 2.7 actuator contract), so swapping them in would break Ontop 5.5.0.
+#   spring-core/-context/-expression/-web/-webmvc 5.3.39 (e.g. CVE-2016-1000027,
+#     CVE-2026-47884, CVE-2024-38816, CVE-2024-38819, CVE-2025-41249,
+#     CVE-2026-41842..41853)
+#   spring-boot, -autoconfigure, -starter-actuator 2.7.18 (CVE-2025-22235,
+#     CVE-2026-40973, CVE-2026-41001, CVE-2026-22733)
+#   micrometer-core 1.9.17 (CVE-2026-40984)
+#   logback-core 1.2.13 (CVE-2024-12798, CVE-2025-11226)
+# Exposure: task definitions registered by VkgStack and the vkg-reload Lambda
+# bind Spring to 127.0.0.1 (-Dserver.address, infra/lib/stacks/services/vkg-stack.ts),
+# and port 8081 is in neither the port mappings nor the security group; the image
+# itself does not enforce the bind (entrypoint.sh passes ONTOP_JAVA_ARGS through).
+# External input reaches it only through translate-server.py,
+# which relays a caller's SPARQL as the urlencoded query parameters of the fixed
+# path /ontop/reformulate. The other local callers are the /actuator/health
+# probes in translate-server.py and entrypoint.sh, which send no caller input.
+# Callers can't choose the path, so the path-based CVEs (CVE-2024-38816,
+# CVE-2024-38819) are not reachable. The others have not been ruled out one by
+# one against the query-parameter path; they are accepted on the loopback bind
+# and the single fixed path. Revisit with each Ontop release.
 org/apache/tomcat/embed/tomcat-embed-core/9.0.122/tomcat-embed-core-9.0.122.jar d89e48fc2835102846988d3cdb9d833f61e1934e5e46440697b6f0cc24923455
 org/apache/tomcat/embed/tomcat-embed-el/9.0.122/tomcat-embed-el-9.0.122.jar cd9fd2b078ec8129134669a9a6bd71c87d87b5e3d4f39dbc328e85342b90bfc6
 org/apache/tomcat/embed/tomcat-embed-websocket/9.0.122/tomcat-embed-websocket-9.0.122.jar e15e6fae2eb07536d545e2d38a8ff71522d91c136be71a55d70f7397a780ad98

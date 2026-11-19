@@ -68,7 +68,10 @@ describe("NamespaceStack", () => {
         Name: "CoaRelationalTable",
         FormName: "CoaTableMetadata",
         FormRevision: {
-          "Fn::GetAtt": [Match.stringLikeRegexp("CoaTableMetadataForm"), "Revision"],
+          "Fn::GetAtt": [
+            Match.stringLikeRegexp("CoaTableMetadataForm"),
+            "Revision",
+          ],
         },
       });
     });
@@ -91,7 +94,6 @@ describe("NamespaceStack", () => {
   });
 
   it("wires only the create-operation Lambda(s) to the idempotency table", () => {
-    // IDEMPOTENCY_TABLE env + Get/Put/Update/DeleteItem on that table only.
     expectIdempotencyWiring(template, ["-namespace-api", "-grants-api"]);
   });
 
@@ -189,26 +191,12 @@ describe("NamespaceStack", () => {
     expect(domains[domainKey].Properties).not.toHaveProperty("SingleSignOn");
   });
 
-  // ── DataZone teardown ─────────────────────────────────────
-
   test("every native DataZone L1 resource has RemovalPolicy.RETAIN", () => {
-    // DataZone rejects deleting these directly via CFN: a FormType must
-    // be DISABLED before DeleteFormType succeeds; a domain's native
-    // DeleteDomain has no force/cascade option and fails outright with
-    // "Domain cannot be deleted because there are existing projects
-    // under this domain" — and a namespace-created project always
-    // exists under this domain while any namespace does, so that's not
-    // an edge case (confirmed against a real stuck stack — see PR
-    // discussion). The native CfnDomain/CfnFormType/CfnProject/... L1
-    // resources have no delete hook to handle any of this, so cdk
-    // destroy fails and leaves the stack DELETE_FAILED. RETAIN means CFN
-    // never attempts to delete these itself; destroy.sh instead calls
-    // DataZone's own delete-domain --skip-deletion-check directly, which
-    // does support a full cascading force-delete at the domain level
-    // (unlike DeleteProject's cascade, which stops at cross-project
-    // asset-type references). This does not apply to CoaRelationalTable
-    // (AWS::DataZone::AssetType has no native CFN resource at all, so it
-    // must remain a custom resource regardless).
+    // DataZone rejects direct CFN deletes: a FormType must be DISABLED
+    // before DeleteFormType, and DeleteDomain fails while any project exists.
+    // The L1 resources have no delete hook, so RETAIN keeps CFN from trying;
+    // destroy.sh calls delete-domain --skip-deletion-check instead.
+    // CoaRelationalTable is a custom resource (no native CFN AssetType).
     const RETAINED_TYPES = [
       "AWS::DataZone::Domain",
       "AWS::DataZone::UserProfile",
@@ -338,6 +326,152 @@ describe("NamespaceStack", () => {
       `:role/${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-*`,
     );
     expect(resourceStr).not.toContain(":role/*");
+  });
+
+  // The smus-exec-policy's statements, for the PassRole and DataZone tests below.
+  const smusExecStatements = (): any[] => {
+    const policy = Object.values(
+      template.findResources("AWS::IAM::ManagedPolicy", {
+        Properties: {
+          ManagedPolicyName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-smus-exec-policy`,
+        },
+      }),
+    )[0] as any;
+    expect(policy).toBeDefined();
+    return policy.Properties.PolicyDocument.Statement;
+  };
+
+  const actionsOf = (stmt: any): string[] =>
+    Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+
+  const domainsInThisAccountAndRegion = {
+    "Fn::Join": [
+      "",
+      [
+        "arn:aws:datazone:",
+        { Ref: "AWS::Region" },
+        ":",
+        { Ref: "AWS::AccountId" },
+        ":domain/*",
+      ],
+    ],
+  };
+
+  // Whether an IAM action pattern (with * and ? wildcards) matches an action,
+  // case-insensitively as IAM does, so `iam:Pass*` counts as a PassRole grant.
+  const grants = (pattern: string, action: string): boolean =>
+    new RegExp(
+      "^" +
+        pattern
+          .split("")
+          .map((c) =>
+            c === "*"
+              ? ".*"
+              : c === "?"
+                ? "."
+                : c.replace(/[.+^${}()|[\]\\]/g, "\\$&"),
+          )
+          .join("") +
+        "$",
+      "i",
+    ).test(action);
+
+  test("domain execution role custom policy conditions every PassRole on PassedToService", () => {
+    const passRoleStatements = smusExecStatements().filter(
+      (stmt) =>
+        stmt.Effect === "Allow" &&
+        actionsOf(stmt).some((a) => grants(a, "iam:PassRole")),
+    );
+    expect(passRoleStatements.length).toBeGreaterThan(0);
+
+    for (const stmt of passRoleStatements) {
+      // Exactly the SMUS services, under StringEquals: widening the list to
+      // lambda or ec2 would let the role hand itself to arbitrary compute.
+      expect(Object.keys(stmt.Condition ?? {})).toEqual(["StringEquals"]);
+      const services: string[] =
+        stmt.Condition.StringEquals["iam:PassedToService"];
+      expect([...services].sort()).toEqual([
+        "athena.amazonaws.com",
+        "datazone.amazonaws.com",
+        "glue.amazonaws.com",
+        "lakeformation.amazonaws.com",
+        "sagemaker.amazonaws.com",
+      ]);
+      // ...and only the execution role itself, never the prefixed wildcard
+      // that would cover the Lake Formation admin and data-access roles.
+      const resourceStr = JSON.stringify(stmt.Resource);
+      expect(resourceStr).toContain(
+        `:role/${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-smus-exec"`,
+      );
+      expect(resourceStr).not.toContain("*");
+    }
+  });
+
+  test("domain execution role PassRole names the role this stack creates", () => {
+    // The grant and the role share one name; if they drifted, the role could
+    // not pass itself and nothing would fail until runtime.
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: {
+        RoleName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-smus-exec`,
+      },
+    });
+    expect(Object.keys(roles)).toHaveLength(1);
+  });
+
+  test("domain execution role custom policy grants no DataZone domain lifecycle or delete actions", () => {
+    const granted = smusExecStatements()
+      .filter((stmt) => stmt.Effect === "Allow")
+      .flatMap(actionsOf);
+    for (const forbidden of [
+      "datazone:CreateDomain",
+      "datazone:UpdateDomain",
+      "datazone:DeleteDomain",
+      "datazone:ListDomains",
+      "datazone:DeleteProject",
+      "datazone:DeleteEnvironment",
+    ]) {
+      // Matched as patterns, so datazone:* or datazone:Delete* also fails.
+      expect(granted.filter((pattern) => grants(pattern, forbidden))).toEqual(
+        [],
+      );
+    }
+  });
+
+  test("domain execution role custom policy still grants the DataZone project and environment actions SMUS needs", () => {
+    const statement = smusExecStatements().find(
+      (stmt) => stmt.Sid === "DataZoneProjectEnvironment",
+    );
+    expect(statement).toBeDefined();
+    expect([...actionsOf(statement)].sort()).toEqual([
+      "datazone:CreateEnvironment",
+      "datazone:CreateProject",
+      "datazone:GetEnvironment",
+      "datazone:GetProject",
+      "datazone:UpdateEnvironment",
+      "datazone:UpdateProject",
+    ]);
+    // DataZone authorizes these against the domain ARN, so they are scoped
+    // like GetDomain rather than granted on every domain in the account.
+    expect(statement.Resource).toEqual(domainsInThisAccountAndRegion);
+  });
+
+  test("domain execution role grants no DataZone action on Resource *", () => {
+    const unscoped = smusExecStatements().filter(
+      (stmt) =>
+        stmt.Effect === "Allow" &&
+        actionsOf(stmt).some((a) => a.toLowerCase().startsWith("datazone:")) &&
+        JSON.stringify(stmt.Resource) === JSON.stringify("*"),
+    );
+    expect(unscoped).toEqual([]);
+  });
+
+  test("domain execution role GetDomain is scoped to domains in this account and region", () => {
+    const statement = smusExecStatements().find(
+      (stmt) => stmt.Sid === "DataZoneDomainRead",
+    );
+    expect(statement).toBeDefined();
+    expect(actionsOf(statement)).toEqual(["datazone:GetDomain"]);
+    expect(statement.Resource).toEqual(domainsInThisAccountAndRegion);
   });
 
   test("domain execution role custom policy has scoped SageMaker resources", () => {
@@ -587,6 +721,38 @@ describe("NamespaceStack", () => {
     template.hasResourceProperties("AWS::SSM::Parameter", {
       Name: `/${DEFAULT_RESOURCE_PREFIX}/smus/dz-project-access-role-arn`,
     });
+  });
+
+  test("lets same-account callers with tagged sessions assume dz-project-access", () => {
+    const roles = template.findResources("AWS::IAM::Role", {
+      Properties: {
+        RoleName: `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}-dz-project-access`,
+      },
+    });
+    const [role] = Object.values(roles);
+    expect(role).toBeDefined();
+    // A session with transitive tags can only assume a role whose trust policy
+    // also allows sts:TagSession. The principal stays this account only.
+    expect(role.Properties.AssumeRolePolicyDocument.Statement).toEqual([
+      {
+        Effect: "Allow",
+        Action: ["sts:AssumeRole", "sts:TagSession"],
+        Principal: {
+          AWS: {
+            "Fn::Join": [
+              "",
+              [
+                "arn:",
+                { Ref: "AWS::Partition" },
+                ":iam::",
+                { Ref: "AWS::AccountId" },
+                ":root",
+              ],
+            ],
+          },
+        },
+      },
+    ]);
   });
 
   test("NamespaceApiFn is granted read-only Query on the sources table ByNamespace GSI for the active-sources precondition check", () => {

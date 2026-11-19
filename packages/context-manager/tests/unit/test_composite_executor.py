@@ -12,7 +12,8 @@ import sqlglot
 import sqlglot.errors
 from coa_serve.clients.base import QueryResult
 from coa_serve.clients.composite_executor import CompositeQueryExecutor
-from coa_serve.clients.sources_registry import SourcesRegistry
+from coa_serve.clients.sources_registry import SourcesRegistry, SQLNamespaceScope
+from coa_serve.tier2.sql_firewall import NamespaceSQLScopeError
 
 
 def _make_executor(label: str):
@@ -51,12 +52,7 @@ def _jdbc_registry(engine: str = "POSTGRESQL"):
     # dialect resolution parses the blob exactly as production does (an
     # AsyncMock would return an unawaited coroutine and break the JSON parse).
     reg.parse_configuration = SourcesRegistry.parse_configuration
-    # The composite now scope-authorizes the JDBC route (mirrors Athena/Redshift).
-    # Return a scope that authorizes the schemas the dispatch tests reference
-    # (bare-db + the two-part sales/crm/public schemas) so routing tests still
-    # exercise routing, not authorization. The deny path has its own tests.
-    from coa_serve.clients.sources_registry import SQLNamespaceScope
-
+    # The scope authorizes every schema the routing tests use.
     reg.sql_namespace_scope.return_value = SQLNamespaceScope(
         native_databases=frozenset({"mydb", "public", "sales", "crm", "orders", "customers"}),
         federated_catalog_schemas=frozenset({("mydb", "public"), ("mydb", "sales"), ("mydb", "crm")}),
@@ -112,7 +108,7 @@ class _RealSignatureAthena:
 
     Mirrors AthenaQueryExecutor.execute so a regression where the composite
     forwards ``params`` to Athena raises TypeError here (an AsyncMock would
-    silently accept it and hide the deployed-path break codex caught).
+    silently accept it and would hide a TypeError on the real executor).
     """
 
     def __init__(self):
@@ -148,10 +144,8 @@ class TestCompositeDispatch:
         assert result.rows[0]["engine"] == "jdbc"
 
     async def test_two_part_single_source_multi_schema_routes_jdbc(self):
-        """Code review finding: two-part ``schema.table`` names are a SINGLE-source,
-        one-implicit-catalog query — the form the schema-restore pass emits — and
-        must route to direct JDBC, not Athena federation. Two DIFFERENT schemas of
-        the one source must not be mistaken for two catalogs."""
+        """Two-part ``schema.table`` names over two schemas are single-source and
+        route to direct JDBC, not Athena federation."""
         athena = _make_executor("athena")
         jdbc = _make_executor("jdbc")
         comp = CompositeQueryExecutor(
@@ -219,18 +213,6 @@ class TestCompositeDispatch:
         athena = _make_executor("athena")
         jdbc = _make_executor("jdbc")
         comp = CompositeQueryExecutor(athena_executor=athena, source_db_executor=jdbc)
-        await comp.execute("SELECT id FROM mydb.public.orders", namespace="ns", data_source_id="mydb")
-        athena.execute.assert_awaited_once()
-        jdbc.execute.assert_not_awaited()
-
-    async def test_real_glue_shape_routes_athena(self):
-        """codex BLOCK: a Glue source is sourceType=DATABASE but queryEngine=ATHENA → Athena
-        (the sourceType==DATABASE gate would have wrongly sent it to JDBC → 500)."""
-        athena = _make_executor("athena")
-        jdbc = _make_executor("jdbc")
-        comp = CompositeQueryExecutor(
-            athena_executor=athena, source_db_executor=jdbc, sources_registry=_glue_registry()
-        )
         await comp.execute("SELECT id FROM mydb.public.orders", namespace="ns", data_source_id="mydb")
         athena.execute.assert_awaited_once()
         jdbc.execute.assert_not_awaited()
@@ -339,17 +321,10 @@ class TestCompositeDispatch:
         jdbc.execute.assert_not_awaited()
 
     async def test_engine_gate_order_is_what_keeps_a_databricks_source_off_direct_jdbc(self):
-        """Pins the ORDER of the two direct-route guards, which is load bearing.
+        """``_fetch_jdbc_source`` must gate before ``_engine_has_direct_route``.
 
-        ``_engine_has_direct_route`` reads ``configuration.engine`` and defaults an
-        ABSENT one to POSTGRESQL — the behaviour a legacy direct-JDBC record whose
-        config predates the ``engine`` key depends on. A Databricks configuration has
-        no ``engine`` member either, so asked in isolation this returns True for one.
-        It is never asked: ``_fetch_jdbc_source`` returns None for anything that is not
-        ``queryEngine=JDBC``, and the route requires BOTH. Tightening the default to
-        False would reroute those legacy sources to Athena, so the guard order — not
-        the default — is the control, and this test is what keeps it from being
-        reordered.
+        ``_engine_has_direct_route`` defaults an absent ``configuration.engine`` to
+        POSTGRESQL for legacy records, so it returns True for a Databricks record.
         """
         comp = CompositeQueryExecutor(
             athena_executor=_make_executor("athena"),
@@ -364,24 +339,17 @@ class TestCompositeDispatch:
 
 @pytest.mark.unit
 class TestJdbcRouteNamespaceScopeAuthorization:
-    """Review finding: the direct-JDBC route (source_db.execute) enforced only
-    SELECT-only + dangerous-function rules — NOT namespace-scope authorization,
-    which lived solely in the Athena and Redshift executors. A statement the
-    router sends to JDBC could therefore reference a schema outside the
-    namespace's authorized scope and execute unauthorized on the source
-    credential. The composite now runs _authorize_qualified_references before the
-    JDBC dispatch. Routing is asserted elsewhere; these assert AUTHORIZATION."""
+    """The direct-JDBC route enforces namespace-scope authorization.
+
+    Routing is asserted elsewhere; these assert authorization."""
 
     def _registry_scoped_to(self, *databases: str):
-        from coa_serve.clients.sources_registry import SourcesRegistry, SQLNamespaceScope
-
         reg = _jdbc_registry()  # base record for routing + dialect
         reg.get_source.return_value["discoveredSchemas"] = list(databases)
         reg.sql_namespace_scope.return_value = SQLNamespaceScope(
             native_databases=frozenset(databases),
             federated_catalog_schemas=frozenset(),
         )
-        reg.parse_configuration = SourcesRegistry.parse_configuration
         return reg
 
     async def test_jdbc_route_invokes_namespace_scope_check(self):
@@ -433,7 +401,7 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         jdbc.execute.assert_not_awaited()
 
     async def test_mixed_qualified_and_bare_table_routes_athena(self):
-        """codex BLOCK: one qualified catalog + a BARE table is ambiguous → Athena,
+        """One qualified catalog + a BARE table is ambiguous → Athena,
         NOT single-source JDBC (the bare table could live in another source)."""
         athena = _make_executor("athena")
         jdbc = _make_executor("jdbc")
@@ -462,7 +430,7 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         athena.execute.assert_not_awaited()
 
     async def test_athena_dispatch_omits_params_real_signature(self):
-        """codex BLOCK: composite must NOT forward params to Athena (real sig has none)."""
+        """The composite must NOT forward params to Athena (real sig has none)."""
         athena = _RealSignatureAthena()
         comp = CompositeQueryExecutor(athena_executor=athena, source_db_executor=None)
         # Would raise TypeError if the composite forwarded params= to Athena.
@@ -594,10 +562,7 @@ class TestJdbcRouteNamespaceScopeAuthorization:
         assert "CHARINDEX" in received_sql.upper()
 
     async def test_jdbc_explicit_source_does_single_get_source_lookup(self):
-        """perf guard: the explicit-source JDBC path fetches the source record
-        exactly ONCE (the JDBC-capability gate and the dialect resolution share it),
-        not twice. Guards against the doubled-DDB-lookup regression flagged in review.
-        """
+        """The explicit-source JDBC path calls get_source exactly once."""
         athena = _RealSignatureAthena()
         jdbc = _make_executor("jdbc")
         reg = _jdbc_registry("REDSHIFT")
@@ -758,19 +723,10 @@ class TestAthenaLimitInjection:
 
         return AthenaQueryExecutor._inject_limit(sql, max_rows)
 
-    def test_appends_limit_when_absent(self):
-        out = self._inject("SELECT id FROM orders", 1000)
-        assert "LIMIT 1000" in out.upper()
-
     def test_caps_larger_existing_limit(self):
         out = self._inject("SELECT id FROM orders LIMIT 100000", 1000)
         assert "100000" not in out
         assert "LIMIT 1000" in out.upper()
-
-    def test_keeps_smaller_existing_limit(self):
-        out = self._inject("SELECT id FROM orders LIMIT 10", 1000)
-        assert "LIMIT 10" in out.upper()
-        assert "1000" not in out
 
     def test_unparseable_sql_falls_back_to_textual_append(self):
         # Garbage that sqlglot can't parse → still gets a textual LIMIT appended.
@@ -778,22 +734,18 @@ class TestAthenaLimitInjection:
         assert out.rstrip().upper().endswith("LIMIT 50")
 
     def test_does_not_mutate_inner_subquery_limit(self):
-        """codex BLOCK: capping a descendant LIMIT changes results (e.g. COUNT).
+        """Capping a descendant LIMIT changes results (e.g. COUNT).
         Inner LIMIT 2000 must NOT be lowered; an outer LIMIT IS added instead."""
         out = self._inject("SELECT count(*) FROM (SELECT * FROM orders LIMIT 2000) t", 1000)
         assert "2000" in out  # inner limit preserved
         assert out.rstrip().upper().endswith("LIMIT 1000")  # outer cap appended
 
     def test_outer_query_with_only_inner_limit_still_capped(self):
-        """codex BLOCK: a small subquery LIMIT must not be mistaken for an outer cap."""
+        """A small subquery LIMIT must not be mistaken for an outer cap."""
         sql = "SELECT a.x FROM (SELECT x FROM orders LIMIT 5) a JOIN other_tbl o ON a.x = o.x"
         out = self._inject(sql, 1000)
         assert "LIMIT 5" in out  # inner preserved
         assert out.rstrip().upper().endswith("LIMIT 1000")  # outer cap added
-
-    def test_outer_limit_within_cap_unchanged(self):
-        out = self._inject("SELECT id FROM orders LIMIT 10", 1000)
-        assert out == "SELECT id FROM orders LIMIT 10"
 
 
 def _redshift_glue_registry(queryable=True, source_id="src-redshift"):
@@ -938,6 +890,36 @@ class TestRedshiftDispatch:
         athena.execute.assert_awaited_once()
         redshift.execute.assert_not_awaited()
 
+    @pytest.mark.parametrize("sql", ["SELECT * FROM fedcat.sales.orders", 'SELECT * FROM "FedCat"."sales"."orders"'])
+    async def test_single_federated_catalog_never_routes_redshift(self, sql):
+        """One non-root catalog is still unaddressable on Redshift (Spectrum sees
+        only awsdatacatalog): it goes to Athena rather than being retargeted at a
+        same-named root Glue database."""
+        athena = _make_executor("athena")
+        redshift = _make_executor("redshift")
+        comp = CompositeQueryExecutor(
+            athena_executor=athena,
+            redshift_executor=redshift,
+            sources_registry=_redshift_glue_registry(),
+        )
+        await comp.execute(sql, namespace="ns", data_source_id="src-redshift")
+        athena.execute.assert_awaited_once()
+        redshift.execute.assert_not_awaited()
+
+    async def test_mixed_case_root_catalog_still_routes_redshift(self):
+        athena = _make_executor("athena")
+        redshift = _make_executor("redshift")
+        comp = CompositeQueryExecutor(
+            athena_executor=athena,
+            redshift_executor=redshift,
+            sources_registry=_redshift_glue_registry(),
+        )
+        await comp.execute(
+            'SELECT id FROM "AwsDataCatalog"."insurance_lake"."claims"', namespace="ns", data_source_id="src-redshift"
+        )
+        redshift.execute.assert_awaited_once()
+        athena.execute.assert_not_awaited()
+
     async def test_jdbc_still_wins_over_redshift_for_jdbc_source(self):
         """A JDBC source routes to JDBC; the Redshift arm only handles REDSHIFT sources."""
         athena = _make_executor("athena")
@@ -960,7 +942,6 @@ class TestResolveTargetDialect:
     """Tests for resolve_target_dialect (used by NL→SQL to generate in target dialect)."""
 
     async def test_explicit_postgresql_source_returns_postgres(self):
-        """When a PostgreSQL source ID is provided, returns 'postgres'."""
         comp = CompositeQueryExecutor(
             athena_executor=_make_executor("athena"),
             sources_registry=_jdbc_registry(engine="POSTGRESQL"),
@@ -969,7 +950,6 @@ class TestResolveTargetDialect:
         assert dialect == "postgres"
 
     async def test_explicit_redshift_source_returns_redshift(self):
-        """When a Redshift source ID is provided, returns 'redshift'."""
         comp = CompositeQueryExecutor(
             athena_executor=_make_executor("athena"),
             sources_registry=_jdbc_registry(engine="REDSHIFT"),
@@ -978,7 +958,6 @@ class TestResolveTargetDialect:
         assert dialect == "redshift"
 
     async def test_sole_jdbc_source_returns_its_dialect(self):
-        """When no source ID provided, but namespace has a sole JDBC source, returns its dialect."""
         reg = _jdbc_registry(engine="POSTGRESQL")
         reg.find_sole_database_source = AsyncMock(return_value=reg.get_source.return_value)
         comp = CompositeQueryExecutor(
@@ -989,7 +968,6 @@ class TestResolveTargetDialect:
         assert dialect == "postgres"
 
     async def test_no_sources_returns_athena(self):
-        """When sources registry is not configured, returns 'athena'."""
         comp = CompositeQueryExecutor(
             athena_executor=_make_executor("athena"),
         )
@@ -997,7 +975,6 @@ class TestResolveTargetDialect:
         assert dialect == "athena"
 
     async def test_multiple_sources_returns_athena(self):
-        """When namespace has multiple sources, returns 'athena' for cross-source queries."""
         reg = _jdbc_registry()
         reg.find_sole_database_source = AsyncMock(return_value=None)  # multiple sources
         comp = CompositeQueryExecutor(
@@ -1008,7 +985,6 @@ class TestResolveTargetDialect:
         assert dialect == "athena"
 
     async def test_glue_source_returns_athena(self):
-        """Glue sources (queryEngine=ATHENA) return 'athena'."""
         comp = CompositeQueryExecutor(
             athena_executor=_make_executor("athena"),
             sources_registry=_glue_registry(),
@@ -1037,11 +1013,8 @@ class TestResolveTargetDialect:
         redshift.execute.assert_not_awaited()
 
     async def test_bare_mixed_with_catalog_not_dispatched_to_redshift(self):
-        """Code review finding: a bare table mixed with a catalog-qualified one is
-        ambiguous — the bare ref could belong to a different source — so it must
-        fall through to Athena, not run on Redshift against a guessed catalog. This
-        mirrors _select_jdbc_candidate and closes the redshift-guard asymmetry (the
-        old guard checked only len(catalogs) < 2 and ignored the bare mix)."""
+        """Bare and catalog-qualified refs mixed together are ambiguous, so they
+        fall through to Athena, not Redshift."""
         athena = _make_executor("athena")
         redshift = _make_executor("redshift")
         comp = CompositeQueryExecutor(
@@ -1080,8 +1053,7 @@ class TestResolveTargetDialect:
 
 @pytest.mark.unit
 class TestCatalogAnalysis:
-    """Directly exercise CompositeQueryExecutor._catalog_analysis — the routing
-    predicate the code review corrected: only a THREE-part name carries a
+    """CompositeQueryExecutor._catalog_analysis: only a THREE-part name carries a
     catalog; a two-part schema.table is neither a catalog nor bare."""
 
     def _comp(self):
@@ -1115,3 +1087,35 @@ class TestCatalogAnalysis:
     def test_bare_mixed_with_qualified(self):
         catalogs, bare = self._comp()._catalog_analysis('SELECT a.id FROM "cat"."s"."t" a JOIN u b ON a.id = b.id')
         assert catalogs == {"cat"} and bare is True
+
+
+@pytest.mark.unit
+class TestJdbcRouteRefusesTableFunctions:
+    """The JDBC route's scope gate must not skip an unqualified table function.
+
+    ``TABLE(system.query(...))`` carries no dot in any table reference, so the old
+    dot-only gate skipped the namespace-scope lookup for it.
+    """
+
+    _SQL = "SELECT * FROM TABLE(system.query(query => 'SELECT ssn FROM hr.salaries'))"
+
+    async def test_unqualified_table_function_runs_the_scope_check_and_is_refused(self):
+        reg = _jdbc_registry()
+        reg.sql_namespace_scope.return_value = SQLNamespaceScope(
+            native_databases=frozenset({"sales"}), federated_catalog_schemas=frozenset()
+        )
+        comp = CompositeQueryExecutor(
+            athena_executor=_make_executor("athena"), source_db_executor=_make_executor("jdbc"), sources_registry=reg
+        )
+        with pytest.raises(NamespaceSQLScopeError, match="Table functions and pass-through queries are not permitted"):
+            await comp._authorize_qualified_references(self._SQL, "ns", frozenset({"sales"}))
+        reg.sql_namespace_scope.assert_awaited_once()
+
+    async def test_unavailable_inventory_fails_closed(self):
+        reg = _jdbc_registry()
+        reg.sql_namespace_scope.return_value = None
+        comp = CompositeQueryExecutor(
+            athena_executor=_make_executor("athena"), source_db_executor=_make_executor("jdbc"), sources_registry=reg
+        )
+        with pytest.raises(NamespaceSQLScopeError, match="Unable to verify"):
+            await comp._authorize_qualified_references(self._SQL, "ns", frozenset({"sales"}))

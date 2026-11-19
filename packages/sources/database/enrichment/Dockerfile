@@ -30,14 +30,21 @@ COPY smithy-generated/control-plane-python-server/ /tmp/server/
 RUN pip install --no-cache-dir /tmp/server/ && rm -rf /tmp/server/
 
 # Install the database package, then remediate scanner findings in the SAME final layer:
-# upgrade pip + setuptools (CVE-2025-47273; build toolchain, not a declared dep), and
+# upgrade setuptools (CVE-2025-47273; build toolchain, not a declared dep), and
 # REMOVE msgpack — an orphan that nothing imports or declares (verified via grep +
 # pipdeptree --reverse), pulled in transiently and left behind. `pip uninstall -y` is a
 # no-op exit 0 if it is absent, so this stays safe.
+# pip is NOT upgraded: installs run on the python3.12-pip RPM; see scripts/pip_sbom_check.py for why.
 COPY packages/sources/ /tmp/sources/
 RUN pip install --no-cache-dir /tmp/sources/ && rm -rf /tmp/sources/ && \
-    pip install --no-cache-dir --upgrade pip "setuptools>=78.1.1" && \
+    pip install --no-cache-dir --upgrade "setuptools>=78.1.1" && \
     pip uninstall -y msgpack
+
+# Prefer IPv4 unless built with PREFER_IPV4=false. In a dual-stack subnet
+# without IPv6 egress to AWS, IPv6-first connects stall for minutes, long
+# enough to expire a request's SigV4 signature. Kept before USER (needs root).
+ARG PREFER_IPV4=true
+RUN if [ "$PREFER_IPV4" = "true" ]; then echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf; fi
 
 USER 1000
 
@@ -45,4 +52,8 @@ USER 1000
 # llama_index is optional: coa_common.embeddings imports it lazily, for kg-build and serve only.
 COPY scripts/image_import_check.py /tmp/
 RUN python /tmp/image_import_check.py coa_sources.database.pipeline.enrichment_handler --optional llama_index
+
+# Fail the build if the image's python can import a pip with a vendored SBOM (scripts/pip_sbom_check.py).
+COPY scripts/pip_sbom_check.py /tmp/
+RUN python /tmp/pip_sbom_check.py
 ENTRYPOINT ["python", "-m", "coa_sources.database.pipeline.enrichment_handler"]

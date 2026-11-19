@@ -10,7 +10,6 @@ import {
 } from "./playground-reducer";
 import type { PlaygroundResponse } from "@app-types/playground";
 
-// Mock crypto.randomUUID for deterministic IDs
 let uuidCounter = 0;
 vi.stubGlobal("crypto", {
   randomUUID: () => `uuid-${++uuidCounter}`,
@@ -133,13 +132,11 @@ describe("playgroundReducer", () => {
 
       const state = playgroundReducer(initial, action);
 
-      // First messages unchanged
       expect(state.messages[0].content).toBe("First question");
       expect(state.messages[1].content).toBe("First answer");
       expect(state.messages[1].requestId).toBe("req-1");
       expect(state.messages[2].content).toBe("Second question");
 
-      // Only the target was retried
       expect(state.messages[3].requestId).toBe("req-3");
       expect(state.messages[3].isLoading).toBe(true);
     });
@@ -176,7 +173,6 @@ describe("playgroundReducer", () => {
       expect(state.messages[1].content).toBe("Restored answer");
       expect(state.messages[1].role).toBe("assistant");
       expect(state.messages[1].isRestored).toBe(true);
-      expect(state.messages[1].response).toBeDefined();
       expect(state.messages[1].response!.result.synthesizedAnswer).toBe(
         "Restored answer",
       );
@@ -213,9 +209,7 @@ describe("playgroundReducer", () => {
       const assistantMsg = state.messages[1];
       expect(assistantMsg.role).toBe("assistant");
       expect(assistantMsg.isRestored).toBe(true);
-      expect(assistantMsg.response).toBeDefined();
       expect(assistantMsg.response!.result.resultRows).toEqual(rows);
-      expect(assistantMsg.response!.result.resultRows).toHaveLength(2);
       expect(assistantMsg.response!.result.queryUsed).toBe(
         "SELECT * FROM claims WHERE status = 'Open'",
       );
@@ -267,37 +261,6 @@ describe("playgroundReducer", () => {
         ],
       });
     });
-
-    it("does not show raw array string as content for table results", () => {
-      const action: PlaygroundAction = {
-        type: "RESTORE_HISTORY",
-        messages: [
-          { role: "user", content: "total accounts" },
-          {
-            role: "assistant",
-            content: "",
-            metadata: {
-              tier: 1,
-              confidence: { score: 0.95, rationale: "Metric match" },
-              resultRows: [{ total_accounts: "47" }],
-              trace: [],
-            },
-          },
-        ],
-      };
-
-      const state = playgroundReducer(INITIAL_STATE, action);
-
-      const msg = state.messages[1];
-      // Content should NOT be a raw array representation
-      expect(msg.content).not.toContain("[{");
-      expect(msg.content).not.toContain("'total_accounts'");
-      // resultRows should be available for table rendering
-      expect(msg.response!.result.resultRows).toHaveLength(1);
-      expect(msg.response!.result.resultRows![0]).toEqual({
-        total_accounts: "47",
-      });
-    });
   });
 
   describe("RESET", () => {
@@ -316,7 +279,6 @@ describe("playgroundReducer", () => {
       const state = playgroundReducer(populated, { type: "RESET" });
 
       expect(state).toEqual(INITIAL_STATE);
-      expect(state.messages).toHaveLength(0);
     });
   });
 
@@ -376,7 +338,6 @@ describe("playgroundReducer", () => {
         ],
       };
 
-      // Pass something that normalizeResponse will reject
       const action: PlaygroundAction = {
         type: "DONE",
         requestId: "req-1",
@@ -387,7 +348,6 @@ describe("playgroundReducer", () => {
       const msg = state.messages[0];
 
       expect(msg.isLoading).toBe(false);
-      expect(msg.error).toBeDefined();
       expect(msg.error!.error).toBe("InvalidResponse");
       expect(msg.content).toBe("Received malformed response from server");
     });

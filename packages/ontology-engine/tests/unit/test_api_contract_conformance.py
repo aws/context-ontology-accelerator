@@ -215,9 +215,6 @@ def test_guard_detects_an_unbound_parameter():
     assert unbound == ["phantomParam"]
 
 
-# ── Route-bound parameters the model does not declare ────────────────────────
-
-
 def _undeclared(method: str, smithy_path: str, params: list[str]) -> list[str]:
     """Query parameters the route binds that the operation does not declare (after renaming)."""
     proxy = _proxy()
@@ -255,9 +252,6 @@ def test_guard_detects_an_undeclared_route_parameter():
     (op,) = [op for op in _engine_operations() if op[0] == "ListOntologies"]
     _, method, smithy_path, params = op
     assert "uri" in _undeclared(method, smithy_path, [p for p in params if p != "uri"])
-
-
-# ── List-operation response envelopes ────────────────────────────────────────
 
 
 def _list_operations() -> list[tuple[str, str, str]]:

@@ -1,17 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Steward-reviewed metadata reaches the ontology and the NL→SQL context (#1167).
+"""Steward-reviewed metadata reaches the ontology and the NL→SQL context.
 
 The review screen lets a steward approve a table's and its columns' description,
-synonyms, glossary terms, tags, primary key and relationships. Before this change
-glossary terms and tags were dropped when the catalog was projected for induction,
-a foreign-key column's description never reached the ontology, and the NL→SQL
-class text carried neither the class hierarchy nor the primary key that Ontop
-already uses. These tests pin each hop:
+synonyms, glossary terms, tags, primary key and relationships. These tests pin each hop:
 
 * catalog → induction input (``_catalog_to_tables``)
 * induction → ontology (``table_to_ontology`` and the RIGOR strategy)
-* re-accept supersession (glossary terms and tags follow the #1118 rule)
+* re-accept supersession (glossary terms and tags follow the approved-wins rule)
 * ontology → NL→SQL context (``_accumulate_embeddings`` class text)
 """
 
@@ -228,7 +224,7 @@ def test_rigor_stamps_approved_metadata_and_replaces_the_llm_description():
     strategy = RigorOntologyStrategy()
     strategy._stamp_catalog_metadata(g, PREFIX, tables, pascal_names_for(tables))
 
-    # Approved description wins over the LLM's (one description per term, #1118).
+    # Approved description wins over the LLM's (one description per term).
     assert _literals(g, NS.Orders, RDFS.comment) == {"Customer orders"}
     assert _literals(g, NS.status, RDFS.comment) == {"Fulfilment state"}
     assert _literals(g, NS.Orders, SKOS.altLabel) == {"purchases"}
@@ -284,7 +280,7 @@ def test_rigor_keeps_the_llm_key_when_the_catalog_key_does_not_resolve():
 
 
 def test_glossary_terms_and_tags_are_superseded_on_re_accept():
-    """Removing a term during review must remove it from the ontology (#1118 rule)."""
+    """Removing a term during review must remove it from the ontology."""
     assert _SUPERSEDED_ANNOTATION_PREDICATES[GLOSSARY_TERM] == SCL.supersededGlossaryTerm
     assert _SUPERSEDED_ANNOTATION_PREDICATES[TAG] == SCL.supersededTag
 
@@ -388,7 +384,7 @@ def test_nl_to_sql_column_term_hints_are_capped_per_kind():
 
 
 def test_nl_to_sql_embedding_text_keeps_its_shape_plus_table_glossary_terms():
-    """The vector input gains only the table's glossary terms (review of #1167).
+    """The vector input gains only the table's glossary terms.
 
     Enrichment fills synonyms, glossary terms and tags for nearly every column, so
     per-column hints, tags, the key and the parent stay in the stored context text

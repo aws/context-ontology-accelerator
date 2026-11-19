@@ -53,15 +53,7 @@ def _matches_model(e: dict, model_id: str | None) -> bool:
 
 @router.post("/", response_model=EmbeddingResponse, status_code=201)
 def store_embedding(body: EmbeddingCreate, namespace: str = "default"):
-    """Store a single entity embedding in the namespace's vector store.
-
-    Args:
-        body: The embedding to store.
-        namespace: The namespace to store the embedding under.
-
-    Returns:
-        The stored embedding's metadata.
-    """
+    """Store a single entity embedding in the namespace's vector store."""
     payload = {**body.model_dump(), "namespace": namespace}
     result = _vec(namespace).store_embedding(payload)
     # store_embedding returns the stored doc; preserve caller-provided dims
@@ -71,15 +63,7 @@ def store_embedding(body: EmbeddingCreate, namespace: str = "default"):
 
 @router.post("/batch", response_model=list[EmbeddingResponse], status_code=201)
 def store_embeddings_batch(body: EmbeddingBatchCreate, namespace: str = "default"):
-    """Store a batch of entity embeddings in the namespace's vector store.
-
-    Args:
-        body: The batch of embeddings to store.
-        namespace: The namespace to store the embeddings under.
-
-    Returns:
-        The stored embeddings' metadata, one per input item.
-    """
+    """Store a batch of entity embeddings in the namespace's vector store."""
     items = [{**e.model_dump(), "namespace": namespace} for e in body.embeddings]
     results = _vec(namespace).store_embeddings_batch(items)
     # Preserve caller-provided dimensions per item (stored doc may omit)
@@ -96,18 +80,7 @@ def get_embeddings_for_entity(
     model_id: str | None = None,
     namespace: str = "default",
 ):
-    """Return all embeddings (with vectors) for a given entity URI.
-
-    Args:
-        entity_uri: The entity whose embeddings to fetch.
-        entity_type: Optional filter by entity type (class/property).
-        embedding_type: Optional filter by embedding type (lexical/structural).
-        model_id: Optional filter to embeddings produced by this model.
-        namespace: The namespace to query.
-
-    Returns:
-        The matching embeddings, each including its vector.
-    """
+    """Return all embeddings (with vectors) for a given entity URI."""
     rows = _vec(namespace).get_embeddings_for_entity(
         entity_uri=entity_uri,
         entity_type=entity_type,
@@ -141,20 +114,7 @@ def list_embeddings_for_ontology(
     limit: int = 100,
     namespace: str = "default",
 ):
-    """List embeddings for an ontology, filtered and paginated.
-
-    Args:
-        ontology_id: The ontology whose embeddings to list.
-        entity_type: Optional filter by entity type (class/property).
-        embedding_type: Optional filter by embedding type (lexical/structural).
-        model_id: Optional filter to embeddings produced by this model.
-        skip: Number of results to skip (pagination offset).
-        limit: Maximum number of results to return.
-        namespace: The namespace to query.
-
-    Returns:
-        The matching embeddings' metadata for the requested page.
-    """
+    """List embeddings for an ontology, filtered and paginated."""
     rows = _vec(namespace).list_embeddings_for_ontology(
         ontology_id,
         entity_type=entity_type,
@@ -167,15 +127,7 @@ def list_embeddings_for_ontology(
 
 @router.post("/search", response_model=list[EmbeddingWithVectorResponse])
 def search_nearest(body: EmbeddingQuery, namespace: str = "default"):
-    """Run a k-nearest-neighbor vector search over the namespace's embeddings.
-
-    Args:
-        body: The query vector plus embedding/model/entity filters and ``top_k``.
-        namespace: The namespace to search within.
-
-    Returns:
-        The nearest embedding hits, each including its vector.
-    """
+    """Run a k-nearest-neighbor vector search over the namespace's embeddings."""
     hits = _vec(namespace).search_nearest(
         vector=body.vector,
         embedding_type=body.embedding_type,

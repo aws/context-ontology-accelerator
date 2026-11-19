@@ -57,16 +57,8 @@ export function toParserForm(raw: string): string {
 }
 
 /**
- * Predict the class name a label will end up as in the graph.
- *
- * Labels are sent to the extractor **verbatim** — graphrag-toolkit imposes no
- * format on the preferred list, so we do not rewrite the user's spelling. But the
- * toolkit *does* title-case whatever the LLM emits
- * (`format_classification`, `topic_utils.py:112`), so the stored class can differ
- * from what was typed. Returning that difference lets the UI show it instead of
- * silently letting the two diverge.
- *
- * Returns `null` when the label round-trips unchanged.
+ * Predict the class name a label ends up as in the graph; `null` when
+ * unchanged. See the module comment.
  */
 export function predictStoredForm(raw: string): string | null {
   const trimmed = raw.trim();
@@ -181,7 +173,7 @@ export function validateTopic(
 }
 
 /**
- * Number of labels beyond which prompt adherence measurably degrades. Advisory
- * only — the API imposes no list-length cap.
+ * Number of labels beyond which prompt adherence measurably degrades. An
+ * advisory threshold below the API cap.
  */
 export const RECOMMENDED_MAX_LABELS = 40;

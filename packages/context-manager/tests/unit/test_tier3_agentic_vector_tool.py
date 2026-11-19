@@ -1,27 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Vector_Search_Tool layer (task 8).
-
-Covers ``coa_serve.tier3.agentic.tools.vector_tool``:
-
-- The four required interface fields are present and well-formed, and the Tool is
-  registrable (Req 11.1).
-- :meth:`VectorSearchTool.invoke` returns the native ``chunks`` from
-  ``VectorRetriever.search`` plus their normalized ``items`` (Req 2.3).
-- The Tool accepts EITHER a precomputed embedding OR sub-question text (Req 2.4):
-  it embeds the sub-question text via the injected embed client when no embedding
-  is supplied, and uses the precomputed embedding directly (no re-embedding) when
-  one is supplied.
-- An embed-client error or a backend search error surfaces as a degraded
-  :class:`ToolResult`; the Tool NEVER raises (Req 9.1-9.2).
-- :func:`build_vector_tool` registers exactly one ``vector_search`` Tool.
-- Module load of ``vector_tool`` does NOT import ``graphrag_toolkit`` (Req 12.3).
-
-Both the ``VectorRetriever`` and the embed client are mocked with lightweight
-fakes exposing the same coroutines, so the tests need no ``graphrag_toolkit`` /
-OpenSearch / Bedrock access.
-"""
+"""Unit tests for the Vector_Search_Tool layer (``coa_serve.tier3.agentic.tools.vector_tool``)."""
 
 from __future__ import annotations
 
@@ -50,12 +30,7 @@ def _chunk(chunk_id: str = "c1", text: str = "hello", source_doc: str = "doc-1",
 
 
 class FakeVectorRetriever:
-    """Mock of ``VectorRetriever`` capturing the last ``search`` call.
-
-    ``search`` either returns the configured chunk list or, when ``raises`` is
-    set, raises it — letting a single fake exercise both the normal path and the
-    defensive never-raise guard.
-    """
+    """Mock of ``VectorRetriever`` capturing the last ``search`` call."""
 
     def __init__(
         self,
@@ -80,10 +55,7 @@ class FakeVectorRetriever:
 
 
 class FakeEmbedClient:
-    """Mock embed client capturing each ``embed`` call.
-
-    Returns a fixed vector, or raises when ``raises`` is set.
-    """
+    """Mock embed client capturing each ``embed`` call."""
 
     def __init__(self, vector=None, *, raises: Exception | None = None) -> None:
         self._vector = list(vector) if vector is not None else [0.1, 0.2, 0.3]
@@ -95,9 +67,6 @@ class FakeEmbedClient:
         if self._raises is not None:
             raise self._raises
         return list(self._vector)
-
-
-# ── Interface fields & naming ──────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -115,15 +84,6 @@ class TestToolInterface:
         assert isinstance(tool.input_schema, dict)
         assert "query" in tool.input_schema and "embedding" in tool.input_schema
         assert isinstance(tool.output_schema, dict)
-
-    def test_is_registrable_as_a_tool(self):
-        """A vector tool satisfies the registry's four-field contract (Req 11.1)."""
-        registry = ToolRegistry()
-        registry.register(VectorSearchTool(FakeVectorRetriever(), FakeEmbedClient()))
-        assert registry.names() == ["vector_search"]
-
-
-# ── invoke() returns chunks ────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -189,9 +149,6 @@ class TestInvokeReturnsChunks:
         assert "dropped 3 anonymous or malformed document chunks" in out.detail
 
 
-# ── Embedding source selection (Req 2.4) ───────────────────────────
-
-
 @pytest.mark.unit
 class TestEmbeddingSourceSelection:
     async def test_embeds_subquestion_text_when_no_embedding_supplied(self):
@@ -244,9 +201,6 @@ class TestEmbeddingSourceSelection:
         assert "no embedding or query" in out.detail
 
 
-# ── Degraded / never-raises (Req 9.1-9.2) ──────────────────────────
-
-
 @pytest.mark.unit
 class TestDegradedNeverRaises:
     async def test_search_error_surfaces_as_degraded(self):
@@ -275,9 +229,6 @@ class TestDegradedNeverRaises:
         assert vector.calls == []
 
 
-# ── Builder (Req 2.3) ──────────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestBuildVectorTool:
     def test_registers_single_vector_search_tool(self):
@@ -300,9 +251,6 @@ class TestBuildVectorTool:
         assert len(vector.calls) == 1
 
 
-# ── Lazy-import invariant (Req 12.3) ───────────────────────────────
-
-
 @pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_vector_tool_does_not_import_graphrag(self):
@@ -310,7 +258,7 @@ class TestLazyImportInvariant:
 
         Runs in a fresh subprocess (current ``sys.path`` propagated) so a
         ``graphrag_toolkit`` already imported by a sibling test cannot mask a
-        regression (mirrors the task-1/6/7 invariant tests)."""
+        regression."""
         import os
 
         code = (

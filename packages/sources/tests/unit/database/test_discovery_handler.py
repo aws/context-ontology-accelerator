@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
+from coa_common.dao import DynamoDBDAO
 from coa_common.domain_models import (
     BusinessMetadata,
     Column,
@@ -23,6 +29,7 @@ from coa_sources.database.connectors.base import (
     ConnectionTestResult,
 )
 from coa_sources.database.errors import PermanentScanError, TransientScanError
+from moto import mock_aws
 
 from tests.unit.conftest import dao_double
 
@@ -52,6 +59,18 @@ def reset_singletons():
     mod._ns_dao = None
 
 
+# The account the Glue sources below declare in ``catalogId`` — pinned as this
+# deployment's own, so they are ordinary same-account sources.
+_LOCAL_ACCOUNT = "123456789012"
+
+
+@pytest.fixture(autouse=True)
+def local_account(monkeypatch):
+    import coa_sources.database.connectors.glue_connection_provisioner as prov
+
+    monkeypatch.setattr(prov, "_account_id", _LOCAL_ACCOUNT)
+
+
 class TestDiscoveryHandler:
     @patch(f"{MODULE}.write_to_datazone")
     @patch(f"{MODULE}._get_ns_dao")
@@ -63,7 +82,6 @@ class TestDiscoveryHandler:
             handler,
         )
 
-        # Mock DAOs
         mock_ds_dao = MagicMock()
         mock_ds_dao.get.return_value = {
             "sourceSubType": "GLUE_DATABASE",
@@ -82,7 +100,6 @@ class TestDiscoveryHandler:
         mock_ns_dao.get.return_value = {"dataZoneProjectId": "proj-123"}
         mock_get_ns.return_value = mock_ns_dao
 
-        # Mock connector
         mock_connector = MagicMock()
         mock_connector.test_connection.return_value = ConnectionTestResult(success=True, message="OK", checks=[])
         test_table = Table(
@@ -981,7 +998,7 @@ class TestDiscoveryHandler:
         the fresh scan equals live, so with the backup ignored the diff is empty —
         nothing is re-flagged, no new backup is written, no live asset is rewritten.
         If the stale backup were read, its added_tables entry would drop orders and
-        re-add it, manufacturing drift on a clean re-scan (the bug this fix closes)."""
+        re-add it, manufacturing drift on a clean re-scan."""
         import json as _json
 
         from coa_common.datazone_forms import serialize_form
@@ -1065,7 +1082,7 @@ class TestDiscoveryHandler:
 
 
 class TestGlueOwnershipGate:
-    """F-8: the last gate before the connector reads Glue, samples through Athena
+    """The last gate before the connector reads Glue, samples through Athena
     and (in strict-LF accounts) self-grants Lake Formation access.
 
     Re-checked here rather than trusted from source-create because this path is
@@ -1198,7 +1215,6 @@ class TestDiscoveryHandlerStatusLifecycle:
 
         handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1", "scanType": "full"}, None)
 
-        # First update call should set SCANNING
         first_update = mock_ds_dao.update.call_args_list[0]
         assert first_update[1]["update_fields"]["status"] == SourceStatus.SCANNING
 
@@ -1211,7 +1227,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
     ):
         """If DataZone asset writes exhaust their retries and the writer raises
-        (e.g. sustained TooManyRequestsException, issue #857), discovery must
+        (e.g. sustained TooManyRequestsException), discovery must
         still write a TERMINAL source status (SCAN_FAILED) — never leave the
         source stuck in SCANNING."""
         from coa_sources.database.pipeline.discovery_handler import handler
@@ -1261,7 +1277,7 @@ class TestDiscoveryHandlerStatusLifecycle:
         from coa_sources.database.pipeline.discovery_handler import handler
 
         mock_ds_dao = MagicMock()
-        mock_ds_dao.get.return_value = None  # Will cause ValueError
+        mock_ds_dao.get.return_value = None
         mock_get_ds.return_value = mock_ds_dao
 
         mock_scan_dao = dao_double()
@@ -1270,12 +1286,10 @@ class TestDiscoveryHandlerStatusLifecycle:
         with pytest.raises(PermanentScanError):
             handler({"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1"}, None)
 
-        # Data source status set to SCAN_FAILED
         ds_update = mock_ds_dao.update.call_args_list
         assert len(ds_update) == 1
         assert ds_update[0][1]["update_fields"]["status"] == SourceStatus.SCAN_FAILED
 
-        # errorMessage set on scan job
         scan_update = mock_scan_dao.update.call_args_list
         assert len(scan_update) == 1
         assert "errorMessage" in scan_update[0][1]["update_fields"]
@@ -1327,16 +1341,6 @@ class TestDiscoveryHandlerStatusLifecycle:
         fields = mock_scan_dao.update.call_args_list[0][1]["update_fields"]
         assert fields["errorMessage"] == hint
         assert fields["errorMessageClientSafe"] is True
-
-
-# ═══════════════════════════════════════════════════════════════════
-# _provision_athena_federation — error isolation + rollback
-# ═══════════════════════════════════════════════════════════════════
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MAX_TABLES_PER_SOURCE env-var parsing — cold-start safety
-# ═══════════════════════════════════════════════════════════════════
 
 
 class TestMaxTablesEnvParsing:
@@ -1514,7 +1518,7 @@ class TestCustomConnectorDiscovery:
         self, mock_get_connector, mock_get_ds, mock_get_scan, mock_get_ns, mock_write
     ):
         """A regex filter that matched nothing leaves the scan successful but unfiltered;
-        the reason must reach the scan job the steward sees (#168)."""
+        the reason must reach the scan job the steward sees."""
         from coa_sources.database.pipeline.discovery_handler import handler
 
         metadata = DiscoveredMetadata(
@@ -2295,3 +2299,153 @@ class TestRescanRestoresTablesBackToApproved:
         assert result["reviewNeeded"] == "true"
         mock_upload.assert_called_once()
         mock_s3_client.return_value.delete_object.assert_not_called()
+
+
+# Scan-run fence: a retry of a replaced run leaves the source alone
+
+# Scan-job SKs: the retrying run, and a re-scan started while Step Functions waited to retry it.
+_THIS_RUN = "2026-11-06T01:00:00.000000Z"
+_NEWER_RUN = "2026-11-06T01:00:20.000000Z"
+_SOURCE_KEY = {"PK": "NS#ns-1", "SK": "SRC#ds-1"}
+
+
+def _run_event() -> dict[str, Any]:
+    return {"datasourceId": "DS#ds-1", "scanJobId": "SCAN#s-1", "namespaceId": "ns-1", "scanJobSK": _THIS_RUN}
+
+
+@pytest.fixture()
+def sources_table() -> Iterator[Any]:
+    """A moto sources table behind discovery's DAO, so its conditions are really evaluated."""
+    with mock_aws():
+        table = boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="test-datasources",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("PK", "SK")],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        with (
+            patch(f"{MODULE}._get_ds_dao", return_value=DynamoDBDAO("test-datasources", region="us-east-1")),
+            patch(f"{MODULE}._get_scan_dao", return_value=dao_double()),
+        ):
+            yield table
+
+
+def _put_failed_source(table: Any, **fields: Any) -> None:
+    """The row as discovery's first failed attempt left it: SCAN_FAILED while Step Functions retries."""
+    table.put_item(
+        Item={
+            **_SOURCE_KEY,
+            "sourceSubType": "GLUE_DATABASE",
+            "configuration": "{}",
+            "status": SourceStatus.SCAN_FAILED,
+            "lastScanJobId": _THIS_RUN,
+            **fields,
+        }
+    )
+
+
+@patch(f"{MODULE}.get_connector", side_effect=RuntimeError("connection reset"))
+class TestDiscoveryOnlyWritesItsOwnRun:
+    def test_discovery_retry_after_newer_run_took_source_stops_without_writing(self, mock_get_connector, sources_table):
+        """A re-scan took the source between two attempts of an older run: the retry neither scans nor writes it."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        _put_failed_source(sources_table, status=SourceStatus.SCANNING, currentScanJobId=_NEWER_RUN)
+
+        with pytest.raises(PermanentScanError, match="newer scan"):
+            handler(_run_event(), None)
+
+        mock_get_connector.assert_not_called()
+        row = sources_table.get_item(Key=_SOURCE_KEY)["Item"]
+        assert row["status"] == SourceStatus.SCANNING
+        assert row["currentScanJobId"] == _NEWER_RUN
+
+    def test_discovery_retry_of_its_own_run_fails_the_source(self, mock_get_connector, sources_table):
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        _put_failed_source(sources_table, currentScanJobId=_THIS_RUN)
+
+        with pytest.raises(TransientScanError):
+            handler(_run_event(), None)
+
+        mock_get_connector.assert_called_once()
+        row = sources_table.get_item(Key=_SOURCE_KEY)["Item"]
+        assert row["status"] == SourceStatus.SCAN_FAILED
+        assert row["lastScanJobId"] == _THIS_RUN
+
+    def test_discovery_on_row_without_recorded_run_fails_the_source(self, mock_get_connector, sources_table):
+        """No run recorded: not fenced, so the source is failed."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        _put_failed_source(sources_table)
+
+        with pytest.raises(TransientScanError):
+            handler(_run_event(), None)
+
+        mock_get_connector.assert_called_once()
+        assert sources_table.get_item(Key=_SOURCE_KEY)["Item"]["status"] == SourceStatus.SCAN_FAILED
+
+    def test_discovery_failure_after_newer_run_took_source_mid_scan_leaves_it(self, mock_get_connector, sources_table):
+        """The race this fence is for: a re-scan takes the row after this attempt's SCANNING write."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        _put_failed_source(sources_table, currentScanJobId=_THIS_RUN)
+
+        def _rescan_then_fail(_sub_type: str) -> None:
+            sources_table.update_item(
+                Key=_SOURCE_KEY,
+                UpdateExpression="SET #run = :run, #st = :st",
+                ExpressionAttributeNames={"#run": "currentScanJobId", "#st": "status"},
+                ExpressionAttributeValues={":run": _NEWER_RUN, ":st": SourceStatus.SCANNING},
+            )
+            raise RuntimeError("connection reset")
+
+        mock_get_connector.side_effect = _rescan_then_fail
+
+        with pytest.raises(TransientScanError):
+            handler(_run_event(), None)
+
+        row = sources_table.get_item(Key=_SOURCE_KEY)["Item"]
+        assert row["status"] == SourceStatus.SCANNING
+        assert row["currentScanJobId"] == _NEWER_RUN
+
+    @pytest.mark.parametrize(
+        ("code", "level"), [("ConditionalCheckFailedException", logging.INFO), ("AccessDeniedException", logging.ERROR)]
+    )
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    def test_discovery_failure_write_error_is_logged_by_cause(
+        self, mock_get_ds, mock_get_scan, mock_get_connector, caplog, code, level
+    ):
+        """A failed fence is expected; any other DynamoDB error is logged as an error. Neither hides the scan error."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        ds_dao = dao_double()
+        ds_dao.get.return_value = {"sourceSubType": "GLUE_DATABASE", "configuration": "{}"}
+        ds_dao.update.side_effect = [True, ClientError({"Error": {"Code": code}}, "UpdateItem")]
+        mock_get_ds.return_value = ds_dao
+        mock_get_scan.return_value = dao_double()
+
+        with caplog.at_level(logging.INFO, logger=MODULE), pytest.raises(TransientScanError, match="connection reset"):
+            handler(_run_event(), None)
+
+        record = next(r for r in caplog.records if "SCAN_FAILED" in r.getMessage() or "left source" in r.getMessage())
+        assert record.levelno == level
+        assert "ds-1" in record.getMessage() and _THIS_RUN in record.getMessage()
+
+    @patch(f"{MODULE}._get_scan_dao")
+    @patch(f"{MODULE}._get_ds_dao")
+    def test_discovery_throttled_scanning_write_stays_retryable(self, mock_get_ds, mock_get_scan, mock_get_connector):
+        """Only a failed condition means another run owns the source; a throttle is still retried."""
+        from coa_sources.database.pipeline.discovery_handler import handler
+
+        ds_dao = dao_double()
+        ds_dao.get.return_value = {"sourceSubType": "GLUE_DATABASE", "configuration": "{}"}
+        ds_dao.update.side_effect = [ClientError({"Error": {"Code": "ThrottlingException"}}, "UpdateItem"), True]
+        mock_get_ds.return_value = ds_dao
+        mock_get_scan.return_value = dao_double()
+
+        with pytest.raises(TransientScanError):
+            handler(_run_event(), None)
+
+        mock_get_connector.assert_not_called()

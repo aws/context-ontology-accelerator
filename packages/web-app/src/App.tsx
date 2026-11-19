@@ -71,6 +71,7 @@ import {
   SUPPORTED_LOCALES,
 } from "./i18n/LocaleProvider";
 import { VersionBadge } from "@components/VersionBadge";
+import { namespaceSwitcherName } from "@utils/namespace-status";
 
 const DARK_MODE_KEY = "scl.darkMode";
 const DENSITY_KEY = "scl.densityCompact";
@@ -124,8 +125,14 @@ function AppShell() {
   const [densityCompact, setDensityCompact] = useState(initialCompact);
   const { locale, setLocale } = useLocale();
   const { t } = useAppI18n();
-  const { current, namespaces, setNamespace, namespaceId, isLoading } =
-    useCurrentNamespace();
+  const {
+    current,
+    namespaces,
+    setNamespace,
+    namespaceId,
+    isLoading,
+    unavailable,
+  } = useCurrentNamespace();
   const { state: splitPanelState, closePanel } = useSplitPanel();
   const { items: breadcrumbItems } = useBreadcrumbs();
   const {
@@ -281,22 +288,16 @@ function AppShell() {
   // identity. Keep the array stable across AppShell re-renders.
   const topNavUtilities: TopNavigationProps["utilities"] = useMemo(
     () => [
-      // The namespace switcher only makes sense once the user has
-      // navigated _into_ a namespace-scoped section. On the namespace
-      // list and create routes there is no "current" namespace, and
-      // surfacing the dropdown there confuses users into thinking
-      // they are viewing a namespace nested inside another. Hide it
-      // there to match the side-nav, which is also empty on those
-      // routes.
       ...(isNamespaceListRoute
         ? []
         : [
             {
               type: "menu-dropdown" as const,
               text: t("Namespace: {name}", {
-                name: isLoading
-                  ? `${t("Loading")}…`
-                  : (current?.displayName ?? current?.name ?? "—"),
+                name: namespaceSwitcherName(
+                  { isLoading, current, unavailable },
+                  t,
+                ),
               }),
               ariaLabel: t("Namespace switcher"),
               title: t("Namespace"),
@@ -418,8 +419,8 @@ function AppShell() {
     [
       isNamespaceListRoute,
       isLoading,
-      current?.displayName,
-      current?.name,
+      current,
+      unavailable,
       namespaces,
       setNamespace,
       darkMode,

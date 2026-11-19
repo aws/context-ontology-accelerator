@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import structlog
 from coa_authorization.schema_visibility import (
@@ -22,15 +22,20 @@ from coa_authorization.schema_visibility import (
     to_authorizer_flags,
 )
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import Field
 
 from .audit import log_tool_invocation
 from .auth.claims import CallerIdentity, ClaimsExtractionError, extract_caller_identity
 from .auth.grant_resolver import TOOL_CEDAR_ACTION, GrantResolutionError, resolve_grant
-from .clients.context_manager import ContextManagerClient
+from .clients.context_manager import (
+    RUNTIME_SESSION_HEADER,
+    ContextManagerClient,
+    ContextManagerError,
+    derive_runtime_session_id,
+)
 from .clients.lambda_client import LambdaClient
 from .config import MCPConfig
 from .tools import discovery, execution
-from .tools.execution import ContextManagerError
 
 logger = structlog.get_logger(__name__)
 
@@ -179,6 +184,44 @@ def _extract_bearer_token(ctx: Any) -> str:
     except (AttributeError, ValueError):
         pass
     raise ValueError("Bearer token extraction failed: no Authorization header found in request")
+
+
+def _mcp_session_id(ctx: Any) -> str | None:
+    """The MCP session of this tool call, from the inbound request headers; ``None`` when both are absent.
+
+    The server is ``stateless_http=True``, so the session is AgentCore's. ``Mcp-Session-Id`` is read first because
+    AgentCore routes MCP traffic on it; the inbound ``X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`` (the MCP
+    runtime's own session) is the fallback. Behind AgentCore one of them is normally present, so ``None`` (and the
+    caller-and-namespace key) is mostly a local or off-platform case.
+    """
+    if ctx is None:
+        return None
+    try:
+        request = ctx.request_context.request
+    except (AttributeError, ValueError):
+        return None
+    if request is None or not hasattr(request, "headers"):
+        return None
+    for header in ("mcp-session-id", RUNTIME_SESSION_HEADER.lower()):
+        value = (request.headers.get(header) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _cm_runtime_session_id(ctx: Any, caller: CallerIdentity, namespace_id: str) -> str:
+    """AgentCore runtime session id for this tool call's Context Manager invocation.
+
+    Keyed by the caller and the MCP session (``_mcp_session_id``: ``Mcp-Session-Id``, else the inbound runtime
+    session id), so the calls of one MCP session share one warm CM microVM and two users never share one.
+    ``SCL_CM_SESSION_SCOPE=caller``, or a request carrying neither header, keys by caller and namespace instead.
+    It only selects the microVM: the MCP tools never send the payload ``sessionId`` that keys the CM's
+    conversational memory, so each call stays independent. Parallel calls of one MCP session share the microVM;
+    the async CM entrypoint serves them, and ``ContextManagerClient.invoke`` retries AgentCore's 409
+    RetryableConflictException while a session is provisioned.
+    """
+    mcp_session_id = _mcp_session_id(ctx) if config.cm_session_scope == "mcp_session" else None
+    return derive_runtime_session_id(caller.user_id, mcp_session_id=mcp_session_id, namespace_id=namespace_id)
 
 
 def _build_authorizer_context(caller: CallerIdentity, profile: dict) -> dict:
@@ -359,6 +402,10 @@ QueryStrategyLiteral = Literal[
 ]
 
 
+# What the ``query`` tool does when ``includeDebugInfo`` is omitted or ``null``.
+_INCLUDE_DEBUG_INFO_DEFAULT = True
+
+
 @mcp.tool()
 async def query(
     ctx: Context,
@@ -370,6 +417,8 @@ async def query(
     strategy: QueryStrategyLiteral | None = None,
     dimensions: list[dict] | None = None,
     includeSupporting: bool = True,
+    # Strict, so "no" or 0 cannot be misread. ``null`` means the default, for clients that send it.
+    includeDebugInfo: Annotated[bool | None, Field(strict=True)] = _INCLUDE_DEBUG_INFO_DEFAULT,
     maxResults: int = 1000,
     timeoutMs: int | None = None,
 ) -> str:
@@ -384,8 +433,9 @@ async def query(
         ctx: MCP request context carrying the caller's identity and bearer token.
         query: Natural-language question (e.g., "What is monthly revenue by region?").
         namespaceId: The namespace to query against.
-        execute: When ``False``, translate only — return the generated query
-            without executing it. Absent = default (execute).
+        execute: Forwarded as ``options.execute`` only when ``False``. Serve
+            does not honour it yet, so the query still runs. To get the
+            generated SQL, use ``includeDebugInfo``.
         tierOverride: Pin resolution to a specific tier (1, 2, or 3), bypassing
             automatic routing. Omit for auto.
         mode: Execution mode — ``standard`` (single-shot) or ``deep-reasoning``
@@ -401,6 +451,12 @@ async def query(
         dimensions: Dimension filters constraining the query. Each entry is a
             ``{name, value}`` object matching ``DimensionFilter``.
         includeSupporting: Whether to include supporting document chunks (default True).
+        includeDebugInfo: Requests the generated SQL (``queryUsed``) and SPARQL
+            (``sparqlGenerated``). Default True, as in the Playground; ``null``
+            means the default. Serve returns the SQL to a caller holding
+            ``viewSource`` and the SPARQL to one holding ``viewOntology``, and
+            omits each field the caller lacks the right for. Send ``false`` to
+            leave both out. Must be a JSON boolean or ``null``.
         maxResults: Maximum result rows (default 1000, max 10000).
         timeoutMs: Optional caller budget in milliseconds. When supplied, the
             Context Manager clamps the request deadline to ``min(transport,
@@ -417,6 +473,12 @@ async def query(
     """
     start = time.perf_counter()
     caller = None
+    include_debug_info = _INCLUDE_DEBUG_INFO_DEFAULT if includeDebugInfo is None else includeDebugInfo
+
+    def audit(**fields: Any) -> None:
+        if caller:
+            log_tool_invocation(caller, "query", namespaceId, include_debug_info=include_debug_info, **fields)
+
     try:
         caller, profile = await _resolve_caller_and_profile(namespaceId, ctx, cedar_action=TOOL_CEDAR_ACTION["query"])
         token = _extract_bearer_token(ctx)
@@ -433,26 +495,24 @@ async def query(
             strategy=strategy,
             dimensions=dimensions,
             include_supporting=includeSupporting,
+            include_debug_info=include_debug_info,
             max_results=maxResults,
             timeout_ms=timeoutMs,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
-        if caller:
-            log_tool_invocation(caller, "query", namespaceId, duration_ms=duration_ms)
+        audit(duration_ms=duration_ms)
         return json.dumps(result, indent=2, default=str)
 
     except (ClaimsExtractionError, GrantResolutionError) as e:
-        if caller:
-            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
+        audit(success=False, error=str(e))
         raise ValueError(str(e)) from e
     except ContextManagerError as e:
-        if caller:
-            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
+        audit(success=False, error=str(e))
         raise ValueError(f"CM {e.status_code}: {e.message}") from e
     except Exception as e:
         logger.error("query_failed", namespace=namespaceId, error=str(e))
-        if caller:
-            log_tool_invocation(caller, "query", namespaceId, success=False, error=str(e))
+        audit(success=False, error=str(e))
         raise
 
 
@@ -485,7 +545,9 @@ async def translate_sparql(
         )
         token = _extract_bearer_token(ctx)
         cm = _get_cm_client()
-        result = await execution.execute_translate_sparql(cm, query, namespaceId, profile, token)
+        result = await execution.execute_translate_sparql(
+            cm, query, namespaceId, profile, token, runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId)
+        )
         if config.auth_enabled:
             result = _suppress_schema_unless_viewer(
                 result, profile, namespaceId, _TRANSLATE_SPARQL_SCHEMA_KEYS, "translate_sparql"
@@ -558,6 +620,7 @@ async def rag_retrieval(
             min_score=minScore,
             source_filter=sourceFilter,
             entity_filter=entityFilter,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
         if caller:
@@ -625,6 +688,7 @@ async def graph_traversal(
             direction=direction,
             max_results=maxResults,
             relationship_filter=relationshipFilter,
+            runtime_session_id=_cm_runtime_session_id(ctx, caller, namespaceId),
         )
         if config.auth_enabled:
             result = _suppress_schema_unless_viewer(

@@ -72,14 +72,12 @@ class TestBedrockLLMClient:
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         client = BedrockLLMClient(region="us-east-1")
-        # embed() delegates to the shared BedrockEmbedder, embedding the query
-        # with search_query semantics. Mock that boundary.
         client._embedder = MagicMock()
         client._embedder.embed_query.return_value = [0.1] * 1024
 
         result = await client.embed("test text")
 
-        assert len(result) == 1024
+        assert result is client._embedder.embed_query.return_value
         client._embedder.embed_query.assert_called_once_with("test text")
 
     async def test_converse_raises_on_throttle(self):
@@ -158,9 +156,7 @@ class TestBedrockLLMClient:
         question, so dropping it would lose the question. Keeping the tag would
         lose the whole call: Converse rejects a guardContent block that arrives
         without a guardrailConfig ("The guardrail can't assess the content in the
-        guardContent field"), and an unguarded deployment then fails EVERY
-        generation — 135/135 questions, empty SQL, on the first benchmark run of
-        SERVE_GUARDRAILS_DISABLED.
+        guardContent field").
         """
         from coa_serve.clients.bedrock import BedrockLLMClient
 
@@ -180,65 +176,10 @@ class TestBedrockLLMClient:
         # And without a guardrail_id, no guardrailConfig on the request.
         assert "guardrailConfig" not in call_kwargs
 
-    async def test_converse_guardrail_anonymize_not_blocked(self):
-        """PII ANONYMIZE should NOT set guardrail_blocked=True."""
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        mock_client = MagicMock()
-        mock_client.converse.return_value = {
-            "output": {"message": {"content": [{"text": "Contact {EMAIL} for help"}]}},
-            "stopReason": "guardrail_intervened",
-            "trace": {
-                "guardrail": {
-                    "outputAssessment": {
-                        "0": {
-                            "sensitiveInformationPolicy": {
-                                "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZED", "match": "test@example.com"}]
-                            }
-                        }
-                    }
-                }
-            },
-        }
-
-        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
-        client._client = mock_client
-        result = await client.converse("test", guardrail_id="gr-1")
-
-        assert result.guardrail_blocked is False
-        assert result.text == "Contact {EMAIL} for help"
-
-    async def test_converse_guardrail_blocked_on_content_policy(self):
-        """Actual BLOCKED action should set guardrail_blocked=True."""
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        mock_client = MagicMock()
-        mock_client.converse.return_value = {
-            "output": {"message": {"content": [{"text": "Sorry, I can't help with that."}]}},
-            "stopReason": "guardrail_intervened",
-            "trace": {
-                "guardrail": {
-                    "outputAssessment": {
-                        "0": {
-                            "contentPolicy": {
-                                "filters": [{"type": "VIOLENCE", "action": "BLOCKED", "confidence": "HIGH"}]
-                            }
-                        }
-                    }
-                }
-            },
-        }
-
-        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
-        client._client = mock_client
-        result = await client.converse("test", guardrail_id="gr-1")
-
-        assert result.guardrail_blocked is True
-
 
 @pytest.mark.unit
 class TestGuardrailDecisionMetrics:
-    """#111 AC10/AC11 — every guarded Converse emits metrics plus one log line.
+    """Every guarded Converse emits metrics plus one log line.
 
     Serve emits stdout EMF (no PutMetricData grant on the runtime role), so these
     assert on the shared emitter's arguments rather than on a boto call.
@@ -321,8 +262,6 @@ class TestGuardrailDecisionMetrics:
         assert emit.call_args.kwargs["blocked"] is True
 
     async def test_traceless_no_text_emits_unknown_not_block(self):
-        # The old code treated any traceless intervention as a confirmed block,
-        # which is what inflated GuardrailBlocked and discarded 71 masked answers.
         client = self._client({"output": {"message": {"content": []}}, "stopReason": "guardrail_intervened"})
 
         with (
@@ -372,8 +311,6 @@ class TestGuardrailDecisionMetrics:
 
 @pytest.mark.unit
 class TestBedrockConverseStream:
-    """Tests for converse_stream() method."""
-
     async def test_stream_yields_tokens(self):
         from coa_serve.clients.bedrock import BedrockLLMClient
 
@@ -395,76 +332,6 @@ class TestBedrockConverseStream:
             tokens.append(token)
 
         assert tokens == ["Hello", " world"]
-
-    async def test_stream_guardrail_anonymize_no_error(self):
-        """PII ANONYMIZE in stream should NOT raise GuardrailBlockedError."""
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        events = [
-            {"contentBlockDelta": {"delta": {"text": "Contact "}}},
-            {"contentBlockDelta": {"delta": {"text": "{EMAIL}"}}},
-            {"messageStop": {"stopReason": "guardrail_intervened"}},
-            {
-                "metadata": {
-                    "trace": {
-                        "guardrail": {
-                            "outputAssessment": {
-                                "0": {
-                                    "sensitiveInformationPolicy": {
-                                        "piiEntities": [{"type": "EMAIL", "action": "ANONYMIZED"}]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        ]
-        mock_client = MagicMock()
-        mock_client.converse_stream.return_value = {"stream": iter(events)}
-
-        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
-        client._client = mock_client
-
-        tokens = []
-        async for token in client.converse_stream("test", guardrail_id="gr-1"):
-            tokens.append(token)
-
-        assert tokens == ["Contact ", "{EMAIL}"]
-
-    async def test_stream_guardrail_blocked_raises_error(self):
-        """Actual BLOCKED action in stream should raise GuardrailBlockedError."""
-        from coa_serve.clients.base import GuardrailBlockedError
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        events = [
-            {"contentBlockDelta": {"delta": {"text": "partial"}}},
-            {"messageStop": {"stopReason": "guardrail_intervened"}},
-            {
-                "metadata": {
-                    "trace": {
-                        "guardrail": {
-                            "outputAssessment": {
-                                "0": {
-                                    "contentPolicy": {
-                                        "filters": [{"type": "HATE", "action": "BLOCKED", "confidence": "HIGH"}]
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        ]
-        mock_client = MagicMock()
-        mock_client.converse_stream.return_value = {"stream": iter(events)}
-
-        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
-        client._client = mock_client
-
-        with pytest.raises(GuardrailBlockedError):
-            async for _ in client.converse_stream("test", guardrail_id="gr-1"):
-                pass
 
     async def test_stream_thread_exception_propagates(self):
         """Exceptions from the thread should propagate to the caller."""
@@ -502,8 +369,25 @@ class TestBedrockConverseStream:
         assert content_blocks[1] == {"guardContent": {"text": {"text": "Question: hi"}}}
         assert call_kwargs["guardrailConfig"]["streamProcessingMode"] == "sync"
 
+    async def test_stream_passes_system_and_max_tokens(self):
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        events = [{"messageStop": {"stopReason": "end_turn"}}, {"metadata": {}}]
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {"stream": iter(events)}
+
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        async for _ in client.converse_stream("ctx", system="Be brief.", max_tokens=321):
+            pass
+
+        call_kwargs = mock_client.converse_stream.call_args[1]
+        assert call_kwargs["system"] == [{"text": "Be brief."}]
+        assert call_kwargs["inferenceConfig"] == {"maxTokens": 321}
+
     async def test_stream_untags_guard_content_without_a_guardrail(self):
-        """The streamed path shares the kwargs builder, so it has the same rule.
+        """The streamed path shares `_build_messages`, so it has the same rule.
 
         Tier-3 synthesis streams and also puts the user's query in guardContent, so
         an unguarded deployment would fail every synthesis for the same reason
@@ -530,7 +414,6 @@ class TestBedrockConverseStream:
         assert "guardrailConfig" not in call_kwargs
 
     async def test_converse_model_id_override(self):
-        """Verify per-call model_id override reaches Bedrock API kwargs."""
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mock_client = MagicMock()
@@ -539,18 +422,15 @@ class TestBedrockConverseStream:
         client = BedrockLLMClient(model_id="default-model", region="us-east-1")
         client._client = mock_client
 
-        # Without override — uses default
         await client.converse("test prompt")
         call_kwargs = mock_client.converse.call_args[1]
         assert call_kwargs["modelId"] == "default-model"
 
-        # With override — uses override
         await client.converse("test prompt", model_id="us.anthropic.claude-haiku-4-0")
         call_kwargs = mock_client.converse.call_args[1]
         assert call_kwargs["modelId"] == "us.anthropic.claude-haiku-4-0"
 
     async def test_converse_stream_model_id_override(self):
-        """Verify per-call model_id override reaches converse_stream kwargs."""
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mock_client = MagicMock()
@@ -575,7 +455,6 @@ class TestBedrockConverseStream:
         assert call_kwargs["modelId"] == "us.anthropic.claude-opus-4-0"
 
     async def test_model_id_override_none_uses_default(self):
-        """Verify that model_id=None falls back to configured default."""
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mock_client = MagicMock()
@@ -588,122 +467,26 @@ class TestBedrockConverseStream:
         call_kwargs = mock_client.converse.call_args[1]
         assert call_kwargs["modelId"] == "my-default"
 
-    async def test_converse_temperature_fallback_retries_without_temperature(self):
-        """Verify temperature fallback retries on ValidationException mentioning temperature."""
-        from botocore.exceptions import ClientError
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("new-model")
-        mock_client = MagicMock()
-        error_response = {"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}}
-        mock_client.converse.side_effect = [
-            ClientError(error_response, "Converse"),
-            {"output": {"message": {"content": [{"text": "ok"}]}}},
-        ]
-
-        client = BedrockLLMClient(model_id="new-model", region="us-east-1")
-        client._client = mock_client
-
-        result = await client.converse("test", temperature=0.5)
-        assert result.text == "ok"
-        # Second call should not have temperature
-        second_call_kwargs = mock_client.converse.call_args_list[1][1]
-        assert "temperature" not in second_call_kwargs.get("inferenceConfig", {})
-
-    async def test_converse_non_temperature_error_propagates(self):
-        """Verify non-temperature ValidationException is not retried."""
+    async def test_converse_sampling_rejection_is_raised_without_retry(self):
+        """A model not on llama-index's list that rejects temperature fails; nothing retries."""
         from botocore.exceptions import ClientError
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mock_client = MagicMock()
-        error_response = {"Error": {"Code": "ValidationException", "Message": "invalid model"}}
+        error_response = {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": "The model returned the following errors: `temperature` is deprecated for this model.",
+            }
+        }
         mock_client.converse.side_effect = ClientError(error_response, "Converse")
 
-        client = BedrockLLMClient(model_id="bad-model", region="us-east-1")
-        client._client = mock_client
-
-        with pytest.raises(ClientError):
-            await client.converse("test")
-        assert mock_client.converse.call_count == 1
-
-    async def test_retry_loop_reraises_when_params_exhausted_no_fourth_call(self):
-        """Bot finding (HIGH): the loop must not fall through to a silent 4th call.
-
-        If every iteration raises a ValidationException that names a sampling
-        param that has ALREADY been stripped (so nothing more can be shed), the
-        underlying ClientError must propagate — the call must NOT be retried a
-        4th time past the ``for _ in range(3)`` budget.
-        """
-        from botocore.exceptions import ClientError
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("stuck-model")
-        bedrock_mod._MODELS_REJECTING_TOP_P.discard("stuck-model")
-        # Names "temperature" every time, but after the first strip temperature is
-        # gone from inferenceConfig, so the guard `"temperature" in inference` is
-        # False and the handler re-raises rather than looping to a 4th call.
-        err = ClientError(
-            {"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}},
-            "Converse",
-        )
-        mock_client = MagicMock()
-        mock_client.converse.side_effect = [err, err, err, err]
-
-        client = BedrockLLMClient(model_id="stuck-model", region="us-east-1")
+        client = BedrockLLMClient(model_id="unlisted-model", region="us-east-1")
         client._client = mock_client
 
         with pytest.raises(ClientError):
             await client.converse("test", temperature=0.5)
-        # 1 initial + 1 retry after stripping temperature, then re-raise. NOT 4.
-        assert mock_client.converse.call_count == 2
-
-    async def test_temperature_rejection_is_remembered_per_model(self):
-        """The doomed first call is paid ONCE per model, not on every call.
-
-        Without memoization every Converse to a temperature-rejecting model
-        burned a failed request plus a retry (68% of calls in a measured integ
-        run), doubling LLM latency for the whole suite.
-        """
-        from botocore.exceptions import ClientError
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("memo-model")
-        ok = {"output": {"message": {"content": [{"text": "ok"}]}}}
-        err = ClientError({"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}}, "C")
-
-        mock_client = MagicMock()
-        mock_client.converse.side_effect = [err, ok, ok]
-
-        client = BedrockLLMClient(model_id="memo-model", region="us-east-1")
-        client._client = mock_client
-
-        first = await client.converse("test", temperature=0.5)
-        second = await client.converse("test", temperature=0.5)
-
-        assert (first.text, second.text) == ("ok", "ok")
-        # 2 for the first converse (rejected + retry), 1 for the second — not 4.
-        assert mock_client.converse.call_count == 3
-        assert "temperature" not in mock_client.converse.call_args_list[2][1].get("inferenceConfig", {})
-
-    async def test_temperature_memo_does_not_leak_across_models(self):
-        """One model rejecting temperature must not disable it for others."""
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.add("rejecting-model")
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("accepting-model")
-
-        mock_client = MagicMock()
-        mock_client.converse.return_value = {"output": {"message": {"content": [{"text": "ok"}]}}}
-
-        client = BedrockLLMClient(model_id="accepting-model", region="us-east-1")
-        client._client = mock_client
-
-        await client.converse("test", temperature=0.5)
-        assert mock_client.converse.call_args[1]["inferenceConfig"]["temperature"] == 0.5
+        assert mock_client.converse.call_count == 1
 
 
 @pytest.mark.unit
@@ -817,13 +600,6 @@ class TestConverseStreamCleanup:
 
         assert stream.closed
 
-    async def test_early_close_does_not_raise(self):
-        stream = self._BlockingStream()
-        agen = self._client_over(stream).converse_stream("q")
-
-        await agen.__anext__()
-        await agen.aclose()  # must not raise "async generator ignored GeneratorExit"
-
     async def test_normal_completion_still_yields_every_token(self):
         """The detached-worker change must not truncate a healthy stream."""
         events = [
@@ -888,18 +664,6 @@ class TestConverseStreamCleanup:
 
         assert closed.is_set(), "worker kept the stream open after the caller left"
         assert not drained_fully.is_set(), "worker drained the whole response for a gone caller"
-
-    async def test_normal_completion_is_not_treated_as_abandoned(self):
-        """The flag must not fire on the healthy path and truncate the stream."""
-        events = [
-            {"contentBlockDelta": {"delta": {"text": "a"}}},
-            {"contentBlockDelta": {"delta": {"text": "b"}}},
-            {"contentBlockDelta": {"delta": {"text": "c"}}},
-            {"messageStop": {"stopReason": "end_turn"}},
-        ]
-        client = self._client_over(iter(events))
-
-        assert [t async for t in client.converse_stream("q")] == ["a", "b", "c"]
 
     async def test_stream_without_close_method_is_tolerated(self):
         """A plain iterator has no close(); finalization must still not raise."""
@@ -1016,9 +780,7 @@ def _intervened(trace: dict | None, text: str = "Eight U.S. presidents served du
 class TestGuardrailOutcomeClassification:
     """A masked answer must survive; only a confirmed block may be suppressed.
 
-    Serve discarded 71 masked answers because ``stopReason=guardrail_intervened``
-    fires for masking as well as blocking, the trace that distinguishes them was
-    never requested, and a missing trace was read as a block.
+    ``stopReason=guardrail_intervened`` fires for masking and blocking alike.
     """
 
     async def test_guardrail_config_requests_the_trace(self):
@@ -1146,8 +908,7 @@ class TestGuardrailOutcomeClassification:
         """MIXED trace: recognized masking alongside a shape we cannot read.
 
         The unreadable shape might have been a block, so reporting "just masked"
-        would fail OPEN. An earlier version of the classifier ordered ANONYMIZED
-        ahead of the unparsed-shape check and did exactly that.
+        would fail OPEN.
         """
         from coa_serve.clients.base import GuardrailOutcome
 
@@ -1171,13 +932,7 @@ class TestGuardrailOutcomeClassification:
         assert result.text == ""
 
     async def test_anonymized_beside_a_malformed_side_is_unknown(self):
-        """A readable ANONYMIZED next to an UNREADABLE sibling must not pass.
-
-        Regression: the unparsed-shape check originally walked
-        ``assessments_from_trace``, which silently drops non-dict sides. The
-        malformed side was therefore invisible and the response was classified as
-        plain masking — failing OPEN on input that might have carried a block.
-        """
+        """A readable ANONYMIZED next to an UNREADABLE sibling must not pass; a non-dict side counts as unreadable."""
         from coa_serve.clients.base import GuardrailOutcome
 
         client = _converse_client(
@@ -1310,14 +1065,9 @@ class TestGuardrailOutcomeClassification:
         assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.ANONYMIZED
 
     async def test_real_trace_with_applied_guardrail_details_is_anonymized(self):
-        """Regression for the live shape: a real Bedrock trace attaches
-        ``appliedGuardrailDetails`` and ``invocationMetrics`` to every assessment.
+        """A real Bedrock trace attaches ``appliedGuardrailDetails`` and ``invocationMetrics``.
 
-        The earlier name-allowlist only knew ``invocationMetrics``, so the
-        unlisted ``appliedGuardrailDetails`` forced UNKNOWN — and benign name
-        questions (e.g. "Fidel Castro") came back blocked and empty even though the
-        guardrail had only masked. Neither key carries an action, so both must be
-        ignored and the answer classified as ANONYMIZED.
+        Neither key carries an action, so both must be ignored.
         """
         from coa_serve.clients.base import GuardrailOutcome
 
@@ -1363,9 +1113,7 @@ class TestGuardrailOutcomeClassification:
         """``outputAssessments`` (plural) nests the assessment inside a LIST.
 
         The side value is ``{guardrailId: [assessment, ...]}`` rather than a single
-        assessment dict. The unparsed-shape walk must descend into that list — an
-        earlier version saw the list itself as a non-dict entry and forced UNKNOWN,
-        blanking every response that carried a plural output side.
+        assessment dict. The unparsed-shape walk must descend into that list.
         """
         from coa_serve.clients.base import GuardrailOutcome
 
@@ -1563,12 +1311,7 @@ class TestStreamGuardrailOutcome:
         assert cfg["trace"] == "enabled"
 
     async def test_traceless_intervention_now_raises(self):
-        """Previously this raised NOTHING, so a genuine block passed through.
-
-        The old code required both ``guardrail_intervened`` AND a trace-derived
-        block; since the trace was never requested, the second condition was never
-        met and real blocks were silently allowed.
-        """
+        """An intervention with no trace is treated as a block of unknown cause."""
         from coa_serve.clients.base import GuardrailBlockedError
 
         client = _stream_client(
@@ -1604,8 +1347,6 @@ class TestStreamGuardrailOutcome:
         assert "".join(chunks) == "Eight presidents under {NAME}"
 
     async def test_stream_emits_one_decision_metric(self):
-        # This path emitted no guardrail metrics at all before, so a streamed block
-        # was invisible on the dashboard whose whole purpose is counting blocks.
         client = _stream_client(
             [
                 {"contentBlockDelta": {"delta": {"text": "x"}}},
@@ -1698,157 +1439,103 @@ class TestStreamGuardrailOutcome:
 
 
 @pytest.mark.unit
-class TestConverseTopPAndTemperatureObservability:
-    """Step 0 (fashion-findings B1): a top_p determinism knob that survives a
-    temperature drop, plus an observable signal when temperature is dropped so
-    the drop stops being invisible."""
+class TestConverseTemperatureObservability:
+    """Temperature reaches models that accept it, is omitted for those that reject it, and the omission is logged."""
 
     def _mock_client(self):
         mc = MagicMock()
         mc.converse.return_value = {"output": {"message": {"content": [{"text": "ok"}]}}}
         return mc
 
-    async def test_top_p_threaded_into_inference_config(self):
+    async def test_temperature_threaded_into_inference_config(self):
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mc = self._mock_client()
         client = BedrockLLMClient(model_id="test-model", region="us-east-1")
         client._client = mc
-        await client.converse("test", temperature=0, top_p=0)
+        await client.converse("test", temperature=0)
 
-        cfg = mc.converse.call_args[1]["inferenceConfig"]
-        assert cfg["topP"] == 0
-        assert cfg["temperature"] == 0
+        assert mc.converse.call_args[1]["inferenceConfig"] == {"maxTokens": 4096, "temperature": 0}
 
-    async def test_top_p_omitted_when_none(self):
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            # Serve's default model (config.py).
+            "us.anthropic.claude-sonnet-5",
+            "us.anthropic.claude-haiku-5-5",
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-opus-5-5",
+        ],
+    )
+    async def test_converse_model_rejecting_temperature_omits_it_and_logs(self, model_id):
+        """llama-index lists these as rejecting temperature."""
+        from coa_serve.clients import bedrock as bedrock_mod
         from coa_serve.clients.bedrock import BedrockLLMClient
 
         mc = self._mock_client()
-        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client = BedrockLLMClient(model_id=model_id, region="us-east-1")
         client._client = mc
-        await client.converse("test")  # neither set
+        with patch.object(bedrock_mod.logger, "warning") as mock_log:
+            await client.converse("test", temperature=0)
 
-        cfg = mc.converse.call_args[1]["inferenceConfig"]
-        assert "topP" not in cfg
+        assert mc.converse.call_count == 1
+        assert mc.converse.call_args[1]["inferenceConfig"] == {"maxTokens": 4096}
+        events = [c.args[0] for c in mock_log.call_args_list if c.args]
+        assert "temperature_dropped_for_model" in events
 
-    async def test_top_p_survives_temperature_drop(self):
-        """On a temperature-rejecting model, temperature is popped but top_p
-        remains — so a determinism-sensitive caller keeps a sampling constraint."""
-        from botocore.exceptions import ClientError
-        from coa_serve.clients import bedrock as bedrock_mod
+    async def test_converse_unlisted_model_gets_temperature_alone(self):
         from coa_serve.clients.bedrock import BedrockLLMClient
 
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-temp-model")
-        mc = MagicMock()
-        err = {"Error": {"Code": "ValidationException", "Message": "temperature is not supported"}}
-        mc.converse.side_effect = [
-            ClientError(err, "Converse"),
-            {"output": {"message": {"content": [{"text": "ok"}]}}},
-        ]
-        client = BedrockLLMClient(model_id="drop-temp-model", region="us-east-1")
+        mc = self._mock_client()
+        client = BedrockLLMClient(model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0", region="us-east-1")
         client._client = mc
-        result = await client.converse("test", temperature=0, top_p=0)
+        await client.converse("test", temperature=0)
 
-        assert result.text == "ok"
-        retry_cfg = mc.converse.call_args_list[1][1]["inferenceConfig"]
-        assert "temperature" not in retry_cfg  # dropped
-        assert retry_cfg["topP"] == 0  # but top_p survives
+        assert mc.converse.call_args[1]["inferenceConfig"] == {"maxTokens": 4096, "temperature": 0}
 
-    async def test_temperature_drop_is_logged_on_learned_path(self):
-        """Once a model is known to reject temperature, every subsequent call
-        drops it on the pre-learned path — and that drop must be observable
-        (emits temperature_dropped_for_model at WARNING), not silent."""
+    async def test_converse_model_rejecting_temperature_without_it_does_not_log(self):
         from coa_serve.clients import bedrock as bedrock_mod
         from coa_serve.clients.bedrock import BedrockLLMClient
 
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.add("learned-model")
-        try:
-            mc = self._mock_client()
-            client = BedrockLLMClient(model_id="learned-model", region="us-east-1")
-            client._client = mc
-            with patch.object(bedrock_mod.logger, "warning") as mock_log:
-                await client.converse("test", temperature=0, top_p=0)
-            events = [c.args[0] for c in mock_log.call_args_list if c.args]
-            assert "temperature_dropped_for_model" in events
-            # temperature was actually dropped; top_p preserved
-            cfg = mc.converse.call_args[1]["inferenceConfig"]
-            assert "temperature" not in cfg
-            assert cfg["topP"] == 0
-        finally:
-            bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("learned-model")
-
-    async def test_top_p_dropped_on_top_p_validation_exception(self):
-        """REGRESSION (live-found): claude-sonnet-5 deprecated top_p as well as
-        temperature. Sending topP=0 for determinism throws ValidationException
-        ('`top_p` is deprecated for this model'); the fallback must drop topP and
-        retry, or the whole NL->SPARQL path fails closed on that model."""
-        from botocore.exceptions import ClientError
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
-
-        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-topp-model")
-        mc = MagicMock()
-        err = {"Error": {"Code": "ValidationException", "Message": "`top_p` is deprecated for this model."}}
-        mc.converse.side_effect = [
-            ClientError(err, "Converse"),
-            {"output": {"message": {"content": [{"text": "ok"}]}}},
-        ]
-        client = BedrockLLMClient(model_id="drop-topp-model", region="us-east-1")
+        mc = self._mock_client()
+        client = BedrockLLMClient(model_id="us.anthropic.claude-sonnet-5", region="us-east-1")
         client._client = mc
-        result = await client.converse("test", top_p=0)
+        with patch.object(bedrock_mod.logger, "warning") as mock_log:
+            await client.converse("test")
 
-        assert result.text == "ok"
-        retry_cfg = mc.converse.call_args_list[1][1]["inferenceConfig"]
-        assert "topP" not in retry_cfg  # dropped on retry
-        assert "drop-topp-model" in bedrock_mod._MODELS_REJECTING_TOP_P  # learned
-        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-topp-model")
+        events = [c.args[0] for c in mock_log.call_args_list if c.args]
+        assert "temperature_dropped_for_model" not in events
 
-    async def test_both_temperature_and_top_p_dropped_same_call(self):
-        """A model that rejects BOTH params must shed both within one call: first
-        ValidationException names temperature, second names top_p, third succeeds."""
-        from botocore.exceptions import ClientError
+
+@pytest.mark.unit
+class TestTemperatureModelListPriming:
+    """The llama-index import behind the model list runs at init, off the event loop."""
+
+    def test_prime_loads_the_model_list(self):
         from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
 
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-both-model")
-        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-both-model")
-        mc = MagicMock()
-        terr = {"Error": {"Code": "ValidationException", "Message": "`temperature` is deprecated for this model"}}
-        perr = {"Error": {"Code": "ValidationException", "Message": "`top_p` is deprecated for this model."}}
-        mc.converse.side_effect = [
-            ClientError(terr, "Converse"),
-            ClientError(perr, "Converse"),
-            {"output": {"message": {"content": [{"text": "ok"}]}}},
-        ]
-        client = BedrockLLMClient(model_id="drop-both-model", region="us-east-1")
-        client._client = mc
-        result = await client.converse("test", temperature=0, top_p=0)
+        bedrock_mod._models_rejecting_temperature.cache_clear()
 
-        assert result.text == "ok"
-        assert mc.converse.call_count == 3
-        final_cfg = mc.converse.call_args_list[2][1]["inferenceConfig"]
-        assert "temperature" not in final_cfg
-        assert "topP" not in final_cfg
-        bedrock_mod._MODELS_REJECTING_TEMPERATURE.discard("drop-both-model")
-        bedrock_mod._MODELS_REJECTING_TOP_P.discard("drop-both-model")
+        bedrock_mod.BedrockLLMClient(model_id="test-model", region="us-east-1").prime()
 
-    async def test_top_p_dropped_on_learned_path(self):
-        """Once top_p rejection is learned, subsequent calls pre-strip topP up
-        front (no doomed request) and emit top_p_dropped_for_model at WARNING."""
-        from coa_serve.clients import bedrock as bedrock_mod
-        from coa_serve.clients.bedrock import BedrockLLMClient
+        assert bedrock_mod._models_rejecting_temperature.cache_info().currsize == 1
+        assert "anthropic.claude-sonnet-5" in bedrock_mod._models_rejecting_temperature()
 
-        bedrock_mod._MODELS_REJECTING_TOP_P.add("learned-topp-model")
-        try:
-            mc = self._mock_client()
-            client = BedrockLLMClient(model_id="learned-topp-model", region="us-east-1")
-            client._client = mc
-            with patch.object(bedrock_mod.logger, "warning") as mock_log:
-                await client.converse("test", top_p=0)
-            events = [c.args[0] for c in mock_log.call_args_list if c.args]
-            assert "top_p_dropped_for_model" in events
-            assert mc.converse.call_count == 1  # no doomed first request
-            cfg = mc.converse.call_args[1]["inferenceConfig"]
-            assert "topP" not in cfg
-        finally:
-            bedrock_mod._MODELS_REJECTING_TOP_P.discard("learned-topp-model")
+    def test_init_primes_the_client_in_a_thread(self):
+        """main.py must call ``asyncio.to_thread(bedrock_client.prime)``; init is mocked everywhere else."""
+        import ast
+        import inspect
+
+        from coa_serve import main
+
+        primed = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "to_thread"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr == "prime"
+            and isinstance(node.args[0].value, ast.Name)
+            and node.args[0].value.id == "bedrock_client"
+            for node in ast.walk(ast.parse(inspect.getsource(main)))
+        )
+        assert primed

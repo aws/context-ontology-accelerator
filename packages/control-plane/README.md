@@ -156,7 +156,7 @@ In addition to the role-based action authorization enforced by Cedar at the API 
 | Field | Type | Purpose | Enforced by |
 |---|---|---|---|
 | `tableAllowlist` | `list[string]` | Allowlist of bare table names the principal may reference. Schema-qualified references match the bare name. | SQL Firewall, table check |
-| `columnDenylist` | `map[string, list[string]]` | Per-table list of columns that may not be projected. `SELECT *` over a restricted table is denied. | SQL Firewall, column check |
+| `columnDenylist` | `map[string, list[string]]` | Per-table list of columns that may not be projected. `SELECT *` or a whole-row reference (`to_json(c)`) over a restricted table is denied. | SQL Firewall, column check |
 | `allowedMetrics` | `list[string]` | Allowlist of metric IDs the principal may evaluate via Tier 1. | Metric service (Tier 1) |
 
 All three fields are validated for shape at write time (`tableAllowlist`/`allowedMetrics` must be `list[string]`; `columnDenylist` must be `map[string, list[string]]`); malformed payloads return `400 Bad Request`. All comparisons in the SQL Firewall are case-insensitive — see [context-manager SQL Firewall docs](../context-manager/README.md#sql-firewall) for enforcement details.
@@ -279,6 +279,16 @@ The authorizer supports two IdP configurations, auto-detected from the `JWKS_ISS
 | **Generic OIDC** | Anything else | `OIDCTokenAuthorizer` — uses `JWKS_URI`, `CLIENT_ID`, and `GROUP_CLAIM_NAME` |
 
 Both produce a `TokenValidationResult` containing `principal_id` (email), `sub`, `groups`, and `token_type`.
+
+The token signing keys (JWKS) are cached for 5 minutes. When a refresh fails, the
+authorizer keeps verifying with the expired key set for up to an hour past that,
+and tries the fetch again, at most once per 5 s, when a request arrives. So while
+the IdP's JWKS endpoint is unreachable, a key the IdP has retired can stay valid
+for up to about 65 minutes after the last successful fetch. No setting turns this
+window off or changes its length. With no cached key set, or one older than that,
+token checks fail. Each failed refetch logs `JWKS fetch failed; serving the
+expired key set` with the set's age. The same library backs every service that
+verifies a caller token, including the workflow-agents and MCP servers.
 
 ### Role Resolution
 

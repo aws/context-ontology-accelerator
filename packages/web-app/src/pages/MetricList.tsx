@@ -90,7 +90,6 @@ export const MetricList: React.FC = () => {
     { text: t("Metrics") },
   ]);
 
-  // Resolve dataSourceId -> human-readable source name
   const sourceNameById = useSourceNameById(namespaceId ?? "");
   const [importModalVisible, setImportModalVisible] = useState(false);
   const [importFiles, setImportFiles] = useState<File[]>([]);
@@ -175,7 +174,6 @@ export const MetricList: React.FC = () => {
   const exportMutation = useExportOsi(namespaceId ?? "");
   const bulkDeleteMutation = useBulkDeleteMetrics(namespaceId ?? "");
 
-  // Selection state for bulk operations
   const [selectedMetrics, setSelectedMetrics] = useState<
     MetricWithDataSource[]
   >([]);
@@ -187,10 +185,7 @@ export const MetricList: React.FC = () => {
   // Export scope modal — mirrors the bulk-delete selected/filtered/all
   // pattern so users can export a subset instead of always the full namespace.
   const [exportModalVisible, setExportModalVisible] = useState(false);
-  // Client-side download failures (blob/anchor errors) and empty-selection
-  // guards for export — kept separate from the page-level `importResult`
-  // banner and from `exportMutation.error`, both of which have their own
-  // rendering; this covers errors that happen outside the mutation itself.
+  // Client-side download errors, shown in the export modal.
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [exportMode, setExportMode] = useState<"all" | "selected" | "filtered">(
     "all",
@@ -204,7 +199,6 @@ export const MetricList: React.FC = () => {
   });
   const { data: importJob } = useGetImportJob(namespaceId ?? "", activeJobId);
 
-  // Auto-clear localStorage when job reaches terminal state
   React.useEffect(() => {
     if (
       importJob &&
@@ -214,25 +208,21 @@ export const MetricList: React.FC = () => {
     }
   }, [importJob, storageKey]);
 
-  // Clear localStorage when job completes or is dismissed
   const clearActiveJob = () => {
     setActiveJobId(null);
     localStorage.removeItem(storageKey);
   };
 
-  // Persist jobId to localStorage when set
   const startJobPolling = (jobId: string) => {
     setActiveJobId(jobId);
     localStorage.setItem(storageKey, jobId);
   };
 
-  // Flatten all pages into a single array
   const allMetricsRaw = useMemo(
     () => data?.pages.flatMap((p) => p.metrics ?? []) ?? [],
     [data],
   );
 
-  // Derive a dataSourceName field for filtering by resolved name instead of UUID
   const allMetrics: MetricWithDataSource[] = useMemo(
     () =>
       allMetricsRaw.map((m) => ({
@@ -249,14 +239,8 @@ export const MetricList: React.FC = () => {
     [allMetricsRaw, sourceNameById],
   );
 
-  // Keep the selection in sync with the underlying data. Without this, a
-  // selection made against a stale table (e.g. right before a bulk-delete's
-  // query invalidation resolves) can retain now-deleted metrics: the table
-  // visually shows nothing checked (the rows are gone), but `selectedMetrics`
-  // — and therefore the "Delete N selected" button — still holds the stale
-  // count. Pruning to the intersection with `allMetrics` on every
-  // data change (rather than clearing outright) preserves a still-valid
-  // in-progress selection across unrelated refetches.
+  // Prune the selection to rows still present so a stale count cannot linger,
+  // without clearing a still-valid selection.
   React.useEffect(() => {
     setSelectedMetrics((prev) => {
       if (prev.length === 0) return prev;
@@ -307,7 +291,6 @@ export const MetricList: React.FC = () => {
     },
   });
 
-  // Auto-fetch next server page when user reaches the end of loaded data
   const pagesCount = paginationProps.pagesCount ?? 1;
   React.useEffect(() => {
     if (
@@ -325,20 +308,12 @@ export const MetricList: React.FC = () => {
     fetchNextPage,
   ]);
 
-  // ── Filtered-scope operations over the COMPLETE namespace ─────
-  // "Delete/Export all matching" must evaluate the filter against every
-  // metric in the namespace, but the list is an infinite query loaded 50 at
-  // a time. When a filtered operation is confirmed while more server pages
-  // exist, we record it as pending, drain the remaining pages, and execute
-  // once the dataset is complete — deriving names from `allPageItems` (the
-  // full filtered set across client pages; `items` is only the CURRENT
-  // client page and must never be used for scope decisions).
+  // Filtered operations run over `allPageItems` after draining the remaining
+  // server pages, never over `items` (the current client page only).
   const [pendingFilteredOp, setPendingFilteredOp] = useState<
     null | "export" | "delete"
   >(null);
 
-  // Type guards for RadioGroup values (project convention: no `as` casts —
-  // .claude/rules/frontend-typescript.md).
   const isDeleteMode = (value: string): value is "selected" | "filtered" =>
     value === "selected" || value === "filtered";
   const isExportMode = (
@@ -346,10 +321,8 @@ export const MetricList: React.FC = () => {
   ): value is "all" | "selected" | "filtered" =>
     value === "all" || value === "selected" || value === "filtered";
 
-  // Drain remaining server pages while a filtered operation is pending.
-  // A failed page fetch must cancel the pending operation and surface the
-  // error — otherwise the confirm button spins forever with no way to
-  // recover short of a page refresh.
+  // Drain remaining server pages while a filtered operation is pending; a failed
+  // page fetch cancels the pending operation and shows the error.
   React.useEffect(() => {
     if (pendingFilteredOp && hasNextPage && !isFetchingNextPage) {
       Promise.resolve(fetchNextPage()).catch((err: unknown) => {
@@ -375,8 +348,6 @@ export const MetricList: React.FC = () => {
     [allPageItems],
   );
 
-  // ── Import handler ──────────────────────────────────────────────────
-
   const openImportModal = () => {
     setImportFiles([]);
     importMutation.reset();
@@ -394,67 +365,50 @@ export const MetricList: React.FC = () => {
 
     const file = importFiles[0];
 
-    try {
-      importMutation.mutate(file, {
-        onSuccess: (result) => {
-          setImportModalVisible(false);
-          setImportFiles([]);
+    importMutation.mutate(file, {
+      onSuccess: (result) => {
+        setImportModalVisible(false);
+        setImportFiles([]);
 
-          if (result.status === "IN_PROGRESS" && result.jobId) {
-            // Async — start polling
-            startJobPolling(result.jobId);
-            setImportResult({
-              type: "success",
-              message: t("Import started. Processing in the background…"),
-            });
-          } else {
-            // Sync — completed immediately
-            const parts: string[] = [];
-            if (result.metricsCreated > 0)
-              parts.push(
-                t("{count} created", { count: result.metricsCreated }),
-              );
-            if (result.metricsUpdated > 0)
-              parts.push(
-                t("{count} updated", { count: result.metricsUpdated }),
-              );
-            if (result.datasetsResolved > 0)
-              parts.push(
-                t("{count} datasets resolved", {
-                  count: result.datasetsResolved,
-                }),
-              );
-            setImportResult({
-              type: "success",
-              message: t("Import successful: {result}.{warnings}", {
-                result: parts.join(", "),
-                warnings: result.warnings?.length
-                  ? t(" Warnings: {warnings}", {
-                      warnings: result.warnings.join("; "),
-                    })
-                  : "",
-              }),
-            });
-          }
-        },
-        onError: (err) => {
+        if (result.status === "IN_PROGRESS" && result.jobId) {
+          startJobPolling(result.jobId);
           setImportResult({
-            type: "error",
-            message: t("Import failed: {message}", { message: err.message }),
+            type: "success",
+            message: t("Import started. Processing in the background…"),
           });
-        },
-      });
-    } catch (err) {
-      setImportResult({
-        type: "error",
-        message: t("Failed to read file: {message}", {
-          message: err instanceof Error ? err.message : t("Unknown error"),
-        }),
-      });
-    }
+        } else {
+          const parts: string[] = [];
+          if (result.metricsCreated > 0)
+            parts.push(t("{count} created", { count: result.metricsCreated }));
+          if (result.metricsUpdated > 0)
+            parts.push(t("{count} updated", { count: result.metricsUpdated }));
+          if (result.datasetsResolved > 0)
+            parts.push(
+              t("{count} datasets resolved", {
+                count: result.datasetsResolved,
+              }),
+            );
+          setImportResult({
+            type: "success",
+            message: t("Import successful: {result}.{warnings}", {
+              result: parts.join(", "),
+              warnings: result.warnings?.length
+                ? t(" Warnings: {warnings}", {
+                    warnings: result.warnings.join("; "),
+                  })
+                : "",
+            }),
+          });
+        }
+      },
+      onError: (err) => {
+        setImportResult({
+          type: "error",
+          message: t("Import failed: {message}", { message: err.message }),
+        });
+      },
+    });
   };
-
-  // ── Export handler ──────────────────────────────────────────────────
 
   const openExportModal = () => {
     // Default to a scoped mode when one is available, mirroring the
@@ -471,12 +425,6 @@ export const MetricList: React.FC = () => {
   };
 
   const runExport = (names: string[] | undefined) => {
-    // Client-side download errors (blob/anchor click failures) are unrelated
-    // to the mutation itself, so they get their own inline state — the
-    // mutation's own failures are already surfaced via `exportMutation.isError`
-    // / `exportMutation.error` in the modal, and shouldn't also go to the
-    // page-level `importResult` banner (that banner is for import/bulk-delete,
-    // not export).
     setDownloadError(null);
     exportMutation.mutate(names ? { names } : undefined, {
       onSuccess: (result) => {
@@ -492,9 +440,7 @@ export const MetricList: React.FC = () => {
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
-          // Only close the modal once the download has actually succeeded —
-          // if any of the steps above throw, we fall into the catch block
-          // below and the modal stays open so the inline error is visible.
+          // Close only after the download succeeds.
           setExportModalVisible(false);
         } catch (err) {
           setDownloadError(
@@ -504,8 +450,7 @@ export const MetricList: React.FC = () => {
           );
         }
       },
-      // No onError here — `exportMutation.isError`/`exportMutation.error`
-      // already drive the inline Alert in the export modal below.
+      // exportMutation.error drives the modal's inline Alert.
     });
   };
 
@@ -556,9 +501,6 @@ export const MetricList: React.FC = () => {
       runExport(names);
       return;
     }
-    // "filtered" — evaluate over the COMPLETE namespace. If more
-    // server pages exist, defer to the pending-op effect below, which drains
-    // them first; otherwise execute immediately from `allPageItems`.
     if (hasNextPage || isFetchingNextPage) {
       setPendingFilteredOp("export");
       return;
@@ -871,7 +813,6 @@ export const MetricList: React.FC = () => {
         }
       />
 
-      {/* Bulk Delete Confirmation Modal */}
       <Modal
         visible={bulkDeleteModalVisible}
         onDismiss={() => {
@@ -897,8 +838,6 @@ export const MetricList: React.FC = () => {
                 variant="primary"
                 onClick={() => {
                   if (deleteMode === "filtered") {
-                    // Filtered scope must cover the whole namespace:
-                    // drain remaining server pages first when needed.
                     if (hasNextPage || isFetchingNextPage) {
                       setPendingFilteredOp("delete");
                       return;
@@ -970,7 +909,6 @@ export const MetricList: React.FC = () => {
         </SpaceBetween>
       </Modal>
 
-      {/* Export Scope Modal */}
       <Modal
         visible={exportModalVisible}
         onDismiss={() => {
@@ -1061,7 +999,6 @@ export const MetricList: React.FC = () => {
         </SpaceBetween>
       </Modal>
 
-      {/* Import Modal */}
       <Modal
         visible={importModalVisible}
         onDismiss={closeImportModal}

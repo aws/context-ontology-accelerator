@@ -35,13 +35,7 @@ class BedrockEmbeddingClient:
         model_id: str = DEFAULT_EMBED_MODEL_ID,
         dimensions: int = DEFAULT_EMBED_DIMENSIONS,
     ):
-        """Construct the client and its underlying Bedrock embedder.
-
-        Args:
-            region: AWS region for the Bedrock runtime client.
-            model_id: Bedrock embedding model identifier.
-            dimensions: Output embedding dimensionality.
-        """
+        """Construct the client and its underlying Bedrock embedder."""
         self.model_id = model_id
         self.dimensions = dimensions
         self._embedder = BedrockEmbedder(
@@ -70,12 +64,8 @@ class BedrockEmbeddingClient:
         # Per-channel dedup: identical channel texts (e.g. the dtype
         # channel, where thousands of columns share "unknown"/"INT") are embedded
         # once, then the vector is scattered back to every original position. The
-        # dedup buffer is LOCAL to this call — never a persistent, text-keyed cache
-        # (that would collide search_document vs search_query; see HLD R1). Scatter
-        # returns exactly len(classes) vectors in input order so the fusion loop's
-        # positional fold (pipeline.py) stays aligned (HLD R2). Aliasing duplicate
-        # positions to one vector object is safe: the fusion loop only reads them
-        # and writes a fresh fused list (HLD R3).
+        # dedup buffer is LOCAL to this call; a persistent text-keyed cache would
+        # collide search_document vs search_query. Scatter keeps input order.
         uniq = list(dict.fromkeys(texts))
         uniq_vecs = self._embedder.embed_documents(uniq)
         by_text = dict(zip(uniq, uniq_vecs, strict=True))

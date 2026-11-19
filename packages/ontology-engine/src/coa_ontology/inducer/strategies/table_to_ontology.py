@@ -24,13 +24,12 @@ from rdflib import OWL, RDF, RDFS, XSD, BNode, Graph, Literal, Namespace, URIRef
 from rdflib.namespace import SKOS
 
 from coa_ontology.inducer.schemas import ConceptMatch
-from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column
+from coa_ontology.inducer.services.data_catalog import CatalogTable, parse_referred_column, parse_referred_schema
 from coa_ontology.inducer.services.generated_text import render
 from coa_ontology.inducer.services.grounding import GroundingLookupError, GroundingRerankError
 from coa_ontology.inducer.services.literal_language import catalog_literal, generated_literal
 from coa_ontology.inducer.services.subtype_detection import detect_pk_sharing_subtypes
 from coa_ontology.inducer.strategies.base import (
-    AUTHORITATIVE_FK_SOURCES,
     SCL,
     InductionStrategy,
     add_glossary_and_tags,
@@ -47,15 +46,12 @@ from coa_ontology.inducer.strategies.base import (
     simple_fk_constraints,
     table_identity,
     to_camel,
-    to_pascal,
 )
 
 log = logging.getLogger(__name__)
 
 # The review gate and the authoritative-source set live in ``base`` so the
-# ontology, the R2RML mapping and the SHACL shapes apply the SAME rule (#1088).
-# Re-exported under the historical private names for existing callers/tests.
-_AUTHORITATIVE_FK_SOURCES = AUTHORITATIVE_FK_SOURCES
+# ontology, the R2RML mapping and the SHACL shapes apply the SAME rule.
 _fk_edge_allowed = fk_edge_allowed
 
 
@@ -109,10 +105,6 @@ _SQL_TO_XSD = {
     "TIMESTAMP": XSD.dateTime,
     "TIME": XSD.time,
 }
-
-
-def _to_pascal(s: str) -> str:
-    return to_pascal(s)
 
 
 def _to_camel(s: str) -> str:
@@ -229,7 +221,6 @@ class TableToOntologyStrategy(InductionStrategy):
         # INDUCER_TABLE_BATCH_SIZE is the tuning lever. Default 500
         # tables/batch ≈ 8.4k columns × 32 KB ≈ 270 MB peak — huge margin under
         # 32 GB. Lower it if per-column fan-out or vector dim grows.
-        from coa_ontology.inducer.schemas import ConceptMatch as CM
 
         batch_size = int(os.getenv("INDUCER_TABLE_BATCH_SIZE", str(DEFAULT_TABLE_BATCH_SIZE)))
         all_matches: list[ConceptMatch] = []
@@ -285,14 +276,8 @@ class TableToOntologyStrategy(InductionStrategy):
                 # httpx.HTTPError.
                 raise
             except GroundingRerankError:
-                # An LLM rerank INFRASTRUCTURE failure (Bedrock error after
-                # retries, unusable/truncated response) — NOT an abstention.
-                # Re-raise so the job fails loud rather than degrading to the
-                # all-novel fallback below, which is exactly the silent
-                # wrong-but-plausible ontology the documented fail-loud guarantee
-                # forbids. This is the fix for the enhanced-grounding
-                # reasoning-model defect (issue #59); the broad handler below
-                # would otherwise swallow it into all-novel.
+                # Rerank infrastructure failure, not an abstention: fail the job
+                # instead of the all-novel fallback below.
                 raise
             except GroundingLookupError:
                 # The lexical metadata listing failed or exceeded a bound, so the
@@ -322,7 +307,7 @@ class TableToOntologyStrategy(InductionStrategy):
                     len(table_batch),
                 )
                 matches = [
-                    CM(
+                    ConceptMatch(
                         source_column=column_name,
                         source_table=table.name,
                         source_table_identity=table_identity(table),
@@ -377,7 +362,7 @@ class TableToOntologyStrategy(InductionStrategy):
     ) -> tuple[Graph, set[str]]:
         """Build the proposal ontology from all tables and grounding matches.
 
-        Language (namespace-language LLD, section 2.2.6): class and property
+        Language: class and property
         labels stay the physical table and column names and are never tagged.
         Descriptions (``rdfs:comment``) and synonyms (``skos:altLabel``) are
         tagged only when the table's or column's ``generatedFields`` proves COA
@@ -437,23 +422,29 @@ class TableToOntologyStrategy(InductionStrategy):
             return ns[f"{local}_{column_locals[column_name]}"]
 
         def parent_class(
-            target_name: str, referrer: CatalogTable, target_datasource_id: str | None = None
+            target_name: str,
+            referrer: CatalogTable,
+            target_datasource_id: str | None = None,
+            target_schema: str = "",
         ) -> URIRef | None:
             """Resolve an FK target table name to its class IRI.
 
             Returns ``None`` when the bare name is ambiguous across the run, so the
             caller declares a datatype property instead of an object property —
             the same degradation build_r2rml applies to its parentTriplesMap.
+            ``target_schema`` is the schema the reference names, if any.
 
             Resolution goes through ``resolve_fk_target_identity``, the resolver
             base.build_r2rml._parent_tmap, the RIGOR writer and the SHACL config
             use, so the ontology's object-property range and the mapping's
             parentTriplesMap always name the same target. A cross-source
-            relationship (#1088) carries ``target_datasource_id`` (``DS#``-prefixed
+            relationship carries ``target_datasource_id`` (``DS#``-prefixed
             or bare); the resolver keeps it inside THAT datasource, and several
             same-named tables there resolve to nothing rather than to one of them.
             """
-            target_id = resolve_fk_target_identity(referrer, target_name, ref_index, target_datasource_id)
+            target_id = resolve_fk_target_identity(
+                referrer, target_name, ref_index, target_datasource_id, target_schema
+            )
             if target_id is not None and target_id in pascal_by_id:
                 return ns[pascal_by_id[target_id]]
             if target_name in ambiguous_names:
@@ -461,14 +452,16 @@ class TableToOntologyStrategy(InductionStrategy):
                 # it would point rdfs:range at one arbitrary same-named table.
                 return None
             # Genuinely outside this run: the target table is not minted
-            # this run. Declaring an owl:ObjectProperty with rdfs:range pointing at
+            # this run (or, for a schema-qualified reference, not minted in the
+            # schema the reference names; see ``resolve_fk_target_identity``).
+            # Declaring an owl:ObjectProperty with rdfs:range pointing at
             # a bare ind:<Target> class that is never declared leaves the ontology
             # referencing an absent class, and makes the mapping's degraded literal
             # (base._parent_tmap) and this range disagree. Degrade to a datatype
             # property, mirroring the ambiguous branch and the R2RML emitter.
             log.warning(
                 "fk_target_out_of_run_degraded_to_literal",
-                extra={"referrer": referrer.name, "target": target_name},
+                extra={"referrer": referrer.name, "target": target_name, "schema": target_schema},
             )
             return None
 
@@ -481,11 +474,6 @@ class TableToOntologyStrategy(InductionStrategy):
             if not is_grounded:
                 novel_tables.add(table.name)
 
-            # Direct subscript, not .get(): pascal_names_for built this dict from the
-            # same ``tables`` being iterated here, so a miss means the two have
-            # diverged and the class IRI would be silently wrong — a KeyError is the
-            # better outcome. parent_class above does use .get(), because its lookup
-            # is an FK target that legitimately may sit outside this run.
             table_cls = ns[pascal_by_id[table_identity(table)]]
             g.add((table_cls, RDF.type, OWL.Class))
             # The label is the physical name on the v1 path: never tagged.
@@ -593,7 +581,12 @@ class TableToOntologyStrategy(InductionStrategy):
                         # under the plain property name (unchanged behaviour).
                         if fk_edge_allowed(anchored.relationshipType, anchored.reviewStatus):
                             t_name, t_col = parse_referred_column(anchored.referredColumns[0])
-                            parent = parent_class(t_name, table, anchored.targetDatasourceId)
+                            parent = parent_class(
+                                t_name,
+                                table,
+                                anchored.targetDatasourceId,
+                                parse_referred_schema(anchored.referredColumns[0]),
+                            )
                             if parent is not None:
                                 relationships.append((base_prop, parent, t_name, t_col, anchored.relationshipType))
                         else:
@@ -606,12 +599,8 @@ class TableToOntologyStrategy(InductionStrategy):
                                 anchored.reviewStatus,
                             )
                     else:
-                        # Simple FKs: EVERY gate-passing one (#1088 follow-up). A column
-                        # may reference several tables — the local parent and one or
-                        # more cross-source targets — and each approved relationship
-                        # must reach the ontology. simple_fk_constraints applies the
-                        # gate before selection, so a PENDING one can no longer hide
-                        # an APPROVED one. Withheld FKs are logged for the operator.
+                        # Every gate-passing simple FK becomes a property (a column
+                        # may reference several tables). Withheld FKs are logged.
                         eligible = simple_fk_constraints(table, col.name)
                         for tc in table.tableConstraints:
                             if (
@@ -636,7 +625,12 @@ class TableToOntologyStrategy(InductionStrategy):
                             # target outside this run falls back to the bare form. An
                             # ambiguous bare name resolves to None and THAT relationship
                             # degrades, matching build_r2rml's rr:datatype for it.
-                            parent = parent_class(t_name, table, tc.targetDatasourceId)
+                            parent = parent_class(
+                                t_name,
+                                table,
+                                tc.targetDatasourceId,
+                                parse_referred_schema(tc.referredColumns[0]),  # type: ignore[index]
+                            )
                             if parent is not None:
                                 resolved.append((parent, t_name, t_col, tc.relationshipType, tc.targetDatasourceId))
                         # Per-FK qualifiers: identical rule as R2RML + SHACL so the

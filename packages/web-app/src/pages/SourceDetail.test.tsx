@@ -151,7 +151,6 @@ describe("SourceDetail table navigation", () => {
     invalidateQueriesMock.mockReset();
   });
 
-  // These are the identifier classes reported by #1090.
   it.each([
     ["sales#2026", "sales%232026"],
     ["sales%2026", "sales%252026"],
@@ -214,7 +213,6 @@ describe("SourceDetail batch review", () => {
       approve.click();
     });
 
-    // One command per table, each with the APPROVED decision and the table id.
     await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(TABLES.length));
     const dispatchedInputs = sendMock.mock.calls.map((c) => c[0].input);
     expect(dispatchedInputs.map((i) => i.tableId).sort()).toEqual(
@@ -252,17 +250,14 @@ describe("SourceDetail batch review", () => {
       approve.click();
     });
 
-    // Success message reports the number of tables approved.
     await waitFor(() =>
       expect(screen.getByText(/2 table\(s\) approved\./i)).toBeInTheDocument(),
     );
-    // Selection cleared → the action is disabled again.
     await waitFor(() =>
       expect(
         screen.getByRole("button", { name: /approve selected/i }),
       ).toBeDisabled(),
     );
-    // Tables + source queries are invalidated so the UI refreshes.
     expect(invalidateQueriesMock).toHaveBeenCalled();
   });
 
@@ -358,7 +353,6 @@ describe("SourceDetail re-scan pending-deletion surfacing", () => {
 
   it("flags a re-scan-removed table with a Pending deletion badge and a Keep button", () => {
     render(<SourceDetail />, { wrapper });
-    // Exactly the flagged table surfaces the badge + Keep control.
     expect(screen.getByText(/pending deletion/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^keep$/i })).toBeInTheDocument();
   });

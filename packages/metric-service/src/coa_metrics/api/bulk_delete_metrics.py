@@ -3,10 +3,9 @@
 
 """Bulk Delete Metrics Lambda handler.
 
-POST /namespaces/{namespaceId}/metrics/bulk-delete → 200 OK
+POST /namespaces/{namespaceId}/bulk-delete-metrics → 200 OK
 
 Deletes metrics by explicit name list or filter criteria.
-Uses a single SPARQL DELETE WHERE for efficiency.
 """
 
 from __future__ import annotations
@@ -72,7 +71,6 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if bound_error:
         return api_response(400, {"message": bound_error})
 
-    # Validate mutual exclusivity
     provided = sum([bool(names), bool(filter_criteria), bool(delete_all)])
     if provided > 1:
         return api_response(400, {"message": "'names', 'filter', and 'deleteAll' are mutually exclusive"})
@@ -83,7 +81,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     opensearch = _get_opensearch()
 
     if delete_all:
-        return _delete_all(namespace, neptune, opensearch)
+        return _delete_all(namespace, neptune)
     elif names:
         return _delete_by_names(namespace, names, neptune, opensearch)
     else:
@@ -117,25 +115,13 @@ def _check_bounds(names: Any, filter_criteria: Any, delete_all: Any) -> str | No
 def _delete_all(
     namespace: str,
     neptune: MetricNeptuneClient,
-    opensearch: MetricOpenSearchClient,
 ) -> dict[str, Any]:
     """Delete ALL metrics for the namespace (authoritative, no name enumeration).
 
-    Used by the namespace deletion pipeline. Does not depend on DynamoDB listing —
-    directly purges all governed-metric triples from Neptune. OpenSearch cleanup is
-    best-effort (metrics that never had embeddings won't be found).
+    Used by the namespace deletion pipeline. Purges all governed-metric triples
+    from Neptune; the pipeline removes the OpenSearch index separately.
     """
     deleted_count = neptune.delete_all_metrics_for_namespace(namespace)
-
-    # Best-effort OpenSearch cleanup: delete the entire namespace's metric embedding collection
-    # (safer than per-name deletion when DDB/Neptune have drifted)
-    if deleted_count > 0:
-        with contextlib.suppress(Exception):
-            # The OpenSearch client doesn't have a delete-all-for-namespace method,
-            # so we rely on the namespace deletion pipeline to clean up the entire
-            # OpenSearch index. Individual embeddings left behind are harmless —
-            # they'll be orphaned and won't match any queries once Neptune is clean.
-            pass
 
     logger.info("bulk_delete_all", namespace=namespace, deleted=deleted_count)
     return api_response(200, {"deleted": deleted_count})
@@ -186,7 +172,6 @@ def _delete_by_filter(
     if not data_source_id and not source_table and not name_prefix:
         return api_response(400, {"message": "At least one filter field is required"})
 
-    # First, list all metrics matching the filter
     all_metrics = neptune.list_metrics(
         namespace=namespace,
         data_source_id=data_source_id,
@@ -195,14 +180,12 @@ def _delete_by_filter(
         offset=0,
     )
 
-    # Apply name prefix filter if specified
     if name_prefix:
         all_metrics = [m for m in all_metrics if m.name.startswith(name_prefix)]
 
     if not all_metrics:
         return api_response(200, {"deleted": 0})
 
-    # Delete each metric
     deleted = 0
     for metric in all_metrics:
         try:

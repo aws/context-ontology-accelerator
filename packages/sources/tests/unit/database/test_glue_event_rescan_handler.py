@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Glue-event → rescan consumer (#683 R8)."""
+"""Unit tests for the Glue-event → rescan consumer."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import pytest
 from botocore.exceptions import ClientError
 
 _MODULE = "coa_sources.database.glue_event_rescan_handler"
-_SH = "coa_sources.api.sources_handler"
 
 
 def _sqs_event(*bodies: dict) -> dict:
@@ -93,8 +92,8 @@ class TestGlueEventRescanHandler:
         assert _failed_ids(result) == ["m0"]
 
     def test_one_bad_message_does_not_take_the_batch_with_it(self):
-        """The whole point of the partial response: the nine good messages are
-        deleted and only the failure is retried."""
+        """The whole point of the partial response: the good messages are deleted
+        and only the failure is retried."""
         from coa_sources.database import glue_event_rescan_handler as mod
 
         def _rescan(event, namespace_id, source_id, trigger=None):

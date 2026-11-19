@@ -17,6 +17,7 @@ import type { AppTranslate, SupportedLocale } from "./LocaleProvider";
 import {
   localizeNamespaceStatus,
   localizeVkgHealth,
+  namespaceSwitcherName,
 } from "@utils/namespace-status";
 import { localizePrincipalType } from "@utils/principal-type";
 import { localizeOntologyType } from "@utils/ontology-display";
@@ -51,6 +52,53 @@ describe("namespace and VKG status", () => {
     expect(localizeNamespaceStatus(undefined, ja)).toBe("—");
   });
 
+  it("builds the switcher name from loading, the namespace, or the reason", () => {
+    const none = { isLoading: false, current: undefined };
+    expect(
+      namespaceSwitcherName({ ...none, unavailable: "not-found" }, en),
+    ).toBe("Not found or not accessible");
+    expect(
+      namespaceSwitcherName({ ...none, unavailable: "not-found" }, ja),
+    ).toBe("見つからないか、アクセスできません");
+    expect(namespaceSwitcherName({ ...none, unavailable: "error" }, en)).toBe(
+      "Could not be loaded",
+    );
+    expect(namespaceSwitcherName({ ...none, unavailable: "error" }, ja)).toBe(
+      "読み込めませんでした",
+    );
+    expect(namespaceSwitcherName({ ...none, unavailable: undefined }, en)).toBe(
+      "—",
+    );
+    // Still resolving: no reason yet, even if one is passed.
+    expect(
+      namespaceSwitcherName(
+        { isLoading: true, current: undefined, unavailable: "not-found" },
+        en,
+      ),
+    ).toBe("Loading…");
+    // A current namespace wins over any reason.
+    expect(
+      namespaceSwitcherName(
+        {
+          isLoading: false,
+          current: { name: "sales", displayName: "Sales" },
+          unavailable: "not-found",
+        },
+        en,
+      ),
+    ).toBe("Sales");
+    expect(
+      namespaceSwitcherName(
+        {
+          isLoading: false,
+          current: { name: "sales" },
+          unavailable: undefined,
+        },
+        en,
+      ),
+    ).toBe("sales");
+  });
+
   it("names each VKG health status in both languages", () => {
     expect(localizeVkgHealth("DEGRADED", en)).toBe("Degraded");
     expect(localizeVkgHealth("DEGRADED", ja)).toBe("機能低下");
@@ -77,7 +125,6 @@ describe("principal and ontology type", () => {
     expect(localizeOntologyType("induced", ja)).toBe(
       formatAppMessage("ja", "Induced"),
     );
-    expect(localizeOntologyType("user_created", ja)).not.toBe("user_created");
   });
 });
 

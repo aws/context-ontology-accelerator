@@ -24,13 +24,17 @@ def log_tool_invocation(
     success: bool = True,
     error: str | None = None,
     duration_ms: int | None = None,
+    include_debug_info: bool | None = None,
 ) -> None:
     """Log an MCP tool invocation for audit purposes.
 
     Agent identity is logged but NOT used for authorization decisions.
     Authorization is based on the delegating USER identity (caller.user_id).
+    ``include_debug_info`` records a ``query`` request for the generated SQL and
+    SPARQL; it is omitted from the line when ``None`` (other tools).
     """
     log_fn = logger.info if success else logger.warning
+    extra = {} if include_debug_info is None else {"include_debug_info": include_debug_info}
     log_fn(
         "mcp_tool_invocation",
         tool=tool_name,
@@ -40,4 +44,5 @@ def log_tool_invocation(
         success=success,
         error=error,
         duration_ms=duration_ms,
+        **extra,
     )

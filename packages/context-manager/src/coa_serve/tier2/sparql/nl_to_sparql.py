@@ -31,8 +31,8 @@ from ..ontop.types import VectorHit
 
 # Full SPARQL 1.1 prompt. Deliberately does NOT carry the Ontop anti-subquery /
 # SUM(IF) rules — those exist only because Ontop cannot compile them to SQL. A
-# native triple store runs them directly, so the graph-native constructs the ADR
-# calls out (property paths, OPTIONAL, UNION) are ENCOURAGED here.
+# native triple store runs them directly, so graph-native constructs
+# (property paths, OPTIONAL, UNION) are ENCOURAGED here.
 NATIVE_SPARQL_SYSTEM_PROMPT = (
     "You are a SPARQL 1.1 query generator for an RDF graph store. "
     "Given a natural language question and an ontology schema, generate a valid, "
@@ -140,7 +140,7 @@ NATIVE_SPARQL_SYSTEM_PROMPT = (
 )
 
 # Calibration for native execution. Not eval-tuned: the NL→SPARQL benchmark that
-# gates fleet-wide auto-detect (LLD task 5) is what tunes these. Complexity is
+# gates fleet-wide auto-detect is what tunes these. Complexity is
 # penalised less than on the Ontop path, because a triple store executes joins,
 # paths and subqueries natively instead of compiling them to SQL.
 _NATIVE_VALIDATION_BOOST = 0.05

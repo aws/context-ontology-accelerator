@@ -197,6 +197,19 @@ export interface AthenaFederationConnectorProps {
    */
   readonly spillRemovalPolicy?: cdk.RemovalPolicy;
 
+  /**
+   * Where the spill bucket's S3 server access logs go, under `spill/{connectorId}/`. Defaults to a
+   * hardened log bucket created for this connector, which follows {@link spillRemovalPolicy}.
+   *
+   * Pass one to share a log bucket across connectors. It must accept delivery from
+   * `logging.s3.amazonaws.com`. For a bucket defined in the same app CDK adds that grant, as a bucket
+   * policy only if the app enables `@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy` and otherwise as
+   * the legacy `LogDeliveryWrite` ACL; the flag this construct sets covers only its own subtree. An
+   * imported bucket gets no grant at all, and a missing one fails silently: no log is ever written.
+   * Ignored under `spill: Provisioning.NONE`, where there is no bucket to log.
+   */
+  readonly accessLogsBucket?: s3.IBucket;
+
   /** Connector-specific environment variables, from the connector's own stack. */
   readonly environment?: Record<string, string>;
 
@@ -235,6 +248,12 @@ export class AthenaFederationConnector extends Construct {
   /** The customer-managed key encrypting {@link spillBucket}, created alongside it. */
   public readonly spillKey?: kms.Key;
 
+  /**
+   * Where {@link spillBucket} writes its server access logs: the one passed in, or the one created
+   * for it. Unset under {@link Provisioning.NONE}.
+   */
+  public readonly accessLogsBucket?: s3.IBucket;
+
   /** Every alarm on this connector, the three below plus any the connector's own stack added. */
   public readonly alarms: cloudwatch.Alarm[] = [];
 
@@ -252,6 +271,10 @@ export class AthenaFederationConnector extends Construct {
 
   constructor(scope: Construct, id: string, props: AthenaFederationConnectorProps) {
     super(scope, id);
+    // Scoped to this subtree, before any child exists (setContext refuses after). Without it, an app
+    // whose cdk.json predates the flag grants log delivery through the legacy LogDeliveryWrite ACL,
+    // re-enabling ACLs on the log bucket, instead of a bucket-policy statement scoped to the source.
+    this.node.setContext("@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy", true);
     this.connectorId = props.connectorId;
 
     if (!fs.existsSync(props.jarPath)) {
@@ -281,6 +304,10 @@ export class AthenaFederationConnector extends Construct {
       });
       cdk.Tags.of(this.spillKey).add(CONNECTOR_SPILL_KMS_TAG_KEY, CONNECTOR_TAG_VALUE);
 
+      // Spill objects are query results, so who read or wrote them is worth a record.
+      this.accessLogsBucket =
+        props.accessLogsBucket ?? this.createAccessLogsBucket(spillRemovalPolicy);
+
       // One-day expiry: spill data is scratch, and anything older than its query is garbage.
       this.spillBucket = new s3.Bucket(this, "SpillBucket", {
         blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -289,6 +316,8 @@ export class AthenaFederationConnector extends Construct {
         encryptionKey: this.spillKey,
         // Without this a CMK turns every spilled block into billable KMS traffic.
         bucketKeyEnabled: true,
+        serverAccessLogsBucket: this.accessLogsBucket,
+        serverAccessLogsPrefix: `spill/${props.connectorId}/`,
         lifecycleRules: [
           { id: "expire-spill", expiration: cdk.Duration.days(1), enabled: true },
         ],
@@ -418,6 +447,25 @@ export class AthenaFederationConnector extends Construct {
         this.spillBucket?.bucketName ??
         "<none: a response over 6 MB has been observed returning SUCCEEDED with zero rows>",
       description: "spill_bucket the connector writes large responses to",
+    });
+  }
+
+  /**
+   * The spill bucket's log target: no public access, TLS only, SSE-S3 (server access log delivery
+   * does not support SSE-KMS), 90-day expiry. Not self-logging, which would be a delivery loop. CDK
+   * grants `logging.s3.amazonaws.com` write through the bucket policy, so ACLs stay disabled.
+   */
+  private createAccessLogsBucket(removalPolicy: cdk.RemovalPolicy): s3.Bucket {
+    return new s3.Bucket(this, "SpillAccessLogsBucket", {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      lifecycleRules: [
+        { id: "expire-access-logs", expiration: cdk.Duration.days(90), enabled: true },
+      ],
+      // Follows the spill bucket: a destroy that keeps the data should keep the record of who read it.
+      removalPolicy,
+      autoDeleteObjects: removalPolicy === cdk.RemovalPolicy.DESTROY,
     });
   }
 

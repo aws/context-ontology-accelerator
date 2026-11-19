@@ -46,14 +46,7 @@ class FewShotExample:
 
 
 class FewShotExampleLoader:
-    """Loads + caches namespace-scoped few-shot examples from S3.
-
-    Args:
-        bucket: ontology-artifacts bucket name. Empty/None → loader is inert
-            (always returns ``[]``), so the prompt falls back to generic examples.
-        region: AWS region for the S3 client.
-        s3_client: optional injected client (tests pass a stub; never raises here).
-    """
+    """Loads + caches namespace-scoped few-shot examples from S3."""
 
     def __init__(self, bucket: str | None = None, region: str | None = None, s3_client=None):
         """Configure the S3 source for few-shot examples.

@@ -1,7 +1,5 @@
 # Metric Service
 
-- **Owner**: ancavi
-- **LLD**: `.kiro/design_docs/md/Metric Onboarding Service - LLD.md`
 - **Status**: Active
 
 ## Overview
@@ -38,10 +36,6 @@ uv sync
 uv run pytest packages/metric-service/tests/unit -m unit -v --tb=short
 ```
 
-> **Note:** The `npx nx test metric-service` target is not yet active — it
-> currently prints a `TODO` placeholder instead of running tests. Use the
-> direct `pytest` command above until the Nx target is enabled.
-
 ### Lint & Format
 
 ```bash
@@ -49,76 +43,10 @@ npx nx lint metric-service     # ruff check + ruff format --check + mypy
 npx nx format metric-service   # auto-format with ruff
 ```
 
-### Test Structure
-
-| Test file | Covers |
-|-----------|--------|
-| `test_create_metric.py` | Create flow, validation on create, conflict detection |
-| `test_update_delete_metrics.py` | Update (full replace) and single delete |
-| `test_bulk_delete.py` | Bulk delete by names list and by filter |
-| `test_validator.py` | All 6 validation checks in isolation |
-| `test_validate_metric.py` | Validate endpoint (dry-run validation) |
-| `test_osi_parser.py` | OSI YAML parsing and serialization |
-| `test_import_osi.py` | Synchronous import path |
-| `test_async_import.py` | Async import (chunked SQS worker) |
-| `test_export_osi.py` | Export to OSI YAML (inline + S3) |
-| `test_s3_import_export.py` | Pre-signed URL generation, S3 upload flow |
-| `test_neptune_client.py` | SPARQL CRUD operations |
-| `test_opensearch_client.py` | Vector embedding operations |
-| `test_dataset_resolver.py` | OSI dataset → data source resolution |
-| `test_metadata_reconciler.py` | Additive metadata merge logic |
-| `test_get_list_metrics.py` | Get/list endpoints, pagination, filters |
-
-#### Integration tests (`tests/integ/`)
+### Integration tests (`tests/integ/`)
 
 End-to-end tests against a **deployed** environment (`@pytest.mark.integ`), run by the CI
 `integ-test` job and locally with `uv run pytest packages/metric-service -m integ`.
-
-| Test file | Covers |
-|-----------|--------|
-| `test_metric_api.py` | Full CRUDL lifecycle + error cases (404 / 400 / 409) |
-| `test_metric_complex_validation.py` | Multi-dialect + full `aiContext` round-trip; 4XX validation; PUT full-replacement |
-| `test_metric_validate_endpoint.py` | `/validate` dry-run — 200 + `warnings` list, does not persist |
-| `test_metric_osi_import_export.py` | OSI import (inline / pre-signed upload-url / async job) + export (inline / S3) |
-| `test_metric_bulk_delete_list.py` | Bulk delete (by names / filter); list filtering + nextToken pagination |
-| `test_metric_authz_isolation.py` | Auth (401 missing / 403 invalid token) + namespace isolation |
-
-## Package Structure
-
-```text
-packages/metric-service/
-├── src/coa_metrics/
-│   ├── api/
-│   │   ├── metric_api_handler.py       # Lambda entry — routes all endpoints
-│   │   ├── create_metric.py            # POST /metrics
-│   │   ├── get_metric.py              # GET /metrics/{name}
-│   │   ├── list_metrics.py            # GET /metrics
-│   │   ├── update_metric.py           # PUT /metrics/{name}
-│   │   ├── delete_metric.py           # DELETE /metrics/{name}
-│   │   ├── bulk_delete_metrics.py     # POST /bulk-delete-metrics
-│   │   ├── validate_metric.py         # POST /metrics/validate
-│   │   ├── import_osi.py             # POST /import-osi (sync or async dispatch)
-│   │   ├── import_worker.py          # SQS worker Lambda (async chunked import)
-│   │   ├── import_job_store.py       # DynamoDB job tracking
-│   │   ├── get_import_job.py         # GET /import-jobs/{jobId}
-│   │   ├── get_osi_upload_url.py     # POST /import-osi/upload-url
-│   │   └── export_osi.py            # GET /export-osi
-│   ├── validator.py                   # 6-check validation engine
-│   ├── neptune_client.py             # SPARQL CRUD (SigV4 + httpx)
-│   ├── opensearch_client.py          # Vector embeddings (Bedrock Cohere Embed v4 + AOSS)
-│   ├── osi_parser.py                 # OSI v1.0 YAML parse/serialize
-│   ├── dataset_resolver.py           # Resolve OSI datasets → data sources
-│   ├── metadata_reconciler.py        # Additive metadata merge
-│   └── constants.py                  # SqlDialect re-exports
-├── examples/
-│   └── sample-osi-import.yaml        # Reference OSI file
-├── tests/
-│   ├── unit/                          # All unit tests
-│   └── integ/                         # Integration tests (placeholder)
-├── pyproject.toml
-├── project.json
-└── requirements.txt
-```
 
 ## Architecture
 
@@ -131,7 +59,7 @@ MetricApiFn (single Lambda, route-based dispatch)
   ├─ OpenSearch (AOSS)   — vector embeddings for Tier 0 routing
   ├─ EventBridge         — lifecycle events (metric.published)
   ├─ S3                  — OSI file staging (large imports/exports)
-  └─ SQS + Worker Lambda — async import for large OSI files (>30 metrics)
+  └─ SQS + Worker Lambda — async import of OSI files
 ```
 
 Each metric is an `owl:Class` that is `rdfs:subClassOf :GovernedMetric` in the
@@ -155,7 +83,7 @@ directions via SPARQL.
 | DELETE | `/namespaces/{ns}/metrics/{name}` | Delete a metric |
 | POST | `/namespaces/{ns}/bulk-delete-metrics` | Delete multiple metrics by `names` list or `filter` (`dataSourceId`/`sourceTable`/`namePrefix`); returns `deleted` count and `notFound` list |
 | POST | `/namespaces/{ns}/metrics/validate` | Dry-run validation (Checks 1–6) without persisting |
-| POST | `/namespaces/{ns}/import-osi` | Import metrics from OSI v1.0 YAML (`s3Key` from upload-url **OR** `content` inline; the two are mutually exclusive). Returns `200` (sync) or `202` with `jobId` (async, >30 metrics) |
+| POST | `/namespaces/{ns}/import-osi` | Import metrics from OSI v1.0 YAML (`s3Key` from upload-url **OR** `content` inline; the two are mutually exclusive). Returns `202` with `jobId` for any import with at least one metric |
 | POST | `/namespaces/{ns}/import-osi/upload-url` | Get a pre-signed S3 PUT URL for large OSI files |
 | GET | `/namespaces/{ns}/import-jobs/{jobId}` | Poll async import status |
 | GET | `/namespaces/{ns}/export-osi` | Export metrics as OSI v1.0 YAML (`format=inline` or `format=s3`) |
@@ -193,10 +121,6 @@ Client                              API                         S3              
   │                                  ├── read YAML from S3 ────►│                  │
   │                                  ├── parse, count metrics   │                  │
   │                                  │                          │                  │
-  │    (≤30 metrics: sync)           │                          │                  │
-  │◄─── 200 { metrics, warnings } ──│                          │                  │
-  │                                  │                          │                  │
-  │    (>30 metrics: async)          │                          │                  │
   │◄─── 202 { jobId, status } ──────│                          │                  │
   │                                  ├── enqueue chunk msg ─────┼─────────────────►│
   │                                  │                          │                  ├── process chunk

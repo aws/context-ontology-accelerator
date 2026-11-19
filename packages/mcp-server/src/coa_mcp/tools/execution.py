@@ -1,7 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Execution tools — query, translate_sparql, rag_retrieval, graph_traversal via the Context Manager."""
+"""Execution tools — query, translate_sparql, rag_retrieval, graph_traversal via the Context Manager.
+
+Every helper takes an optional ``runtime_session_id``, the AgentCore runtime session the call is routed to
+(``clients.context_manager``): it picks the CM microVM, never changes the payload.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ from typing import Any
 import structlog
 from coa_common.smithy_shapes import normalize_dimensions
 
-from ..clients.context_manager import _INVOKE_TIMEOUT_S, ContextManagerClient
+from ..clients.context_manager import _INVOKE_TIMEOUT_S, ContextManagerClient, ContextManagerError
 
 logger = structlog.get_logger(__name__)
 
@@ -18,20 +22,6 @@ logger = structlog.get_logger(__name__)
 # read timeout, not the REST 29000 ms API Gateway limit.
 QUERY_TIMEOUT_MS_MIN = 1
 QUERY_TIMEOUT_MS_MAX = _INVOKE_TIMEOUT_S * 1000
-
-
-class ContextManagerError(Exception):
-    """Raised when the Context Manager returns a >=400 status.
-
-    Carries the status code so the tool layer can map it back to a matching
-    MCP error surface instead of collapsing every failure to a generic 500.
-    """
-
-    def __init__(self, status_code: int, message: str) -> None:
-        """Record ``status_code`` alongside the human-readable ``message``."""
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
 
 
 def _build_cm_profile(profile: dict) -> dict:
@@ -75,8 +65,10 @@ async def execute_query(
     strategy: str | None = None,
     dimensions: list[dict] | None = None,
     include_supporting: bool = True,
+    include_debug_info: bool = False,
     max_results: int = 1000,
     timeout_ms: int | float | None = None,
+    runtime_session_id: str | None = None,
 ) -> dict[str, Any]:
     """End-to-end NL query with tiered resolution.
 
@@ -87,8 +79,10 @@ async def execute_query(
 
     Returns the ``{result, requestId, sessionId}`` envelope. Raises
     :class:`ContextManagerError` on CM >=400 and ``ValueError`` on invalid
-    ``timeout_ms``.
+    ``timeout_ms`` or a non-bool ``include_debug_info``.
     """
+    if not isinstance(include_debug_info, bool):
+        raise ValueError("Invalid includeDebugInfo. Must be a boolean.")
     if timeout_ms is not None and (
         isinstance(timeout_ms, bool)
         or not isinstance(timeout_ms, int)
@@ -121,10 +115,12 @@ async def execute_query(
             payload["options"]["dimensions"] = normalized
     if not include_supporting:
         payload["options"]["includeSupporting"] = False
+    if include_debug_info:
+        payload["options"]["includeDebugInfo"] = True
     if timeout_ms is not None:
         payload["options"]["timeoutMs"] = timeout_ms
 
-    response = await cm_client.invoke(payload, bearer_token)
+    response = await cm_client.invoke(payload, bearer_token, runtime_session_id=runtime_session_id)
     _raise_for_cm_error(response)
     return {
         "result": response.get("result", _strip_envelope(response)),
@@ -139,6 +135,8 @@ async def execute_translate_sparql(
     namespace_id: str,
     profile: dict,
     bearer_token: str,
+    *,
+    runtime_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Translate NL to SPARQL using the published ontology.
 
@@ -152,7 +150,7 @@ async def execute_translate_sparql(
         "profile": _build_cm_profile(profile),
     }
 
-    response = await cm_client.invoke(payload, bearer_token)
+    response = await cm_client.invoke(payload, bearer_token, runtime_session_id=runtime_session_id)
     _raise_for_cm_error(response)
     unwrapped = _strip_envelope(response)
 
@@ -176,6 +174,7 @@ async def execute_rag_retrieval(
     min_score: float | None = None,
     source_filter: list[str] | None = None,
     entity_filter: list[str] | None = None,
+    runtime_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Retrieve semantically similar document chunks from the knowledge base.
 
@@ -196,7 +195,7 @@ async def execute_rag_retrieval(
     if entity_filter:
         payload["options"]["entityFilter"] = entity_filter
 
-    response = await cm_client.invoke(payload, bearer_token)
+    response = await cm_client.invoke(payload, bearer_token, runtime_session_id=runtime_session_id)
     _raise_for_cm_error(response)
     unwrapped = _strip_envelope(response)
 
@@ -218,6 +217,7 @@ async def execute_graph_traversal(
     direction: str = "both",
     max_results: int = 100,
     relationship_filter: list[str] | None = None,
+    runtime_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Traverse the semantic graph for entity relationships and context.
 
@@ -244,7 +244,7 @@ async def execute_graph_traversal(
         "options": options,
     }
 
-    response = await cm_client.invoke(payload, bearer_token)
+    response = await cm_client.invoke(payload, bearer_token, runtime_session_id=runtime_session_id)
     _raise_for_cm_error(response)
     unwrapped = _strip_envelope(response)
 

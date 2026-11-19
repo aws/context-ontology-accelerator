@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -151,9 +152,14 @@ class TestSqlExecutionService:
         executor.execute = AsyncMock(return_value=_exec_result())
         svc = SqlExecutionService(fw, executor)
 
-        await svc.execute("SELECT 1", namespace="ns1", max_rows=25, timeout_seconds=7, dialect="postgres")
+        await svc.execute("SELECT 1", namespace="ns1", max_rows=25, timeout_seconds=7)
 
         kwargs = executor.execute.await_args.kwargs
         assert kwargs["max_rows"] == 25 and kwargs["timeout_seconds"] == 7 and kwargs["namespace"] == "ns1"
-        # The read-dialect is the firewall's safety parse, not the executor's concern.
-        assert fw.evaluate.call_args.kwargs["dialect"] == "postgres"
+        # Authorized as Trino, the dialect every executor reads the statement in.
+        assert fw.evaluate.call_args.kwargs["dialect"] == DEFAULT_READ_DIALECT
+
+    def test_caller_cannot_choose_the_authorization_dialect(self):
+        # Another dialect could read comments differently from the Trino parse the
+        # executors run, so the firewall would authorize a different statement.
+        assert "dialect" not in inspect.signature(SqlExecutionService.execute).parameters

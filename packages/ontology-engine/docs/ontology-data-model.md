@@ -256,6 +256,7 @@ anything independently:
 |---|---|
 | `table_identity`, `pascal_names_for` | Two tables (`public.customers`, `analytics.customers`, or `order_item` vs `order-item`) fusing onto one class/TriplesMap IRI. A fused TriplesMap carries two `rr:tableName` values, which is invalid R2RML — Ontop rejects the mapping or silently picks one table. |
 | `reference_index`, `ambiguous_target_names` | Resolving an unqualified FK target to the wrong parent. An ambiguous target is degraded to a datatype property + `rr:datatype` literal in **both** artifacts, because a wrong join is worse than a missing one. |
+| `parse_referred_schema`, `resolve_fk_target_identity` | A schema-qualified target (`CRM.CUSTOMERS.ID`) binding to a same-named table in another schema or source. It resolves only to that schema's table in the referrer's datasource (or the hinted one) and is otherwise degraded like a target outside the run. |
 | `composite_fk_anchors`, `composite_fk_columns` | The two builders picking different anchor columns for a multi-column FK. |
 | `composite_fk_is_usable` | Declaring `rdfs:range <Class>` for a column the mapping exposes as a literal. |
 | `parse_referred_column` | Splitting a dotted FK target under two incompatible conventions — it was previously reimplemented at six call sites, `parts[0]` in some and `parts[-2]` in others. |

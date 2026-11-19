@@ -38,11 +38,7 @@ export function useCreateNamespace(
     mutationFn: async (input) => {
       return client.send(new CreateNamespaceCommand(input));
     },
-    // Spread the caller's options first: a caller onSuccess (the create page
-    // navigates with one) must not replace this one, or the namespace list and
-    // the switcher keep their pre-create pages and miss the new namespace.
-    // Return the caller's result so the mutation still waits for a promise it
-    // returns.
+    // See use-create-source: a caller onSuccess must not skip this refresh.
     onSuccess: (...args) => {
       void queryClient.invalidateQueries({ queryKey: ["namespaces"] });
       return options?.onSuccess?.(...args);

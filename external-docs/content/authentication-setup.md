@@ -381,7 +381,10 @@ discovers its backends without a rebuild:
 
 When a user authenticates, the authorizer resolves their permissions:
 
-1. **Validate token** — Verify JWT signature against the JWKS endpoint
+1. **Validate token** — Verify JWT signature against the JWKS endpoint. The
+   key set is cached for 5 minutes. If a refresh fails, the expired set is still
+   used for up to an hour, so a key retired at your IdP can stay valid for up to
+   about 65 minutes while the JWKS endpoint is unreachable.
 2. **Extract principal** — Read `email` (or `sub`) as the principal ID
 3. **Extract groups** — Read the configured group claim
 4. **Query grants** — Look up grants for `User::{email}` and `Group::{group}` in DynamoDB

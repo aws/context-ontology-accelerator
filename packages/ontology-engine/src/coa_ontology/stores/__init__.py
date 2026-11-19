@@ -18,13 +18,11 @@ The public surface is two Protocols — :class:`GraphStore` and
 """
 
 from coa_ontology.stores.base import EmbeddingHit, GraphStore, VectorStore
-from coa_ontology.stores.factory import build_stores, get_graph_store, get_vector_store
+from coa_ontology.stores.factory import build_stores
 
 __all__ = [
     "GraphStore",
     "VectorStore",
     "EmbeddingHit",
     "build_stores",
-    "get_graph_store",
-    "get_vector_store",
 ]

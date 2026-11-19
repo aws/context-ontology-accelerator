@@ -50,8 +50,8 @@ COPY packages/context-manager/src/ ./src/
 COPY packages/mcp-server/pyproject.toml /tmp/mcp-server/pyproject.toml
 COPY packages/mcp-server/src/ /tmp/mcp-server/src/
 
-# pip itself is upgraded to its newest release, not pinned: like the OS packages above, it floats for security
-# fixes, and the service never imports it. setuptools stays at the lock's version through the constraints.
+# setuptools stays at the lock's version through the constraints.
+# pip is NOT upgraded: installs run on the python3.12-pip RPM; see scripts/pip_sbom_check.py for why.
 # spaCy (pulled in by graphrag-lexical-graph) ships a test suite whose spacy/tests/package/requirements.txt pins
 # black==22.3.0, which scanners report as an installed package (CVE-2026-31900, CVE-2026-32274) although black is
 # never installed. Nothing at runtime imports spacy.tests, so it is deleted in this layer, the one that installs spaCy;
@@ -61,7 +61,7 @@ RUN pip install --no-cache-dir uv==0.13.4 && \
     sed -i '/\[tool.uv.sources\]/,$ d' /tmp/mcp-server/pyproject.toml && \
     uv pip install --system --python /usr/bin/python3.12 --no-cache --constraint /tmp/constraints.txt . /tmp/mcp-server/ && \
     rm -rf /tmp/mcp-server/ && \
-    pip install --no-cache-dir -c /tmp/constraints.txt --upgrade pip "setuptools>=78.1.1" && \
+    pip install --no-cache-dir -c /tmp/constraints.txt --upgrade "setuptools>=78.1.1" && \
     pip uninstall -y msgpack && \
     python -c "import os, shutil, spacy; d = os.path.join(os.path.dirname(spacy.__file__), 'tests'); shutil.rmtree(d); assert not os.path.exists(d)" && \
     pip uninstall -y uv && \
@@ -69,11 +69,21 @@ RUN pip install --no-cache-dir uv==0.13.4 && \
 
 EXPOSE 8080
 
+# Prefer IPv4 unless built with PREFER_IPV4=false. In a dual-stack subnet
+# without IPv6 egress to AWS, IPv6-first connects stall for minutes, long
+# enough to expire a request's SigV4 signature. Kept before USER (needs root).
+ARG PREFER_IPV4=true
+RUN if [ "$PREFER_IPV4" = "true" ]; then echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf; fi
+
 USER appuser
 
 # Fail the build if the code this image runs imports anything the image cannot (scripts/image_import_check.py).
 COPY scripts/image_import_check.py /tmp/
 RUN python /tmp/image_import_check.py coa_serve.main coa_mcp.__main__
+
+# Fail the build if the image's python can import a pip with a vendored SBOM (scripts/pip_sbom_check.py).
+COPY scripts/pip_sbom_check.py /tmp/
+RUN python /tmp/pip_sbom_check.py
 
 # Health probe for container orchestrators (ECS, etc.) to detect unresponsive processes.
 # BedrockAgentCoreApp exposes GET /ping per the AgentCore protocol.

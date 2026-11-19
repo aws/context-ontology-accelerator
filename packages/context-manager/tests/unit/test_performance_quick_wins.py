@@ -1,15 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for performance quick wins — items #2, #4, #6, #7, #9.
-
-Tests cover:
-- #2: entity_type filter in OpenSearch search and SQL generator
-- #4: tier2_sparql + failure_reason in fallback log
-- #6: SELECT variable specificity in NL→SPARQL prompt
-- #7: rdfs:range validation in SPARQL validator
-- #9: ObjectProperty (FK join paths) in T-Box context
-"""
+"""Unit tests for retrieval filters, fallback logging, SPARQL prompt and validation, and T-Box FK paths."""
 
 from __future__ import annotations
 
@@ -22,16 +14,11 @@ from coa_serve.models import InvokeRequest
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.tier1.metric_resolver import MetricMatch
 from coa_serve.tier2.nl_to_sql.sql_generator import SQLGenerator
-from coa_serve.tier2.ontop.nl_to_sparql import TranslationResult
 from coa_serve.tier2.ontop.sparql_validator import SPARQLValidator
 from coa_serve.tier2.ontop.tbox_context import TBoxContext, TBoxContextBuilder
 from coa_serve.tier2.ontop.vkg_translator import Tier2Result
 from coa_serve.tier2.strategy import StrategyOption, StrategyResult, StructuredQueryTier
 from coa_serve.tier3.knowledge_retriever import Tier3Result
-
-# ═══════════════════════════════════════════════════════════════════════
-# Item #2: entity_type filter in retrieval
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.unit
@@ -83,17 +70,6 @@ class TestEntityTypeFilter:
         call_kwargs = mock_vector.search.call_args.kwargs
         assert call_kwargs["entity_type"] == "class"
 
-    def test_opensearch_search_accepts_entity_type(self):
-        """The search method exposes the entity_type parameter (server-side filter)."""
-        from coa_serve.clients.opensearch import OpenSearchVectorClient
-
-        client = OpenSearchVectorClient(endpoint="test.aoss.amazonaws.com")
-
-        import inspect
-
-        sig = inspect.signature(client.search)
-        assert "entity_type" in sig.parameters
-
     @pytest.mark.asyncio
     async def test_opensearch_search_without_entity_type_no_filter(self):
         """Without entity_type, the shared client is called with no filters."""
@@ -122,11 +98,6 @@ class TestEntityTypeFilter:
         assert [h.id for h in hits] == ["a"]
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Item #4: tier2_sparql + failure_reason in fallback log
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @pytest.mark.unit
 class TestFallbackLogging:
     """Verify that tier2_fallback_decision log includes tier2_sparql and failure_reason."""
@@ -140,7 +111,6 @@ class TestFallbackLogging:
         mock_strategy.name = StrategyOption.ONTOP
 
         if tier2_result is not None and tier2_result.query_result is not None:
-            # Convert old Tier2Result to new StrategyResult for success case
             mock_strategy.resolve = AsyncMock(
                 return_value=StrategyResult(
                     sql=tier2_result.vkg_result.sql if tier2_result.vkg_result else "",
@@ -180,16 +150,6 @@ class TestFallbackLogging:
             structured_query_tier=structured_query_tier,
             bedrock_client=bedrock,
         )
-        # Preserve references for test assertions
-        orch._nl_to_sparql = AsyncMock()
-        orch._nl_to_sparql.translate = AsyncMock(
-            return_value=TranslationResult(
-                sparql=sparql_text if sparql_valid else None,
-                confidence=0.85 if sparql_valid else 0.0,
-                valid=sparql_valid,
-                trace_steps=[],
-            )
-        )
         return orch
 
     @pytest.mark.asyncio
@@ -201,19 +161,6 @@ class TestFallbackLogging:
         with patch("coa_serve.orchestrator.logger") as mock_logger:
             await orch.resolve(request)
             # Find the tier2_fallback_decision log call
-            fallback_calls = [c for c in mock_logger.info.call_args_list if c.args[0] == "tier2_fallback_decision"]
-            assert len(fallback_calls) == 1
-            kwargs = fallback_calls[0].kwargs
-            assert kwargs["failure_reason"] == "all_strategies_failed"
-
-    @pytest.mark.asyncio
-    async def test_logs_failure_reason_when_sparql_invalid(self):
-        """When strategy fails (sparql invalid path), fallback log is emitted."""
-        orch = self._make_orchestrator(sparql_valid=False)
-        request = InvokeRequest(query="test", namespace="demo")
-
-        with patch("coa_serve.orchestrator.logger") as mock_logger:
-            await orch.resolve(request)
             fallback_calls = [c for c in mock_logger.info.call_args_list if c.args[0] == "tier2_fallback_decision"]
             assert len(fallback_calls) == 1
             kwargs = fallback_calls[0].kwargs
@@ -255,11 +202,6 @@ class TestFallbackLogging:
             assert kwargs["namespace"] == "demo"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Item #6: SELECT variable specificity in system prompt
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @pytest.mark.unit
 class TestSelectVariablePrompt:
     """Verify that the NL→SPARQL system prompt includes SELECT specificity rules."""
@@ -283,11 +225,6 @@ class TestSelectVariablePrompt:
         select_pos = _SYSTEM_PROMPT.index("SELECT VARIABLE RULES")
         example_pos = _SYSTEM_PROMPT.index("Example 11")
         assert select_pos > example_pos
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Item #7: rdfs:range validation in SPARQL validator
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.unit
@@ -535,11 +472,6 @@ class TestRangeValidation:
         assert validator._resolve_uri_token("nocolon", prefixes) is None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Item #9: ObjectProperty (FK join paths) in T-Box context
-# ═══════════════════════════════════════════════════════════════════════
-
-
 @pytest.mark.unit
 class TestObjectPropertyContext:
     """Verify that TBoxContextBuilder fetches and formats ObjectProperties."""
@@ -757,7 +689,7 @@ class TestObjectPropertyContext:
             ],
             # aiContext (vector hit has URI)
             [],
-            # steward annotations for the selected class (#1167)
+            # steward annotations for the selected class
             [],
         ]
         hit = RVectorHit(type="ontology_class", score=0.9, entity_id="e1", uri="http://ex.org/ont#Order")

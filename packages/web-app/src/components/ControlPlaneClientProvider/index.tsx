@@ -28,7 +28,7 @@ export const useControlPlaneClient = (): ControlPlaneServiceClient => {
  * A refusal's sentence, wherever the service wrote it. The sources service answers `{error, ...}`  while the generated client reads only `message`, falling back to "UnknownError"; the client keeps every body
  * field on the exception, so the sentence is there to read. A modeled `message` is kept as it is.
  */
-export function withServiceSentence(err: unknown): unknown {
+function withServiceSentence(err: unknown): unknown {
   if (err instanceof Error) {
     const sentence = "error" in err ? err.error : undefined;
     const fallback = !err.message || err.message === "UnknownError";
@@ -55,15 +55,9 @@ export const ControlPlaneClientProvider: React.FC<PropsWithChildren> = ({
       token: async () => {
         const token = await provider.getIdToken();
         if (!token) throw new Error("Failed to retrieve authentication token");
-        // Return the token's own expiry. The smithy httpBearerAuth client wraps
-        // this provider in memoizeIdentityProvider, which only re-invokes it
-        // when the cached identity reports it is expiring. WITHOUT an
-        // `expiration`, the SDK treats the token as non-expiring and caches the
-        // first one for the client's lifetime — so getIdToken()'s refresh never
-        // runs here and every request keeps sending the initial ID token until
-        // it expires (403 "Signature has expired"; only a page reload recovered
-        // it). Sourced from the ID token's `exp` claim because that is the token
-        // sent as the bearer.
+        // smithy's memoizeIdentityProvider caches an identity without an
+        // `expiration` forever, so return the ID token's own `exp` (it is the
+        // bearer) to make the SDK re-invoke this provider.
         const user = await provider.getUser();
         const expiration =
           user?.profile?.exp !== undefined

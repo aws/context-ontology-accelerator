@@ -3,22 +3,26 @@
 """Retrying a failed re-scan must keep the merge path.
 
 A re-scan of an APPROVED source that fails leaves the source SCAN_FAILED with
-its curated assets still live. Re-scanning from SCAN_FAILED used to send
-``isRescan=false``, so discovery took the first-scan path and revised every live
-asset with fresh, uncurated metadata. v0.3.4's SCHEDULED and EVENT triggers made
-that retry run with nobody watching.
+its curated assets still live, so re-scanning from SCAN_FAILED must send
+``isRescan=true`` rather than revise them with fresh, uncurated metadata.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import boto3
 import pytest
+from botocore.exceptions import ClientError
+from coa_common.dao import DynamoDBDAO
 from coa_control_plane_server.models.scan_trigger import ScanTrigger
 from coa_sources.database.rescan_backup import BACKUP_SCAN_JOB_FIELD
+from coa_sources.database.scan_run import CURRENT_SCAN_JOB_FIELD
+from moto import mock_aws
 
 from tests.unit.api.test_sources_handler_extended import (  # noqa: I001
     _NAMESPACE_ID,
@@ -165,6 +169,14 @@ class TestLockWriteRecordsOrigin:
         # Still the conditional lock on the status just read.
         assert lock.kwargs["condition_values"] == {":prev": entry_status}
 
+    @pytest.mark.parametrize("entry_status", ["APPROVED", "SCAN_FAILED"])
+    def test_rescan_records_its_run_with_the_lock(self, entry_status):
+        # The scan-job SK the state machine carries, recorded in the same write that
+        # takes the lock, so an older run still retrying can no longer fail the source.
+        _status, message, lock = _rescan(_db_source_item(entry_status))
+
+        assert lock.args[1]["currentScanJobId"] == message["scanJobSK"]
+
     def test_retry_carries_the_origin_forward(self):
         # A retry that also fails must still remember the chain began at APPROVED,
         # not record SCAN_FAILED as its own origin.
@@ -204,3 +216,91 @@ class TestLockWriteRecordsOrigin:
         _status, _message, lock = _rescan(item, event=event)
 
         assert lock.kwargs["remove_fields"] is None
+
+
+# A re-scan that never starts gives the row back as it found it
+
+_KEY = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}"}
+# The failed run whose discovery Step Functions is still retrying, and a re-scan
+# that takes the row in between (a third party, not the request under test).
+_OLDER_RUN = "2026-11-06T01:00:00.000000Z"
+_OTHER_RUN = "2099-01-01T00:00:00.000000Z"
+_PUT_FAILED = ClientError({"Error": {"Code": "InternalServerError"}}, "PutItem")
+
+
+@pytest.fixture()
+def sources_table() -> Iterator[Any]:
+    """A moto sources table behind the handler's DAO, so the rollback condition is really evaluated."""
+    with mock_aws():
+        yield boto3.resource("dynamodb", region_name="us-east-1").create_table(
+            TableName="sources",
+            KeySchema=[{"AttributeName": "PK", "KeyType": "HASH"}, {"AttributeName": "SK", "KeyType": "RANGE"}],
+            AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("PK", "SK")],
+            BillingMode="PAY_PER_REQUEST",
+        )
+
+
+def _rescan_that_fails(fail_at: str, scan_put: Any = None) -> int:
+    """Re-scan the row in ``sources_table`` with the scan-job put or the SQS send failing."""
+    scan_dao = MagicMock()
+    sqs = MagicMock()
+    if fail_at == "scan_job_put":
+        scan_dao.put.side_effect = scan_put or _PUT_FAILED
+    else:
+        sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+    ns_dao = MagicMock()
+    ns_dao.get.return_value = {"PK": f"NS#{_NAMESPACE_ID}", "SK": "METADATA"}
+    with (
+        patch(f"{_SH}._get_dao", return_value=DynamoDBDAO("sources", region="us-east-1")),
+        patch(f"{_SH}._get_ns_dao", return_value=ns_dao),
+        patch(f"{_SH}._get_scan_dao", return_value=scan_dao),
+        patch(f"{_SH}._get_sqs", return_value=sqs),
+        patch(f"{_SH}._SCAN_QUEUE_URL", _QUEUE),
+    ):
+        status, _body = _parse(_current_sh()._handle_rescan({}, _NAMESPACE_ID, _SOURCE_ID, trigger=ScanTrigger.MANUAL))
+    return status
+
+
+@pytest.mark.unit
+class TestFailedRescanReleasesItsRun:
+    @pytest.mark.parametrize("fail_at", ["scan_job_put", "sqs_send"])
+    def test_restores_the_run_it_replaced(self, sources_table, fail_at):
+        # The re-scan never started, so the older run's pending retry must still own the row.
+        sources_table.put_item(Item=_failed(**{CURRENT_SCAN_JOB_FIELD: _OLDER_RUN}))
+
+        assert _rescan_that_fails(fail_at) == 500
+
+        row = sources_table.get_item(Key=_KEY)["Item"]
+        assert row["status"] == "SCAN_FAILED"
+        assert row[CURRENT_SCAN_JOB_FIELD] == _OLDER_RUN
+
+    @pytest.mark.parametrize("fail_at", ["scan_job_put", "sqs_send"])
+    def test_removes_the_field_from_a_row_that_had_none(self, sources_table, fail_at):
+        # A first-scan retry, or a row last written before runs were recorded.
+        sources_table.put_item(Item=_failed())
+
+        assert _rescan_that_fails(fail_at) == 500
+
+        row = sources_table.get_item(Key=_KEY)["Item"]
+        assert row["status"] == "SCAN_FAILED"
+        assert CURRENT_SCAN_JOB_FIELD not in row
+
+    def test_does_not_undo_a_newer_claim(self, sources_table):
+        # Another re-scan took the row between this one's lock and its rollback:
+        # the rollback must leave that claim and its SCANNING status alone.
+        sources_table.put_item(Item=_failed(**{CURRENT_SCAN_JOB_FIELD: _OLDER_RUN}))
+
+        def _taken_then_fail(_item: dict[str, Any]) -> None:
+            sources_table.update_item(
+                Key=_KEY,
+                UpdateExpression="SET #run = :run",
+                ExpressionAttributeNames={"#run": CURRENT_SCAN_JOB_FIELD},
+                ExpressionAttributeValues={":run": _OTHER_RUN},
+            )
+            raise _PUT_FAILED
+
+        assert _rescan_that_fails("scan_job_put", scan_put=_taken_then_fail) == 500
+
+        row = sources_table.get_item(Key=_KEY)["Item"]
+        assert row["status"] == "SCANNING"
+        assert row[CURRENT_SCAN_JOB_FIELD] == _OTHER_RUN

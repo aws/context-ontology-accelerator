@@ -125,20 +125,15 @@ describe("formatStepDetail", () => {
       );
     });
 
-    // The sibling bypass. The backend records match_count > 1 as a bare STRING
-    // ("3 metrics"), so the object formatter never sees it and the raw fragment
-    // used to reach the UI verbatim.
+    // The backend records match_count > 1 as a bare string ("3 metrics").
     it("explains the multi-metric bypass instead of showing the raw count", () => {
       const result = formatStepDetail("t1.metric_match", "3 metrics");
       expect(result).toBe(
         "Question matched 3 metrics, so it is ambiguous for the single-metric path; routing to structured query.",
       );
-      expect(result).not.toBe("3 metrics");
     });
 
     it("pluralizes the count rather than interpolating it bare", () => {
-      // The backend emits f"{count} metrics" unconditionally, so relying on its
-      // wording produced "matched 1 metrics".
       expect(formatStepDetail("t1.metric_match", "1 metric")).toBe(
         "Question matched 1 metric, so it is ambiguous for the single-metric path; routing to structured query.",
       );
@@ -497,8 +492,7 @@ describe("formatStepDetail", () => {
   });
 
   describe("Python-style dicts (single quotes)", () => {
-    it("extracts message from Python dict", () => {
-      // error field takes precedence over message in extraction order
+    it("prefers the error field over message in a Python dict", () => {
       const pyDict = "{'error': 'timeout', 'message': 'Connection timed out'}";
       expect(formatStepDetail("t1.execute", pyDict)).toBe("timeout");
     });

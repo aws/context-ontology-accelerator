@@ -68,7 +68,7 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # Short on purpose: a status call returns in milliseconds, and an unreachable endpoint
 # should fail the verify quickly rather than hold the invocation to its timeout.
 PROBE_TIMEOUT_S = int(os.environ.get("GRAPH_VERIFY_TIMEOUT_S", "8"))
-# The queue's maxReceiveCount (sources-stack.ts): the receive SQS will not redeliver records, rather than raises.
+# The queue's maxReceiveCount (sources-stack.ts): on that receive the failure is recorded instead of raised.
 MAX_RECEIVES = int(os.environ.get("GRAPH_VERIFY_MAX_RECEIVES", "3"))
 # The platform catalog cluster (sources-stack.ts), which no graph source may point at.
 PLATFORM_NEPTUNE_CLUSTER_ID = os.environ.get("PLATFORM_NEPTUNE_CLUSTER_ID", "")

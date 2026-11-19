@@ -15,7 +15,6 @@ describe("downloadTextFile", () => {
     const revokeObjectURL = vi.fn();
     vi.stubGlobal("URL", { ...URL, createObjectURL, revokeObjectURL });
 
-    // Capture the anchor the util creates so we can assert on it.
     const anchor = document.createElement("a");
     const clickSpy = vi.spyOn(anchor, "click").mockImplementation(() => {});
     const createElement = vi

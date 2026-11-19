@@ -44,8 +44,7 @@ describe("isProposalAcceptInProgress — gates Accept + the detail-page poll", (
 describe("proposalBlocksNewInduction — the Start-induction lock", () => {
   it("blocks on unreviewed work, including accept_failed", () => {
     // accept_failed must block: the backend lock (induce_catalog.py) 409s on it,
-    // so leaving it out enables a button whose request always fails. Before that
-    // state existed a failed accept rolled back to pending, which blocked.
+    // so leaving it out enables a button whose request always fails.
     for (const s of ["inducing", "pending", "updated", "accept_failed"]) {
       expect(proposalBlocksNewInduction(s)).toBe(true);
     }
@@ -69,9 +68,8 @@ describe("proposalBlocksNewInduction — the Start-induction lock", () => {
 
 describe("isAcceptTerminalFailure — when the accept poll stops on a failure", () => {
   it("treats accept_failed as terminal (the worker's failure state)", () => {
-    // #456/#466/#467: a step that exhausted its retries. Without this the poll
-    // loop ignored the failure and spun for the full 5-minute timeout, showing
-    // "still in progress" instead of the real error.
+    // A step that exhausted its retries. Without this the poll spins until
+    // timeout instead of showing the error.
     expect(
       isAcceptTerminalFailure({
         status: "accept_failed",
@@ -114,8 +112,8 @@ describe("proposalHasComputedOntology — gates the SHACL / infer-constraints pa
     "accepting",
     "embeddings_sync",
     "accepted",
-    // A failed accept still HAS a computed ontology — the user needs to see it
-    // to diagnose the failing step and re-accept (#456/#466/#467).
+    // A failed accept still has a computed ontology; the user needs it to
+    // diagnose the failing step and re-accept.
     "accept_failed",
     "rejected",
     "cancelled",
@@ -134,22 +132,20 @@ describe("proposalHasComputedOntology — gates the SHACL / infer-constraints pa
 });
 
 describe("proposalIsReadOnly — statuses that disable every edit + accept control", () => {
-  // Terminal statuses have no more transitions AND "inducing" has no ontology
+  // Terminal statuses have no more transitions, and "inducing" has no ontology
   // to act on yet. Both disable every edit + accept control on the page.
-  // #909: a failed or in-progress induction must NOT be acceptable.
   it.each([
     "accepted", // already merged — no more edits
     "rejected", // explicitly rejected — terminal
     "cancelled", // explicitly cancelled — terminal
-    "failed", // induction errored; no ontology to accept (#909)
-    "inducing", // worker still running; ontology not ready yet (#909)
+    "failed", // induction errored; no ontology to accept
+    "inducing", // worker still running; ontology not ready yet
   ])("disables edits for %s", (status) => {
     expect(proposalIsReadOnly(status)).toBe(true);
   });
 
-  // These statuses have a proposal a user can still act on. "accept_failed" is
-  // the important case — the ontology still exists and the user can retry the
-  // accept (#456/#466/#467), so the Accept button must re-enable.
+  // These statuses have a proposal a user can still act on. "accept_failed"
+  // keeps its ontology, so the Accept button must re-enable.
   it.each([
     "pending", // awaiting review
     "updated", // edits saved, not yet accepted

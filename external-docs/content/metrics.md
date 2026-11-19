@@ -181,6 +181,11 @@ definition first, then update the metric with
 OSI import all enforce the complete-query rule, so an import containing a
 legacy fragment records an error for that metric instead of persisting it.
 
+A metric stored by an earlier release that reads through a table function or
+pass-through query (see the table below) is no longer executed either. Rewrite
+it to read the named source tables, check the rewrite with
+`POST /namespaces/{namespaceId}/metrics/validate`, then update the metric.
+
 #### SQL Safety Reference
 
 Metric SQL is read-only. The onboarding checks and serve-time SQL Firewall
@@ -192,6 +197,7 @@ CTE, stacked after a semicolon, or exposed through a function:
 | Data and schema changes | `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `TRUNCATE`, `GRANT`, `COPY`, `CALL` |
 | Locking reads and table hints | `FOR UPDATE`, `FOR SHARE`, `WITH (UPDLOCK)`, `WITH (TABLOCKX)` |
 | Filesystem, network, and external execution | `pg_read_file`, `pg_ls_dir`, `dblink_exec`, `LOAD_FILE`, `OPENROWSET`, `xp_cmdshell` |
+| Table functions and pass-through queries | `TABLE(pg.system.query(query => '...'))`, `OPENQUERY`, `EXTERNAL_QUERY`, `JSON_TABLE`, a user-defined function in `FROM` or `LATERAL` (`generate_series` and `UNNEST` are allowed) |
 | Sequence and session mutation | `nextval`, `setval`, `set_config`, `pg_notify`, `LAST_INSERT_ID` |
 | Advisory locks and resource delays | `pg_advisory_lock`, `GET_LOCK`, `pg_sleep`, `SLEEP`, `BENCHMARK`, `SYSTEM$WAIT` |
 | Administrative control functions | `pg_terminate_backend`, `pg_reload_conf`, `SYSTEM$ABORT_SESSION`, `SYSTEM$CANCEL_QUERY` |

@@ -7,4 +7,4 @@ Exposes 6 MCP tools (2 discovery + 4 execution) on AgentCore Runtime
 via Streamable HTTP transport.
 """
 
-__version__ = "0.3.10"
+__version__ = "0.3.11"

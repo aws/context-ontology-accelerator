@@ -88,11 +88,12 @@ Serve answers natural language questions using the semantic layer. See [Serve](s
 
 ### SQL firewall rules
 
-The SQL firewall always allows only `SELECT` statements and rejects anything it can't parse. When the caller's grant profile includes restrictions, it also enforces them:
+The SQL firewall always allows only `SELECT` statements and rejects anything it can't parse. It also always rejects table functions and pass-through queries (`TABLE(catalog.system.query(...))`, `OPENQUERY`, `EXTERNAL_QUERY`, `JSON_TABLE`, a user-defined function in `FROM`): every relation must be a named table, a subquery or a row generator (`generate_series`, `UNNEST`). When the caller's grant profile includes restrictions, it also enforces them:
 
 - Every table in the query must be in the profile's table allowlist.
 - Columns on the profile's column denylist can't be projected.
-- `SELECT *` over a table that has denied columns is rejected, because denied columns can't be proven absent. `COUNT(*)` is allowed.
+- `SELECT *`, a whole-row reference such as `SELECT to_json(c) FROM customers c`, or a column alias list such as `FROM customers AS c(id, s)` over a table that has denied columns is rejected, because denied columns can't be proven absent. `COUNT(*)` is allowed.
+- These checks read the query the same way the query engine does, so a table or column can't be hidden from them in text the engine runs as SQL. If a later step that adds schema or catalog names to the query changes which tables or columns it reads, the query is refused.
 
 ### Graph sources (optional)
 

@@ -30,6 +30,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -43,7 +44,7 @@ from coa_serve.tier3.agentic.context import AccumulatedContext
 from coa_serve.tier3.agentic.controller import ReasoningController
 from coa_serve.tier3.agentic.models import PlannerDecision, StopReason, SubQuestion
 from coa_serve.tier3.agentic.ontology import Ontology
-from coa_serve.tier3.agentic.planner import BedrockStepPlanner
+from coa_serve.tier3.agentic.planner import BedrockStepPlanner, _document_window_view
 from coa_serve.tier3.agentic.retriever import AgenticRetriever, _RequestTools
 from coa_serve.tier3.agentic.tools.base import ToolResult
 from coa_serve.tier3.agentic.tools.document_anchor import anchor_segments, choose_center
@@ -671,6 +672,122 @@ class TestPlannerDocumentPrompt:
         llm = _FakeLLM('{"sufficient": true, "working_answer": "a"}')
         await BedrockStepPlanner(llm).assess(sub_question=SubQuestion(text="q"), context=ctx)
         assert body in llm.calls[0]["prompt"]
+
+    @staticmethod
+    def _wide_window(anchor_at: int | None, key: str = "docs/manual.md") -> tuple[ChunkResult, str]:
+        """A 20,000-character window (the whole document) with its answer at character 13,600."""
+        body = "".join(f"line {i:05d} filler text. " for i in range(800))[:20000]
+        answer = "THE LATE-SHIFT TAXI RULE PAYS 11,400 YEN"
+        body = body[:13600] + answer + body[13600 + len(answer) :]
+        header = f"[Source document {key}: characters 0-20000 of 20000"
+        if anchor_at is not None:
+            header += f"; centred on the anchored passage (exact match at character {anchor_at})"
+        return ChunkResult(
+            chunk_id=f"doc:{key}@0", text=f"{header}]\n{body}", source_doc=key, relevance_score=1
+        ), answer
+
+    @pytest.mark.asyncio
+    async def test_assess_view_centres_a_wide_window_on_its_anchor(self):
+        chunk, answer = self._wide_window(anchor_at=13600)
+        ctx = AccumulatedContext()
+        ctx.chunks.append(chunk)
+        llm = _FakeLLM('{"sufficient": true, "working_answer": "a"}')
+        await BedrockStepPlanner(llm).assess(sub_question=SubQuestion(text="q"), context=ctx)
+        prompt = llm.calls[0]["prompt"]
+        view = prompt.split("Full source-document text read", 1)[1]
+        assert answer in view
+        assert "line 00000" not in view
+        assert "Showing characters 9600-17600 of this window" in prompt
+        assert "characters 0-1600 (read_document anchored on a phrase from that part)" in prompt
+        assert "characters 1600-9600 (read_document with offset=1600 and no anchor)" in prompt
+        assert "characters 17600-20000 (read_document with offset=17600 and no anchor)" in prompt
+
+    @pytest.mark.asyncio
+    async def test_assess_view_near_the_window_start_names_no_offset_that_repeats_the_window(self):
+        # Anchored early: the hidden earlier part is shorter than one view, so any offset that
+        # covers it starts at the window's own start and would be dropped as already seen.
+        chunk, _ = self._wide_window(anchor_at=5000)
+        ctx = AccumulatedContext()
+        ctx.chunks.append(chunk)
+        llm = _FakeLLM('{"sufficient": false}')
+        await BedrockStepPlanner(llm).assess(sub_question=SubQuestion(text="q"), context=ctx)
+        prompt = llm.calls[0]["prompt"]
+        assert "Showing characters 1000-9000 of this window" in prompt
+        assert "characters 0-1000 (read_document anchored on a phrase from that part)" in prompt
+        assert "offset=0 " not in prompt
+        assert "characters 9000-20000 (read_document with offset=9000 and no anchor)" in prompt
+
+    @pytest.mark.asyncio
+    async def test_every_named_offset_opens_a_window_the_context_keeps(self):
+        # Follow each offset the view names through the real reader and the context's de-dupe:
+        # each must be a NEW window (so the loop makes progress) showing text the first view hid.
+        chunk, _ = self._wide_window(anchor_at=13600)
+        doc = chunk.text.partition("\n")[2]
+        tool, _ = _anchored(doc)
+        ctx = AccumulatedContext()
+        ctx.add(ToolResult(chunks=(chunk,)))
+        first = _document_window_view(chunk.text)
+        offsets = [int(o) for o in re.findall(r"offset=(\d+) and no anchor", first)]
+        assert offsets == [1600, 17600]
+        for offset in offsets:
+            page = await tool.invoke(namespace=NS, source_key=KEY, offset=offset, max_chars=HARD_MAX_CHARS)
+            assert ctx.add(page) == 1, f"offset={offset} was dropped as an already-seen window"
+            hidden = doc[offset : offset + 200]
+            assert hidden not in first.partition("\n")[2].partition("\n")[2]
+            assert hidden in page.chunks[0].text
+
+    @pytest.mark.parametrize("anchor_at, shown", [(None, "0-8000"), (13600, "9600-17600")])
+    def test_view_ignores_the_anchor_phrase_inside_a_document_key(self, anchor_at, shown):
+        # The key is data from outside; a key that happens to read "match at character N" must
+        # neither invent an anchor nor override the real one.
+        chunk, _ = self._wide_window(anchor_at=anchor_at, key="docs/fuzzy match at character 90000.md")
+        assert f"Showing characters {shown} of this window" in _document_window_view(chunk.text)
+
+    @pytest.mark.asyncio
+    async def test_view_of_a_real_anchored_read_replaces_the_headers_offsets(self):
+        # A real anchored read of a document longer than one window: its header carries the
+        # reader's own "earlier text" / "more text follows" offsets, which assume the whole
+        # window was seen. The view must keep the anchored passage in sight and leave only its
+        # own offsets, with exactly one way forward.
+        doc = _filler(18_000) + "\n## November 2024 month-end\nThe retained invoice count was 4,217.\n"
+        doc += _filler(30_000, "ipsum")
+        tool, _ = _anchored(doc)
+        read = await tool.invoke(
+            namespace=NS, source_key=KEY, anchor="retained invoice count", max_chars=HARD_MAX_CHARS
+        )
+        text = read.chunks[0].text
+        header = text.partition("\n")[0]
+        assert "centred on the anchored passage" in header
+        assert "more text follows" in header and "earlier text starts" in header
+        view = _document_window_view(text)
+        assert "The retained invoice count was 4,217." in view
+        assert "more text follows" not in view and "earlier text starts" not in view
+        shown_end = int(re.search(r"Showing characters \d+-(\d+)", view)[1])
+        forward = [int(o) for o in re.findall(r"offset=(\d+)", view) if int(o) >= shown_end]
+        assert forward == [shown_end]
+
+    @pytest.mark.asyncio
+    async def test_assess_view_of_a_wide_unanchored_window_names_the_unseen_offset(self):
+        chunk, answer = self._wide_window(anchor_at=None)
+        ctx = AccumulatedContext()
+        ctx.chunks.append(chunk)
+        llm = _FakeLLM('{"sufficient": false}')
+        await BedrockStepPlanner(llm).assess(sub_question=SubQuestion(text="q"), context=ctx)
+        prompt = llm.calls[0]["prompt"]
+        assert answer not in prompt
+        assert "Showing characters 0-8000 of this window" in prompt
+        assert "characters 8000-20000 (read_document with offset=8000 and no anchor)" in prompt
+
+    @pytest.mark.asyncio
+    async def test_reading_the_named_offset_brings_the_answer_into_view(self):
+        doc = self._wide_window(anchor_at=None)[0].text.partition("\n")[2]
+        tool, _ = _anchored(doc)
+        page = await tool.invoke(namespace=NS, source_key=KEY, offset=8000, max_chars=HARD_MAX_CHARS)
+        ctx = AccumulatedContext()
+        ctx.chunks.extend(page.chunks)
+        llm = _FakeLLM('{"sufficient": true, "working_answer": "a"}')
+        await BedrockStepPlanner(llm).assess(sub_question=SubQuestion(text="q"), context=ctx)
+        assert "THE LATE-SHIFT TAXI RULE PAYS 11,400 YEN" in llm.calls[0]["prompt"]
 
 
 # ── controller ─────────────────────────────────────────────────────

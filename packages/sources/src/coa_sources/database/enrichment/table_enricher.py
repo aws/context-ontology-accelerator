@@ -21,7 +21,6 @@ from coa_common.domain_models import (
     BusinessMetadata,
     Column,
     EnrichmentSource,
-    ForeignKey,
     GeneratedField,
     PrimaryKey,
     ReviewStatus,
@@ -68,7 +67,7 @@ def _resolve_guardrail_id() -> str | None:
 
 
 # Description provenance values that AI enrichment must not overwrite. Mirrors
-# the deterministic-PK/FK skip pattern (``_apply_primary_key`` / ``_apply_foreign_keys``):
+# the deterministic-PK skip pattern (``_apply_primary_key``):
 #   * DETERMINISTIC      — pulled directly from the source system (Glue
 #                          ``Description``/``Comment``, PostgreSQL
 #                          ``pg_description``, Oracle ``ALL_*_COMMENTS``, …).
@@ -196,7 +195,6 @@ def run(
     system_prompt = build_system_prompt(namespace_language)
     logger.info("Enrichment language for datasource %s: %s", datasource_id, namespace_language)
 
-    # PLAN: build all Bedrock call work items
     work_items: list[tuple[Table, list[Column], int, dict]] = []
     table_batch_counts: dict[str, int] = {}
 
@@ -238,7 +236,6 @@ def run(
 
     publish(force=True)
 
-    # EXECUTE: submit all Bedrock calls to shared pool
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
             executor.submit(
@@ -254,7 +251,6 @@ def run(
             for table, cols, batch_idx, ctx in work_items
         }
 
-        # COLLECT: gather results grouped by table
         table_results: dict[str, list[tuple[int, dict]]] = {}
         table_usage: dict[str, dict] = defaultdict(lambda: {"latency_ms": 0.0, "input_tokens": 0, "output_tokens": 0})
         # Tables that had at least one column batch fail (guardrail block or
@@ -268,10 +264,7 @@ def run(
             table, batch_idx = futures[future]
             try:
                 parsed, latency_ms, input_tokens, output_tokens = future.result()
-                # Always keep a succeeded batch's result, even if a SIBLING batch
-                # of the same wide table failed. Discarding it here is exactly the
-                # Data-loss bug: one failed batch erased the whole table's
-                # enrichment (description + every succeeded batch's columns).
+                # A succeeded batch's result is kept even when a sibling batch failed.
                 table_results.setdefault(table.table_id, []).append((batch_idx, parsed))
                 table_usage[table.table_id]["latency_ms"] += latency_ms
                 table_usage[table.table_id]["input_tokens"] += input_tokens
@@ -345,7 +338,6 @@ def run(
         if is_partial:
             partial_tables.add(table_id)
 
-    # Structured log per table for offline analysis
     for table_id, usage in table_usage.items():
         if table_id in failed_tables:
             status = "failed"
@@ -365,7 +357,6 @@ def run(
             },
         )
 
-    # PASS 2: Cross-table FK inference on successfully enriched tables
     if succeeded_tables:
         from coa_sources.database.enrichment.relationship_inferrer import (
             apply_inferred_relationships,
@@ -382,12 +373,7 @@ def run(
     failed = len(failed_tables)
     partial = len(partial_tables)
 
-    # Invariant: every discovered table lands in exactly one of enriched / failed /
-    # skipped_unchanged (partial is a SUBSET of enriched, not a fourth bucket).
-    # These checks are on INDEPENDENTLY-tracked sets — not on a derived value — so
-    # a real classification drift trips them (a tautology on the derived count
-    # could not). Assert the two sets are disjoint, the enriched+failed total does
-    # not exceed the discovered tables, and partial is contained in enriched.
+    # Every table lands in exactly one of enriched / failed / skipped_unchanged.
     succeeded_ids = {t.table_id for t in succeeded_tables}
     assert succeeded_ids.isdisjoint(failed_tables), (
         f"table classified as both enriched and failed: {sorted(succeeded_ids & failed_tables)}"
@@ -400,16 +386,9 @@ def run(
         f"partial tables not a subset of enriched: {sorted(partial_tables - succeeded_ids)}"
     )
 
-    # skipped_unchanged is the remainder: tables that had nothing pending to enrich.
-    # The asserts above guarantee this is non-negative and correctly partitioned.
     skipped_unchanged = len(tables) - enriched - failed
 
-    # Observability for the partial-enrichment case: a wide table where one
-    # or more column batches failed but others succeeded is now written back with
-    # the surviving description + columns (counted under `enriched`), rather than
-    # discarded. Surface HOW MANY landed incomplete and WHICH ones, so a steward
-    # can tell a partially-enriched table from a fully-enriched one at review time
-    # — mirrors the failed_table_ids diagnostic the caller already records.
+    # Wide tables written back with some column batches missing, for steward review.
     emitter.emit_metric("TablesPartiallyEnriched", partial, "Count")
     if partial:
         logger.warning(
@@ -432,7 +411,6 @@ def run(
             enriched,
         )
 
-    # Write only successfully enriched tables back to DataZone
     _write_enriched_assets(succeeded_tables, domain_id, namespace_id)
 
     logger.info(
@@ -446,18 +424,8 @@ def run(
         "tables_enriched": enriched,
         "tables_failed": failed,
         "tables_skipped_unchanged": skipped_unchanged,
-        # Count of tables written back with PARTIAL enrichment (>=1 column batch
-        # failed but >=1 succeeded). These are a SUBSET of tables_enriched, not a
-        # separate bucket — the surviving metadata was applied. Kept distinct so
-        # the caller can flag them for steward review.
         "tables_partial": partial,
-        # The db.table ids that errored (guardrail block or parse/timeout) and
-        # were written back WITHOUT enrichment. The aggregate `failed` count
-        # alone hides which tables regressed; the caller records these names so
-        # a steward can see them at review time.
         "failed_table_ids": sorted(failed_tables),
-        # The db.table ids enriched only PARTIALLY (subset of tables_enriched);
-        # surfaced so a steward knows the table's metadata is incomplete.
         "partial_table_ids": sorted(partial_tables),
     }
 
@@ -549,13 +517,8 @@ def _apply_table_metadata(table: Table, result: dict) -> None:
 
     ai_description = table_meta.get("description") or ""
     if not ai_description:
-        # Do NOT fabricate a description here. A synthesized string like
-        # "Table orders in sales" carries no information the table name does not
-        # already carry, but would be persisted as AI_GENERATED — passing it off
-        # to stewards as real enrichment and diluting the description embeddings
-        # used for semantic search / NL→SQL. Leave it empty, make it loud, and
-        # let the prompt contract plus the TablesMissingDescription metric
-        # surface regressions.
+        # Left empty rather than synthesized; the TablesMissingDescription metric
+        # surfaces it.
         logger.warning(
             "table_description_missing: LLM returned no table description for %s.%s "
             "(synonyms=%d tags=%d) — leaving description empty",
@@ -593,28 +556,6 @@ def _apply_primary_key(table: Table, result: dict) -> None:
             source=EnrichmentSource.AI_INFERRED,
             confidence=pk.get("confidence", 0.0),
         )
-
-
-def _apply_foreign_keys(table: Table, result: dict) -> None:
-    """Apply foreign key inferences from LLM result.
-
-    Skipped entirely when deterministic foreign keys already exist — the
-    source schema is authoritative.
-    """
-    if any(fk.source == EnrichmentSource.DETERMINISTIC for fk in table.foreign_keys):
-        return
-    fks = result.get("foreign_keys", [])
-    for fk in fks:
-        if fk.get("column") and fk.get("target_table"):
-            table.foreign_keys.append(
-                ForeignKey(
-                    column=fk["column"],
-                    target_table=fk["target_table"],
-                    target_column=fk.get("target_column", ""),
-                    source=EnrichmentSource.AI_INFERRED,
-                    confidence=fk.get("confidence", 0.0),
-                )
-            )
 
 
 def _apply_column_metadata(table: Table, column_results: list[dict]) -> None:

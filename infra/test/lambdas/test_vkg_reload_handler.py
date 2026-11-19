@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -370,8 +371,6 @@ class TestHandler:
         result = index.handler(_make_event(), None)
         assert result["status"] == "provisioned"
 
-    # ── circuit breaker + reload-outcome metrics ────────────────
-
     @patch.dict(os.environ, ENV)
     @patch("index.ecs")
     @patch("index.sd")
@@ -468,8 +467,6 @@ class TestHandler:
         index.ecs = mock_ecs
         index.sd = mock_sd
         index.ssm = mock_ssm
-
-        import pytest
 
         with pytest.raises(RuntimeError, match="ecs boom"):
             index.handler(_make_event(), None)
@@ -1190,13 +1187,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_task_sizing_env_threaded_into_task_definition(self, mock_ssm, mock_sd, mock_ecs):
-        """#149 cause B/C: reload reads VKG_TASK_CPU/MEMORY/ONTOP_JAVA_ARGS and
-
-        threads them into the registered task def, so a reloaded task matches the
-        CDK-provisioned initial one instead of the old hardcoded 512/1024 with a
-        dead JAVA_OPTS. Guards against a regression that would silently
-        under-provision and never apply the heap.
-        """
+        """Reload threads VKG_TASK_CPU/MEMORY/ONTOP_JAVA_ARGS into the registered task definition."""
         mock_ssm.get_parameter.return_value = {
             "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
         }
@@ -1224,7 +1215,7 @@ class TestSweep:
         env = {e["name"]: e["value"] for e in td_kwargs["containerDefinitions"][0]["environment"]}
         # The Lambda enforces the loopback bind itself, even when the env value lacks it.
         assert env["ONTOP_JAVA_ARGS"] == "-Xmx3072m -Xms1024m -Dserver.address=127.0.0.1"
-        # The dead variable must NOT be emitted — that was the #149 cause C no-op.
+        # The unused JAVA_OPTS variable must NOT be emitted.
         assert "JAVA_OPTS" not in env
 
     @pytest.mark.parametrize(
@@ -1281,11 +1272,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_task_sizing_defaults_match_cdk_when_env_unset(self, mock_ssm, mock_sd, mock_ecs):
-        """With the sizing env unset, the reload falls back to defaults that match
-
-        the CDK stack (cpu=1024/memory=2048, -Xmx1536m -Xms512m), so an
-        un-parameterised reload is still safe rather than the old 512/1024.
-        """
+        """With the sizing env unset, the reload falls back to the CDK stack defaults."""
         mock_ssm.get_parameter.return_value = {
             "Parameter": {"Value": "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-NEW"}
         }
@@ -1424,10 +1411,7 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_heap_derived_from_task_memory_when_java_args_unset(self, mock_ssm, mock_sd, mock_ecs):
-        """When VKG_ONTOP_JAVA_ARGS is unset, the heap is derived from
-        VKG_TASK_MEMORY (max heap ~=75%, initial ~=25%) so bumping memory alone
-        scales the heap in step rather than leaving a stale hardcoded -Xmx.
-        """
+        """When VKG_ONTOP_JAVA_ARGS is unset, the heap is derived from VKG_TASK_MEMORY."""
         # Ensure no explicit heap override leaks in from a broader ENV.
         os.environ.pop("VKG_ONTOP_JAVA_ARGS", None)
         mock_ssm.get_parameter.return_value = {
@@ -1462,20 +1446,12 @@ class TestSweep:
     @patch("index.sd")
     @patch("index.ssm")
     def test_register_task_definition_failure_fails_cleanly_without_creating_service(self, mock_ssm, mock_sd, mock_ecs):
-        """If register_task_definition raises during a provision, the handler
-
-        returns failed and never calls create_service, rather than letting the
-        exception propagate and orphan the just-created Cloud Map entry.
-        """
+        """A failed register_task_definition returns failed and never calls create_service."""
         mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
         mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
         mock_ecs.exceptions.InvalidParameterException = type("InvalidParameterException", (Exception,), {})
         same_image = "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-abc"
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": same_image}}
-        # Same image so the reload path takes the unchanged branch (no task-def
-        # registration there); update_service then raises ServiceNotFound so the
-        # handler routes to the provision path, where _register_task_definition
-        # is called and we force it to fail.
         mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
         mock_ecs.describe_task_definition.return_value = {
             "taskDefinition": {"containerDefinitions": [{"image": same_image}]}
@@ -1791,3 +1767,180 @@ class TestTaskDefinitionLifecycle:
 
         assert index.handler(_make_event(), None)["status"] == "reload_triggered"
         assert self._deregistered(mock_ecs) == [f"{self.FAMILY}:1", f"{self.FAMILY}:2"]
+
+
+class TestScaleUpFromZero:
+    """A service left at zero tasks is scaled back to one by its next reload or sweep."""
+
+    IMAGE = "111.dkr.ecr.us-west-2.amazonaws.com/scl:vkg-same"
+
+    @staticmethod
+    def _metrics(index):
+        return [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
+
+    @staticmethod
+    def _reload_log(out):
+        return next(json.loads(line) for line in out.splitlines() if '"action": "reload_triggered"' in line)
+
+    @staticmethod
+    def _load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count, image=IMAGE, current_image=IMAGE):
+        import importlib
+
+        import index
+
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": image}}
+        mock_ecs.describe_services.return_value = {
+            "services": [{"taskDefinition": "arn:td:current", "desiredCount": desired_count}]
+        }
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": current_image}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:new"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.ecr = MagicMock()
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+        index.autoscaling = mock_autoscaling
+        return index
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_a_publish_scales_a_service_at_zero_back_to_one(
+        self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs, capsys
+    ):
+        """MinCapacity goes back to 1 before the desired count, so auto scaling cannot undo it."""
+        index = self._load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count=0)
+        order = []
+        mock_autoscaling.register_scalable_target.side_effect = lambda **_: order.append("min_capacity")
+        mock_ecs.update_service.side_effect = lambda **_: (
+            order.append("desired_count") or {"service": {"deployments": [{"id": "d"}]}}
+        )
+
+        result = index.handler(_make_event(), None)
+
+        assert result["status"] == "reload_triggered"
+        assert order == ["min_capacity", "desired_count"]
+        target = mock_autoscaling.register_scalable_target.call_args[1]
+        assert target["ResourceId"] == "service/vkg/coa-dev-vkg-test-ns"
+        assert (target["MinCapacity"], target["MaxCapacity"]) == (1, 3)
+        mock_autoscaling.put_scaling_policy.assert_called_once()
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-test-ns",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+            desiredCount=1,
+        )
+        log = self._reload_log(capsys.readouterr().out)
+        assert (log["scaled_up_from_zero"], log["min_capacity_restored"]) == (True, True)
+        assert "ReloadFailed" not in self._metrics(index)
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_a_new_image_also_scales_a_service_at_zero_back_to_one(self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs):
+        index = self._load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count=0, current_image="img:old")
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+        mock_autoscaling.register_scalable_target.assert_called_once()
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-test-ns",
+            taskDefinition="arn:td:new",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+            desiredCount=1,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_a_running_service_keeps_its_desired_count(self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs, capsys):
+        """Auto scaling owns the count of a service with tasks; the reload leaves it and MinCapacity alone."""
+        index = self._load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count=2)
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+        mock_autoscaling.register_scalable_target.assert_not_called()
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-test-ns",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+        )
+        log = self._reload_log(capsys.readouterr().out)
+        assert log["scaled_up_from_zero"] is False
+        assert "min_capacity_restored" not in log
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_a_failed_min_capacity_update_still_scales_up(self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs, capsys):
+        """The task count comes back anyway, and the failure is logged and alarmed on."""
+        index = self._load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count=0)
+        mock_autoscaling.register_scalable_target.side_effect = RuntimeError("AccessDenied")
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+        assert mock_ecs.update_service.call_args[1]["desiredCount"] == 1
+        out = capsys.readouterr().out
+        assert '"action": "autoscaling_failed"' in out
+        assert '"error_type": "RuntimeError"' in out
+        assert self._reload_log(out)["min_capacity_restored"] is False
+        assert {"ReloadTriggered", "ReloadFailed"} <= set(self._metrics(index))
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_the_sweep_never_leaves_a_service_at_zero_alone(self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs):
+        """Even when the task list still reports the current digest, a service at zero is scaled up."""
+        index = self._load(
+            mock_ssm,
+            mock_sd,
+            mock_ecs,
+            mock_autoscaling,
+            desired_count=0,
+            image=TestSweep.REUSED_TAG,
+            current_image=TestSweep.REUSED_TAG,
+        )
+        TestSweep._services(mock_ecs, "ns1")
+        TestSweep._running(mock_ecs, {"coa-dev-vkg-ns1": TestSweep.NEW_DIGEST})
+        TestSweep._tag_points_at(index.ecr, TestSweep.NEW_DIGEST)
+
+        result = index.handler({"sweep": True}, None)
+
+        assert (result["triggered"], result["unchanged"]) == (1, 0)
+        mock_ecs.update_service.assert_called_once_with(
+            cluster=ENV["CLUSTER_ARN"],
+            service="coa-dev-vkg-ns1",
+            forceNewDeployment=True,
+            deploymentConfiguration=index._DEPLOY_CONFIG,
+            desiredCount=1,
+        )
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    @patch("index.autoscaling")
+    def test_a_failed_service_lookup_does_not_scale(self, mock_autoscaling, mock_ssm, mock_sd, mock_ecs):
+        """Without a desired count the reload updates the service as before and leaves the count alone."""
+        index = self._load(mock_ssm, mock_sd, mock_ecs, mock_autoscaling, desired_count=0)
+        mock_ecs.describe_services.side_effect = RuntimeError("throttled")
+
+        assert index.handler(_make_event(), None)["status"] == "reload_triggered"
+        mock_autoscaling.register_scalable_target.assert_not_called()
+        assert "desiredCount" not in mock_ecs.update_service.call_args[1]

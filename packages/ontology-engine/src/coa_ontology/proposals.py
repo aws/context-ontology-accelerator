@@ -16,7 +16,7 @@ the pipeline step that failed. An ``accept_failed`` proposal is
 re-acceptable: re-running converges on a correct graph (triples dedup,
 counts are reconciled from Neptune), with the known non-idempotent
 residual documented at the ``ingest`` step. It converges but does NOT
-resume — every re-accept restarts at ``ingest`` (#851). The work itself
+resume — every re-accept restarts at ``ingest``. The work itself
 can take 30–60 seconds (catalog projection,
 Turtle bulk load, embedding accumulation, S3 persist), which exceeds
 API Gateway's 29-second integration timeout, so we must run it
@@ -30,7 +30,7 @@ import random
 import time as _t
 import uuid
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from threading import Thread
 from typing import TYPE_CHECKING, Annotated, Any, Self
@@ -38,7 +38,12 @@ from urllib.parse import urlsplit
 
 from botocore.exceptions import ClientError
 from coa_common import sql_ident as _sql_ident
-from coa_common.constants import EVENT_SOURCE_PREFIX, VOCAB_URI, split_sql_ident_path
+from coa_common.constants import (
+    EVENT_SOURCE_PREFIX,
+    VOCAB_URI,
+    normalize_sql_ident_path,
+    split_sql_ident_path,
+)
 from coa_control_plane_server.models.induction_source_type import InductionSourceType
 from coa_control_plane_server.models.proposal_status import ProposalStatus
 from fastapi import APIRouter, HTTPException, Query
@@ -56,7 +61,6 @@ from coa_ontology.catalog.ingest import (
 )
 from coa_ontology.pagination import InvalidNextToken, decode_next_token, page_body
 from coa_ontology.query_params import require_enum_value
-from coa_ontology.stores import build_stores as _build_stores  # noqa: F401 (re-exported for tests)
 
 if TYPE_CHECKING:
     from coa_ontology.inducer.schemas import ConceptMatch
@@ -77,11 +81,11 @@ router = APIRouter()
 PROPOSAL_STATUS_EMBEDDINGS_SYNC = ProposalStatus.EMBEDDINGS_SYNC.value
 
 # Terminal state for an accept that ran, hit an error on some step, and
-# exhausted its per-step retries (#456/#466/#467). Distinct from ``pending``
+# exhausted its per-step retries. Distinct from ``pending``
 # (never attempted) so the UI can say "accept failed, fix and retry" and the
 # stale-sweep / accept guard can tell a broken attempt from a fresh proposal.
 # Re-accepting from this state re-runs the pipeline from the START — it converges
-# but does not resume (#851); see the ingest step for the non-idempotent residual.
+# but does not resume; see the ingest step for the non-idempotent residual.
 PROPOSAL_STATUS_ACCEPT_FAILED = ProposalStatus.ACCEPT_FAILED.value
 
 # In-progress accept states — a worker is (or was) running, so Accept is
@@ -95,11 +99,8 @@ _ACCEPT_IN_PROGRESS_STATUSES = (
 # Statuses that block starting a NEW induction in the namespace (see the
 # in-flight guard in induce_catalog). Two kinds of "not finished with this one":
 #
-#   - unreviewed work: ``pending`` / ``updated`` / ``accept_failed``. The first
-#     two preserve the original behaviour; ``accept_failed`` is included because
-#     before that state existed a failed accept rolled back to ``pending``, which
-#     blocked. Dropping it would remove the guard for exactly the case a user is
-#     most likely to hit — accept broke, so they trigger another induction.
+#   - unreviewed work: ``pending`` / ``updated`` / ``accept_failed`` (a user whose
+#     accept broke is the one most likely to start another induction).
 #   - an accept actively merging: ``accepting`` / ``embeddings_sync``. The
 #     induction lock (acquire_induction_lock) is only held for the duration of an
 #     INDUCTION, so without these a new induction can start while a worker is
@@ -112,15 +113,12 @@ PROPOSAL_STATUSES_BLOCKING_NEW_INDUCTION = (
 )
 
 # Per-step auto-retry policy for the accept pipeline. A transient step error
-# (AOSS 5xx — see #582, Neptune/Bedrock blip, timeout) is retried up to
+# (AOSS 5xx, Neptune/Bedrock blip, timeout) is retried up to
 # _ACCEPT_STEP_MAX_ATTEMPTS with exponential backoff before the accept is
 # marked ``accept_failed``. Structural errors (bad Turtle, validation) are
 # never retried — they need the user to fix the proposal first.
 _ACCEPT_STEP_MAX_ATTEMPTS = int(os.getenv("ACCEPT_STEP_MAX_ATTEMPTS", "3"))
 _ACCEPT_STEP_BACKOFF_SECONDS = float(os.getenv("ACCEPT_STEP_BACKOFF_SECONDS", "2"))
-
-
-# ── Schemas ─────────────────────────────────────────────────────────────
 
 
 class RejectRequest(BaseModel):
@@ -224,8 +222,6 @@ class AcceptProposalResponse(BaseModel):
     status: str
 
 
-# ── S3 persistence for induced ontologies ───────────────────────────────
-
 _S3_BUCKET = dynamo_store.resolve_ontology_bucket()
 _S3_PREFIX = "ontologies"
 
@@ -245,12 +241,6 @@ def _ontology_short_id(ontology_id: str) -> str:
     ontology.published event. Shared by ``_persist_induced_to_s3`` and the
     ``notify_vkg`` accept step so the event's version always matches the object
     actually written.
-
-    Args:
-        ontology_id: The ontology IRI to shorten.
-
-    Returns:
-        The trailing segment, with IRI punctuation replaced by underscores.
     """
     safe_id = ontology_id.replace("/", "_").replace("#", "").replace(":", "_").rstrip("_")
     return safe_id.split("_")[-1] if "_" in safe_id else safe_id
@@ -282,6 +272,44 @@ def _mapping_table_names(r2rml_turtle: str | None) -> set[str] | None:
     return {str(o) for o in graph.objects(None, rr.tableName)}
 
 
+def _r2rml_declares_sql_view(r2rml_turtle: str | None) -> bool:
+    """Whether the mapping defines a logical table as an ``rr:sqlQuery`` view.
+
+    A logical table may be named (``rr:tableName``) or an R2RML *view*
+    (``rr:sqlQuery``, optionally with ``rr:sqlVersion``). The named form is
+    screened for injection by :func:`unemittable_table_names`, but an
+    ``rr:sqlQuery`` carries raw SQL that the VKG container runs against H2 over
+    the admin (``sa``) connection Ontop is configured with — where ``FILE_READ``,
+    ``CSVWRITE``, ``RUNSCRIPT`` and ``CREATE ALIAS`` (which compiles Java, i.e.
+    OS command execution in the container) are all reachable. Our induction only
+    ever emits ``rr:tableName`` (see the strategy emitters and
+    ``catalog/ingest.py``, which treats an ``rr:sqlQuery`` class as a derived
+    relation and drops it from the answerable set), so a view can only arrive
+    from a hand-edited or uploaded mapping. There is no supported path that
+    needs one, so it is refused outright rather than sandboxed.
+
+    Returns ``True`` when the mapping cannot be parsed: a mapping whose SQL we
+    cannot read is not a mapping we can clear.
+    """
+    if not r2rml_turtle:
+        return False
+    from rdflib import Graph, Namespace
+
+    rr = Namespace("http://www.w3.org/ns/r2rml#")
+    try:
+        graph = Graph().parse(data=r2rml_turtle, format="turtle")
+    except Exception:  # noqa: BLE001 - unparseable R2RML is refused, not cleared
+        return True
+    return bool(set(graph.objects(None, rr.sqlQuery)))
+
+
+_R2RML_SQL_VIEW_REJECTION = (
+    "Invalid R2RML: a logical table must be an rr:tableName, not an rr:sqlQuery view. "
+    "rr:sqlQuery carries raw SQL the VKG container would run against H2 as an admin, "
+    "so it is not accepted."
+)
+
+
 def _generate_schema_sql(
     namespace: str,
     ontology_id: str,
@@ -296,30 +324,16 @@ def _generate_schema_sql(
     so they match the source datasource; no canonical→original column map is
     needed.
 
-    ``r2rml_turtle`` is the mapping being persisted alongside this DDL. It is what
-    makes the two agree: the logical-table names in a mapping depend on WHICH
-    tables were in the run that produced it (a bare ``customers`` while one source
-    exposed that name, ``"public__2f77729f"."customers"`` once two did), and the
-    table set re-derived here is the union over ALL accepted proposals — a
-    different set, so a re-derivation can name a table differently from the
-    mapping that is about to be stored beside it. Ontop rejects a mapping naming a
-    table its validation schema does not declare, and that failure is
-    namespace-wide, not per-table. Passing the mapping makes the DDL a function of
-    it (see :func:`_tables_to_h2_ddl`) instead of a parallel guess.
+    ``r2rml_turtle`` is the mapping stored beside this DDL; the DDL is aligned to
+    its logical-table names (see :func:`_tables_to_h2_ddl`) because Ontop rejects
+    a mapping naming an undeclared table, namespace-wide.
 
-    ``extra_datasource_ids`` are unioned with the datasource ids gathered from the
-    accepted-proposal scan. The scan (``list_proposals(status="accepted")``) is
-    eventually consistent, and this can run inside the very accept that flipped its
-    own proposal to ``accepted`` moments earlier — so on a merge the scan may not
-    yet see it and would drop that source's tables. Passing the in-flight accept's
-    own ids here closes that read-after-write gap; they union with, never replace,
-    the scan, so re-accepts stay idempotent.
+    ``extra_datasource_ids`` are unioned with the accepted-proposal scan, which is
+    eventually consistent and may not yet see the in-flight accept's own proposal.
 
     Raises :class:`SchemaSqlGenerationError` on a genuine failure so the caller
     can tell it apart from the ``None`` empty state.
     """
-    import os
-
     try:
         from coa_ontology.induce_catalog import _catalog_to_tables, _fetch_catalog_from_smus
         from coa_ontology.inducer.services.data_catalog import CatalogTable
@@ -335,15 +349,6 @@ def _generate_schema_sql(
             for ds_id in meta.get("datasource_ids") or []:
                 ds_ids.add(ds_id)
 
-        # Union the CURRENT accept's datasource ids. ``list_proposals`` is an
-        # eventually-consistent DynamoDB scan, and this runs inside the same accept
-        # that just flipped its own proposal to ``accepted`` a few steps earlier —
-        # so the scan can miss that proposal and drop its source's tables from the
-        # DDL, even though the merged mapping (accumulated from Neptune) still names
-        # them. That mismatch makes ``_tables_to_h2_ddl`` fail closed, leaving a
-        # stale schema.sql and breaking every Tier-2 query in the namespace. Adding
-        # the in-flight ids here closes the read-after-write gap deterministically;
-        # they union with (never replace) the scan, so a re-accept is idempotent.
         for ds_id in extra_datasource_ids or []:
             ds_ids.add(ds_id)
 
@@ -394,7 +399,7 @@ def _generate_schema_sql(
         return _tables_to_h2_ddl(all_tables, _mapping_table_names(r2rml_turtle))
 
     except Exception as e:
-        # Genuine failure — do NOT mask as the ``None`` empty state (#457).
+        # Genuine failure — do NOT mask as the ``None`` empty state.
         raise SchemaSqlGenerationError(f"{type(e).__name__}: {e}") from e
 
 
@@ -414,15 +419,9 @@ _CATALOG_TO_H2 = {
     "CHAR": "CHAR(255)",
     "STRING": "VARCHAR(255)",
     "BOOLEAN": "BOOLEAN",
-    # Temporal types map faithfully. These were previously VARCHAR(255), which
-    # forced the R2RML rr:datatype and the ontology rdfs:range to xsd:string to
-    # stay consistent with this schema. The consequence was that Ontop's type
-    # reasoner saw every temporal column as a string, found comparisons against
-    # xsd:date/xsd:dateTime literals disjoint, proved the query unsatisfiable,
-    # and emitted its no-mapping placeholder ("SELECT 1 AS uselessVariable") —
-    # so EVERY date-filtered SPARQL query returned nothing. Verified against
-    # Ontop 5.5.0: faithful temporal types load cleanly (no
-    # MappingOntologyMismatchException) and produce real SQL.
+    # Temporal types keep real types: as VARCHAR, Ontop (verified on 5.5.0)
+    # proves comparisons with xsd:date/xsd:dateTime literals unsatisfiable and
+    # every date-filtered SPARQL query returns nothing.
     "DATE": "DATE",
     "TIMESTAMP": "TIMESTAMP",
     "DATETIME": "TIMESTAMP",
@@ -433,6 +432,56 @@ _CATALOG_TO_H2 = {
     "BINARY": "VARBINARY",
     "BLOB": "BLOB",
 }
+
+
+def unemittable_table_names(table_names: Iterable[str]) -> list[str]:
+    """The ``rr:tableName`` literals that must never be spliced into SQL.
+
+    A literal is emittable only if it is a well-formed SQL identifier path (see
+    :func:`coa_common.constants.normalize_sql_ident_path`). Everything else is
+    rejected rather than escaped, because escaping would silently rename the
+    table: an unquoted name folds to upper case where a quoted one does not, so
+    quoting ``orders`` into ``"orders"`` would make the DDL describe a table the
+    mapping does not name, and Ontop rejects such a mapping for the WHOLE
+    namespace rather than for that table.
+
+    The literals come from user-supplied R2RML and what is emitted from them is
+    run against H2 by a database admin at VKG startup, where ``CREATE ALIAS``
+    compiles Java — so a literal carrying its own SQL is code execution in the
+    VKG container, not a cosmetic defect. Rejecting is therefore the fail-closed
+    direction: a namespace whose mapping cannot be described loses Tier-2
+    queries, which is the same outcome Ontop would produce anyway.
+
+    Args:
+        table_names: ``rr:tableName`` literals to check.
+
+    Returns:
+        The offending literals, sorted; empty when all of them are emittable.
+    """
+    return sorted(name for name in table_names if normalize_sql_ident_path(name) is None)
+
+
+def _emittable_path(literal: str) -> list[str]:
+    """``literal``'s identifier segments, as they must appear in the emitted SQL.
+
+    The single choke point every name passes through on its way into schema.sql.
+    It raises rather than escapes (see :func:`unemittable_table_names`), so a
+    caller that forgot to screen its input with that function fails closed
+    instead of splicing unescaped text into DDL.
+
+    Args:
+        literal: A logical table name, catalog-derived or from the mapping.
+
+    Returns:
+        The segments to join with ``.``.
+
+    Raises:
+        SchemaSqlGenerationError: If ``literal`` is not an identifier path.
+    """
+    segments = normalize_sql_ident_path(literal)
+    if segments is None:
+        raise SchemaSqlGenerationError(f"refusing to emit a logical table name that is not an identifier: {literal!r}")
+    return segments
 
 
 def _align_to_mapping(
@@ -490,14 +539,8 @@ def _align_to_mapping(
             )
             chosen = derived
         elif chosen != derived:
-            # WARNING, not info: chosen != derived means the STORED mapping names
-            # this table differently from what the current catalog would derive —
-            # i.e. a persisted rr:tableName whose shape differs from today's rule.
-            # That is the exact signal an operator needs when diagnosing a
-            # namespace accepted under an older qualification rule (see the
-            # byte-identical-relative-to-pre-#149 note in the MR). (_align_to_mapping
-            # has no namespace/ontology_id in scope; the caller logs those around
-            # generation.)
+            # WARNING: the stored mapping names this table differently from
+            # today's derivation, the signal an operator needs.
             _log.warning(
                 "schema.sql: mapping's stored logical name %s for table %s differs from the "
                 "catalog-derived name %s — persisted mapping shape differs from the current rule",
@@ -538,7 +581,22 @@ def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None)
     """
     from coa_ontology.inducer.strategies.base import logical_table_names, table_identity
 
+    # Reject before anything is emitted. Every literal below is spliced into DDL
+    # text that the VKG container runs through H2's RunScript as an admin, so a
+    # literal that is not a single identifier path is an injection — see
+    # :func:`unemittable_table_names`. This gate is what makes the ``logical`` and
+    # ``literal`` interpolations further down safe to write as plain f-strings.
+    unemittable = unemittable_table_names(mapping_table_names or ())
+    if unemittable:
+        raise SchemaSqlGenerationError(
+            "mapping declares rr:tableName literal(s) that are not valid SQL identifier paths, "
+            f"so schema.sql cannot describe them: {unemittable}"
+        )
     logical_names = _align_to_mapping(logical_table_names(tables), tables, mapping_table_names)
+    # Identity -> the segments to emit. Every name reaching the DDL below comes
+    # from here, so one screening covers both the catalog-derived names and the
+    # mapping literals _align_to_mapping may have preferred over them.
+    logical_paths = {identity: _emittable_path(name) for identity, name in logical_names.items()}
     lines = ["-- Auto-generated schema for Ontop H2 validation (from datasource catalog)"]
     # H2 rejects a qualified CREATE TABLE whose schema does not exist yet, so every
     # schema a qualified name references is declared up front. The schema is taken
@@ -546,11 +604,12 @@ def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None)
     # genuinely named ``q1.results`` is ONE identifier (``"q1.results"``), and
     # splitting it textually emitted ``CREATE SCHEMA IF NOT EXISTS "q1;`` —
     # unbalanced quotes that make the entire schema.sql a syntax error, so Ontop
-    # validates the mapping against nothing at all.
-    schemas = sorted(
-        {parts[0] for parts in (split_sql_ident_path(n) for n in logical_names.values()) if len(parts) > 1}
-    )
-    lines += [f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(s)};" for s in schemas]
+    # validates the mapping against nothing at all. The segment is declared AS
+    # WRITTEN, not re-quoted: ``CREATE SCHEMA "db"`` does not create the schema
+    # that ``db."orders"`` then references, because an unquoted name folds to
+    # upper case and a quoted one does not.
+    schemas = sorted({segments[0] for segments in logical_paths.values() if len(segments) > 1})
+    lines += [f"CREATE SCHEMA IF NOT EXISTS {s};" for s in schemas]
     # Identity breaks the tie: two same-named tables would otherwise be ordered by
     # the arrival order of a set() of datasource ids, so the emitted DDL differed
     # run to run for no reason.
@@ -571,7 +630,8 @@ def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None)
         if pk_cols:
             pk_quoted = ", ".join(_sql_ident(c) for c in pk_cols)
             col_defs.append(f"PRIMARY KEY ({pk_quoted})")
-        logical = logical_names.get(table_identity(table)) or _sql_ident(table.name)
+        path = logical_paths.get(table_identity(table))
+        logical = ".".join(path) if path else _sql_ident(table.name)
         # One CREATE per logical name. Two tables can legitimately share one — the
         # mapping itself declares one logical table for both when their bare name
         # was unique in each of the runs that produced them — and H2 makes the
@@ -611,14 +671,15 @@ def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None)
         extra_schemas: list[str] = []
         extra_tables: list[str] = []
         for literal in undeclared:
-            parts = split_sql_ident_path(literal)
-            literal_cols = cols_by_bare.get(parts[-1])
+            # Already screened above; this keeps the emitted text built from parsed segments.
+            segments = _emittable_path(literal)
+            literal_cols = cols_by_bare.get(split_sql_ident_path(segments[-1])[-1])
             if literal_cols is None:
                 uncoverable.append(literal)
                 continue
-            if len(parts) > 1 and parts[0] not in schemas:
-                extra_schemas.append(parts[0])
-            extra_tables.append(f"CREATE TABLE IF NOT EXISTS {literal} ({', '.join(literal_cols)});")
+            if len(segments) > 1 and segments[0] not in schemas:
+                extra_schemas.append(segments[0])
+            extra_tables.append(f"CREATE TABLE IF NOT EXISTS {'.'.join(segments)} ({', '.join(literal_cols)});")
             emitted[literal] = literal_cols
         if uncoverable:
             raise SchemaSqlGenerationError(
@@ -628,7 +689,7 @@ def _tables_to_h2_ddl(tables: list, mapping_table_names: set[str] | None = None)
         for s in sorted(set(extra_schemas)):
             # Insert schema declarations after the initial comment + existing schema
             # block so a qualified extra literal has its schema created first.
-            decl = f"CREATE SCHEMA IF NOT EXISTS {_sql_ident(s)};"
+            decl = f"CREATE SCHEMA IF NOT EXISTS {s};"
             if decl not in lines:
                 lines.insert(1, decl)
         lines += extra_tables
@@ -728,13 +789,6 @@ def _clean_ontology_for_vkg(turtle: str, r2rml_turtle: str | None = None) -> str
                 if s in _bridged_props:
                     g.remove((s, _pred, o))
 
-    # Temporal ranges are left INTACT. They used to be rewritten to xsd:string
-    # to match the R2RML rr:datatype, which itself only said xsd:string because
-    # the H2 validation schema declared temporal columns as VARCHAR. All three
-    # layers now carry the real type, so the alignment below is satisfied
-    # without discarding it. Rewriting them made every date FILTER
-    # unsatisfiable — see the _CATALOG_TO_H2 comment above.
-
     # Align ontology property ranges with R2RML rr:datatype declarations.
     # Ontop is strict: if the R2RML says xsd:decimal but the ontology says
     # xsd:string, translation fails with MappingOntologyMismatchException.
@@ -812,6 +866,19 @@ def _accumulated_r2rml(ontology_id: str, namespace: str) -> str | None:
             r2rml = dynamo_store._get_s3_text(p["r2rml_s3_key"]) or ""
         if not r2rml:
             continue
+        # The edit and accept boundaries refuse an rr:sqlQuery view, but a
+        # proposal accepted before they existed may still carry one. Drop it
+        # here so it can never reach latest/mappings.r2rml, without failing
+        # every later accept on this ontology.
+        if _r2rml_declares_sql_view(r2rml):
+            _log.error(
+                "r2rml: dropped the mapping of accepted proposal %s (ontology=%s, ns=%s) from the VKG payload: "
+                "it declares an rr:sqlQuery view or cannot be parsed",
+                p.get("proposal_id"),
+                ontology_id,
+                namespace,
+            )
+            continue
         # Deduplicate @prefix lines across proposals
         lines = []
         for line in r2rml.split("\n"):
@@ -829,7 +896,6 @@ def _accumulated_r2rml(ontology_id: str, namespace: str) -> str | None:
     # duplicate logicalTable nodes on the same TriplesMap subject.
     if r2rml_turtle:
         try:
-            from rdflib import Graph
             from rdflib import Namespace as RdfNamespace
 
             RR = RdfNamespace("http://www.w3.org/ns/r2rml#")
@@ -880,91 +946,79 @@ def _persist_induced_to_s3(
 
     from coa_ontology.stores.neptune_db_graph import _gsp_get_turtle
 
-    try:
-        # 1. Get full ontology turtle from Neptune named graph
-        ontology_turtle = _gsp_get_turtle(graph_uri) if graph_uri else None
-        if not ontology_turtle:
-            _log.warning("s3 persist: no turtle from graph %s, skipping", graph_uri)
-            return
+    ontology_turtle = _gsp_get_turtle(graph_uri) if graph_uri else None
+    if not ontology_turtle:
+        _log.warning("s3 persist: no turtle from graph %s, skipping", graph_uri)
+        return
 
-        # 2. Accumulate R2RML from all accepted proposals for this ontology
-        r2rml_turtle = _accumulated_r2rml(ontology_id, namespace)
+    r2rml_turtle = _accumulated_r2rml(ontology_id, namespace)
 
-        # 3. Write to S3
-        short_id = _ontology_short_id(ontology_id)
+    short_id = _ontology_short_id(ontology_id)
 
-        s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
-        base_key = f"{_S3_PREFIX}/{namespace}/induced/{short_id}"
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    base_key = f"{_S3_PREFIX}/{namespace}/induced/{short_id}"
 
-        _put_induced_turtle(namespace, ontology_id, ontology_turtle, s3=s3)
+    _put_induced_turtle(namespace, ontology_id, ontology_turtle, s3=s3)
 
-        if r2rml_turtle:
-            s3.put_object(
-                Bucket=_S3_BUCKET,
-                Key=f"{base_key}.r2rml.ttl",
-                Body=r2rml_turtle.encode("utf-8"),
-                ContentType="text/turtle",
-            )
-            _log.info("s3 persist: wrote %s.r2rml.ttl (%d bytes)", base_key, len(r2rml_turtle))
-
-        # 4. Write to the VKG-expected "latest/" path so the VKG service
-        #    can discover and load the ontology + mappings at startup.
-        #    The VKG ontology is cleaned for OWL 2 QL compatibility (Ontop).
-        latest_key = f"{_S3_PREFIX}/{namespace}/latest"
-        vkg_turtle = _clean_ontology_for_vkg(ontology_turtle, r2rml_turtle=r2rml_turtle)
+    if r2rml_turtle:
         s3.put_object(
             Bucket=_S3_BUCKET,
-            Key=f"{latest_key}/ontology.ttl",
-            Body=vkg_turtle.encode("utf-8"),
+            Key=f"{base_key}.r2rml.ttl",
+            Body=r2rml_turtle.encode("utf-8"),
             ContentType="text/turtle",
         )
-        _log.info("s3 persist: wrote %s/ontology.ttl (%d bytes)", latest_key, len(vkg_turtle))
+        _log.info("s3 persist: wrote %s.r2rml.ttl (%d bytes)", base_key, len(r2rml_turtle))
 
-        if r2rml_turtle:
-            s3.put_object(
-                Bucket=_S3_BUCKET,
-                Key=f"{latest_key}/mappings.r2rml",
-                Body=r2rml_turtle.encode("utf-8"),
-                ContentType="text/turtle",
-            )
-            _log.info("s3 persist: wrote %s/mappings.r2rml (%d bytes)", latest_key, len(r2rml_turtle))
+    # 4. Write to the VKG-expected "latest/" path so the VKG service
+    #    can discover and load the ontology + mappings at startup.
+    #    The VKG ontology is cleaned for OWL 2 QL compatibility (Ontop).
+    latest_key = f"{_S3_PREFIX}/{namespace}/latest"
+    vkg_turtle = _clean_ontology_for_vkg(ontology_turtle, r2rml_turtle=r2rml_turtle)
+    s3.put_object(
+        Bucket=_S3_BUCKET,
+        Key=f"{latest_key}/ontology.ttl",
+        Body=vkg_turtle.encode("utf-8"),
+        ContentType="text/turtle",
+    )
+    _log.info("s3 persist: wrote %s/ontology.ttl (%d bytes)", latest_key, len(vkg_turtle))
 
-        # 5. Generate and upload schema.sql from datasource catalog.
-        #    Ontop needs schema.sql to validate R2RML column references at startup.
-        #    Identifiers are emitted verbatim (SQL-delimited), so they match the
-        #    source datasource directly — no canonical→original column map needed.
-        #
-        #    A generation failure is logged at ERROR but kept best-effort: the
-        #    rest of the VKG payload is already written. (Failing the whole accept
-        #    on this is coupled to the accept-flow ordering rework — #467.)
-        try:
-            schema_sql = _generate_schema_sql(
-                namespace, ontology_id, r2rml_turtle, extra_datasource_ids=current_datasource_ids
-            )
-        except SchemaSqlGenerationError as e:
-            schema_sql = None
-            _log.error(
-                "s3 persist: schema.sql generation FAILED for %s (ns=%s) — Ontop R2RML "
-                "column validation will be degraded until re-accept: %s",
-                ontology_id,
-                namespace,
-                e,
-            )
-        if schema_sql:
-            s3.put_object(
-                Bucket=_S3_BUCKET,
-                Key=f"{latest_key}/schema.sql",
-                Body=schema_sql.encode("utf-8"),
-                ContentType="text/sql",
-            )
-            _log.info("s3 persist: wrote %s/schema.sql (%d bytes)", latest_key, len(schema_sql))
-    except Exception:
-        # RAISE — do NOT swallow (#467). Warning-and-returning here hid a
-        # Neptune<->S3 split-brain: the graph is committed and DDB says
-        # ``accepted``, but VKG keeps serving the stale ``latest/`` copy with no
-        # signal. The caller retries this as the ``s3_persist`` step and logs
-        # each attempt, so no log line is needed here.
-        raise
+    if r2rml_turtle:
+        s3.put_object(
+            Bucket=_S3_BUCKET,
+            Key=f"{latest_key}/mappings.r2rml",
+            Body=r2rml_turtle.encode("utf-8"),
+            ContentType="text/turtle",
+        )
+        _log.info("s3 persist: wrote %s/mappings.r2rml (%d bytes)", latest_key, len(r2rml_turtle))
+
+    # 5. Generate and upload schema.sql from datasource catalog.
+    #    Ontop needs schema.sql to validate R2RML column references at startup.
+    #    Identifiers are emitted verbatim (SQL-delimited), so they match the
+    #    source datasource directly — no canonical→original column map needed.
+    #
+    #    A generation failure is logged at ERROR but kept best-effort: the
+    #    rest of the VKG payload is already written.
+    try:
+        schema_sql = _generate_schema_sql(
+            namespace, ontology_id, r2rml_turtle, extra_datasource_ids=current_datasource_ids
+        )
+    except SchemaSqlGenerationError as e:
+        schema_sql = None
+        _log.error(
+            "s3 persist: schema.sql generation FAILED for %s (ns=%s) — Ontop R2RML "
+            "column validation will be degraded until re-accept: %s",
+            ontology_id,
+            namespace,
+            e,
+        )
+    if schema_sql:
+        s3.put_object(
+            Bucket=_S3_BUCKET,
+            Key=f"{latest_key}/schema.sql",
+            Body=schema_sql.encode("utf-8"),
+            ContentType="text/sql",
+        )
+        _log.info("s3 persist: wrote %s/schema.sql (%d bytes)", latest_key, len(schema_sql))
 
 
 def _emit_ontology_published(namespace: str, version: str) -> bool:
@@ -977,19 +1031,12 @@ def _emit_ontology_published(namespace: str, version: str) -> bool:
     here would mean a single transient ``PutEvents`` blip became a permanent
     skip instead of being retried 3×.
 
-    Why the caller declares it non-fatal (#467): losing this event means S3 holds
-    the correct new ontology while the VKG service keeps serving the previous
-    payload — real user-visible staleness (Tier-2 answers from the old mappings,
-    with no error raised), but the ontology itself is complete and correct, so it
-    is not worth failing an otherwise-perfect accept. It is its OWN pipeline step
-    (was a silent tail-call inside :func:`_persist_induced_to_s3`), so an
-    exhausted retry is recorded as
-    ``accept_progress {step: notify_vkg, state: skipped}`` and is greppable.
+    Non-fatal: losing the event leaves VKG serving the previous payload while S3
+    holds the correct ontology. An exhausted retry is recorded as
+    ``accept_progress {step: notify_vkg, state: skipped}``.
 
-    GAP (#851): a skipped notify_vkg has no in-product recovery — re-accept
-    returns early on ``accepted`` and cannot re-emit. Today an operator forces a
-    new VKG ECS deployment. The EventBridge retry/alarm only cover delivery of an
-    event that reached EventBridge, not a ``put_events`` that never succeeded.
+    A skipped notify_vkg has no in-product recovery (re-accept returns early on
+    ``accepted``); an operator forces a new VKG ECS deployment.
     """
     import boto3
 
@@ -1015,9 +1062,6 @@ def _emit_ontology_published(namespace: str, version: str) -> bool:
         raise RuntimeError(f"put_events reported FailedEntryCount={failed}: {resp.get('Entries')}")
     _log.info("eventbridge: emitted ontology.published for namespace=%s version=%s", namespace, version)
     return True
-
-
-# ── Routes ──────────────────────────────────────────────────────────────
 
 
 # ListProposals ``maxResults`` bounds and default. The max equals the Smithy
@@ -1156,17 +1200,6 @@ def get_proposal(proposal_id: str, namespace: str = "default"):
     return item
 
 
-# ── Accept (async) ──────────────────────────────────────────────────────
-# The accept flow runs Neptune SPARQL projections, GSP bulk Turtle load,
-# Bedrock embedding for every class+property, and S3 persistence — easily
-# 30-60 seconds for a real proposal, well past API Gateway's 29-second
-# integration timeout. The handler returns 202 after flipping the
-# proposal status to ``accepting``; a daemon thread completes the work
-# and writes the terminal status (``accepted``, or ``accept_failed`` with
-# ``accept_error`` naming the failed step) to DDB. Clients observe
-# progress via ``GET /proposals/{id}``.
-
-
 def _reconcile_counts(ontology_id: str, namespace: str, graph_uri: str) -> bool:
     """Overwrite DDB registry counts with actual Neptune graph counts (deduped).
 
@@ -1177,7 +1210,7 @@ def _reconcile_counts(ontology_id: str, namespace: str, graph_uri: str) -> bool:
     would put the blast-radius decision in the step rather than at the pipeline
     call site where it is reviewable.
 
-    Why the caller declares it non-fatal (#467): a failure leaves the registry
+    Why the caller declares it non-fatal: a failure leaves the registry
     holding the ingest-derived (additive) counts, so the Catalog tab can show
     inflated class/property numbers for an otherwise-correct ontology. Misleading
     but not corrupting, and the next accept recomputes it — not worth blocking an
@@ -1224,7 +1257,7 @@ def _checkpoint_accept_step(proposal_id: str, namespace: str, step: str, state: 
     """Record ``{step, state}`` in ``accept_progress`` — and heartbeat ``updated_at``.
 
     NOT resume state: nothing reads ``accept_progress``, so a re-accept restarts at
-    ``ingest`` rather than continuing from here (#851). It is diagnostics plus the
+    ``ingest`` rather than continuing from here. It is diagnostics plus the
     heartbeat.
 
     Best-effort by design: a progress-write hiccup must never fail a step whose
@@ -1266,11 +1299,8 @@ def _run_accept_step(
       failure leaves the ontology itself correct (see :func:`_reconcile_counts`,
       :func:`_emit_ontology_published`).
 
-    Either way the step gets the SAME retry. That is the point of routing
-    non-fatal steps through here too: previously they caught their own exception
-    and returned ``False``, so this loop never saw a failure and the documented
-    3-attempt retry silently never happened — one EventBridge blip was a
-    permanent skip. Steps must therefore RAISE on failure, not return ``False``.
+    Either way the step gets the same retry, so steps must RAISE on failure, not
+    return ``False``.
 
     A step returning ``False`` is still checkpointed ``skipped`` rather than
     ``done``, for steps that legitimately report "did not complete" without
@@ -1283,8 +1313,6 @@ def _run_accept_step(
         attempt += 1
         try:
             result = fn()
-            # Checkpoint + heartbeat. Best-effort: a progress-write hiccup must
-            # not fail an otherwise-successful step.
             state = "skipped" if result is False else "done"
             _checkpoint_accept_step(proposal_id, namespace, step, state)
             if state == "skipped":
@@ -1311,11 +1339,7 @@ def _run_accept_step(
                     )
                     return False
                 raise _AcceptStepError(step, f"{type(e).__name__}: {e}") from e
-            # Jitter matches the idiom used by every other backoff in the repo
-            # (e.g. libs/common opensearch/retry.py, embeddings.py): without it,
-            # two accept workers that hit the same Neptune/AOSS blip retry in
-            # lockstep at exactly the same instants and re-collide. Scaled by the
-            # configured base so setting the base to 0 (tests) stays instant.
+            # Jitter keeps concurrent workers from retrying in lockstep.
             base = _ACCEPT_STEP_BACKOFF_SECONDS * (2 ** (attempt - 1))
             backoff = base + random.uniform(0, _ACCEPT_STEP_BACKOFF_SECONDS / 2)
             _log.warning(
@@ -1352,19 +1376,10 @@ def _run_accept_proposal(
     converges rather than corrupting: Neptune ``INSERT DATA`` dedups identical
     triples (ingest append semantics), and the count-reconcile step SETs the
     deduped Neptune cardinality (not an additive ADD), so class/property counts
-    self-heal on every accept, and the S3 persist that #467 used to swallow is
-    now a retried, failure-propagating step.
+    self-heal on every accept, and the S3 persist is a retried, failure-propagating step.
 
-    Converges, does NOT resume (#851): every re-accept restarts at ``ingest``, so
-    a failure in the last step still re-runs the Neptune load and the full
-    embedding pass. Costly, and the AOSS duplication below is the price.
-
-    KNOWN LIMITATION (tracked by #594, not fixed here): AOSS has no
-    client-supplied ``_id`` and no per-entity delete — only an ontology-wide
-    ``delete_embeddings_for_ontology`` — so re-accepting can leave duplicate
-    embedding docs. We deliberately do NOT pre-clean embeddings in the accept
-    path: on the append-merge flow that would wipe co-merged proposals'
-    embeddings. AOSS dedupe belongs to the cancel/reject cleanup (#594).
+    Converges, does NOT resume: every re-accept restarts at ``ingest`` (see the
+    ingest step for the AOSS embedding duplication this causes).
     """
     from coa_ontology.stores import build_stores
 
@@ -1392,10 +1407,10 @@ def _run_accept_proposal(
         #   - axiom_count / embedding_count are ADD-only, so they stay high.
         #     Display-only.
         #   - AOSS embeddings DUPLICATE (no client-supplied _id — see
-        #     opensearch_vector), degrading recall rather than breaking it. #824.
+        #     opensearch_vector), degrading recall rather than breaking it.
         # No local fix: append mode shares one ontology across proposals, so a
         # pre-retry delete_embeddings_for_ontology would wipe co-tenant embeddings.
-        # This is also why the no-resume gap (#851) is expensive: a failure in the
+        # This is also why the no-resume gap is expensive: a failure in the
         # LAST step re-runs this whole step, duplicating embeddings for nothing.
         result = _run_accept_step(
             "ingest",
@@ -1419,20 +1434,9 @@ def _run_accept_proposal(
         # ontology (or a serve request) could miss just-written embeddings.
         # Surface as ``embeddings_sync`` so a poller shows "Syncing embeddings…".
         #
-        # fatal=True (was False): with the #173 write-path fixes, the embeddings
-        # are KNOWN-ACKNOWLEDGED by the vector store before this wait runs
-        # (bulk_with_retry raises on any doc that fails to land). So a stall here
-        # is no longer "durably written, visibility just lagged" — it means the
-        # index did NOT converge on writes we were told succeeded, i.e. loss or
-        # an unhealthy index. Accepting anyway would publish an ontology whose
-        # embeddings are not fully retrievable — exactly the silent-degradation
-        # #173 reports. We therefore RAISE on a non-convergence so the accept
-        # lands accept_failed / embeddings_searchable and can be re-accepted,
-        # rather than being checkpointed ``skipped`` and reported as success.
-        #
-        # The no-progress-deadline + on_progress heartbeat still protect a
-        # large-but-healthy sync: the deadline resets on every advance, so only a
-        # genuinely wedged index trips it.
+        # fatal=True: the writes were acknowledged (bulk_with_retry raises on any
+        # failed doc), so an index that does not converge means loss. The
+        # no-progress deadline resets on every advance, so only a wedged index trips it.
         embedded_uris = (result.get("embeddings") or {}).get("entity_uris", [])
         dynamo_store.update_proposal(proposal_id, namespace=namespace, status=PROPOSAL_STATUS_EMBEDDINGS_SYNC)
 
@@ -1507,14 +1511,9 @@ def _run_accept_proposal(
             ),
         )
 
-        # ── Step: mirror job status — NON-FATAL by design (#467) ───────────
-        # A pipeline step rather than a bare try/except, so it gets the same
-        # 3-attempt retry and a real checkpoint. A failure only leaves the job row
-        # showing its pre-accept status while the proposal itself is correctly
-        # ``accepted`` — cosmetic, and the proposal row is what the UI reads — so
-        # it must not fail the accept. It is recorded as
-        # ``{step: job_status_mirror, state: skipped}`` instead of vanishing into
-        # a log warning.
+        # ── Step: mirror job status — NON-FATAL by design ───────────
+        # Non-fatal: a failure only leaves the job row's status stale; the UI
+        # reads the proposal row.
         _run_accept_step(
             "job_status_mirror",
             proposal_id,
@@ -1523,12 +1522,7 @@ def _run_accept_proposal(
             fatal=False,
         )
 
-        # ── Step: reconcile counts — NON-FATAL by design (#467) ───────────
-        # fatal=False: retried 3× like every other step, but an exhausted retry
-        # is checkpointed ``skipped`` and the accept still succeeds. A failure
-        # only leaves inflated Catalog-tab counts (the next accept recomputes
-        # them), so it must NOT block an accept whose graph/embeddings/S3 are
-        # good — but it is never recorded as a false ``done``.
+        # ── Step: reconcile counts — NON-FATAL by design ───────────
         _run_accept_step(
             "reconcile_counts",
             proposal_id,
@@ -1537,14 +1531,9 @@ def _run_accept_proposal(
             fatal=False,
         )
 
-        # ── Step: persist induced ontology + R2RML to S3 for VKG — FATAL (#467)
-        # Previously swallowed on failure, silently stranding VKG on a stale
-        # copy. Now a retried, failure-propagating step: on exhaustion the accept
-        # lands ``accept_failed`` / ``s3_persist``. This also covers schema.sql
-        # generation, which raises SchemaSqlGenerationError (#457) rather than
-        # masking a real failure as the "nothing to describe" None — without
-        # schema.sql Ontop cannot validate the R2RML and Tier-2 SQL breaks at
-        # query time, so a structured ontology must not be accepted without one.
+        # ── Step: persist induced ontology + R2RML to S3 for VKG — FATAL
+        # On exhaustion the accept lands ``accept_failed`` / ``s3_persist``. A
+        # schema.sql generation failure is logged inside the step, not raised.
         # The current proposal's own datasource ids, read by primary key (unlike
         # the eventually-consistent scan inside _generate_schema_sql, a keyed fetch
         # always sees this accept's just-written row) so this source's tables are
@@ -1567,13 +1556,7 @@ def _run_accept_proposal(
             ),
         )
 
-        # ── Step: notify VKG to reload — NON-FATAL by design (#467) ────────
-        # Own step (was a silent tail-call inside _persist_induced_to_s3) so it
-        # gets the same retry as everything else. fatal=False: if it still fails,
-        # S3 is correct but VKG serves the previous payload until something else
-        # triggers a reload: recoverable, so the accept succeeds and the lost
-        # signal is recorded as ``{step: notify_vkg, state: skipped}`` instead of
-        # disappearing into a log warning.
+        # ── Step: notify VKG to reload — NON-FATAL by design ────────
         _run_accept_step(
             "notify_vkg",
             proposal_id,
@@ -1604,47 +1587,20 @@ def _run_accept_proposal(
 def _accept_fail(proposal_id: str, namespace: str, error: str, step: str = "unknown") -> None:
     """Move a failed accept to the terminal ``accept_failed`` state.
 
-    The user observes this via the next ``GET /proposals/{id}`` poll: the status
-    is ``accept_failed`` (distinct from ``pending``, so the UI can say "accept
-    failed on step X — fix and retry" rather than showing a fresh proposal) and
-    ``accept_error`` carries the reason. ``accept_failed`` is re-acceptable: the
-    accept guard treats it like ``pending``/``updated``. Re-running CONVERGES but
-    does NOT resume — it restarts at ``ingest`` no matter how far the failed
-    attempt got, because nothing reads ``accept_progress`` (#851).
+    ``accept_error`` carries the reason (truncated to 1000 chars for DynamoDB) and
+    ``step`` is recorded on ``accept_progress``. ``accept_failed`` is re-acceptable;
+    re-running restarts at ``ingest``. Logs at ERROR, since every terminal-failure
+    path goes through here. The rollback write error is swallowed; the stale-sweep
+    is the backstop.
 
-    ``step`` names the failing pipeline stage (ingest, embeddings_searchable,
-    reconcile_counts, s3_persist, …) and is recorded on ``accept_progress`` for
-    diagnosis. We swallow the rollback write error so the worker doesn't crash on
-    a transient DDB hiccup; the stale-sweep is the backstop if this write is lost.
-
-    Error messages are truncated to 1000 chars to avoid DynamoDB
-    ValidationException on large error payloads (e.g. BulkIndexError with
-    embedded vectors).
-
-    Logs at ERROR before writing. This is the single choke point for every
-    terminal-failure path (parse, validation, exhausted step retries, and the
-    catch-all), so logging here means a failed accept is always visible in
-    CloudWatch — without it an operator only sees the route's 202 and no trace of
-    why the accept never completed.
-
-    NEVER DOWNGRADES AN ALREADY-``accepted`` PROPOSAL. ``flip_accepted`` runs
-    BEFORE ``reconcile_counts``/``s3_persist``/``notify_vkg`` (it has to: those
-    steps read ``list_proposals(status="accepted")`` to accumulate this
-    proposal's own R2RML and datasource ids). So a post-flip step failure hits a
-    proposal whose graph, embeddings and registry row are already live and
-    serving. Reverting it to ``accept_failed`` would be actively harmful: four
-    call sites select on ``status="accepted"`` — ``_generate_schema_sql``,
-    ``_persist_induced_to_s3``, ``list_induced_datasources`` and the
-    duplicate-detection scan — so the reverted proposal silently drops out of
-    them, and the NEXT accept into the same ontology rebuilds
-    ``latest/mappings.r2rml`` WITHOUT its mappings. That is silent mapping loss,
-    the opposite of what #467 set out to fix.
-
-    The write is therefore conditional on the status still being non-terminal.
-    When it is already ``accepted`` the status is left alone and only the
-    diagnostic fields are recorded, so the failed step is still greppable and
-    visible on the proposal while the live ontology keeps its ``accepted``
-    identity. A re-accept re-runs the tail steps (they are overwrites).
+    Never downgrades an ``accepted`` proposal. ``flip_accepted`` runs before
+    ``reconcile_counts``/``s3_persist``/``notify_vkg`` because those steps read
+    ``list_proposals(status="accepted")``. Reverting a live proposal would drop it
+    from every ``status="accepted"`` selector (``_generate_schema_sql``,
+    ``_persist_induced_to_s3``, ``list_induced_datasources``, duplicate detection),
+    so the next accept would rebuild ``latest/mappings.r2rml`` without its
+    mappings. The write is therefore conditional; on an ``accepted`` proposal only
+    the diagnostic fields are recorded.
     """
     _log.error("accept[%s]: FAILED on step '%s': %s", proposal_id, step, str(error)[:500])
     error_msg = str(error)[:1000]
@@ -1719,15 +1675,10 @@ def accept_proposal(
     if status in _ACCEPT_IN_PROGRESS_STATUSES:
         raise HTTPException(409, "Accept already in progress for this proposal")
     # ``accept_failed`` falls through to the accept path below — it is
-    # re-acceptable, same as pending/updated. Re-running converges on a correct end
-    # state but re-executes every step from ``ingest`` (no resume — see #851).
+    # re-acceptable, same as pending/updated; it re-executes every step from ``ingest``.
 
     # Prefer user-reviewed Turtle if the user revised the proposal.
-    reviewed = (
-        dynamo_store.get_reviewed_proposal(item["job_id"], kind="ontology", namespace=namespace)
-        if hasattr(dynamo_store, "get_reviewed_proposal")
-        else None
-    )
+    reviewed = dynamo_store.get_reviewed_proposal(item["job_id"], kind="ontology", namespace=namespace)
     if reviewed and reviewed.get("ontology_turtle"):
         turtle = reviewed["ontology_turtle"]
     else:
@@ -1743,6 +1694,10 @@ def accept_proposal(
         r2rml_turtle = reviewed["r2rml_turtle"]
     else:
         r2rml_turtle = item.get("r2rml_turtle", "")
+    # A proposal stored before the edit boundary refused views can still hold
+    # one; refuse it here too, before anything is written.
+    if _r2rml_declares_sql_view(r2rml_turtle):
+        raise HTTPException(422, _R2RML_SQL_VIEW_REJECTION)
 
     explicit_target = body.ontology_id if body else None
     target_ontology_id = explicit_target or item.get("ontology_id", "")
@@ -1756,13 +1711,9 @@ def accept_proposal(
     # induces every source under a namespace-derived prefix, so all sources in a
     # namespace share one ontology_id and merge into a single VKG payload).
     #
-    # A caller (direct API) *can* induce sources under DISTINCT
-    # ``ontology_uri_prefix`` values, producing distinct ontology_ids in one
-    # namespace. Accepting the second then used to OVERWRITE the first source's
-    # per-namespace ``latest/`` VKG payload (single Ontop instance serves one
-    # payload per namespace), silently breaking Tier-2 for the first source.
-    # Rather than tolerate that by merging mismatched ontologies, reject it
-    # loudly: a namespace holds exactly one induced ontology.
+    # A namespace holds exactly one induced ontology: one Ontop instance serves
+    # one ``latest/`` payload per namespace, so a second ontology_id would
+    # overwrite the first source's payload.
     #
     # The explicit ``body.ontology_id`` override is the deliberate
     # "merge this proposal into target ontology X" path — honoured as-is,
@@ -1811,15 +1762,8 @@ def accept_proposal(
     # the worker fails, ``_accept_fail`` moves this to ``accept_failed``
     # with the new error (still re-acceptable).
     #
-    # ``expected_status`` makes the transition atomic in DDB. The earlier
-    # ``get → check → update`` sequence had a small race window: two
-    # concurrent accepts both reading ``pending``, both writing
-    # ``accepting``, both spawning workers. The conditional update
-    # collapses that window — only one writer can transition the row,
-    # the other gets ``ConditionalCheckFailedException`` which we
-    # surface as 409 (same response the up-front check would have
-    # returned). Cost: one extra ``ConditionExpression`` in the same
-    # request, no extra round-trip.
+    # ``expected_status`` makes the transition atomic, so only one concurrent
+    # accept wins; the other gets 409.
     try:
         dynamo_store.update_proposal(
             proposal_id,
@@ -1858,11 +1802,7 @@ def cancel_proposal(proposal_id: str, namespace: str = "default"):
     item = dynamo_store.get_proposal_by_id(proposal_id, namespace=namespace)
     if not item:
         raise HTTPException(404, f"Proposal '{proposal_id}' not found")
-    # ``accept_failed`` is cancellable: before this state existed a failed accept
-    # rolled back to ``pending``, so it was. The UI enables Cancel for it too
-    # (isTerminal is only accepted/rejected/cancelled), so omitting it here would
-    # 409 a button the user is invited to press. It is a reviewable, discardable
-    # proposal like any other non-terminal one.
+    # ``accept_failed`` is cancellable: the UI offers Cancel for it.
     if item.get("status") not in (
         ProposalStatus.PENDING.value,
         ProposalStatus.UPDATED.value,
@@ -1973,21 +1913,41 @@ def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
     #     that request cap (the mirror of the presigned-GET read path). The
     #     server reads it back here to validate before committing the pointer.
     def _validate_turtle(ttl: str, what: str) -> None:
-        from rdflib import Graph as RdfGraph
-
         try:
-            RdfGraph().parse(data=ttl, format="turtle")
+            Graph().parse(data=ttl, format="turtle")
         except Exception as e:
             raise HTTPException(422, f"Invalid {what} Turtle: {e}") from e
 
-    # NOTE: we deliberately do NOT canonicalize datatype tokens here. Editing a
-    # proposal persists the user's Turtle verbatim — silently rewriting their
-    # data at the write boundary is the anti-pattern this feature removes. Any
-    # malformed/mis-cased/aliased token (xsd:datetime, xsd:varchar, …) is instead
-    # surfaced by DatatypeTokenValidator at validation time and fixed only via the
-    # consent-gated /repair-datatypes action. (The served VKG copy is still
-    # sanitized at accept time in _clean_ontology_for_vkg, so a skipped repair
-    # can't break Ontop queries.)
+    def _validate_r2rml_table_names(ttl: str) -> None:
+        """Reject R2RML whose logical tables cannot be safely emitted.
+
+        Parsing as Turtle says nothing about the CONTENT of a logical table, and
+        that content reaches H2 over the VKG container's admin connection:
+
+        * an ``rr:tableName`` literal is spliced into the schema.sql the VKG
+          container feeds to ``RunScript`` at startup; and
+        * an ``rr:sqlQuery`` (an R2RML *view*) is raw SQL Ontop runs against H2
+          as ``sa`` at query time, where ``FILE_READ``/``CSVWRITE``/``RUNSCRIPT``/
+          ``CREATE ALIAS`` are all reachable.
+
+        Catching a bad ``rr:tableName`` here turns what would otherwise be a
+        failed accept (``_tables_to_h2_ddl`` raises ``SchemaSqlGenerationError``)
+        into an actionable 422 on the edit that introduced it. An ``rr:sqlQuery``
+        view is refused outright: induction never emits one and no supported path
+        needs one (see :func:`_r2rml_declares_sql_view`).
+        """
+        if _r2rml_declares_sql_view(ttl):
+            raise HTTPException(422, _R2RML_SQL_VIEW_REJECTION)
+        offenders = unemittable_table_names(_mapping_table_names(ttl) or ())
+        if offenders:
+            raise HTTPException(
+                422,
+                "Invalid R2RML: rr:tableName must be a SQL identifier path "
+                f'(e.g. "schema"."table"); rejected {offenders}',
+            )
+
+    # Edits are stored verbatim; bad datatype tokens are fixed only by the
+    # consent-gated /repair-datatypes, and accept sanitizes the VKG copy.
     has_uploaded_artifact = body.ontology_uploaded or body.r2rml_uploaded
     if has_uploaded_artifact and body.upload_revision_id is None:
         raise HTTPException(400, "uploadRevisionId is required when an uploaded flag is true")
@@ -2028,6 +1988,7 @@ def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
 
     if body.r2rml_turtle is not None:
         _validate_turtle(body.r2rml_turtle, "R2RML")
+        _validate_r2rml_table_names(body.r2rml_turtle)
         updates["r2rml_s3_key"] = dynamo_store._put_artifact_s3(
             namespace,
             body.proposal_id,
@@ -2040,6 +2001,7 @@ def update_proposal(body: UpdateProposalRequest, namespace: str = "default"):
         if ttl is None:
             raise HTTPException(400, "r2rml_uploaded was set but no uploaded artifact was found in S3")
         _validate_turtle(ttl, "R2RML")
+        _validate_r2rml_table_names(ttl)
         updates["r2rml_s3_key"] = dynamo_store._proposal_s3_key(
             namespace,
             body.proposal_id,
@@ -2091,8 +2053,7 @@ def repair_proposal_datatypes(
 
     User-initiated, consent-gated counterpart to the DatatypeTokenValidator
     finding: the validator surfaces the offending tokens at validation time and
-    the user invokes this to apply the fix (replacing the previous silent
-    write-boundary canonicalization). Rewrites the stored ontology Turtle AND the
+    the user invokes this to apply the fix. Rewrites the stored ontology Turtle AND the
     R2RML mappings, since a malformed ``rr:datatype`` is copied into the served
     ontology range at accept. Server-authoritative: the canonical XSD map lives
     here, not in the client. Idempotent — a clean proposal returns
@@ -2186,8 +2147,6 @@ def _grounding_override_key(
 
 def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None], item: dict, namespace: str) -> dict:
     """Patch grounding matches and rebuild Turtle + R2RML."""
-    import os
-
     from coa_ontology.induce_catalog import _catalog_to_tables, fetch_datasource_catalog
     from coa_ontology.inducer.schemas import ConceptMatch
     from coa_ontology.inducer.services.data_catalog import CatalogTable
@@ -2237,7 +2196,7 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
             scheme = ""
         if (
             not override_uri
-            or len(override_uri) > 2048
+            or len(override_uri) > MAX_GROUNDING_TARGET_URI_LENGTH
             or not override_uri.isprintable()
             or any(character.isspace() for character in override_uri)
             or scheme not in ("http", "https")
@@ -2246,7 +2205,7 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
                 409,
                 (
                     f"Grounding override for '{override_key}' must be an HTTP(S) URI "
-                    "of at most 2048 printable non-whitespace characters"
+                    f"of at most {MAX_GROUNDING_TARGET_URI_LENGTH} printable non-whitespace characters"
                 ),
             )
     # A chosen URI must be one of the stored candidates of the match its key
@@ -2285,14 +2244,8 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
             m.similarity = None
         else:
             m.matched_class_uri = override_uri
-            # Derive the tier from the chosen candidate's own score rather than
-            # hardcoding "high_confidence". Hardcoding was lossy and wrong: an
-            # original *exact* match (e.g. publication → Publication @ 0.95)
-            # demoted to high_confidence on the first override and never
-            # recovered — even when the user reverted to that same candidate.
-            # Each stored candidate keeps its score, so re-classifying with the
-            # grounding service's own thresholds makes overrides round-trip:
-            # reverting to the original grounding restores its original tier.
+            # Re-derive the tier from the candidate's stored score so overrides
+            # round-trip (reverting restores the original tier).
             cand = None
             if m.candidates:
                 cand = next((c for c in m.candidates if c.entity_uri == override_uri), None)
@@ -2497,12 +2450,6 @@ def _apply_grounding_overrides(proposal_id: str, overrides: dict[str, str | None
     return {"proposal_id": proposal_id, "status": "updated"}
 
 
-# ── Refresh Grounding ──────────────────────────────────────────────────
-
-
-# ── Validate ───────────────────────────────────────────────────────────
-
-
 class ValidateProposalRequest(BaseModel):
     """Request body for validating a proposal across the selected tiers."""
 
@@ -2524,8 +2471,7 @@ def _persist_async_job(kind: str, job: dict, namespace: str) -> None:
     The in-memory dict is a fast-path cache; DynamoDB is the durable copy that
     survives ECS task restarts and cross-instance polls. Uses an unconditional
     put (upsert) — ``job`` always holds the full current state, so we don't need
-    a read-before-write to choose insert-vs-update (that was an extra round-trip
-    on every status transition). Persisted under the proposal's ``namespace`` so
+    a read-before-write to choose insert-vs-update. Persisted under the proposal's ``namespace`` so
     the async-job partition stays tenant-isolated, matching the proposal row.
     Persistence failures are logged and swallowed — the poll can still read the
     in-memory copy on the same task.
@@ -2551,17 +2497,10 @@ def _safe_get_async_job(kind: str, job_id: str, namespace: str) -> dict | None:
 
 
 def _evict_terminal_jobs(jobs: dict[str, dict], cap: int) -> None:
-    """Bound the in-memory job dict, preferring to evict TERMINAL jobs.
+    """Bound the in-memory job dict (a cache over DynamoDB), evicting the oldest TERMINAL jobs first.
 
-    The in-memory dict is only a fast-path cache — every job is also persisted
-    to DynamoDB, and the poll falls back to that durable copy on a cache miss.
-    So we evict oldest TERMINAL jobs first (their poll reads the finished DDB
-    row); if that alone can't get under the cap because everything is still
-    running, we force-evict the oldest entries anyway at a hard ceiling. The
-    running job's poll still resolves via the DynamoDB fallback, so eviction
-    never loses a result — it just falls back to the durable store. Without the
-    hard ceiling the dict could grow unbounded when all jobs are non-terminal.
-    Insertion order = age (dict preserves it).
+    At the hard ceiling the oldest entries are evicted regardless; their poll falls
+    back to DynamoDB.
     """
     if len(jobs) < cap:
         return
@@ -2587,9 +2526,7 @@ def _run_proposal_validation(
     namespace: str,
     r2rml_turtle: str | None = None,
 ):
-    from coa_ontology.validation.schemas import (
-        ValidationTier,
-    )
+    from coa_ontology.validation.schemas import ValidationTier
     from coa_ontology.validation.validators import OntologyValidator
     from coa_ontology.validation.validators.tier1 import (
         ConnectivityValidator,
@@ -2714,7 +2651,6 @@ def validate_proposal(
 
     job_id = str(uuid.uuid4())
 
-    # Evict oldest TERMINAL jobs only — never a running/pending one.
     _evict_terminal_jobs(_validation_jobs, _MAX_VALIDATION_JOBS)
 
     _validation_jobs[job_id] = {
@@ -2752,9 +2688,6 @@ def get_proposal_validation_job(proposal_id: str, job_id: str, namespace: str = 
     return job
 
 
-# ── Constraint config endpoints ────────────────────────────────────────
-
-
 _MAX_INFER_JOBS = 200
 _infer_jobs: dict[str, dict] = {}
 
@@ -2787,9 +2720,7 @@ def _run_infer_constraints(
         job["status"] = "completed"
     except RuntimeError as e:
         # The LLM/parse failure path raises RuntimeError with a scrubbed
-        # message (``Constraint inference failed: …``); surface it verbatim
-        # so the UI can show what went wrong, matching the synchronous
-        # 500-with-str(e) behaviour it replaced.
+        # message; surface it verbatim.
         _log.error("Constraint inference failed for job %s: %s", job_id, e, exc_info=True)
         job["error"] = str(e)
         job["status"] = "failed"
@@ -2833,7 +2764,6 @@ def infer_constraints(proposal_id: str, namespace: str = "default"):
 
     job_id = str(uuid.uuid4())
 
-    # Evict oldest TERMINAL jobs only — never a running/pending one.
     _evict_terminal_jobs(_infer_jobs, _MAX_INFER_JOBS)
 
     _infer_jobs[job_id] = {

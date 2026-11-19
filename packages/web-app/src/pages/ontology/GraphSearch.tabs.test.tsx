@@ -7,13 +7,7 @@
  * to a marker element — their contents have dedicated tests in
  * `explorer/*.test.tsx`; here we only prove which tab body the page mounts.
  */
-import {
-  render,
-  screen,
-  waitFor,
-  cleanup,
-  within,
-} from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -133,7 +127,6 @@ function activeTabLabel(view: ReturnType<typeof renderPage>): string | null {
 
 describe("GraphSearchPage — Explorer tabs", () => {
   beforeEach(() => {
-    cleanup();
     vi.clearAllMocks();
     searchEntitiesPaged.mockResolvedValue(CLASS_PAGE);
     getOntologyOverview.mockResolvedValue(OVERVIEW);
@@ -145,9 +138,8 @@ describe("GraphSearchPage — Explorer tabs", () => {
 
     await waitFor(() => expect(activeTabLabel(view)).toBe("Classes"));
     // The Classes body is the graph/list browser, identified by its List/Graph
-    // View toggle (Cloudscape gives each SegmentedControl segment a
-    // data-testid of its option id, which is unambiguous — the visible "List"
-    // text is duplicated by the control's narrow-viewport Select fallback).
+    // toggle. Cloudscape gives each SegmentedControl segment a data-testid equal
+    // to its id; the visible "List" text is repeated by its narrow-viewport Select.
     // Neither inventory view is mounted.
     expect(view.getByTestId("list")).toBeInTheDocument();
     expect(view.queryByTestId("ontology-inventory")).toBeNull();

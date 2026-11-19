@@ -3,27 +3,9 @@
 
 """A schema whose table and column names are not Latin must still induce usably.
 
-``to_pascal`` / ``to_camel`` mint the local name of every class, property and
-R2RML term in the STRUCTURED (database) induction path. Both stripped every
-character outside ``[a-zA-Z0-9\\s_\\-]``, so an identifier written in Japanese,
-Chinese, Korean, Cyrillic, Greek, Hindi or Arabic reduced to the empty string.
-
-Table names survived that by luck: :func:`pascal_names_for` already treats
-``to_pascal`` as lossy and appends a deterministic discriminator, so N tables
-whose names all vanish become ``Entity``, ``Entity_<hash>``, ... — ugly, but
-distinct. COLUMN names have no such layer. Every column of one table collapsed
-onto the single key ``{table}_``, which fused the columns into one property and
-dropped all but one ``rr:predicateObjectMap`` per TriplesMap.
-
-Measured against a deployed environment before this was fixed: a 3-table
-Japanese schema (15 columns) produced 3 classes named ``Entity``,
-``Entity_4719e596`` and ``Entity_60f9f8f9``, one merged DatatypeProperty per
-table carrying 4 labels and a mixed ``rdfs:range``, and an R2RML mapping for
-6 of 15 columns — 60% of the schema unqueryable.
-
-The Latin cases below are the other half of the contract: ASCII identifiers must
-mint byte-identical local names before and after, because every ontology induced
-so far has ASCII identifiers and their IRIs must not move.
+Non-Latin table and column names mint non-empty, distinct local names in the
+structured induction path. ASCII identifiers mint unchanged local names, so
+existing IRIs do not move.
 """
 
 from __future__ import annotations
@@ -363,19 +345,7 @@ class TestTwoEntriesSharingATableIdentity:
 
 
 class TestFusionDoesNotMixColumnMetadata:
-    """The column fusion carried each column's NL→SQL hints onto one property.
-
-    Documented as Part B2 of the induction normalization issue and the reason the
-    fusion is worse than a dropped column: ``_build_proposal_ontology`` attaches
-    ``skos:altLabel`` from ``col.synonyms``, ``coa:distinctValues`` from
-    ``col.distinctValues`` (sampled enum literals, emitted specifically so serve's
-    NL→SQL context can hint the LLM with correct ``WHERE`` values) and
-    ``rdfs:comment`` from ``col.description`` — all keyed on the property IRI.
-
-    With every non-Latin column of a table minting one IRI, a single predicate was
-    offered a city column's values AND a status column's values as candidate
-    literals for the same ``WHERE`` clause. That produces a wrong query, not an ugly
-    name.
+    """Column metadata (altLabel, distinctValues, comment) is keyed on the property IRI.
 
     The columns below collide only OUTSIDE the retained character set, so they
     exercise :func:`camel_names_for` rather than the letter-retention fix — the
@@ -789,13 +759,9 @@ class TestDiscriminatorCollisionWidening:
 class TestLiteralEntityColumnBesideASymbolOnlyColumn:
     """``%`` falls back to the ``entity`` local; a column can also be named ``entity``.
 
-    ``camel_names_for`` (since !1274) keeps the bare form for the smaller column
-    name, and ``%`` sorts before ``entity``, so the symbol-only column keeps
-    ``t_entity`` and the literal ``entity`` column gains the discriminator. Before
-    !1274 the mapping minted ``t_entity`` / ``POM_Entity`` for both and cross-wired
-    them, while the ontology declared ``t_entity`` labelled ``entity`` and ``t_``
-    labelled ``%``. So the ontology meaning of ``t_entity`` moved from the literal
-    column to ``%``. What this pins is that the two stay distinct and that every
+    ``camel_names_for`` keeps the bare form for the smaller column name, and ``%``
+    sorts before ``entity``, so the symbol-only column keeps ``t_entity`` and the
+    literal ``entity`` column gains the discriminator. What this pins is that the two stay distinct and that every
     emitter agrees on which one is which.
     """
 

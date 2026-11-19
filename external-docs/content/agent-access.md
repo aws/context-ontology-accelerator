@@ -53,12 +53,18 @@ client with a `localhost:9876/oauth/callback` redirect URI (see the
 [Authentication Setup Guide](authentication-setup.md)) so IDE integrations can
 complete the PKCE login without a server-side secret.
 
+The tool calls of one MCP session share one warm Context Manager session, so
+only the first call pays the start-up cost. That session keeps the runtime
+version it started on, so after deploying the serve stack, reconnect the MCP
+client (start a new MCP session) to test the new version.
+
 ### Which token to send
 
 | You call | Send | Read the client ID from |
 |---|---|---|
 | The MCP server | ID token from the MCP/CLI client | `McpClientId` (auth stack output), or SSM `/<prefix>/mcp-client-id` |
 | The REST API | ID token from the web app client | `UserPoolClientId`, or SSM `/<prefix>/userpool-client-id` |
+| The self-hosted workflow MCP server | ID token from the web app client | `UserPoolClientId`, or SSM `/<prefix>/userpool-client-id` |
 
 The MCP server rejects any other token with HTTP 401, starting with the
 first request a client sends. That includes an ID token from the web app
@@ -71,6 +77,27 @@ the Bearer token from the request, forwards it to the same authorizer path,
 and the acting user's grants determine what the tool can do — a `data-analyst`
 grant restricted to certain tables via `tableAllowlist` restricts `query` tool
 calls the same way it would restrict a direct API call.
+
+### Self-hosted workflow MCP server
+
+The workflow MCP server (`coa-ai/workflow-agents`) is a second MCP server that you run
+yourself, on your machine or in your own infrastructure; the deployment does not host it. It
+exposes one tool, `run_workflow`: you describe what you want in plain language, and an agent
+works it out against the REST API. Today it reports a namespace's status (its sources,
+induction jobs and proposals), onboards data sources (register, scan, approve, re-scan,
+delete) and runs ontology induction over approved sources.
+
+- It accepts only an **ID token from the web app client**, because it forwards that token on
+  every REST call and the REST API accepts only that client. An MCP-client token or an access
+  token is refused.
+- It holds no credentials: every call runs with the signed-in user's own grants. Mutating
+  operations run only when the call names them in `confirm_mutations`.
+- It listens on `127.0.0.1` by default. In a container, publish its port to `127.0.0.1` only.
+  It accepts only loopback `Host` and `Origin` headers, so a web page cannot reach it through
+  DNS rebinding; `SCL_MCP_ALLOWED_HOSTS` adds your own hostname when you serve it under one.
+
+Setup, configuration and errors are in `coa-ai/skills/workflow-agents/SKILL.md` in the
+repository.
 
 ## Obtaining a Token (3LO, on behalf of a user)
 
@@ -129,13 +156,21 @@ without schema rights:
 |------|-----------------|----------------------------------------|
 | `list_metrics` | `viewNamespace` | Metrics are listed, but each metric's SQL `expression` and `sourceTable` are empty and `ontologyConcepts` is omitted |
 | `describe_schema` | `viewOntology` | Denied (`isError: true`) |
-| `query` | `query` | Results only: no compiled SQL or generated SPARQL, no table lists, no graph context, no trace step details |
+| `query` | `query` | Results only: no compiled SQL or generated SPARQL, no table lists, no graph context, no trace step details. A caller who holds the rights gets the SQL (with `viewSource`) and SPARQL (with `viewOntology`) by default; `includeDebugInfo: false` leaves both out |
 | `translate_sparql` | `query` | Succeeds, but `sparqlQuery` is an empty string |
 | `rag_retrieval` | `searchDocuments` | Unchanged |
 | `graph_traversal` | `traverseGraph` | Succeeds, but `entities` and `relationships` are empty lists |
 
 A `data-analyst` holds neither schema right, so an agent acting for one gets
-results without schema. An empty field therefore does not always mean "nothing
+results without schema.
+
+The `query` tool's `includeDebugInfo` parameter defaults to `true`, as in the
+Playground, so an agent acting for a user who holds `viewSource` or
+`viewOntology` receives the generated SQL and SPARQL without asking. Those
+include table, column and ontology names, and they enter the agent's context
+and can be repeated to anyone the agent talks to. If that is not wanted, have
+the agent send `includeDebugInfo: false`, or grant the user a role without
+those rights. The REST API defaults the same parameter to `false`. An empty field therefore does not always mean "nothing
 found"; it can mean the field was withheld. If the server cannot evaluate
 authorization (for example, its roles table is not configured), tool calls fail
 with an "authorization is temporarily unavailable" error rather than running.
@@ -189,3 +224,4 @@ context-manager logs which record SQL Firewall decisions.
 | `403` on API call | The acting user has no grant | Create a grant for the user's principal ID |
 | Token expires mid-workflow | No refresh handling | Use the refresh token to renew the user's token |
 | Agent can authenticate but queries return empty | Data-level restrictions too narrow | Check `tableAllowlist` and `allowedMetrics` on the user's grant |
+| MCP tool returns `CM 409` (session operation in progress) | Many parallel tool calls on a new MCP session while its Context Manager session is still starting; the server's retries (about 4 s) ran out | Retry the call; it succeeds once the session is warm |

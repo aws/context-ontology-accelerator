@@ -24,17 +24,6 @@ export function readE2EEnv(): E2EEnv | null {
   return { baseURL, username, password };
 }
 
-/** Like readE2EEnv but throws — used by auth setup, which must fail fast. */
-export function requireE2EEnv(): E2EEnv {
-  const env = readE2EEnv();
-  if (!env) {
-    throw new Error(
-      "E2E environment is not configured. Set E2E_BASE_URL, E2E_USERNAME and E2E_PASSWORD.",
-    );
-  }
-  return env;
-}
-
 /** Reason used in test.skip(...) when the env is absent. */
 export const MISSING_ENV_REASON =
   "E2E env not configured (E2E_BASE_URL / E2E_USERNAME / E2E_PASSWORD) — skipping";

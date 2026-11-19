@@ -42,7 +42,7 @@ describe("buildContentSecurityPolicy", () => {
   });
 
   it("allows the region's S3 origin in connect-src for the OSI presigned upload", () => {
-    // OSI import PUTs directly to S3 from the browser (issue 103). Without the
+    // OSI import PUTs directly to S3 from the browser. Without the
     // S3 origin here, connect-src blocks the upload with "Failed to fetch".
     const csp = parse(
       buildContentSecurityPolicy({
@@ -59,13 +59,9 @@ describe("buildContentSecurityPolicy", () => {
   });
 
   it("also allows the legacy global S3 host in connect-src (us-east-1 presigns it)", () => {
-    // Regression for issue #211: boto3 presigns S3 URLs for a us-east-1 bucket
-    // using the legacy global virtual-hosted host `<bucket>.s3.amazonaws.com`
-    // (no region segment), NOT the regional `s3.us-east-1.amazonaws.com`. The
-    // region-only allowlist above never matches it, so the browser refuses the
-    // presigned proposal fetch with "Failed to fetch" and the proposal detail
-    // page shows "Could not load proposal". The global host must be allowlisted
-    // alongside the regional forms. Both the virtual-hosted wildcard and the
+    // boto3 presigns us-east-1 S3 URLs with the legacy global host
+    // `<bucket>.s3.amazonaws.com` (no region segment), which the regional
+    // allowlist never matches. Both the virtual-hosted wildcard and the
     // path-style host are included, mirroring the regional pair.
     const csp = parse(
       buildContentSecurityPolicy({
@@ -98,8 +94,8 @@ describe("buildContentSecurityPolicy", () => {
 
   describe("cross-stack (token) API endpoint", () => {
     // In the real app the API URL is `api.api.url`, a cross-stack token that
-    // `new URL()` cannot parse. That used to drop the API origin and fall back
-    // to a blanket `https:` in connect-src.
+    // `new URL()` cannot parse; the CSP must still carry the API origin rather
+    // than a blanket `https:` in connect-src.
     const API_URL = "https://kusm5j4qz5.execute-api.us-west-2.amazonaws.com/prod/";
 
     /** Evaluate the few CFN intrinsics the CSP can contain, as CloudFormation would. */
@@ -195,15 +191,13 @@ describe("buildContentSecurityPolicy", () => {
   });
 });
 
-describe("buildContentSecurityPolicy — Cognito hosted-UI origin (issue #130)", () => {
+describe("buildContentSecurityPolicy — Cognito hosted-UI origin", () => {
   const PREFIX = "coa-prod-auth-123456789012";
   const HOSTED_UI = `https://${PREFIX}.auth.us-east-1.amazoncognito.com`;
 
   it("allows the hosted-UI origin in connect-src for the OAuth token exchange", () => {
-    // The regression this pins: the token endpoint is on the hosted-UI domain,
-    // NOT on the issuer's `cognito-idp.<region>.amazonaws.com`. Allowlisting only
-    // the issuer blocks the PKCE code→token POST and every sign-in fails, with
-    // nothing visible in the app — only a CSP violation in devtools.
+    // The token endpoint is on the hosted-UI domain, not the issuer's
+    // `cognito-idp.<region>.amazonaws.com`; without it the PKCE token POST is blocked.
     const csp = parse(
       buildContentSecurityPolicy(baseConfig, undefined, PREFIX),
     );
@@ -262,7 +256,7 @@ describe("buildContentSecurityPolicy — Cognito hosted-UI origin (issue #130)",
   });
 
   it("never emits a wildcard amazoncognito.com host", () => {
-    // Canary: the cheap fix for #130 is `https://*.auth.<region>.amazoncognito.com`,
+    // Canary: the cheap fix is `https://*.auth.<region>.amazoncognito.com`,
     // which would allow every Cognito hosted UI in the region. Keep it exact.
     const csp = buildContentSecurityPolicy(baseConfig, undefined, PREFIX);
     expect(csp).not.toContain("*.auth.");

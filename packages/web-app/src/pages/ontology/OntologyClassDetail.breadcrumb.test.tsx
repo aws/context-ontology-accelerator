@@ -2,12 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * OntologyClassDetail's breadcrumb trail is origin-aware: reached from the
- * Explorer ("Expand" link, `?from=explorer`) it is one shape, reached from
- * the Induced Ontology page (default) it is a different, longer shape. This
- * is the one non-trivial per-page trail in the breadcrumb feature, so it
- * gets a dedicated test asserting both branches rather than only mounting
- * the page under BreadcrumbProvider without checking what it published.
+ * OntologyClassDetail publishes an origin-aware breadcrumb trail: reached from
+ * the Explorer (`?from=explorer`) it is one shape, from the Induced Ontology
+ * page (default) another. Asserts both branches.
  */
 import { render, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";

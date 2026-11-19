@@ -15,8 +15,6 @@
  *   sources == 0 & ACTIVE                  → archive
  *   sources == 0 & ARCHIVED/DELETE_FAILED  → delete
  *   DELETED / gone (404)                   → done
- * A *failed* list never triggers reactivation (it once resurrected a mid-delete
- * namespace and stranded it).
  */
 import type { Page } from "@playwright/test";
 
@@ -100,7 +98,6 @@ async function forceDeleteOne(api: Api, id: string): Promise<void> {
     const status = await getStatus(api, id);
     if (status === "DELETED" || status === null) return;
 
-    // Async delete in progress — wait it out.
     if (status === "DELETING") {
       await sleep(8_000);
       continue;
@@ -141,7 +138,6 @@ async function forceDeleteOne(api: Api, id: string): Promise<void> {
         body: JSON.stringify({ status: "ARCHIVED" }),
       }).catch(() => undefined);
     } else {
-      // ARCHIVED or DELETE_FAILED with no sources → (re)issue delete.
       await fetch(`${api.base}/namespaces/${id}`, {
         method: "DELETE",
         headers: api.headers,
@@ -180,7 +176,6 @@ export async function forceDeleteNamespaces(
     // omitted from the list).
     const ids = new Set<string>(knownIds);
 
-    // Resolve tracked display names → ids via ListNamespaces.
     if (names.length > 0) {
       const wanted = new Set(names);
       let nextToken: string | undefined;

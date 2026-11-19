@@ -10,34 +10,15 @@ registered in our account. So we register the catalog **here**, pointing at thei
 Lambda ARN — we do not consume a catalog registered on their side, which would be
 unreferenceable from our Athena.
 
-Registration only records a name → ARN mapping. It does not invoke the Lambda, so
-it succeeds even before the customer has granted us invoke on it; a missing grant
-surfaces later, at discovery, where ``test_connection`` reports it with an
-actionable message.
+Registration only records a name → ARN mapping and does not invoke the Lambda; a
+missing invoke grant surfaces at discovery, in ``test_connection``.
 
-Two design points that are easy to get wrong:
-
-* **We derive the catalog name; the customer never supplies one.** Athena catalog
-  names are account+region-global, so a customer-chosen name would let two
-  sources collide — and under a get-then-create guard the second source would
-  silently bind to the *first* source's Lambda, so deleting one would break the
-  other. The name is therefore derived from the source id via the same
-  :func:`~.glue_connection_provisioner.build_catalog_name` the federated-JDBC path
-  uses, which both guarantees a 1:1 source↔catalog mapping and keeps every
-  catalog inside the ``{sanitizedPrefix}ds_*`` window the IAM policy is scoped to.
-* **Idempotency is a get-then-create check, not a caught duplicate error.**
-  ``CreateDataCatalog`` declares only ``InternalServerException`` (500) and
-  ``InvalidRequestException`` (400) — there is no ``AlreadyExistsException`` — so
-  a duplicate name arrives as a 400 that no error code distinguishes from a
-  malformed request.
-
-* **The idempotency check stops discriminating when the handler ARN is shared.** It
-  compares catalog type plus the *set of handler ARNs*, so where one connector Lambda
-  serves every source of a sub-type that comparison is trivially true and a name
-  collision reads as a retried create (``False``) instead of raising
-  ``AthenaCatalogConflictError``. Such callers pass ``require_absent=True`` plus a
-  ``source_id`` for the ``coa:sourceId`` tag delete verifies against. Both are opt-in,
-  so ``CUSTOM_CONNECTOR``'s per-source ARN keeps its existing behaviour.
+* The catalog name is derived from the source id with
+  :func:`~.glue_connection_provisioner.build_catalog_name`, never supplied by the
+  customer: catalog names are account+region-global, and a derived name keeps a 1:1
+  source↔catalog mapping inside the ``{sanitizedPrefix}ds_*`` window the IAM policy allows.
+* Idempotency is a get-then-create check: ``CreateDataCatalog`` has no
+  ``AlreadyExistsException``, so a duplicate name is an indistinguishable 400.
 * Tagging needs ``athena:TagResource`` on create and ``athena:ListTagsForResource``
   to read back, because ``GetDataCatalog`` returns no tags at all.
 """
@@ -131,13 +112,9 @@ def build_catalog_parameters(connector_function_arn: str) -> dict[str, str]:
     * ``metadata-function=<arn>`` **and** ``record-function=<arn>`` for a split
       deployment.
 
-    Only the composite form is produced. ``CustomConnectorConfiguration`` models one ARN, so
-    the split pair is unreachable from the API — see that shape for why. Athena still
-    understands the pair, so restoring it means adding the member back and branching
-    here; nothing else about the catalog changes.
-
-    Note the pair keys are NOT dead here even so: Athena rewrites what it stores,
-    which is what :func:`_handler_arns` has to cope with.
+    Only the composite form is produced, because ``CustomConnectorConfiguration``
+    models one ARN. Athena rewrites what it stores, so :func:`_handler_arns` still
+    reads the pair keys.
     """
     return {_PARAM_COMPOSITE_FUNCTION: connector_function_arn}
 
@@ -351,17 +328,6 @@ def _is_not_found(exc: ClientError) -> bool:
     name has to be recognised from the message. ``ResourceNotFoundException`` is
     matched defensively; it exists in the Athena model but is not declared on
     these operations.
-
-    Both error directions are contained, but not equally, which is why the two
-    callers treat this result differently:
-
-    * On the lookup path, a *false positive* (a real error read as "absent") leads
-      to a create that fails loudly on the duplicate name, and a *false negative*
-      raises. Both end in a 500 and a rollback.
-    * On the delete path, a false positive would report success — so the caller
-      drops the source row and the catalog becomes unfindable. That is why
-      :func:`delete_lambda_catalog` confirms with a lookup instead of trusting
-      this alone.
     """
     error = exc.response.get("Error") or {}
     code = error.get("Code", "")

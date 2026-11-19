@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Namespace-language label selection across the serve readers (LLD §2.2.5).
+"""Namespace-language label selection across the serve readers.
 
 Every reader groups rows by resource URI and picks one display label with the
 request's namespace-language preference: the tag COA asserts for that language,
@@ -55,9 +55,6 @@ class _RowsGraph:
             if marker in sparql:
                 return rows
         return []
-
-
-# ── Tier 2 graph tools ─────────────────────────────────────────────────────
 
 
 _FK_ROWS = [
@@ -155,9 +152,6 @@ class TestGraphTools:
         assert customers["schema"] == "Table: customers | Columns: name:string (Customer name)"
 
 
-# ── Tier 2 T-Box context ───────────────────────────────────────────────────
-
-
 def _tbox_rows() -> list[dict]:
     return [
         {"class": _iri("Equipment"), "label": "Equipment", "parentClass": None},
@@ -205,9 +199,6 @@ class TestTBoxContext:
             ("customers", "Regionen"),
         ]
         assert "LANG(?domainLabel)" in graph.calls[-1]
-
-
-# ── Tier 3 ontology source ─────────────────────────────────────────────────
 
 
 class TestOntologySource:
@@ -263,15 +254,9 @@ class TestOntologySource:
         assert all("LANG(" in call for call in type_queries)
 
 
-# ── Tier 3 graph traverser ─────────────────────────────────────────────────
-
-
 class TestGraphTraverser:
-    # Rows carry the directed-provenance columns the query now selects
-    # (source/predicate/target URIs + their language-tagged labels). The entity
-    # arrives once per label value so the namespace-language preference can pick
-    # the display label and each relationship-endpoint label independently of row
-    # order.
+    # Rows carry source/predicate/target URIs plus language-tagged labels, one row
+    # per label value, so each label is picked independently of row order.
     ROWS = [
         {
             "entity": _iri("Equipment"),

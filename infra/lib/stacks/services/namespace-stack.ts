@@ -121,6 +121,19 @@ export class NamespaceStack extends SCLStack {
     // Custom scoped policy for SMUS domain execution role.
     // Grants only the minimum permissions required for SMUS IAM-based domain operations.
     // Replaces SageMakerStudioAdminIAMPermissiveExecutionPolicy which grants overly broad iam:* and s3:* wildcards.
+    //
+    // One name for the role and its PassRole grant, so the two cannot drift.
+    // The ARN is built from it rather than executionRole.roleArn: the role
+    // attaches this policy, so referencing the role here would be a cycle.
+    const executionRoleName = this.prefixed("smus-exec");
+    const executionRoleArn = `arn:aws:iam::${this.account}:role/${executionRoleName}`;
+    // DataZone authorizes domain-scoped calls against the domain ARN, even
+    // for actions the Service Authorization Reference lists without a
+    // resource type: a GetProject the caller's policy denies names
+    // arn:aws:datazone:<region>:<account>:domain/<id> as the resource. The
+    // exact domain ID can't be used here because the domain references this
+    // role, which would be a cycle.
+    const domainsInThisAccountAndRegion = `arn:aws:datazone:${this.region}:${this.account}:domain/*`;
     const smusExecutionPolicy = new iam.ManagedPolicy(
       this,
       "SMUSExecutionPolicy",
@@ -128,24 +141,32 @@ export class NamespaceStack extends SCLStack {
         managedPolicyName: this.prefixed("smus-exec-policy"),
         description: "Scoped permissions for SMUS domain execution role",
         statements: [
-          // DataZone domain operations
+          // DataZone domain read. The domain lifecycle (create, update,
+          // delete, list) is owned by CloudFormation and destroy.sh running
+          // as the deploying principal, never by this role, so it is not
+          // granted here.
           new iam.PolicyStatement({
+            sid: "DataZoneDomainRead",
+            actions: ["datazone:GetDomain"],
+            resources: [domainsInThisAccountAndRegion],
+          }),
+          // DataZone project and environment operations, on domains in this
+          // account and region only. Deletes are not granted:
+          // project deletion runs as the dz-project-access role (see
+          // cleanup.delete_smu_project) and domain teardown cascades through
+          // destroy.sh, and the metadata-only project profile has no
+          // environments to delete.
+          new iam.PolicyStatement({
+            sid: "DataZoneProjectEnvironment",
             actions: [
-              "datazone:CreateDomain",
-              "datazone:GetDomain",
-              "datazone:UpdateDomain",
-              "datazone:DeleteDomain",
-              "datazone:ListDomains",
               "datazone:CreateProject",
               "datazone:GetProject",
               "datazone:UpdateProject",
-              "datazone:DeleteProject",
               "datazone:CreateEnvironment",
               "datazone:GetEnvironment",
               "datazone:UpdateEnvironment",
-              "datazone:DeleteEnvironment",
             ],
-            resources: ["*"],
+            resources: [domainsInThisAccountAndRegion],
           }),
           // SageMaker operations for SMUS
           new iam.PolicyStatement({
@@ -188,8 +209,12 @@ export class NamespaceStack extends SCLStack {
               `arn:aws:glue:${this.region}:${this.account}:table/*`,
             ],
           }),
-          // Lake Formation permissions
+          // Lake Formation permissions. Lake Formation actions have no
+          // resource-level permissions, so Resource must be "*". Grant and
+          // revoke also require the caller to be a data lake administrator or
+          // to hold the permission with grant option, which this role is not.
           new iam.PolicyStatement({
+            sid: "LakeFormationPermissions",
             actions: [
               "lakeformation:GrantPermissions",
               "lakeformation:RevokePermissions",
@@ -233,17 +258,39 @@ export class NamespaceStack extends SCLStack {
               `arn:aws:s3:::${this.prefixed("*")}/*`,
             ],
           }),
-          // IAM operations scoped to roles/policies created by this stack only
+          // IAM read operations scoped to roles created by this deployment only
           new iam.PolicyStatement({
+            sid: "IAMReadPlatformRoles",
             actions: [
               "iam:GetRole",
-              "iam:PassRole",
               "iam:ListRolePolicies",
               "iam:GetRolePolicy",
             ],
             resources: [
               `arn:aws:iam::${this.account}:role/${this.prefixed("*")}`,
             ],
+          }),
+          // PassRole only on this role itself, and only to the SMUS services
+          // that run domain work as the domain execution role. The
+          // metadata-only project profile has no blueprints, so the domain
+          // has no other role to pass. Never grant PassRole on the prefixed
+          // wildcard: that would let this role hand the Lake Formation admin
+          // and data-access roles to any service.
+          new iam.PolicyStatement({
+            sid: "IAMPassSelfToSMUSServices",
+            actions: ["iam:PassRole"],
+            resources: [executionRoleArn],
+            conditions: {
+              StringEquals: {
+                "iam:PassedToService": [
+                  "datazone.amazonaws.com",
+                  "sagemaker.amazonaws.com",
+                  "glue.amazonaws.com",
+                  "lakeformation.amazonaws.com",
+                  "athena.amazonaws.com",
+                ],
+              },
+            },
           }),
           // EventBridge Scheduler operations
           new iam.PolicyStatement({
@@ -307,7 +354,7 @@ export class NamespaceStack extends SCLStack {
     );
 
     const executionRole = new iam.Role(this, "DomainExecutionRole", {
-      roleName: this.prefixed("smus-exec"),
+      roleName: executionRoleName,
       assumedBy: new iam.ServicePrincipal("datazone.amazonaws.com"),
       managedPolicies: [smusExecutionPolicy],
     });
@@ -339,17 +386,10 @@ export class NamespaceStack extends SCLStack {
         "SMUS domain for namespace isolation and metadata management",
     });
     domain.node.addDependency(executionRole);
-    // CFN's native DeleteDomain has no force/cascade option (unlike
-    // DeleteProject, which CFN always calls with skipDeletionCheck=true
-    // under the hood — confirmed via CloudTrail), so it fails outright
-    // once any project exists under the domain: "Domain cannot be
-    // deleted because there are existing projects under this domain".
-    // Namespace-created projects (one per namespace, holding that
-    // namespace's scanned-table assets) always exist while any namespace
-    // does, so this is not an edge case — RETAIN means CFN never
-    // attempts this delete itself; destroy.sh calls DataZone's own
-    // delete-domain --skip-deletion-check directly instead, which does
-    // support a full cascading force-delete at the domain level.
+    // CFN's DeleteDomain has no force option and fails while any project
+    // exists under the domain, and each namespace owns one. RETAIN keeps CFN
+    // from attempting it; destroy.sh calls DataZone delete-domain
+    // --skip-deletion-check instead.
     domain.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
 
     this.domainId = domain.attrId;
@@ -367,9 +407,13 @@ export class NamespaceStack extends SCLStack {
     // IAM-permitted on the datazone:DeleteProject action — the deletion
     // pipeline's DeletePlatform step assumes this role for that reason
     // (see cleanup.delete_smu_project).
+    // The trust policy also allows sts:TagSession. A caller whose session
+    // carries transitive session tags, such as a CI job's session, hands them
+    // on to every role it assumes, and STS refuses that unless the target role
+    // allows sts:TagSession.
     const dzProjectAccessRole = new iam.Role(this, "DzProjectAccessRole", {
       roleName: this.prefixed("dz-project-access"),
-      assumedBy: new iam.AccountPrincipal(this.account),
+      assumedBy: new iam.AccountPrincipal(this.account).withSessionTags(),
       description:
         "Shared role for DataZone project access - assumed by service Lambdas",
       inlinePolicies: {
@@ -411,7 +455,7 @@ export class NamespaceStack extends SCLStack {
     );
     dzProjectAccessUserProfile.node.addDependency(dzProjectAccessRole);
     dzProjectAccessUserProfile.node.addDependency(domain);
-    // #660 — same DataZone delete-order class of problem as FormType
+    // Same DataZone delete-order class of problem as FormType
     // below (see its comment for detail): the native CfnUserProfile L1
     // has no hook to satisfy DataZone's own deletion preconditions, so
     // RETAIN avoids CFN attempting (and failing) to delete it directly.
@@ -552,7 +596,7 @@ export class NamespaceStack extends SCLStack {
     });
     formType.node.addDependency(systemProject);
     formType.node.addDependency(createFormTypeGrant);
-    // #660 — DataZone requires a FormType to be DISABLED before
+    // DataZone requires a FormType to be DISABLED before
     // DeleteFormType succeeds; the native CfnFormType resource has no
     // such delete hook, so cdk destroy fails with "should be disabled to
     // Delete" and leaves the stack in DELETE_FAILED. RETAIN (see
@@ -721,7 +765,7 @@ export class NamespaceStack extends SCLStack {
     // Precondition checks for delete: read-only queries to detect active
     // operations that could race with the deletion pipeline's cleanup.
     // - SOURCES_TABLE ByNamespace GSI: sources actively scanning/enriching.
-    // - METRIC_IMPORT_JOBS_TABLE: IN_PROGRESS import jobs (#215 — completed/
+    // - METRIC_IMPORT_JOBS_TABLE: IN_PROGRESS import jobs (completed/
     //   failed jobs no longer block deletion).
     // Ontology induction jobs are checked via an HTTP call to the
     // ontology-engine (see delete_handler._check_active_induction_jobs) —
@@ -790,7 +834,7 @@ export class NamespaceStack extends SCLStack {
     // Read-time VKG health resolution (GetNamespace -> resolve_vkg_health)
     // calls ecs:DescribeServices, then ecs:ListTasks + ecs:DescribeTasks to
     // read the container's functional-probe healthStatus (a running task is not
-    // necessarily able to translate — #170). All scoped to the VKG cluster via
+    // necessarily able to translate). All scoped to the VKG cluster via
     // the ecs:cluster condition, mirroring the deletion pipeline grant.
     if (props.vkgClusterArn) {
       namespaceApiFn.addToRolePolicy(
@@ -856,9 +900,6 @@ export class NamespaceStack extends SCLStack {
         ontologyBucketName: props.ontologyBucketName,
         ontologyEngineEndpoint: props.ontologyEngineEndpoint,
         // For dropping the namespace's GraphRAG doc-KG indexes on teardown.
-        // Read from SSM (the storage stack writes both) — see bin/app.ts for
-        // the explicit addDependency this read requires, since CDK cannot infer
-        // ordering from valueForStringParameter.
         opensearchEndpoint,
         opensearchCollectionName,
         resourcePrefix: this.prefixed(""),

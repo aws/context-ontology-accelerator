@@ -24,9 +24,7 @@ def _glue_catalog_id() -> str:
     Resolved lazily from STS rather than defaulting to ``""``. An empty catalogId
     is not a soft failure: ``catalogId`` is length-constrained to an AWS account
     id, so every onboarding request built from it is rejected 400
-    ``"String should have at least 12 characters"`` — before any of the engine
-    behaviour under test is exercised. CI does not set INTEG_GLUE_CATALOG_ID, so
-    the empty default failed these four tests on every single run.
+    ``"String should have at least 12 characters"``.
     """
     override = os.environ.get("INTEG_GLUE_CATALOG_ID", "").strip()
     if override:

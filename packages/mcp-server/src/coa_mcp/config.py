@@ -4,6 +4,7 @@
 """MCP Server configuration."""
 
 import os
+from typing import Literal
 
 from coa_common.config import resolve_region
 from pydantic import Field, model_validator
@@ -34,6 +35,11 @@ class MCPConfig(BaseSettings):
     # MCP Server
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8000
+
+    # How tool calls map onto Context Manager runtime sessions (microVMs):
+    # "mcp_session" (default) = one per (caller, MCP session); "caller" = one per
+    # (caller, namespace), for clients that open a new MCP session per tool call.
+    cm_session_scope: Literal["mcp_session", "caller"] = "mcp_session"
 
     # Auth
     auth_enabled: bool = True

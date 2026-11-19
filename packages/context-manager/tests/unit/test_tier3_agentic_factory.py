@@ -1,29 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Agentic Retriever tool-registry factory (task 17).
-
-Covers ``coa_serve.tier3.agentic.factory``:
-
-- Endpoint-gated registration (Req 12.5-12.6): with the Neptune / OpenSearch
-  endpoints unconfigured, the strategy / graph / vector tools are OMITTED and a
-  ``structlog`` warning names each omitted tool and the missing endpoint(s); the
-  Ontology_Lookup_Tool is ALWAYS present (Req 12.4).
-- With both store endpoints configured, the full tool set — the seven
-  ``strategy:<value>`` tools plus ``graph_traversal``, ``vector_search``, and
-  ``ontology_lookup`` — is registered (Req 2.2, 2.3).
-- Ontology source selection (Req 3.2, 12.7): the file source is selected when
-  ``deep_reasoning_ontology_source="file"`` and the graph source when ``"graph"``.
-- ``build_agentic_retriever`` composes the registry, controller, decomposer,
-  synthesizer, and budget into an :class:`AgenticRetriever`.
-- The Req 12.3 lazy-import invariant: importing ``factory`` does not import
-  ``graphrag_toolkit``.
-
-The "all tools present" test enumerates the real ``RetrieverStrategy`` enum and
-builds the lexical adapter, which transitively imports ``graphrag_toolkit`` — but
-at test-run time, never at module load, preserving the invariant the dedicated
-subprocess test asserts.
-"""
+"""Unit tests for the Agentic Retriever tool-registry factory (``coa_serve.tier3.agentic.factory``)."""
 
 from __future__ import annotations
 
@@ -53,9 +31,6 @@ ONTOLOGY_TOOL = "ontology_lookup"
 GRAPH_TOOL = "graph_traversal"
 CHUNK_TOOL = "chunk_window"
 VECTOR_TOOL = "vector_search"
-
-
-# ── test doubles ───────────────────────────────────────────────────
 
 
 def make_config(**overrides) -> ServiceConfig:
@@ -110,9 +85,6 @@ def _omission_events(logs: list[dict]) -> dict[str, dict]:
     }
 
 
-# ── endpoint-gated omission (Req 12.5-12.6) ────────────────────────
-
-
 @pytest.mark.unit
 class TestEndpointGatedOmission:
     def test_unconfigured_endpoints_omit_tools_with_warning(self):
@@ -123,13 +95,10 @@ class TestEndpointGatedOmission:
         with structlog.testing.capture_logs() as logs:
             registry = build_tool_registry(config, clients)
 
-        # Only the always-on ontology tool survives (Req 12.4).
+        # Only the always-on ontology tool survives.
         assert registry.names() == [ONTOLOGY_TOOL]
-        assert GRAPH_TOOL not in registry.names()
-        assert VECTOR_TOOL not in registry.names()
-        assert not [n for n in registry.names() if n.startswith("strategy:")]
 
-        # Each omitted tool is named with its missing endpoint(s) (Req 12.6).
+        # Each omitted tool is named with its missing endpoint(s).
         omissions = _omission_events(logs)
         assert GRAPH_TOOL in omissions
         assert omissions[GRAPH_TOOL]["missing_endpoints"] == ["neptune_endpoint"]
@@ -179,16 +148,12 @@ class TestEndpointGatedOmission:
             assert ONTOLOGY_TOOL in registry.names()
 
 
-# ── full registration when configured (Req 2.2, 2.3) ───────────────
-
-
 @pytest.mark.unit
 class TestFullRegistration:
     def test_all_tools_present_when_endpoints_configured(self):
         """Both store endpoints set → 7 strategy + graph + vector + ontology.
 
-        chunk_window (idea 6) is DISABLED by default (opt-in via
-        AGENTIC_ENABLE_CHUNK_WINDOW), so it is NOT in the default registry.
+        chunk_window is opt-in via AGENTIC_ENABLE_CHUNK_WINDOW, so it is NOT in the default registry.
         """
         config = make_config(
             neptune_endpoint="my-neptune-host:8182",
@@ -200,17 +165,17 @@ class TestFullRegistration:
         names = registry.names()
 
         strategy_names = [n for n in names if n.startswith("strategy:")]
-        assert len(strategy_names) == 8, names  # 7 traversal + topic_beam (now always registered)
+        assert len(strategy_names) == 8, names  # 7 traversal + topic_beam
         assert "strategy:topic_beam" in names
         assert GRAPH_TOOL in names
-        assert CHUNK_TOOL not in names  # disabled by default (idea 6 opt-in)
+        assert CHUNK_TOOL not in names  # disabled by default (opt-in)
         assert VECTOR_TOOL in names
         assert ONTOLOGY_TOOL in names
         # 8 strategy + graph + vector + ontology.
         assert len(names) == 11  # nl_to_sql/nl_to_sparql need a StructuredQueryTier (not supplied here)
 
     def test_chunk_window_registered_when_enabled(self, monkeypatch):
-        """AGENTIC_ENABLE_CHUNK_WINDOW=1 + neptune → chunk_window is registered (idea 6)."""
+        """AGENTIC_ENABLE_CHUNK_WINDOW=1 + neptune → chunk_window is registered."""
         monkeypatch.setenv("AGENTIC_ENABLE_CHUNK_WINDOW", "1")
         config = make_config(
             neptune_endpoint="my-neptune-host:8182",
@@ -221,9 +186,6 @@ class TestFullRegistration:
         assert CHUNK_TOOL in names
         # 8 strategy + graph + chunk_window + vector + ontology.
         assert len(names) == 12
-
-
-# ── ontology source selection (Req 3.2, 12.7) ──────────────────────
 
 
 @pytest.mark.unit
@@ -256,9 +218,6 @@ class TestOntologySourceSelection:
         assert isinstance(source, OntologyGraphSource)
 
 
-# ── budget config mapping ──────────────────────────────────────────
-
-
 @pytest.mark.unit
 class TestBudgetConfig:
     def test_budget_built_from_config_fields(self):
@@ -273,9 +232,6 @@ class TestBudgetConfig:
         assert budget.max_steps == 12
         assert budget.per_tool_timeout_s == 20.0
         assert budget.max_fanout == 7
-
-
-# ── full assembly ──────────────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -293,13 +249,7 @@ class TestBuildAgenticRetriever:
         assert ONTOLOGY_TOOL in retriever._registry.names()
 
     def test_threads_guardrail_provider_into_synthesizer_and_decomposer(self, monkeypatch):
-        """The injected provider must reach BOTH agentic-built consumers.
-
-        Guards the silent-drift seam — a future refactor could drop the provider
-        arg and the agentic path would silently revert to a frozen guardrail. We
-        assert each composed consumer resolves the provider's LIVE value, and that
-        flipping it is reflected without reconstruction.
-        """
+        """The injected provider must reach BOTH agentic-built consumers and stay live."""
         monkeypatch.setenv("ENVIRONMENT", "local")
         config = make_config(neptune_endpoint="", opensearch_endpoint="", guardrail_id="gr-startup")
         clients = make_clients()
@@ -324,7 +274,6 @@ class TestBuildAgenticRetriever:
 
         retriever = build_agentic_retriever(make_config(), clients, FakeStepPlanner())
 
-        assert retriever._controller._embed_fn is not None
         assert retriever._controller._embed_fn is clients.llm
         assert retriever._embed_client is clients.llm
 
@@ -353,8 +302,7 @@ class TestBuildAgenticRetriever:
         )
 
     def test_planner_built_without_the_stop_signal_config_warns(self, monkeypatch):
-        """R18-n4: a planner left at the default config while the controller elicits is logged."""
-        import structlog.testing
+        """A planner left at the default config while the controller elicits is logged."""
         from coa_serve.tier3.agentic.planner import BedrockStepPlanner
 
         monkeypatch.setenv("ENVIRONMENT", "local")
@@ -413,9 +361,6 @@ class TestStopSignalConfig:
         assert BedrockStepPlanner(FakeLLM(), stop_signals=signals)._stop_signals is signals
 
 
-# ── lazy-import invariant (Req 12.3) ───────────────────────────────
-
-
 @pytest.mark.unit
 class TestLazyImportInvariant:
     def test_importing_factory_does_not_import_graphrag(self):
@@ -423,7 +368,7 @@ class TestLazyImportInvariant:
 
         Runs in a fresh subprocess (current ``sys.path`` propagated) so a
         ``graphrag_toolkit`` already imported by a sibling test cannot mask a
-        regression (mirrors the task-1 invariant test)."""
+        regression."""
         code = (
             "import sys; "
             "import coa_serve.tier3.agentic.factory; "

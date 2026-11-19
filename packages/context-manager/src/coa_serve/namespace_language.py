@@ -5,7 +5,7 @@
 
 Serve readers (Tier-2 graph tools and T-Box context, Tier-3 ontology and graph
 readers) choose one display label per resource from the namespace's immutable
-language (namespace-language LLD §2.2.5). The entrypoint resolves that language
+language. The entrypoint resolves that language
 once per request, from the namespace item it already reads for the existence
 gate, and binds the preference here; readers read it without every call path
 threading a parameter through.

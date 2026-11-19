@@ -11,12 +11,6 @@ from __future__ import annotations
 
 import pytest
 
-# A dead Snowflake account and a real regression both surface as SCAN_FAILED, so
-# these tests have to tell them apart from the persisted errorMessage — the
-# account this suite runs against is a 30-day trial, and when it lapses every
-# Snowflake test would otherwise start reporting a code failure that no code
-# change can fix.
-#
 # Deliberately narrow: only account-level death, where NOTHING about our
 # request could have caused it. Notably absent is "does not exist or not
 # authorized" — that is what a wrong warehouse/database value looks like too, so
@@ -39,11 +33,8 @@ _ACCOUNT_UNAVAILABLE_SIGNATURES = (
 def _account_unavailable_reason(message: str) -> str | None:
     """Return the matched signature when a failure is the Snowflake ACCOUNT dying.
 
-    ``message`` is the failed scan job's ``errorMessage``. Note it must come from
-    the scan job, NOT from GetSource: ``_build_database_detail`` does not project
-    ``errorMessage`` (only the document-source builder does), so a DATABASE
-    source detail never carries it — reading it there would silently classify
-    every failure as "unknown" and defeat this whole mechanism.
+    ``message`` is the failed scan job's ``errorMessage`` (see
+    ``detail_helpers.source_scan_error``).
     """
     lowered = str(message or "").lower()
     return next((sig for sig in _ACCOUNT_UNAVAILABLE_SIGNATURES if sig in lowered), None)

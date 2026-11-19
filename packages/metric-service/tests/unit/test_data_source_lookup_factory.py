@@ -26,7 +26,6 @@ class TestBuildDataSourceLookup:
     def test_missing_config_returns_none(self):
         from coa_metrics.data_source_lookup_factory import build_data_source_lookup
 
-        # No env vars set → configuration incomplete → None.
         with patch.dict("os.environ", {}, clear=True):
             assert build_data_source_lookup("ns-1") is None
 
